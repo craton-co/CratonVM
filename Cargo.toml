@@ -1,5 +1,9 @@
 [workspace]
-members = ["reader", "types", "native-api", "native-collections", "native-io", "native-builtins", "native-awt", "jit-api", "jit", "jit-cuda", "cuda-bridge", "classloading", "craton-gpu", "gc", "vm", "vm-cli", "jfr", "fuzz"]
+members = ["reader", "types", "native-api", "native-collections", "native-io", "native-builtins", "native-awt", "jit-api", "jit", "jit-cuda", "cuda-bridge", "classloading", "craton-gpu", "gc", "vm", "vm-cli", "jfr"]
+# `fuzz` is intentionally NOT a workspace member: its libFuzzer `fuzz_target!`
+# macros expand to `#![no_main]` / `#[no_mangle]` code that trips the
+# workspace's production lints. It is its own standalone workspace (see
+# `fuzz/Cargo.toml`) and is built via `cargo +nightly fuzz build` / CI.
 resolver = "2"
 
 [workspace.package]
@@ -117,6 +121,13 @@ unused_imports = "allow"
 unused_variables = "allow"
 unused_mut = "allow"
 unused_assignments = "allow"
+# Unlike the style allows above, this is an ABI-safety lint: two `extern`
+# declarations of the same Win32/native symbol with different signatures or
+# struct layouts are a real defect (one call path can read a mis-laid-out
+# struct). We had two such clashes in the vm crate (`VirtualQuery`,
+# `GetCurrentProcess`) declared per-module; both are now unified. Deny it so a
+# future divergent re-declaration fails the build instead of warning silently.
+clashing_extern_declarations = "deny"
 
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "allow"

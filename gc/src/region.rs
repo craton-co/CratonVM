@@ -845,10 +845,36 @@ impl RegionHeap {
 // ---------------------------------------------------------------------------
 
 /// Compute total object size from header.
+///
+/// Defensive corruption handling (gc-abort-cleanup, mirrors `gc.rs`): a corrupt /
+/// implausible array header (e.g. a stale `array_length` so large that
+/// `header + length * element_size` overflows `usize`) must NOT abort the whole
+/// VM. This previously `.expect()`-panicked here, killing the process on a bad
+/// header, whereas the non-moving sweep (`gen_heap.rs::gen_object_total_size`)
+/// returns a `0` sentinel and lets its walker re-sync. Mirror that behavior: on
+/// overflow, log a diagnostic and return `0`. `0 < HEADER_SIZE`, so every
+/// caller's existing corruption guard treats it as a bad header and stops /
+/// re-syncs the linear walk rather than advancing the cursor by 0 and spinning.
+///
+/// This does not mask genuine bugs silently — the corruption is logged — but it
+/// converts a hard process abort into a recoverable / fail-safe path.
 fn object_total_size(header: &ObjectHeader) -> usize {
     if header.kind == ObjectKind::Array {
-        HEADER_SIZE + array_data_size(header.array_length as usize, header.element_type)
-            .expect("array_data_size overflow in object_total_size")
+        match array_data_size(header.array_length as usize, header.element_type) {
+            Ok(data) => HEADER_SIZE + data,
+            Err(_) => {
+                // Implausible array header — treat as corrupt. Return 0 so the
+                // caller's `total_size < HEADER_SIZE` guard fires (matching the
+                // non-moving sweep's re-sync contract) instead of panicking.
+                tracing::warn!(
+                    "region: implausible array_length {} (element_type={:?}) in object header — \
+                     treating as corrupt; caller will skip/stop the walk",
+                    header.array_length,
+                    header.element_type,
+                );
+                0
+            }
+        }
     } else {
         HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
     }

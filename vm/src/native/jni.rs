@@ -102,6 +102,25 @@ thread_local! {
     /// can reconstruct the correct `Vec` layout and deallocate safely.
     static JNI_STRING_BUFFERS: std::cell::RefCell<HashMap<usize, usize>> =
         std::cell::RefCell::new(HashMap::new());
+    /// Tracks (pointer -> element count) for the copy buffers handed out by
+    /// `Get<Type>ArrayElements` so that `Release<Type>ArrayElements` can copy
+    /// the elements back and reconstruct the exact `Vec` layout for
+    /// deallocation.
+    ///
+    /// BUG FIX (vm-jni-roots #2): `Release` previously RE-DERIVED the length
+    /// from the array handle (`array_length`). If the length observed at
+    /// Release differed from the length at Get — the array moved/was realloc'd
+    /// under a moving GC, the handle was aliased/stale, or `array_length` read
+    /// 0 — then `Vec::from_raw_parts(elems, len, len)` was built with the wrong
+    /// length/capacity, corrupting the allocator. We now key the allocation by
+    /// its returned pointer at Get time and use the STORED count for both the
+    /// copy-back loop and `from_raw_parts`, never re-deriving from the handle.
+    /// Value is `(initialised_len, capacity)`: `initialised_len` is the number
+    /// of elements actually written (bounds the copy-back loop so we never read
+    /// uninitialised memory) and `capacity` is the original `Vec` allocation
+    /// size that MUST be passed to `Vec::from_raw_parts` for a sound free.
+    static JNI_ARRAY_ELEM_BUFFERS: std::cell::RefCell<HashMap<usize, (usize, usize)>> =
+        std::cell::RefCell::new(HashMap::new());
     /// Tracks temporary contiguous buffers handed out by
     /// `GetPrimitiveArrayCritical` when the underlying array is a G1
     /// **humongous** array (whose payload is split across non-contiguous
@@ -659,6 +678,63 @@ pub fn delete_local_ref(jobj: JObject) {
     });
 }
 
+/// Collect every active JNI **local** reference held by THIS thread into `out`
+/// for GC root scanning.
+///
+/// BUG FIX (vm-jni-roots #1): the per-thread `JNI_LOCAL_FRAMES` stack holds
+/// local-ref `JObject` handles, which for local refs are raw heap pointers
+/// (bit 0 = 0). Previously only `JniGlobalRefs::collect_roots` was folded into
+/// the root set (see `roots.rs`), so a heap object reachable ONLY through a JNI
+/// local ref could be reclaimed mid-native-call (or, under a moving GC, left as
+/// a stale from-space pointer). This mirrors `JniGlobalRefs::collect_roots`,
+/// but for the thread-local local-frame stack. Must be called on each thread
+/// that may hold local refs (the per-thread `roots::collect_roots`).
+///
+/// Global refs (bit 0 = 1) never appear in `JNI_LOCAL_FRAMES`, but we defend
+/// against a tagged value sneaking in by skipping any handle with bit 0 set
+/// (those are rooted separately via `JniGlobalRefs`).
+pub fn collect_local_ref_roots(out: &mut Vec<ObjectRef>) {
+    JNI_LOCAL_FRAMES.with(|f| {
+        for frame in f.borrow().iter() {
+            for &handle in frame.iter() {
+                if handle == 0 || handle & 1 == 1 {
+                    continue;
+                }
+                // Safety: a local ref is a raw, non-null heap pointer; it was a
+                // live ObjectRef when pushed and is kept live precisely by being
+                // reported here.
+                out.push(unsafe { ObjectRef::from_raw(handle as *mut u8) });
+            }
+        }
+    });
+}
+
+/// Apply a GC pointer map to every active JNI local reference on THIS thread,
+/// rewriting moved-object handles in place.
+///
+/// BUG FIX (vm-jni-roots #1): after a moving GC relocates objects, the raw
+/// pointers stored in `JNI_LOCAL_FRAMES` would dangle (point at from-space).
+/// This mirrors `JniGlobalRefs::update_after_gc` for the local-frame stack:
+/// for each stored local-ref handle whose address appears in `pointer_map`, we
+/// overwrite it with the relocated address so the native code's local jobject
+/// continues to resolve to the live object. Must be called on each thread that
+/// may hold local refs, after the heap has been compacted.
+pub fn update_local_refs_after_gc(pointer_map: &std::collections::HashMap<usize, usize>) {
+    JNI_LOCAL_FRAMES.with(|f| {
+        for frame in f.borrow_mut().iter_mut() {
+            for handle in frame.iter_mut() {
+                if *handle == 0 || *handle & 1 == 1 {
+                    continue;
+                }
+                let old_addr = *handle as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    *handle = new_addr as JObject;
+                }
+            }
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Conversion helpers
 // ---------------------------------------------------------------------------
@@ -789,6 +865,77 @@ unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
     }
     tracing::warn!("JNI cstr_to_str: string exceeds {MAX_JNI_CSTR_LEN} byte limit");
     None
+}
+
+/// Encode a Rust `&str` into JNI "modified UTF-8" (JNI spec, "Modified UTF-8
+/// Strings"). This differs from standard UTF-8 in two ways:
+///
+///   * `U+0000` is encoded as the two bytes `0xC0 0x80` (never a single `0x00`),
+///     so the byte stream contains no interior NUL and can be terminated by a
+///     single trailing `0x00` like a C string. Returning null for strings that
+///     contain an embedded NUL — as `CString::new` would force — violates the
+///     JNI contract for `GetStringUTFChars`.
+///   * Supplementary characters (code points `> U+FFFF`) are encoded as a UTF-16
+///     surrogate pair, each surrogate then emitted as its own three-byte
+///     sequence (CESU-8). A modified-UTF-8 sequence therefore never exceeds
+///     three bytes per unit, matching HotSpot's behaviour.
+///
+/// The returned `Vec<u8>` contains no `0x00` bytes, so it can be wrapped in a
+/// `CString` without error.
+fn to_modified_utf8(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len() + 1);
+    for ch in s.chars() {
+        let cp = ch as u32;
+        match cp {
+            // U+0000 — encode as the overlong two-byte form, not a NUL byte.
+            0x0000 => out.extend_from_slice(&[0xC0, 0x80]),
+            // U+0001..U+007F — single byte (ASCII), unchanged.
+            0x0001..=0x007F => out.push(cp as u8),
+            // U+0080..U+07FF — two bytes.
+            0x0080..=0x07FF => {
+                out.push(0xC0 | (cp >> 6) as u8);
+                out.push(0x80 | (cp & 0x3F) as u8);
+            }
+            // U+0800..U+FFFF — three bytes (BMP, including the non-surrogate
+            // range; `char` never holds a lone surrogate, so this is safe).
+            0x0800..=0xFFFF => {
+                out.push(0xE0 | (cp >> 12) as u8);
+                out.push(0x80 | ((cp >> 6) & 0x3F) as u8);
+                out.push(0x80 | (cp & 0x3F) as u8);
+            }
+            // Supplementary plane — emit a UTF-16 surrogate pair, each surrogate
+            // as a three-byte sequence (CESU-8), per the JNI spec.
+            _ => {
+                let v = cp - 0x1_0000;
+                let hi = 0xD800 | (v >> 10);
+                let lo = 0xDC00 | (v & 0x3FF);
+                for unit in [hi, lo] {
+                    out.push(0xE0 | (unit >> 12) as u8);
+                    out.push(0x80 | ((unit >> 6) & 0x3F) as u8);
+                    out.push(0x80 | (unit & 0x3F) as u8);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Number of bytes [`to_modified_utf8`] would produce for `s`, without
+/// allocating the encoded buffer. Used by `GetStringUTFLength` so the reported
+/// length agrees with the bytes `GetStringUTFChars` returns.
+fn modified_utf8_len(s: &str) -> usize {
+    let mut n = 0usize;
+    for ch in s.chars() {
+        let cp = ch as u32;
+        n += match cp {
+            0x0000 => 2,           // overlong NUL
+            0x0001..=0x007F => 1,  // ASCII
+            0x0080..=0x07FF => 2,  // two-byte
+            0x0800..=0xFFFF => 3,  // three-byte BMP
+            _ => 6,                // surrogate pair: two 3-byte sequences
+        };
+    }
+    n
 }
 
 /// Encode a method identity as a JMethodID.
@@ -2043,7 +2190,12 @@ extern "C" fn jni_get_string_utf_length(_env: JNIEnv, str_obj: JString) -> JSize
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(str_obj)?;
         let s = read_java_string(&shared.heap, oref)?;
-        Some(s.len() as JSize)
+        // The JNI contract specifies the *modified* UTF-8 length, which must
+        // agree with what GetStringUTFChars produces (a caller commonly does
+        // `malloc(GetStringUTFLength()+1)` then copies the chars in). Standard
+        // `s.len()` undercounts interior NULs (1→2 bytes) and supplementary
+        // chars (4→6 bytes), so compute the modified-UTF-8 length explicitly.
+        Some(modified_utf8_len(&s) as JSize)
     })
     .flatten()
     .unwrap_or(0)
@@ -2061,8 +2213,16 @@ extern "C" fn jni_get_string_utf_chars(
     let result = with_shared_vm(|shared| {
         let oref = jobject_to_obj(str_obj)?;
         let s = read_java_string(&shared.heap, oref)?;
-        // Allocate a C string (caller must free with ReleaseStringUTFChars)
-        let c_string = std::ffi::CString::new(s).ok()?;
+        // Encode as JNI "modified UTF-8": interior NUL (U+0000) must be encoded
+        // as the two-byte sequence 0xC0 0x80 rather than a single 0x00, so that
+        // the C string is only terminated by the trailing NUL we append below.
+        // (Plain CString::new() would reject any embedded NUL and return None,
+        // violating the JNI contract for strings that contain U+0000.)
+        let modified = to_modified_utf8(&s);
+        // `modified` contains no interior NUL bytes, so CString::new never fails;
+        // it appends the single terminating NUL. Caller frees via
+        // ReleaseStringUTFChars (CString::from_raw), which round-trips cleanly.
+        let c_string = std::ffi::CString::new(modified).ok()?;
         Some(c_string.into_raw() as *const c_char)
     })
     .flatten();
@@ -2211,7 +2371,41 @@ new_prim_array!(jni_new_float_array, ArrayElementType::Float); // 181
 new_prim_array!(jni_new_double_array, ArrayElementType::Double); // 182
 
 // ---- Indices 183-190: Get<Type>ArrayElements ----
-// Returns a pointer to the raw array data. For simplicity, we allocate a copy.
+// Returns a pointer to the raw array data.
+//
+// PERF (jni-arrayelems-perf): the previous implementation ALWAYS materialised a
+// full per-element copy (a `get_array_element` + `match` loop over the whole
+// array) and reported `is_copy = JNI_TRUE` — an O(n) copy on every call, even
+// for ordinary contiguous primitive arrays whose in-heap layout is already a
+// flat native-endian block. The heap stores primitives exactly as the C side
+// expects them: `write_prim_element`/`read_prim_element` use native-endian
+// widths (boolean/byte=1, char/short=2, int/float=4, long/double=8) that match
+// the `JBoolean/JByte/JChar/JShort/JInt/JLong/JFloat/JDouble` typedefs
+// one-for-one, so a `*mut $rust_type` view over the array body is bit-identical
+// to the copy the old loop produced.
+//
+// We therefore hand out a DIRECT pointer into the (pinned, non-moving) array
+// body with `is_copy = JNI_FALSE` whenever the array is contiguous, avoiding the
+// copy entirely. This mirrors the long-established `GetPrimitiveArrayCritical`
+// fast path (see `jni_get_primitive_array_critical`), which already returns the
+// same `array_data_ptr` directly: ordinary arrays live in the non-moving
+// generational heap / a single G1 region and are not relocated across a GC while
+// native code holds the pointer (the codebase's "our heap doesn't move objects
+// between GC" contract, cf. `GetStringCritical`).
+//
+// GC SAFETY / Release semantics: a direct pointer is deliberately NOT recorded
+// in `JNI_ARRAY_ELEM_BUFFERS`. `Release<Type>ArrayElements` looks the pointer up
+// and, finding no entry, treats it as a no-op — which is exactly right: native
+// writes already landed in the live array body (nothing to copy back) and there
+// is no separate buffer to free. Consistent with the JNI spec, when
+// `is_copy == JNI_FALSE` the `JNI_ABORT` release mode cannot undo in-place
+// writes, identical to the critical-section direct path.
+//
+// The COPY path is preserved verbatim for the one case that genuinely requires
+// it: a G1 *humongous* array, whose payload spans non-contiguous regions and so
+// has no flat data pointer (`array_data_ptr` returns `None`). There we still
+// build a contiguous buffer, register it, and report `is_copy = JNI_TRUE` so
+// Release copies any mutations back and frees it.
 macro_rules! get_array_elements {
     ($name:ident, $rust_type:ty, $value_variant:ident, $default:expr) => {
         extern "C" fn $name(
@@ -2222,8 +2416,22 @@ macro_rules! get_array_elements {
             if array == 0 {
                 return std::ptr::null_mut();
             }
+            // `(ptr, is_copy_flag)` — `is_copy_flag` is JNI_FALSE for the direct
+            // (no-copy) pointer and JNI_TRUE for the humongous copy buffer.
             let result = with_shared_vm(|shared| {
                 let oref = jobject_to_obj(array)?;
+                // FAST PATH: ordinary contiguous array → hand out the live body
+                // pointer, no copy. `array_data_ptr` returns `None` only for a
+                // G1 humongous array (non-contiguous payload), which falls
+                // through to the copy path below.
+                if let Some(base) = shared.heap.array_data_ptr(oref) {
+                    // The data region is a native-endian block of `$rust_type`
+                    // (see `write_prim_element`), so this reinterpretation is the
+                    // same bit pattern the per-element copy loop would have built.
+                    return Some((base as *mut $rust_type, JNI_FALSE));
+                }
+                // SLOW PATH (G1 humongous): materialise a contiguous copy via the
+                // region-safe per-element accessor, register it for Release.
                 let len = shared.heap.array_length(oref);
                 let mut buf: Vec<$rust_type> = Vec::with_capacity(len);
                 for i in 0..len {
@@ -2238,15 +2446,28 @@ macro_rules! get_array_elements {
                     buf.push(elem);
                 }
                 let ptr = buf.as_mut_ptr();
+                // BUG FIX (vm-jni-roots #2): record (ptr -> (len, cap)) so
+                // Release uses the EXACT layout we allocated. `buf` was created
+                // with `Vec::with_capacity(len)` then filled via `push`, so its
+                // capacity is `len` and its initialised count is `buf.len()`
+                // (== len unless an element fetch broke early). We store BOTH:
+                // `buf.len()` bounds the copy-back (never read uninitialised
+                // tail) and `buf.capacity()` is the size `Vec::from_raw_parts`
+                // requires for a sound free.
+                let buf_len = buf.len();
+                let buf_cap = buf.capacity();
+                JNI_ARRAY_ELEM_BUFFERS.with(|c| {
+                    c.borrow_mut().insert(ptr as usize, (buf_len, buf_cap));
+                });
                 std::mem::forget(buf); // OWNERSHIP: buffer transferred to native caller, freed by Release<Type>ArrayElements via Vec::from_raw_parts
-                Some(ptr)
+                Some((ptr, JNI_TRUE))
             })
             .flatten();
             match result {
-                Some(ptr) => {
+                Some((ptr, copy_flag)) => {
                     if !is_copy.is_null() {
                         unsafe {
-                            *is_copy = JNI_TRUE;
+                            *is_copy = copy_flag;
                         }
                     }
                     ptr
@@ -2279,14 +2500,39 @@ macro_rules! release_array_elements {
             if elems.is_null() {
                 return;
             }
+            // BUG FIX (vm-jni-roots #2): look up the (initialised_len, capacity)
+            // recorded for THIS buffer at Get time. Never re-derive the length
+            // from the array handle — the array may have moved/realloc'd under a
+            // moving GC, the handle may be aliased/stale, or `array_length` may
+            // read 0, any of which made the old code build the copy-back loop
+            // and `Vec::from_raw_parts` with a wrong length → heap corruption.
+            //
+            // For mode != 1 (i.e. modes that free) we `remove` the entry so the
+            // pointer can never be double-freed; for JNI_COMMIT (1, no free) we
+            // only `get` so a later release can still find it.
+            let entry = if mode != 1 {
+                JNI_ARRAY_ELEM_BUFFERS.with(|c| c.borrow_mut().remove(&(elems as usize)))
+            } else {
+                JNI_ARRAY_ELEM_BUFFERS.with(|c| c.borrow().get(&(elems as usize)).copied())
+            };
+            let (stored_len, stored_cap) = match entry {
+                Some(v) => v,
+                // Unknown pointer — not one we handed out (or already released).
+                // Do nothing rather than risk a wrong-length free.
+                None => return,
+            };
             // mode 0 = copy back and free, JNI_COMMIT = copy back don't free,
             // JNI_ABORT = free without copy back
             if mode != 2 && array != 0 {
-                // Copy back to array (mode 0 or JNI_COMMIT=1)
+                // Copy back to array (mode 0 or JNI_COMMIT=1). Bound the loop by
+                // BOTH our initialised length and the live array length so we
+                // neither read past the end of our buffer nor write out of the
+                // array's bounds if it has since shrunk.
                 with_shared_vm(|shared| {
                     let oref = jobject_to_obj(array)?;
-                    let len = shared.heap.array_length(oref);
-                    for i in 0..len {
+                    let arr_len = shared.heap.array_length(oref);
+                    let copy_len = stored_len.min(arr_len);
+                    for i in 0..copy_len {
                         let val = unsafe { *elems.add(i) };
                         let value = $value_constructor(val);
                         let _ = shared.heap.set_array_element(oref, i, value);
@@ -2295,21 +2541,10 @@ macro_rules! release_array_elements {
                 });
             }
             if mode != 1 {
-                // Free buffer (mode 0 or JNI_ABORT=2)
-                // Reconstruct Vec to free — we need the length.
-                // Since we don't track length, use array length.
-                if array != 0 {
-                    let len = with_shared_vm(|shared| {
-                        jobject_to_obj(array)
-                            .map(|oref| shared.heap.array_length(oref))
-                    })
-                    .flatten()
-                    .unwrap_or(0);
-                    if len > 0 {
-                        unsafe {
-                            drop(Vec::from_raw_parts(elems, len, len));
-                        }
-                    }
+                // Free buffer (mode 0 or JNI_ABORT=2) using the EXACT length and
+                // capacity we recorded at allocation time.
+                unsafe {
+                    drop(Vec::from_raw_parts(elems, stored_len, stored_cap));
                 }
             }
         }
@@ -3313,45 +3548,49 @@ pub unsafe fn dispatch_jni_native(
 ) -> Value {
     let param_types = parse_param_types_cached(descriptor);
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        static FLOAT_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if param_types.iter().any(|&t| t == b'F' || t == b'D')
-            && !FLOAT_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            tracing::warn!(
-                "JNI dispatch with float/double args on non-Windows platform — \
-                 values are passed as integer bit patterns which may not match \
-                 the System V ABI XMM register convention"
-            );
-        }
+    // Build a type-tagged argument list. `env` and `receiver` are always the
+    // first two integer-class arguments; the Java args follow, each tagged
+    // integer (GP register class) or floating-point (SSE register class) so the
+    // platform calling convention can route them to the correct registers.
+    let mut jargs: Vec<JniArg> = Vec::with_capacity(args.len() + 2);
+    // `env` is a raw pointer (`*const *const usize`); flatten it to a 64-bit
+    // integer-class word. `receiver` is already a `JObject` (u64 handle).
+    jargs.push(JniArg::int(env as usize as u64));
+    jargs.push(JniArg::int(receiver));
+    for (v, tag) in args.iter().zip(param_types.iter()) {
+        let a = match v {
+            Value::Int(i) => JniArg::int(*i as i64 as u64),
+            Value::Long(l) => JniArg::int(*l as u64),
+            // Float/double are SSE-class: their bit pattern must go in an XMM
+            // register on SysV (and in the positionally-shared XMM slot on
+            // Win64), not in a GP register.
+            Value::Float(f) => JniArg::float(f.to_bits() as u64),
+            Value::Double(d) => JniArg::float(d.to_bits()),
+            Value::Object(Some(r)) => JniArg::int(obj_to_jobject(*r)),
+            Value::Object(None) => JniArg::int(0u64),
+            // Defensive: an operand of an unexpected variant. Fall back to the
+            // declared descriptor tag to keep the register class correct.
+            _ => {
+                if *tag == b'F' || *tag == b'D' {
+                    JniArg::float(0)
+                } else {
+                    JniArg::int(0)
+                }
+            }
+        };
+        jargs.push(a);
     }
 
-    // Convert each Value to a raw u64. Object refs → pointer as u64,
-    // floats/doubles → bit representation. Works for all non-float args on all
-    // x86-64 ABIs; float support on Linux x86-64 requires libffi.
-    let raw: Vec<u64> = args
-        .iter()
-        .zip(param_types.iter())
-        .map(|(v, _tag)| match v {
-            Value::Int(i) => *i as i64 as u64,
-            Value::Long(l) => *l as u64,
-            Value::Float(f) => f.to_bits() as u64,
-            Value::Double(d) => d.to_bits(),
-            Value::Object(Some(r)) => obj_to_jobject(*r),
-            Value::Object(None) => 0u64,
-            _ => 0u64,
-        })
-        .collect();
-
-    let raw_result = call_jni_fn_ptr(fn_ptr, env, receiver, &raw);
-
-    // Determine return type from descriptor (byte after the closing ')')
+    // Whether the return value comes back in XMM0 (F/D) rather than RAX.
     let ret_char = descriptor
         .rfind(')')
         .and_then(|i| descriptor.as_bytes().get(i + 1).copied())
         .unwrap_or(b'V');
+    let fp_return = ret_char == b'F' || ret_char == b'D';
 
+    let raw_result = call_jni_marshalled(fn_ptr, &jargs, fp_return);
+
+    // `ret_char` was already computed above to decide `fp_return`.
     match ret_char {
         b'V' => Value::Object(None),
         b'Z' => Value::Int((raw_result & 1) as i32),
@@ -3369,81 +3608,463 @@ pub unsafe fn dispatch_jni_native(
     }
 }
 
-/// Call a raw `extern "C"` function pointer with (env, recv, args[0..N]).
-/// All arguments and the return value are treated as `u64`.
+/// A single C-ABI argument together with its register class.
 ///
-/// # Safety
-/// `fn_ptr` must be a valid function pointer whose actual C signature is
-/// compatible with receiving all arguments as 64-bit integers.
-unsafe fn call_jni_fn_ptr(fn_ptr: usize, env: JNIEnv, recv: JObject, args: &[u64]) -> u64 {
-    // Validate function pointer before transmute to prevent calling
-    // null, misaligned, or obviously-invalid pointers.
+/// The register class decides whether the 64-bit `bits` value is passed in a
+/// general-purpose register (integers, pointers, JNI handles) or an SSE/XMM
+/// register (float/double). This distinction is invisible once a value is
+/// flattened to a bare `u64`, which is why the previous implementation passed
+/// floats in integer registers — correct only on the Windows x64 ABI, wrong on
+/// System V (Linux/macOS) where FP args use XMM0–XMM7.
+#[derive(Clone, Copy)]
+struct JniArg {
+    bits: u64,
+    /// `true` if this argument is floating-point (SSE register class).
+    is_fp: bool,
+}
+
+impl JniArg {
+    #[inline]
+    fn int(bits: u64) -> Self {
+        JniArg { bits, is_fp: false }
+    }
+    #[inline]
+    fn float(bits: u64) -> Self {
+        JniArg { bits, is_fp: true }
+    }
+}
+
+/// Validate a JNI native function pointer before calling through it.
+/// Returns `false` (and logs) for null / misaligned pointers.
+#[inline]
+fn jni_fn_ptr_ok(fn_ptr: usize) -> bool {
     if fn_ptr == 0 {
         tracing::error!("JNI call with null function pointer — returning 0");
-        return 0;
+        return false;
     }
     // Alignment check: function pointers must be at least 2-byte aligned
     // on all modern architectures (4-byte on ARM).
     #[cfg(target_arch = "aarch64")]
     if fn_ptr % 4 != 0 {
         tracing::error!("JNI call with misaligned function pointer {:#x} — returning 0", fn_ptr);
-        return 0;
+        return false;
     }
     #[cfg(not(target_arch = "aarch64"))]
     if fn_ptr % 2 != 0 {
         tracing::error!("JNI call with misaligned function pointer {:#x} — returning 0", fn_ptr);
+        return false;
+    }
+    true
+}
+
+/// Call a JNI native function pointer, marshalling each argument into the
+/// correct register class (GP vs XMM) and spilling any overflow to the stack,
+/// per the platform calling convention. `args` already includes `env` and the
+/// receiver/class as its first two (integer) entries.
+///
+/// On `x86_64` this routes through a small assembly trampoline that honours the
+/// active ABI (Windows x64 or System V), so float/double arguments land in XMM
+/// registers and calls with more than the register-resident argument count
+/// correctly spill the remainder to the stack. When `fp_return` is set, the
+/// XMM0 result is returned in place of RAX so the caller can reinterpret it as
+/// a float/double.
+///
+/// On non-`x86_64` targets we keep the previous fixed-arity integer fast path
+/// (correct for integer/reference args up to the register limit) and fail loud
+/// for the float/double or large-arity cases we cannot honour without an
+/// architecture-specific trampoline — never fabricating a 0/null result.
+///
+/// # Safety
+/// `fn_ptr` must be a valid JNI native function whose C signature matches the
+/// argument register classes described by `args` and the requested return kind.
+unsafe fn call_jni_marshalled(fn_ptr: usize, args: &[JniArg], fp_return: bool) -> u64 {
+    if !jni_fn_ptr_ok(fn_ptr) {
         return 0;
     }
 
-    // We use explicit transmutes to extern "C" function types so that Rust
-    // generates correct platform-ABI call sequences (register assignments,
-    // stack layout) for each argument count.
-    let a = args;
-    match a.len() {
+    // Fast path: integer/reference-only calls (no FP arg, no FP return) are
+    // dispatched with the proven fixed-arity `extern "C"` transmutes. The
+    // compiler emits the correct ABI sequence for these, INCLUDING spilling any
+    // integer overflow past the register file to the stack, so this is valid for
+    // every all-integer arity the helper enumerates (up to MAX_INT_FAST total
+    // args). This keeps the overwhelmingly common JNI call shape on the
+    // well-tested path and confines the assembly trampoline strictly to the
+    // cases that path cannot express: float/double arguments or return values.
+    const MAX_INT_FAST: usize = 8; // highest fixed-arity arm in call_jni_fn_ptr_int
+    if !fp_return && args.len() <= MAX_INT_FAST && !args.iter().any(|a| a.is_fp) {
+        return call_jni_fn_ptr_int(fn_ptr, args);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Partition the arguments into GP-register, XMM-register and stack-spill
+        // slots according to the active x86-64 ABI.
+        //
+        //  * Windows x64: the first FOUR arguments go in registers and integer
+        //    vs FP shares one positional counter — i.e. argument N (0-based) uses
+        //    GP slot N if integer or XMM slot N if FP, and any argument with
+        //    N >= 4 spills to the stack. Each register arg still reserves its
+        //    32-byte "shadow space" slot, which the trampoline allocates.
+        //  * System V: integers and FP have INDEPENDENT counters — up to 6 GP
+        //    registers (RDI,RSI,RDX,RCX,R8,R9) and up to 8 XMM registers
+        //    (XMM0–7); anything beyond a class's register budget spills.
+        let mut gp: [u64; 6] = [0; 6];
+        let mut xmm: [u64; 8] = [0; 8];
+        let mut stack: Vec<u64> = Vec::new();
+
+        #[cfg(target_os = "windows")]
+        {
+            const MAX_REG: usize = 4; // RCX/RDX/R8/R9 share positions with XMM0–3
+            let mut n_gp = 0usize;
+            let mut n_xmm = 0usize;
+            for (pos, a) in args.iter().enumerate() {
+                if pos < MAX_REG {
+                    if a.is_fp {
+                        xmm[pos] = a.bits;
+                        n_xmm = n_xmm.max(pos + 1);
+                    } else {
+                        gp[pos] = a.bits;
+                        n_gp = n_gp.max(pos + 1);
+                    }
+                } else {
+                    stack.push(a.bits);
+                }
+            }
+            jni_trampoline_call(fn_ptr, &gp, n_gp, &xmm, n_xmm, &stack, fp_return)
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut n_gp = 0usize;
+            let mut n_xmm = 0usize;
+            for a in args.iter() {
+                if a.is_fp {
+                    if n_xmm < xmm.len() {
+                        xmm[n_xmm] = a.bits;
+                        n_xmm += 1;
+                    } else {
+                        stack.push(a.bits);
+                    }
+                } else if n_gp < gp.len() {
+                    gp[n_gp] = a.bits;
+                    n_gp += 1;
+                } else {
+                    stack.push(a.bits);
+                }
+            }
+            jni_trampoline_call(fn_ptr, &gp, n_gp, &xmm, n_xmm, &stack, fp_return)
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // No architecture-specific trampoline. We can still correctly dispatch
+        // integer/reference-only calls that fit the GP register file via fixed
+        // -arity transmutes; FP args or oversized arg lists cannot be honoured
+        // safely here, so we fail loud rather than fabricate a result.
+        if args.iter().any(|a| a.is_fp) || fp_return {
+            tracing::error!(
+                "JNI native dispatch with float/double argument or return type is \
+                 unsupported on this architecture (no FP-aware trampoline) — \
+                 refusing to call to avoid an ABI mismatch"
+            );
+            jni_throw_unsatisfied_link("float/double JNI signatures require an FP-aware trampoline on this architecture");
+            return 0;
+        }
+        call_jni_fn_ptr_int(fn_ptr, args)
+    }
+}
+
+/// x86-64 assembly trampoline driver.
+///
+/// Lays out the GP registers, XMM registers and any stack-spill words into a
+/// single contiguous control block and tail-calls the naked trampoline, which
+/// performs the actual register loads and the `call`. The naked trampoline
+/// stores XMM0 back into the control block on return so we can surface an
+/// FP result.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn jni_trampoline_call(
+    fn_ptr: usize,
+    gp: &[u64; 6],
+    n_gp: usize,
+    xmm: &[u64; 8],
+    n_xmm: usize,
+    stack: &[u64],
+    fp_return: bool,
+) -> u64 {
+    // Control block consumed by the naked trampoline. Field order/offsets are
+    // mirrored exactly by the assembly below — DO NOT reorder without updating
+    // the offsets there.
+    #[repr(C)]
+    struct CallBlock {
+        fn_ptr: u64,       // +0
+        gp: [u64; 6],      // +8
+        xmm: [u64; 8],     // +56
+        stack_ptr: u64,    // +120  (pointer to first stack word, or null)
+        n_stack: u64,      // +128  (count of stack words)
+        n_xmm: u64,        // +136  (used for AL: # of vector regs, SysV varargs)
+        xmm0_ret: u64,     // +144  (out: XMM0 result)
+    }
+
+    let mut block = CallBlock {
+        fn_ptr: fn_ptr as u64,
+        gp: *gp,
+        xmm: *xmm,
+        stack_ptr: if stack.is_empty() { 0 } else { stack.as_ptr() as u64 },
+        n_stack: stack.len() as u64,
+        n_xmm: n_xmm as u64,
+        xmm0_ret: 0,
+    };
+    let _ = n_gp; // GP regs are always loaded (unused entries are 0); kept for clarity.
+
+    let rax = jni_naked_trampoline(&mut block as *mut CallBlock as *mut u8);
+    if fp_return {
+        block.xmm0_ret
+    } else {
+        rax
+    }
+}
+
+// Naked x86-64 trampoline. Receives a single pointer to the `CallBlock` in the
+// first integer-argument register of the active ABI (RCX on Windows, RDI on
+// System V). It:
+//   1. computes the stack space for spilled args (+ 32 bytes shadow space on
+//      Windows), keeping 16-byte alignment at the `call`,
+//   2. copies the stack-spill words into place,
+//   3. loads the GP and XMM argument registers from the block,
+//   4. sets AL = n_xmm (required by the System V variadic convention; ignored
+//      by the Windows ABI),
+//   5. `call`s the target, then stores XMM0 into the block and returns RAX.
+//
+// Field offsets MUST match `CallBlock` above. Two fully separate, item-level
+// `cfg`-gated `global_asm!` blocks are used (rather than per-line `cfg`
+// attributes inside one `global_asm!`, which are not supported) so the Windows
+// x64 and System V variants are each unambiguous.
+//
+// Common prologue/epilogue note: after `push rbp; mov rbp,rsp; push rbx; push
+// r12`, the saved-register window is [rbp]=rbp, [rbp-8]=rbx, [rbp-16]=r12, so
+// the epilogue restores RSP with `lea rsp,[rbp-16]` before popping r12/rbx/rbp.
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+core::arch::global_asm!(
+    ".p2align 4",
+    ".globl jni_naked_trampoline_asm",
+    "jni_naked_trampoline_asm:",
+    "push rbp",
+    "mov rbp, rsp",
+    "push rbx",
+    "push r12",
+    "mov rbx, rcx",          // block ptr (Win64 arg0 = RCX)
+    "mov r12, [rbx + 128]",  // r12 = n_stack
+    "mov rax, r12",
+    "shl rax, 3",            // bytes for stack args
+    "add rax, 32",           // + 32-byte shadow space (Win64)
+    "sub rsp, rax",
+    "and rsp, -16",          // 16-byte align at the call
+    "mov r8, [rbx + 120]",   // r8 = stack_ptr (source, may be 0)
+    "test r12, r12",
+    "jz 2f",
+    "test r8, r8",
+    "jz 2f",
+    "mov r9, rsp",
+    "add r9, 32",            // dest = above the shadow space
+    "xor r10, r10",
+    "1:",
+    "mov rax, [r8 + r10*8]",
+    "mov [r9 + r10*8], rax",
+    "inc r10",
+    "cmp r10, r12",
+    "jb 1b",
+    "2:",
+    "movq xmm0, [rbx + 56]",
+    "movq xmm1, [rbx + 64]",
+    "movq xmm2, [rbx + 72]",
+    "movq xmm3, [rbx + 80]",
+    // XMM4–7 are loaded too (harmless on Win64; only XMM0–3 are arg regs).
+    "movq xmm4, [rbx + 88]",
+    "movq xmm5, [rbx + 96]",
+    "movq xmm6, [rbx + 104]",
+    "movq xmm7, [rbx + 112]",
+    "mov rax, [rbx + 136]",  // AL = n_xmm (ignored by Win64; set for uniformity)
+    "mov r11, [rbx + 0]",    // target fn ptr
+    "mov rcx, [rbx + 8]",    // gp[0]
+    "mov rdx, [rbx + 16]",   // gp[1]
+    "mov r8,  [rbx + 24]",   // gp[2]
+    "mov r9,  [rbx + 32]",   // gp[3]
+    "call r11",
+    "movq [rbx + 144], xmm0", // capture FP return
+    "lea rsp, [rbp - 16]",
+    "pop r12",
+    "pop rbx",
+    "pop rbp",
+    "ret",
+);
+
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+core::arch::global_asm!(
+    ".p2align 4",
+    ".globl jni_naked_trampoline_asm",
+    "jni_naked_trampoline_asm:",
+    "push rbp",
+    "mov rbp, rsp",
+    "push rbx",
+    "push r12",
+    "mov rbx, rdi",          // block ptr (SysV arg0 = RDI)
+    "mov r12, [rbx + 128]",  // r12 = n_stack
+    "mov rax, r12",
+    "shl rax, 3",            // bytes for stack args (no shadow space on SysV)
+    "sub rsp, rax",
+    "and rsp, -16",          // 16-byte align at the call
+    "mov r8, [rbx + 120]",   // r8 = stack_ptr (source, may be 0)
+    "test r12, r12",
+    "jz 2f",
+    "test r8, r8",
+    "jz 2f",
+    "mov r9, rsp",           // dest = [rsp] (no shadow space)
+    "xor r10, r10",
+    "1:",
+    "mov rax, [r8 + r10*8]",
+    "mov [r9 + r10*8], rax",
+    "inc r10",
+    "cmp r10, r12",
+    "jb 1b",
+    "2:",
+    "movq xmm0, [rbx + 56]",
+    "movq xmm1, [rbx + 64]",
+    "movq xmm2, [rbx + 72]",
+    "movq xmm3, [rbx + 80]",
+    "movq xmm4, [rbx + 88]",
+    "movq xmm5, [rbx + 96]",
+    "movq xmm6, [rbx + 104]",
+    "movq xmm7, [rbx + 112]",
+    "mov rax, [rbx + 136]",  // AL = n_xmm (SysV variadic FP-reg count)
+    "mov r11, [rbx + 0]",    // target fn ptr
+    "mov rdi, [rbx + 8]",    // gp[0]
+    "mov rsi, [rbx + 16]",   // gp[1]
+    "mov rdx, [rbx + 24]",   // gp[2]
+    "mov rcx, [rbx + 32]",   // gp[3]
+    "mov r8,  [rbx + 40]",   // gp[4]
+    "mov r9,  [rbx + 48]",   // gp[5]
+    "call r11",
+    "movq [rbx + 144], xmm0", // capture FP return
+    "lea rsp, [rbp - 16]",
+    "pop r12",
+    "pop rbx",
+    "pop rbp",
+    "ret",
+);
+
+#[cfg(target_arch = "x86_64")]
+extern "C" {
+    // The naked trampoline defined in `global_asm!` above. Takes the control
+    // block pointer, returns the integer (RAX) result.
+    fn jni_naked_trampoline_asm(block: *mut u8) -> u64;
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn jni_naked_trampoline(block: *mut u8) -> u64 {
+    jni_naked_trampoline_asm(block)
+}
+
+/// Integer/reference-only dispatch via fixed-arity `extern "C"` transmutes, so
+/// the compiler emits the correct platform register layout. This is the fast
+/// path on `x86_64` for all-integer calls that fit in GP registers, and the
+/// only dispatch mechanism on non-`x86_64` targets (which lack the assembly
+/// trampoline). Calls with more arguments than the register file can hold are
+/// not supported here and fail loud (UnsatisfiedLinkError) rather than silently
+/// returning 0.
+///
+/// # Safety
+/// Every entry of `args` must be an integer/reference-class value; `fn_ptr`
+/// must match a signature receiving them all as 64-bit integers.
+unsafe fn call_jni_fn_ptr_int(fn_ptr: usize, args: &[JniArg]) -> u64 {
+    // args[0]=env, args[1]=recv, args[2..]=the Java params.
+    let g = |i: usize| args[i].bits;
+    match args.len() {
         0 => {
-            let f: extern "C" fn(JNIEnv, JObject) -> u64 = std::mem::transmute(fn_ptr);
-            f(env, recv)
+            let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr);
+            f()
         }
         1 => {
-            let f: extern "C" fn(JNIEnv, JObject, u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(env, recv, a[0])
+            let f: extern "C" fn(u64) -> u64 = std::mem::transmute(fn_ptr);
+            f(g(0))
         }
         2 => {
-            let f: extern "C" fn(JNIEnv, JObject, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(env, recv, a[0], a[1])
+            let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+            f(g(0), g(1))
         }
         3 => {
-            let f: extern "C" fn(JNIEnv, JObject, u64, u64, u64) -> u64 =
-                std::mem::transmute(fn_ptr);
-            f(env, recv, a[0], a[1], a[2])
+            let f: extern "C" fn(u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+            f(g(0), g(1), g(2))
         }
         4 => {
-            let f: extern "C" fn(JNIEnv, JObject, u64, u64, u64, u64) -> u64 =
-                std::mem::transmute(fn_ptr);
-            f(env, recv, a[0], a[1], a[2], a[3])
+            let f: extern "C" fn(u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+            f(g(0), g(1), g(2), g(3))
         }
         5 => {
-            let f: extern "C" fn(JNIEnv, JObject, u64, u64, u64, u64, u64) -> u64 =
-                std::mem::transmute(fn_ptr);
-            f(env, recv, a[0], a[1], a[2], a[3], a[4])
+            let f: extern "C" fn(u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+            f(g(0), g(1), g(2), g(3), g(4))
         }
         6 => {
-            let f: extern "C" fn(JNIEnv, JObject, u64, u64, u64, u64, u64, u64) -> u64 =
-                std::mem::transmute(fn_ptr);
-            f(env, recv, a[0], a[1], a[2], a[3], a[4], a[5])
+            let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+            f(g(0), g(1), g(2), g(3), g(4), g(5))
         }
         7 => {
-            let f: extern "C" fn(JNIEnv, JObject, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
                 std::mem::transmute(fn_ptr);
-            f(env, recv, a[0], a[1], a[2], a[3], a[4], a[5], a[6])
+            f(g(0), g(1), g(2), g(3), g(4), g(5), g(6))
         }
-        _ => {
+        8 => {
+            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                std::mem::transmute(fn_ptr);
+            f(g(0), g(1), g(2), g(3), g(4), g(5), g(6), g(7))
+        }
+        n => {
             tracing::error!(
-                "JNI call with {} args exceeds maximum supported (8) — returning 0 to prevent undefined behavior",
-                a.len()
+                "JNI call with {} total args exceeds the supported register count on this \
+                 architecture (no stack-spill trampoline) — raising UnsatisfiedLinkError",
+                n
+            );
+            jni_throw_unsatisfied_link(
+                "JNI signatures with more register-resident integer arguments than this \
+                 architecture supports require a stack-spilling trampoline",
             );
             0
         }
+    }
+}
+
+/// Raise an `UnsatisfiedLinkError` on the current thread so an unsupported
+/// native dispatch surfaces as a real Java exception rather than a fabricated
+/// 0/null return.
+///
+/// Mirrors [`raise_jni_aioobe`]: when a `JvmThread` context is available we
+/// materialise a real exception object and store its handle in
+/// `JNI_PENDING_EXCEPTION`, so `vm_exec` rethrows it on return from the native
+/// call. Without a thread context (e.g. a direct unit-test call) we fall back
+/// to the `ThrowNew` sentinel so the error is flagged rather than swallowed.
+fn jni_throw_unsatisfied_link(msg: &str) {
+    let full = format!("Unsupported native method ABI: {msg}");
+    let raised = with_jni_context(|shared, thread| {
+        match crate::runtime::exceptions::create_exception_object(
+            shared,
+            thread,
+            "java/lang/UnsatisfiedLinkError",
+            Some(&full),
+        ) {
+            Ok(exc) => {
+                let handle = obj_to_jobject(exc);
+                JNI_PENDING_EXCEPTION.with(|cell| cell.set(handle));
+                true
+            }
+            Err(_) => false,
+        }
+    })
+    .unwrap_or(false);
+    if !raised {
+        JNI_PENDING_EXCEPTION.with(|cell| cell.set(u64::MAX));
     }
 }
 
@@ -5268,6 +5889,120 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // vm-jni-roots #1: JNI LOCAL refs are GC roots and are remapped on move.
+    //
+    // These exercise the pure thread-local-frame bookkeeping without a heap:
+    // `collect_local_ref_roots` / `update_local_refs_after_gc` only read/write
+    // raw handle integers (and wrap them with `ObjectRef::from_raw`, which does
+    // not dereference), so fabricated aligned, non-null, bit-0-clear handles
+    // are sufficient. Each test pops its frame at the end so it leaves no
+    // residue for sibling tests sharing the thread-local stack.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn local_refs_collected_as_roots() {
+        push_local_frame(8);
+        // Two valid local-ref handles (8-byte aligned, non-null, bit 0 == 0).
+        let h1: JObject = 0x1_0000;
+        let h2: JObject = 0x2_0000;
+        track_local_ref(h1);
+        track_local_ref(h2);
+        // A global ref (bit 0 == 1) and null must NOT be picked up here.
+        track_local_ref(0x3_0001);
+        track_local_ref(0);
+
+        let mut roots = Vec::new();
+        collect_local_ref_roots(&mut roots);
+        let addrs: Vec<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
+        assert!(addrs.contains(&(h1 as usize)));
+        assert!(addrs.contains(&(h2 as usize)));
+        assert!(!addrs.contains(&0x3_0001));
+        assert_eq!(addrs.len(), 2, "only the 2 untagged local refs are roots");
+
+        pop_local_frame(0);
+    }
+
+    #[test]
+    fn local_refs_remapped_after_gc() {
+        push_local_frame(8);
+        let old_addr: JObject = 0x4_0000;
+        track_local_ref(old_addr);
+        let new_addr = (old_addr as usize).wrapping_add(0x1000);
+        let mut pointer_map = std::collections::HashMap::new();
+        pointer_map.insert(old_addr as usize, new_addr);
+
+        update_local_refs_after_gc(&pointer_map);
+
+        let mut roots = Vec::new();
+        collect_local_ref_roots(&mut roots);
+        let addrs: Vec<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
+        assert!(
+            addrs.contains(&new_addr),
+            "moved local ref must report its relocated address"
+        );
+        assert!(
+            !addrs.contains(&(old_addr as usize)),
+            "stale from-space address must be gone after remap"
+        );
+
+        pop_local_frame(0);
+    }
+
+    #[test]
+    fn local_refs_dropped_when_frame_popped() {
+        push_local_frame(4);
+        track_local_ref(0x5_0000);
+        pop_local_frame(0);
+        // After popping the only frame there are no local-ref roots.
+        let mut roots = Vec::new();
+        collect_local_ref_roots(&mut roots);
+        assert!(roots.iter().all(|r| r.as_ptr() as usize != 0x5_0000));
+    }
+
+    // -----------------------------------------------------------------------
+    // vm-jni-roots #2: Get/Release<Type>ArrayElements free with the STORED
+    // length/capacity, never a length re-derived from the array handle.
+    //
+    // We mirror the exact pattern the macros use — `Vec::with_capacity` +
+    // `forget`, record `(len, cap)` in `JNI_ARRAY_ELEM_BUFFERS`, then look it
+    // up and `Vec::from_raw_parts(ptr, len, cap)` — and prove the round-trip is
+    // sound even when a (simulated) handle-derived length would DIFFER. With
+    // the old re-derivation, a divergent length here produced a from_raw_parts
+    // mismatch (heap corruption); with the stored layout it is always exact.
+    // (Miri/ASAN would flag any mismatch; a normal build at least proves the
+    // map plumbing compiles and the lengths are preserved.)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn array_elem_buffer_freed_with_stored_layout() {
+        let mut buf: Vec<i32> = Vec::with_capacity(5);
+        for i in 0..5 {
+            buf.push(i);
+        }
+        let ptr = buf.as_mut_ptr();
+        let stored = (buf.len(), buf.capacity());
+        std::mem::forget(buf);
+        JNI_ARRAY_ELEM_BUFFERS.with(|c| {
+            c.borrow_mut().insert(ptr as usize, stored);
+        });
+
+        // Simulate a Release that does NOT trust the handle: pull the stored
+        // layout and reconstruct exactly. A spurious "handle length" of 0 or 99
+        // must be irrelevant.
+        let entry = JNI_ARRAY_ELEM_BUFFERS.with(|c| c.borrow_mut().remove(&(ptr as usize)));
+        let (len, cap) = entry.expect("buffer must be tracked");
+        assert_eq!(len, 5);
+        assert_eq!(cap, 5);
+        // Sound free using the stored layout (NOT a re-derived length).
+        unsafe {
+            drop(Vec::from_raw_parts(ptr, len, cap));
+        }
+        // Entry is consumed; a second release would find nothing and no-op.
+        assert!(
+            JNI_ARRAY_ELEM_BUFFERS.with(|c| c.borrow().get(&(ptr as usize)).is_none())
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // encode / decode method_id roundtrip
     // -----------------------------------------------------------------------
 
@@ -5602,4 +6337,132 @@ mod tests {
         assert_ne!(func_ptr, 0, "AttachCurrentThreadAsDaemon must be registered");
     }
 
+    // ---- Modified UTF-8 encoding (GetStringUTFChars contract) ----
+
+    #[test]
+    fn modified_utf8_plain_ascii_unchanged() {
+        assert_eq!(to_modified_utf8("hello"), b"hello".to_vec());
+    }
+
+    #[test]
+    fn modified_utf8_interior_nul_is_two_bytes() {
+        // Interior U+0000 must encode as 0xC0 0x80, never a 0x00 byte.
+        let s = "a\u{0}b";
+        let m = to_modified_utf8(s);
+        assert_eq!(m, vec![b'a', 0xC0, 0x80, b'b']);
+        // The result contains no interior NUL, so CString::new succeeds.
+        assert!(std::ffi::CString::new(m).is_ok());
+    }
+
+    #[test]
+    fn modified_utf8_two_byte_char() {
+        // U+00E9 (é) → 0xC3 0xA9 (same as standard UTF-8 for the BMP <= 0x7FF).
+        assert_eq!(to_modified_utf8("\u{00e9}"), vec![0xC3, 0xA9]);
+    }
+
+    #[test]
+    fn modified_utf8_three_byte_bmp() {
+        // U+20AC (€) → 0xE2 0x82 0xAC.
+        assert_eq!(to_modified_utf8("\u{20ac}"), vec![0xE2, 0x82, 0xAC]);
+    }
+
+    #[test]
+    fn modified_utf8_supplementary_is_surrogate_pair() {
+        // U+1F600 (😀) → CESU-8 surrogate pair, two 3-byte sequences.
+        // High surrogate D83D → ED A0 BD; low surrogate DE00 → ED B8 80.
+        let m = to_modified_utf8("\u{1f600}");
+        assert_eq!(m, vec![0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80]);
+        // No interior NUL bytes anywhere.
+        assert!(!m.contains(&0));
+    }
+
+    #[test]
+    fn modified_utf8_len_agrees_with_encoder() {
+        // GetStringUTFLength must report exactly the byte count GetStringUTFChars
+        // produces (excluding the trailing NUL) for every code-point class.
+        for s in ["", "ascii", "a\u{0}b", "\u{00e9}", "\u{20ac}", "\u{1f600}", "mix\u{0}é€😀"] {
+            assert_eq!(
+                modified_utf8_len(s),
+                to_modified_utf8(s).len(),
+                "length mismatch for {s:?}"
+            );
+        }
+    }
+
+    // ---- JNI argument register classification (ABI marshalling) ----
+
+    #[test]
+    fn jni_arg_register_class() {
+        assert!(!JniArg::int(42).is_fp);
+        assert!(JniArg::float(1.5f64.to_bits()).is_fp);
+        assert_eq!(JniArg::int(0xDEAD).bits, 0xDEAD);
+    }
+
+    // ---- ABI marshalling end-to-end (x86_64 trampoline) ----
+    //
+    // These exercise the FP-register and stack-spill paths the integer
+    // fast-path cannot express. They run real machine code through the naked
+    // trampoline, so a passing run validates register placement on the host ABI.
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn dispatch_marshals_double_arg_and_return() {
+        // double f(env, this, double a, double b) { return a*10 + b; }
+        extern "C" fn mul_add(_env: JNIEnv, _this: JObject, a: f64, b: f64) -> f64 {
+            a * 10.0 + b
+        }
+        let fn_ptr = mul_add as *const () as usize;
+        let env = get_jni_env();
+        let args = [crate::types::Value::Double(3.5), crate::types::Value::Double(0.25)];
+        let result = unsafe { dispatch_jni_native(fn_ptr, env, 0, &args, "(DD)D") };
+        assert_eq!(result, crate::types::Value::Double(35.25));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn dispatch_marshals_mixed_int_float_args() {
+        // int f(env, this, int i, float fl, long l) { return i + (int)fl + (int)l; }
+        extern "C" fn mixed(_env: JNIEnv, _this: JObject, i: i32, fl: f32, l: i64) -> i32 {
+            i + fl as i32 + l as i32
+        }
+        let fn_ptr = mixed as *const () as usize;
+        let env = get_jni_env();
+        let args = [
+            crate::types::Value::Int(100),
+            crate::types::Value::Float(20.0),
+            crate::types::Value::Long(3),
+        ];
+        let result = unsafe { dispatch_jni_native(fn_ptr, env, 0, &args, "(IFJ)I") };
+        assert_eq!(result, crate::types::Value::Int(123));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn dispatch_spills_excess_integer_args_to_stack() {
+        // Ten integer Java args (+ env + this = 12 total) — forces stack spilling
+        // on both Win64 (4 GP regs) and SysV (6 GP regs).
+        #[allow(clippy::too_many_arguments)]
+        extern "C" fn sum10(
+            _env: JNIEnv,
+            _this: JObject,
+            a: i64,
+            b: i64,
+            c: i64,
+            d: i64,
+            e: i64,
+            f: i64,
+            g: i64,
+            h: i64,
+            i: i64,
+            j: i64,
+        ) -> i64 {
+            a + b + c + d + e + f + g + h + i + j
+        }
+        let fn_ptr = sum10 as *const () as usize;
+        let env = get_jni_env();
+        let args: Vec<crate::types::Value> =
+            (1..=10).map(|n| crate::types::Value::Long(n as i64)).collect();
+        let result = unsafe { dispatch_jni_native(fn_ptr, env, 0, &args, "(JJJJJJJJJJ)J") };
+        assert_eq!(result, crate::types::Value::Long(55));
+    }
 }

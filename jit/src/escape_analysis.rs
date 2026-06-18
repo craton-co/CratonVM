@@ -36,7 +36,14 @@ pub enum Op {
     Add,
     Sub,
     Mul,
+    /// Field/array **load**.  The `usize` payload is a *field index* relative
+    /// to the holder allocation (NOT a `MemKind` / type tag — see the layout
+    /// contract below).  Canonical EA input layout: `[holder, (index)?]`
+    /// (`STORE_LOAD_HOLDER_INPUT == 0`).
     Load(usize),
+    /// Field/array **store**.  The `usize` payload is a *field index* relative
+    /// to the holder allocation.  Canonical EA input layout:
+    /// `[holder, value, (index)?]` (holder at 0, value at 1).
     Store(usize),
     New { class_id: u32, num_fields: usize },
     NewArray { element_type: u8 },
@@ -98,6 +105,82 @@ impl Graph {
     }
 }
 
+// ── Load/Store node layout contract ─────────────────────────────────────
+//
+// PINNED SEMANTICS (do not change without updating `ir_lower`/the builder):
+//
+// The escape-analysis IR is a *simplified* dataflow graph that is distinct
+// from the JIT's full `ir::Graph`.  In the EA graph, memory-access nodes use
+// a compact, control-/memory-edge-free layout so that the connection-graph
+// builder can read operands positionally:
+//
+//   Op::Store(field_idx)  inputs = [holder, value]   (extra inputs ignored)
+//   Op::Load(field_idx)   inputs = [holder]          (extra inputs ignored)
+//
+// where:
+//   * `holder` is the reference node whose field is being accessed, and
+//   * `value`  (Store only) is the reference/primitive node being written.
+//   * `field_idx` is the **field index** within the holder object, used to
+//     key field edges and to drive scalar replacement.
+//
+// IMPORTANT (the historical landmine this contract closes): the full
+// `ir::Op::{Load,Store}` variants carry a `MemKind` *type tag*, not a field
+// index, and their inputs are `[ctrl, mem, base, index/offset, (value)]`.
+// A naive lowering that forwarded those verbatim would (a) place the holder
+// at input index 2 (not 0) and the value at index 4 (not 1), and (b) pass a
+// `MemKind` discriminant where a field index is expected.  Either mistake
+// silently corrupts the escape lattice (e.g. a store's value would be read
+// from the *memory* edge, and field arrays would be indexed by a type tag).
+//
+// To keep the lattice sound regardless of how the lowering evolves, the
+// helpers below are the *single* place that interprets Load/Store operands
+// and field indices.  `store_holder`/`store_value`/`load_holder` return
+// `None` when the layout invariant is violated, and every caller treats a
+// `None` (or an out-of-range field index) **conservatively** — i.e. it may
+// only *add* escape, never remove it.
+
+/// Input position of the holder reference for `Load`/`Store` nodes.
+const MEM_HOLDER_INPUT: usize = 0;
+/// Input position of the stored value for `Store` nodes.
+const STORE_VALUE_INPUT: usize = 1;
+
+/// Holder reference of a `Store` node, or `None` if the layout is malformed.
+fn store_holder(node: &Node) -> Option<NodeId> {
+    debug_assert!(matches!(node.op, Op::Store(_)));
+    node.inputs.get(MEM_HOLDER_INPUT).copied()
+}
+
+/// Stored value of a `Store` node, or `None` if the layout is malformed.
+fn store_value(node: &Node) -> Option<NodeId> {
+    debug_assert!(matches!(node.op, Op::Store(_)));
+    node.inputs.get(STORE_VALUE_INPUT).copied()
+}
+
+/// Holder reference of a `Load` node, or `None` if the layout is malformed.
+fn load_holder(node: &Node) -> Option<NodeId> {
+    debug_assert!(matches!(node.op, Op::Load(_)));
+    node.inputs.get(MEM_HOLDER_INPUT).copied()
+}
+
+/// True if `field` is a valid field index for *every* allocation a holder may
+/// resolve to.  An empty/unknown holder set, or any allocation whose
+/// `num_fields` does not cover `field`, returns `false` so the caller can
+/// fall back to the conservative (escape-everything) path.  This prevents a
+/// `MemKind`-as-field-index mix-up (or a genuinely out-of-range index) from
+/// silently indexing the wrong field.
+fn field_in_range(graph: &Graph, holder_allocs: &HashSet<NodeId>, field: usize) -> bool {
+    if holder_allocs.is_empty() {
+        return false;
+    }
+    holder_allocs.iter().all(|&a| match graph.nodes.get(a).map(|n| &n.op) {
+        Some(Op::New { num_fields, .. }) => field < *num_fields,
+        // Arrays have no statically-known field count here; treat any index as
+        // out-of-range so array stores take the conservative escape path.
+        Some(Op::NewArray { .. }) => false,
+        _ => false,
+    })
+}
+
 // ── Escape state ────────────────────────────────────────────────────────
 
 /// How far an allocated object escapes from its allocation site.
@@ -131,6 +214,11 @@ pub struct ConnectionGraph {
     pub field_edges: HashMap<(NodeId, usize), HashSet<NodeId>>,
     /// Deferred edges: node -> set of nodes it copies from.
     pub deferred_edges: HashMap<NodeId, HashSet<NodeId>>,
+    /// Field loads recorded during graph construction:
+    /// `(load_node, holder_node, field_index)`.  Resolved field-sensitively
+    /// during propagation — a load points to whatever was stored into that
+    /// field of any allocation the holder may resolve to.
+    pub field_loads: Vec<(NodeId, NodeId, usize)>,
 }
 
 impl ConnectionGraph {
@@ -140,6 +228,7 @@ impl ConnectionGraph {
             points_to: HashMap::new(),
             field_edges: HashMap::new(),
             deferred_edges: HashMap::new(),
+            field_loads: Vec::new(),
         }
     }
 
@@ -278,27 +367,39 @@ fn build_connection_graph(graph: &Graph) -> ConnectionGraph {
                 }
             }
 
-            // Store: field edge from object to stored value.
+            // Store: field edge from holder to stored value.
+            // Layout: inputs = [holder, value] (see MEM_HOLDER_INPUT /
+            // STORE_VALUE_INPUT).  `field_idx` is a field index, NOT a
+            // MemKind tag.
             Op::Store(field_idx) => {
-                // inputs: [object, value, ...]
-                if node.inputs.len() >= 2 {
-                    let obj = node.inputs[0];
-                    let val = node.inputs[1];
+                if let (Some(obj), Some(val)) = (store_holder(node), store_value(node)) {
                     cg.add_field_edge(obj, *field_idx, val);
                 }
+                // A malformed store (missing holder/value) is conservatively
+                // handled in propagation, where any unresolved holder forces
+                // the stored value to escape.
             }
 
-            // Load: deferred edge — the result points to whatever is in the field.
+            // Load: the result reads a *field* of the holder, so its
+            // provenance is whatever was stored INTO that field, NOT the
+            // holder object itself.
+            //
+            // BUGFIX / landmine closed: the previous implementation added a
+            // deferred edge `load -> holder`, which made the load alias the
+            // holder allocation.  That is unsound — it conflates "I read a
+            // field of X" with "I am X", so escaping the loaded value would
+            // wrongly escape the holder (and vice versa), and a load of a
+            // primitive field would spuriously create a reference edge.
+            //
+            // We instead record a *field load* and resolve it through
+            // `field_edges[(holder_alloc, field_idx)]` during propagation,
+            // making loads field-sensitive.  If the field's contents are
+            // unknown (no matching store, or an unresolvable holder), the
+            // load conservatively points to nothing here and is treated as a
+            // fresh unknown reference by escape propagation.
             Op::Load(field_idx) => {
-                if !node.inputs.is_empty() {
-                    let obj = node.inputs[0];
-                    // Connect load result to values stored in that field.
-                    // We record a deferred edge; during propagation we'll
-                    // resolve through field edges.
-                    cg.add_deferred(id, obj);
-                    // Also check if there is a direct field edge we can use.
-                    // This is refined in propagation.
-                    let _ = field_idx; // used during scalar replacement
+                if let Some(obj) = load_holder(node) {
+                    cg.field_loads.push((id, obj, *field_idx));
                 }
             }
 
@@ -370,6 +471,41 @@ fn propagate_escape_states(cg: &mut ConnectionGraph, graph: &Graph) {
             }
         }
 
+        // Resolve field loads field-sensitively: a `Load(field)` of `holder`
+        // points to whatever was stored into that field of any allocation the
+        // holder may resolve to.  We materialise this as deferred edges
+        // `load -> stored_value` (one per matching store), so the load
+        // inherits both the points-to set and the escape state of the field
+        // contents on the next deferred-propagation pass.  Adding edges that
+        // already exist is a no-op (HashSet insert), so this is monotone and
+        // converges with the rest of the fixed point.
+        let field_loads = cg.field_loads.clone();
+        for (load, holder, field) in field_loads {
+            let holder_allocs = cg.resolve_points_to(holder);
+            // Only resolve field-sensitively when the index validly addresses
+            // the holder's allocations.  An out-of-range index (e.g. a leaked
+            // MemKind tag) leaves the load as a conservative unknown rather
+            // than aliasing an unrelated field edge that happens to share the
+            // numeric key.
+            if !field_in_range(graph, &holder_allocs, field) {
+                continue;
+            }
+            for &alloc in &holder_allocs {
+                if let Some(stored) = cg.field_edges.get(&(alloc, field)).cloned() {
+                    for &val in &stored {
+                        if cg
+                            .deferred_edges
+                            .get(&load)
+                            .map_or(true, |s| !s.contains(&val))
+                        {
+                            cg.add_deferred(load, val);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
         // Propagate through points-to sets: if node N points to alloc A,
         // and N escapes, then A escapes at least as much.
         let alloc_ids: Vec<NodeId> = graph
@@ -397,31 +533,63 @@ fn propagate_escape_states(cg: &mut ConnectionGraph, graph: &Graph) {
                     }
                 }
 
-                // If a reference is stored into a globally-escaping object's
-                // field, the stored value escapes globally too.
+                // Store escape rule (the soundness core of the lattice):
+                // a value stored into a field of a holder is reachable by
+                // anyone who can reach the holder.  Therefore the stored
+                // value must escape *at least as much as* the holder.
+                //
+                // This must fire for BOTH GlobalEscape (the holder is visible
+                // to other threads / the heap) AND ArgEscape (the holder is
+                // passed to a callee, which can then reach the stored value):
+                // the previous code only handled GlobalEscape, leaving values
+                // stored into Arg-escaping holders spuriously NoEscape, which
+                // is unsound for stack-allocation / lock-elision decisions.
                 if let Op::Store(field_idx) = &node.op {
-                    if node.inputs.len() >= 2 {
-                        let obj = node.inputs[0];
-                        let val = node.inputs[1];
-                        let obj_escape = cg.get_escape(obj);
-                        // Resolve what obj points to.
+                    if let (Some(obj), Some(val)) = (store_holder(node), store_value(node)) {
+                        // The holder's "reach" is the max escape of any
+                        // allocation it may resolve to, joined with the
+                        // holder node's own escape (covers Param/Call holders
+                        // that have no concrete allocation here).
+                        //
+                        // NOTE: whole-object escape is intentionally
+                        // field-INsensitive — a value stored into *any* field
+                        // of an escaping holder escapes, regardless of which
+                        // field index it is, so we do not gate this on
+                        // `field_in_range` here.  Field validity only matters
+                        // for field-sensitive *reads* and scalar replacement.
                         let obj_pts = cg.resolve_points_to(obj);
-                        for &target_alloc in &obj_pts {
-                            let target_escape = cg.get_escape(target_alloc);
-                            if target_escape == EscapeState::GlobalEscape {
-                                let val_escape = cg.get_escape(val);
-                                if val_escape != EscapeState::GlobalEscape {
-                                    cg.set_escape(val, EscapeState::GlobalEscape);
-                                    // Also propagate to what val points to.
-                                    let val_pts = cg.resolve_points_to(val);
-                                    for &vp in &val_pts {
-                                        cg.set_escape(vp, EscapeState::GlobalEscape);
+                        let mut holder_escape = cg.get_escape(obj);
+                        for &a in &obj_pts {
+                            holder_escape = holder_escape.join(cg.get_escape(a));
+                        }
+
+                        if holder_escape > EscapeState::NoEscape {
+                            let val_escape = cg.get_escape(val);
+                            let joined = val_escape.join(holder_escape);
+                            if joined != val_escape {
+                                cg.set_escape(val, joined);
+                                // Propagate to allocations the value points to.
+                                let val_pts = cg.resolve_points_to(val);
+                                for &vp in &val_pts {
+                                    let vp_escape = cg.get_escape(vp);
+                                    let vp_joined = vp_escape.join(holder_escape);
+                                    if vp_joined != vp_escape {
+                                        cg.set_escape(vp, vp_joined);
                                     }
-                                    changed = true;
                                 }
+                                changed = true;
                             }
                         }
-                        let _ = (obj_escape, field_idx);
+                        let _ = field_idx;
+                    } else if let Some(val) = store_value(node) {
+                        // Malformed store: a value with no resolvable holder.
+                        // We cannot know where it was written, so be
+                        // conservative and let it escape globally rather than
+                        // silently keeping it NoEscape.
+                        if cg.get_escape(val) != EscapeState::GlobalEscape {
+                            cg.set_escape(val, EscapeState::GlobalEscape);
+                            changed = true;
+                        }
                     }
                 }
             }
@@ -455,19 +623,38 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                 if use_id >= graph.nodes.len() {
                     continue;
                 }
-                match &graph.nodes[use_id].op {
+                let use_node = &graph.nodes[use_id];
+                match &use_node.op {
                     Op::Store(field_idx) => {
-                        if *field_idx < *num_fields && graph.nodes[use_id].inputs.len() >= 2 {
-                            let stored_val = graph.nodes[use_id].inputs[1];
-                            field_values[*field_idx] = Some(stored_val);
+                        // This allocation may appear in a Store either as the
+                        // HOLDER (storing into our field — recordable) or as
+                        // the VALUE (we are being published into another
+                        // object — that escapes us, so bail).  Distinguish by
+                        // role rather than assuming holder.
+                        let is_holder = store_holder(use_node) == Some(id);
+                        let is_value = store_value(use_node) == Some(id);
+                        if is_holder && *field_idx < *num_fields {
+                            // Record the value written into our field.  If the
+                            // value operand is malformed, leave the field as
+                            // None (uninitialised) rather than guessing.
+                            if let Some(stored_val) = store_value(use_node) {
+                                field_values[*field_idx] = Some(stored_val);
+                            }
                             eliminated_stores.push(use_id);
+                        } else if is_value {
+                            // Published into another object's field -> escapes;
+                            // cannot scalar-replace.
+                            can_replace = false;
+                            break;
                         } else {
+                            // Holder role but out-of-range / malformed field.
                             can_replace = false;
                             break;
                         }
                     }
                     Op::Load(field_idx) => {
-                        if *field_idx < *num_fields {
+                        // Only a load OF this object's field is replaceable.
+                        if load_holder(use_node) == Some(id) && *field_idx < *num_fields {
                             replaced_loads.push(use_id);
                         } else {
                             can_replace = false;
@@ -609,9 +796,17 @@ pub fn find_materialization_points(
             if other_use >= graph.nodes.len() || other_use == use_id {
                 continue;
             }
-            if let Op::Store(field_idx) = &graph.nodes[other_use].op {
-                if *field_idx < num_fields && graph.nodes[other_use].inputs.len() >= 2 {
-                    fields_at_escape[*field_idx] = Some(graph.nodes[other_use].inputs[1]);
+            let other_node = &graph.nodes[other_use];
+            if let Op::Store(field_idx) = &other_node.op {
+                // Only stores whose HOLDER is this allocation describe its
+                // field state; a store that merely uses this alloc as a value
+                // is irrelevant here.
+                if store_holder(other_node) == Some(alloc)
+                    && *field_idx < num_fields
+                {
+                    if let Some(stored_val) = store_value(other_node) {
+                        fields_at_escape[*field_idx] = Some(stored_val);
+                    }
                 }
             }
         }
@@ -1483,5 +1678,259 @@ mod tests {
         assert_eq!(g.exit, 1);
         assert_eq!(g.nodes[0].op, Op::Start);
         assert_eq!(g.nodes[1].op, Op::Return);
+    }
+
+    // ---- Load/Store input + field-index modeling (landmine pins) ----
+    //
+    // These tests pin the CANONICAL EA-internal Load/Store layout
+    // (`Store: [holder, value]`, `Load: [holder]`, payload = FIELD INDEX) so a
+    // future builder/lowering change that emits these nodes cannot silently
+    // miscompile the escape lattice.  They are the regression fence for the
+    // bugs described in the layout-contract comment near `Op::Load`/`Op::Store`.
+
+    /// Helper accessors must read holder/value from the documented positions.
+    #[test]
+    fn test_store_load_layout_accessors() {
+        let mut g = Graph::new();
+        let holder = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let value = g.add_node(Op::Const(7), vec![]);
+        let store = g.add_node(Op::Store(0), vec![holder, value]);
+        let load = g.add_node(Op::Load(0), vec![holder]);
+
+        assert_eq!(store_holder(&g.nodes[store]), Some(holder));
+        assert_eq!(store_value(&g.nodes[store]), Some(value));
+        assert_eq!(load_holder(&g.nodes[load]), Some(holder));
+    }
+
+    /// A malformed store (holder only, no value) must NOT fabricate a value.
+    #[test]
+    fn test_store_missing_value_is_none() {
+        let mut g = Graph::new();
+        let holder = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let store = g.add_node(Op::Store(0), vec![holder]); // no value operand
+        assert_eq!(store_value(&g.nodes[store]), None);
+        // Build must not panic and must record no field edge for the missing value.
+        let cg = build_connection_graph(&g);
+        assert!(cg.field_edges.get(&(holder, 0)).is_none());
+    }
+
+    /// SOUNDNESS: a value stored into an *ArgEscape* holder must escape too.
+    /// (The pre-fix code only handled GlobalEscape, leaving this value
+    /// spuriously NoEscape — unsound for stack-allocation / lock elision.)
+    #[test]
+    fn test_value_stored_into_arg_escaping_holder_escapes() {
+        let mut g = Graph::new();
+        let holder = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let inner = g.add_node(
+            Op::New {
+                class_id: 2,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        // inner is stored into holder's field 0 ...
+        let _store = g.add_node(Op::Store(0), vec![holder, inner]);
+        // ... and holder is passed to a call (ArgEscape, NOT GlobalEscape).
+        let _call = g.add_node(Op::Call, vec![holder]);
+
+        let result = analyze_escapes(&g);
+        assert_eq!(
+            result.escape_states.get(&holder),
+            Some(&EscapeState::ArgEscape)
+        );
+        // inner is reachable through holder by the callee, so it must escape
+        // at least as much as holder.
+        let inner_state = *result.escape_states.get(&inner).unwrap();
+        assert!(
+            inner_state >= EscapeState::ArgEscape,
+            "value stored into ArgEscape holder must escape >= ArgEscape, got {:?}",
+            inner_state
+        );
+    }
+
+    /// A load reads the FIELD's contents, not the holder: the load's
+    /// provenance/escape comes from the stored value, and the load must NOT
+    /// alias the holder allocation (the old `load -> holder` deferred edge).
+    #[test]
+    fn test_load_is_field_sensitive_not_holder_alias() {
+        let mut g = Graph::new();
+        let holder = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let stored = g.add_node(
+            Op::New {
+                class_id: 2,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let _store = g.add_node(Op::Store(0), vec![holder, stored]);
+        let load = g.add_node(Op::Load(0), vec![holder]);
+
+        let mut cg = build_connection_graph(&g);
+        propagate_escape_states(&mut cg, &g);
+
+        let load_pts = cg.resolve_points_to(load);
+        // The load points to what was stored into the field ...
+        assert!(
+            load_pts.contains(&stored),
+            "field-sensitive load must point to the stored value"
+        );
+        // ... and crucially NOT to the holder allocation itself.
+        assert!(
+            !load_pts.contains(&holder),
+            "load must not alias its holder object"
+        );
+    }
+
+    /// Escaping the loaded value must escape the STORED value (through the
+    /// field), but must NOT, by itself, escape the holder via aliasing.
+    #[test]
+    fn test_returned_load_escapes_stored_value_only() {
+        let mut g = Graph::new();
+        let holder = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let stored = g.add_node(
+            Op::New {
+                class_id: 2,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let _store = g.add_node(Op::Store(0), vec![holder, stored]);
+        let load = g.add_node(Op::Load(0), vec![holder]);
+        // Return the loaded value -> GlobalEscape flows to the stored value.
+        g.nodes[1].inputs.push(load);
+        g.nodes[load].uses.push(1);
+
+        let result = analyze_escapes(&g);
+        // The value read out of the field and returned escapes globally.
+        assert_eq!(
+            result.escape_states.get(&stored),
+            Some(&EscapeState::GlobalEscape)
+        );
+    }
+
+    /// An out-of-range field index (e.g. a `MemKind` tag mistakenly used as a
+    /// field index) must NOT mis-index a field: scalar replacement bails, and
+    /// the value still escapes conservatively if the holder escapes.
+    #[test]
+    fn test_out_of_range_field_index_is_conservative() {
+        let mut g = Graph::new();
+        let holder = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1, // only field 0 exists
+            },
+            vec![],
+        );
+        let value = g.add_node(Op::Const(3), vec![]);
+        // field index 4 is out of range (mimics a leaked MemKind::Ref tag).
+        let _store = g.add_node(Op::Store(4), vec![holder, value]);
+        let _load = g.add_node(Op::Load(4), vec![holder]);
+
+        let result = analyze_escapes(&g);
+        // Holder cannot be scalar-replaced because of the out-of-range access.
+        assert!(
+            result.scalar_replaceable.is_empty(),
+            "out-of-range field access must block scalar replacement"
+        );
+        // field_in_range rejects index 4 for a 1-field object.
+        let allocs: HashSet<NodeId> = std::iter::once(holder).collect();
+        assert!(!field_in_range(&g, &allocs, 4));
+        assert!(field_in_range(&g, &allocs, 0));
+    }
+
+    /// A NoEscape holder must NOT escape values stored into it.
+    #[test]
+    fn test_value_stored_into_local_holder_does_not_escape() {
+        let mut g = Graph::new();
+        let holder = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let inner = g.add_node(
+            Op::New {
+                class_id: 2,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let _store = g.add_node(Op::Store(0), vec![holder, inner]);
+        // Neither holder nor inner escapes anywhere.
+        let result = analyze_escapes(&g);
+        assert_eq!(
+            result.escape_states.get(&holder),
+            Some(&EscapeState::NoEscape)
+        );
+        assert_eq!(
+            result.escape_states.get(&inner),
+            Some(&EscapeState::NoEscape)
+        );
+    }
+
+    /// An allocation used as a stored VALUE (published into another object's
+    /// field) must not be scalar-replaced.
+    #[test]
+    fn test_published_value_not_scalar_replaced() {
+        let mut g = Graph::new();
+        let outer = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let inner = g.add_node(
+            Op::New {
+                class_id: 2,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let _store = g.add_node(Op::Store(0), vec![outer, inner]);
+        // outer escapes via return -> inner is published into an escaping field.
+        g.nodes[1].inputs.push(outer);
+        g.nodes[outer].uses.push(1);
+
+        let result = analyze_escapes(&g);
+        // inner must not be in the scalar-replacement set.
+        assert!(
+            result
+                .scalar_replaceable
+                .iter()
+                .all(|sr| sr.alloc_node != inner),
+            "a value published into an escaping object's field is not SR-eligible"
+        );
     }
 }

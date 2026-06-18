@@ -1757,6 +1757,32 @@ fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
     }
 }
 
+/// array_receiver_local soundness fix — build a bitmap of valid instruction
+/// START offsets for `code[..code_len]`.
+///
+/// Backward scans (e.g. reading `code[pc - 1]` and guessing the opcode) are
+/// unsound: a multi-byte instruction's trailing OPERAND byte can collide with
+/// a real opcode value, so a naive "previous byte" decode mis-identifies the
+/// instruction. The only reliable way to know whether a given offset is an
+/// instruction boundary is to walk FORWARD from PC 0 stepping by
+/// [`bytecode_len_at`] (the same walk used by [`compute_branch_targets`] and
+/// the oop-map dataflow). `starts[k]` is `true` iff `k` is the first byte of
+/// some instruction reached by that linear walk.
+///
+/// Callers use this to *validate* a candidate instruction position before
+/// trusting a backward-derived decode; when the candidate is not a real
+/// instruction start the caller must fall back to the conservative path.
+fn instruction_start_map(code: &[u8], code_len: usize) -> Vec<bool> {
+    let mut starts = vec![false; code_len];
+    let mut pc = 0usize;
+    while pc < code_len {
+        starts[pc] = true;
+        let len = bytecode_len_at(code, pc).max(1); // never advance 0 → no infinite loop
+        pc += len;
+    }
+    starts
+}
+
 /// EC-SCALAR-SOUNDNESS (bc math-ec JIT miscompile fix) — compute the set of
 /// bytecode PCs that are the TARGET of any branch (conditional, `goto`,
 /// `goto_w`, `jsr`, `jsr_w`, `tableswitch`, `lookupswitch`).
@@ -2731,33 +2757,160 @@ fn array_receiver_local(code: &[u8], pc: usize) -> Option<usize> {
     if pc == 0 {
         return None;
     }
-    // The instruction at `pc` is the array load/store itself. Walk
-    // backwards: the index-push is the previous instruction (1-3
-    // bytes), and the aload is the one before that.
-    let p_index = code[pc - 1];
-    let index_len: usize = match p_index {
-        // Single-byte index ops:
-        //   iconst_m1..iconst_5 (0x02..0x08), iload_0..3 (0x1A..0x1D),
-        //   dup (0x59 — when index is already on stack from a dup pair)
-        0x02..=0x08 | 0x1A..=0x1D | 0x59 => 1,
-        // Multi-byte: distinguish by the opcode byte at pc-2 / pc-3.
-        //   bipush <byte>  (0x10) — 2 bytes
-        //   iload  <u8>    (0x15) — 2 bytes
-        //   sipush <short> (0x11) — 3 bytes
-        _ if pc >= 2 && code[pc - 2] == 0x10 => 2,
-        _ if pc >= 2 && code[pc - 2] == 0x15 => 2,
-        _ if pc >= 3 && code[pc - 3] == 0x11 => 3,
-        _ => return None,
-    };
-    let aload_pc = pc.checked_sub(1 + index_len)?;
+    let code_len = code.len();
+    if pc >= code_len {
+        return None;
+    }
+    // SOUNDNESS FIX (array_receiver_local): the previous implementation guessed
+    // instruction boundaries by reading `code[pc - 1]` / `code[pc - 2]` /
+    // `code[pc - 3]` and matching them against opcode values. That is unsound:
+    // for a multi-byte index push (sipush/iload-u8/bipush) the byte at `pc - 1`
+    // is an OPERAND, not an opcode, and when that operand byte happens to equal
+    // a single-byte index opcode (e.g. an `sipush` low byte of 0x03 looks like
+    // `iconst_0`) the receiver `aload` is mis-located → the inline null check is
+    // wrongly elided → SIGSEGV on a null array. We instead validate against a
+    // forward-walked instruction-start map and only accept a decode whose
+    // instructions chain forward EXACTLY onto `pc`. On any misalignment we
+    // return `None`, so the caller conservatively KEEPS the runtime null check.
+    //
+    // Building the map is O(code_len). This helper runs once per inline
+    // array-access site at COMPILE time (not per array element at runtime), and
+    // `jit_scan` bounds the method size, so the per-site recompute is cheap and
+    // not worth a pointer-keyed cache (which would risk an ABA stale-map hit).
+    // Correctness over micro-optimization: always build a fresh, exact map.
+    let starts = instruction_start_map(code, code_len);
+
+    // The array load/store at `pc` must itself be a real instruction start
+    // (it always is when reached from the codegen walk, but assert via the map).
+    if !starts[pc] {
+        return None;
+    }
+
+    // Locate the index-push: the unique instruction whose start `s_idx < pc`
+    // satisfies `s_idx + bytecode_len_at(.. , s_idx) == pc`. Scan back over the
+    // (at most 3) bytes an index push can occupy, accepting only a real start.
+    let mut idx_pc: Option<usize> = None;
+    for back in 1..=3usize {
+        let cand = match pc.checked_sub(back) {
+            Some(c) => c,
+            None => break,
+        };
+        if !starts[cand] {
+            continue;
+        }
+        // A real instruction start: it must end exactly at `pc` to be the
+        // immediately-preceding instruction (the index push).
+        if cand + bytecode_len_at(code, cand) == pc {
+            idx_pc = Some(cand);
+        }
+        // The nearest real start that ends at `pc` is the predecessor; since we
+        // scan increasing `back`, the FIRST such hit is the closest. But a real
+        // start that does NOT end at `pc` means `pc` is mid-instruction relative
+        // to it — impossible once we've confirmed `starts[pc]`, so keep scanning
+        // only until we find the predecessor.
+        if idx_pc.is_some() {
+            break;
+        }
+    }
+    let idx_pc = idx_pc?;
+
+    // The index push must be one of the recognised single-instruction index
+    // forms. Validate the OPCODE at the instruction start (not a trailing byte).
+    let idx_op = code[idx_pc];
+    let idx_ok = matches!(idx_op,
+        // iconst_m1..iconst_5 (0x02..=0x08), iload_0..3 (0x1A..=0x1D),
+        // dup (0x59 — index already on stack from a dup pair),
+        // bipush (0x10), iload <u8> (0x15), sipush (0x11).
+        0x02..=0x08 | 0x1A..=0x1D | 0x59 | 0x10 | 0x15 | 0x11
+    );
+    if !idx_ok {
+        return None;
+    }
+
+    // Locate the aload: the instruction whose start `s_a < idx_pc` ends exactly
+    // at `idx_pc`. Again accept only a real, forward-aligned start.
+    let mut aload_pc: Option<usize> = None;
+    for back in 1..=2usize {
+        let cand = match idx_pc.checked_sub(back) {
+            Some(c) => c,
+            None => break,
+        };
+        if !starts[cand] {
+            continue;
+        }
+        if cand + bytecode_len_at(code, cand) == idx_pc {
+            aload_pc = Some(cand);
+        }
+        if aload_pc.is_some() {
+            break;
+        }
+    }
+    let aload_pc = aload_pc?;
+
     let aop = code[aload_pc];
     if (0x2A..=0x2D).contains(&aop) {
         return Some((aop - 0x2A) as usize);
     }
-    if aop == 0x19 && aload_pc + 1 < pc {
+    // aload <u8> — the index byte is at aload_pc+1, which is strictly < idx_pc
+    // because this instruction's forward length is 2 and it ends at idx_pc.
+    if aop == 0x19 && aload_pc + 1 < idx_pc {
         return Some(code[aload_pc + 1] as usize);
     }
     None
+}
+
+#[cfg(test)]
+mod array_receiver_local_tests {
+    use super::{array_receiver_local, instruction_start_map};
+
+    // Opcodes used below:
+    //   0x2A aload_0, 0x19 aload, 0x11 sipush, 0x10 bipush, 0x03 iconst_0,
+    //   0x32 aaload, 0x53 aastore, 0x2E iaload.
+
+    #[test]
+    fn simple_aload0_iconst0_iaload() {
+        // aload_0; iconst_0; iaload
+        let code = [0x2Au8, 0x03, 0x2E];
+        assert_eq!(array_receiver_local(&code, 2), Some(0));
+    }
+
+    #[test]
+    fn aload_u8_then_sipush_index() {
+        // aload 5; sipush 0x0003; aaload
+        // sipush operand low byte is 0x03 (== iconst_0). The OLD backward scan
+        // read code[pc-1]=0x03 and mis-decoded it as a single-byte index op,
+        // mislocating the aload. The forward-validated decode must still find
+        // the real aload at offset 0 (local 5).
+        let code = [0x19u8, 0x05, 0x11, 0x00, 0x03, 0x32];
+        // pc of aaload = 5.
+        assert_eq!(array_receiver_local(&code, 5), Some(5));
+    }
+
+    #[test]
+    fn misaligned_collision_is_rejected_or_correct() {
+        // Construct a method where a backward scan would be fooled but the
+        // forward walk disambiguates. bipush index whose operand equals 0x2A
+        // (aload_0): aload_1; bipush 0x2A; iastore-style aaload.
+        // aload_1 = 0x2B, bipush = 0x10, operand 0x2A, aaload = 0x32.
+        let code = [0x2Bu8, 0x10, 0x2A, 0x32];
+        // Forward walk: 0:aload_1, 1:bipush(2), 3:aaload. Receiver local = 1.
+        assert_eq!(array_receiver_local(&code, 3), Some(1));
+    }
+
+    #[test]
+    fn no_aload_returns_none() {
+        // iconst_1; iconst_0; iaload — no array receiver aload present.
+        let code = [0x04u8, 0x03, 0x2E];
+        assert_eq!(array_receiver_local(&code, 2), None);
+    }
+
+    #[test]
+    fn instruction_start_map_basic() {
+        // aload_0; sipush 0x0102; aaload
+        let code = [0x2Au8, 0x11, 0x01, 0x02, 0x32];
+        let starts = instruction_start_map(&code, code.len());
+        assert_eq!(starts, vec![true, true, false, false, true]);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3172,10 +3325,18 @@ fn plan_scalar_replacement(
     let mut total_slots = 0usize;
     let mut sorted_pcs: Vec<usize> = non_escaping_new.iter().copied().collect();
     sorted_pcs.sort();
+    // PERF: index new_info by PC once (O(new_info_len)) instead of doing a
+    // linear `new_info.iter().find(|(p,..)| *p == new_pc)` inside the loop
+    // below — that was O(sorted_pcs.len() * new_info.len()). To preserve the
+    // exact prior behavior, where `find` returns the FIRST matching entry, we
+    // keep the first occurrence on duplicate PCs (`entry(..).or_insert(..)`).
+    let mut new_info_by_pc: FxHashMap<usize, usize> = FxHashMap::default();
+    new_info_by_pc.reserve(new_info.len());
+    for &(p, _, num_fields, _, _) in new_info {
+        new_info_by_pc.entry(p).or_insert(num_fields);
+    }
     for &new_pc in &sorted_pcs {
-        if let Some(&(_, _, num_fields, _, _)) =
-            new_info.iter().find(|(p, _, _, _, _)| *p == new_pc)
-        {
+        if let Some(&num_fields) = new_info_by_pc.get(&new_pc) {
             if num_fields > 0 && num_fields <= 16 {
                 let field_base_offset = ((scalar_base + total_slots) as i32 + 1) * 8; // Cast: x86-64 immediate encoding
                 objects.insert(new_pc, ScalarReplacedObject { num_fields, field_base_offset });

@@ -715,6 +715,54 @@ pub(crate) fn native_secure_random_next_float(
     Ok(Some(Value::Float(f)))
 }
 
+pub(crate) fn native_secure_random_next_gaussian(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    // LOW-FIX: SecureRandom must NOT inherit java.util.Random's LCG-backed
+    // nextGaussian (which would derive its two uniforms from the predictable
+    // linear congruential generator on the synthetic seed field).  Instead we
+    // draw both uniforms from the OS CSPRNG, matching the CSPRNG output of
+    // every other SecureRandom method in this module.
+    //
+    // Algorithm: Marsaglia polar method — the same transform java.util.Random
+    // .nextGaussian uses — but each uniform `v` in (-1, 1) is built from a
+    // fresh 53-bit CSPRNG double rather than from `lcg_next`.  We generate one
+    // deviate and discard the partner; SecureRandom keeps no per-instance state
+    // here (consistent with the rest of the module), so caching the partner in
+    // a field is neither needed nor possible.
+    //
+    // Cap the retry loop so a (vanishingly unlikely) run of rejected pairs
+    // cannot hang us: P(reject) per pair ≈ 1 - π/4 ≈ 0.215, so 64 retries is
+    // well under 2^-32 failure probability.
+    #[inline]
+    fn secure_uniform() -> Result<f64, cratonvm_types::error::RuntimeError> {
+        // 53 bits of CSPRNG entropy → double in [0, 1); mapped to (-1, 1).
+        match os_random_u64() {
+            // Mirror `native_secure_random_next_double`: take the top 53 bits.
+            Some(v) => Ok((v >> 11) as f64 / ((1u64 << 53) as f64)),
+            None => Err(cratonvm_types::error::RuntimeError::SecurityException {
+                message: "OS entropy source unavailable".to_string(),
+            }),
+        }
+    }
+    for _ in 0..64 {
+        let v1 = 2.0 * secure_uniform()? - 1.0;
+        let v2 = 2.0 * secure_uniform()? - 1.0;
+        let s = v1 * v1 + v2 * v2;
+        if s < 1.0 && s != 0.0 {
+            let mult = (-2.0 * s.ln() / s).sqrt();
+            return Ok(Some(Value::Double(v1 * mult)));
+        }
+    }
+    // Extraordinarily unlikely with a healthy CSPRNG; surface loud rather than
+    // returning a misleading 0.0.
+    Err(cratonvm_types::error::RuntimeError::SecurityException {
+        message: "SecureRandom.nextGaussian: polar method failed to converge".to_string(),
+    }
+    .into())
+}
+
 pub(crate) fn native_secure_random_generate_seed(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -886,6 +934,11 @@ pub fn register_random_and_securerandom_natives(registry: &mut NativeMethodRegis
     registry.register(sr, "nextDouble", "()D", native_secure_random_next_double);
     registry.register(sr, "nextBoolean", "()Z", native_secure_random_next_boolean);
     registry.register(sr, "nextFloat", "()F", native_secure_random_next_float);
+    // LOW-FIX: override nextGaussian on SecureRandom so it derives its uniforms
+    // from the CSPRNG; otherwise it inherits java.util.Random's LCG-backed
+    // `native_random_next_gaussian` (registered above on java/util/Random),
+    // leaking predictable Gaussian deviates from a "secure" source.
+    registry.register(sr, "nextGaussian", "()D", native_secure_random_next_gaussian);
     registry.register(sr, "generateSeed", "(I)[B", native_secure_random_generate_seed);
     // Static factories — `getInstance(...)` / `getInstanceStrong()`.  Without
     // these the real-JDK body falls through to the JCA provider chain, which has
@@ -1081,5 +1134,41 @@ mod tests {
             t.remove(&KEY_A);
             t.remove(&KEY_B);
         });
+    }
+
+    #[test]
+    fn test_secure_gaussian_uses_csprng_and_is_finite() {
+        // Regression for the LOW finding: SecureRandom.nextGaussian must derive
+        // its uniforms from the OS CSPRNG, not java.util.Random's LCG.  We can't
+        // call the native (it needs a NativeContext), but we can exercise the
+        // exact CSPRNG-backed polar transform it runs and confirm the deviates
+        // are finite, non-degenerate, and roughly standard-normal.
+        //
+        // Mirror `native_secure_random_next_gaussian::secure_uniform`: top 53
+        // bits of a fresh OS draw → double in [0, 1).
+        let secure_uniform = || -> f64 {
+            let v = os_random_u64().expect("OS entropy available in test env");
+            (v >> 11) as f64 / ((1u64 << 53) as f64)
+        };
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for _ in 0..2000 {
+            // One polar-method attempt; skip the (~21.5%) rejected pairs.
+            let v1 = 2.0 * secure_uniform() - 1.0;
+            let v2 = 2.0 * secure_uniform() - 1.0;
+            let s = v1 * v1 + v2 * v2;
+            if s < 1.0 && s != 0.0 {
+                let g = v1 * (-2.0 * s.ln() / s).sqrt();
+                assert!(g.is_finite(), "gaussian deviate must be finite, got {g}");
+                sum += g;
+                count += 1;
+            }
+        }
+        assert!(count > 0, "polar method produced no accepted samples");
+        // The sample mean of a standard normal should sit near 0; allow a wide
+        // band so this never flakes on real entropy (|mean| < 0.5 is extremely
+        // loose for ~1500 samples but still catches a stuck/constant source).
+        let mean = sum / count as f64;
+        assert!(mean.abs() < 0.5, "gaussian mean wildly off zero: {mean}");
     }
 }

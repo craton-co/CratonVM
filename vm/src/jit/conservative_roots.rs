@@ -669,17 +669,152 @@ pub fn current_thread_jit_depth() -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-thread JIT-root gap detector (multi-thread-in-JIT-under-STW)
+// ---------------------------------------------------------------------------
+
+/// Diagnostic counter: number of times [`scan_active_jit_frames`] observed the
+/// unsupported "multi-thread-in-JIT" condition (this thread's chain is empty
+/// while another thread holds live JIT frames). Exposed for tests / JFR.
+pub static CROSS_THREAD_JIT_GAP_HITS: AtomicUsize = AtomicUsize::new(0);
+
+/// Cached `CRATONVM_STRICT_JIT_ROOTS` gate. When set, the cross-thread-JIT-gap
+/// detector PANICS instead of merely warning, so a CI / fuzzing run can make
+/// the (otherwise silent) unsupported condition a hard, visible failure. Off by
+/// default so production keeps the safe published-snapshot path. Cached because
+/// the detector runs on the per-native-call hot path.
+fn strict_jit_roots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CRATONVM_STRICT_JIT_ROOTS").is_some())
+}
+
+/// Detect — and loudly report — the unsupported *multi-thread-in-JIT* condition
+/// for the thread-local JIT-frame scanner.
+///
+/// ## What it detects
+///
+/// `scan_active_jit_frames` only ever discovers the **calling** thread's JIT
+/// roots (the chain is thread-local). When the calling thread's chain is empty
+/// (`current_thread_jit_depth() == 0`) yet `any_thread_in_jit()` is true, this
+/// scan contributes **nothing** for JIT roots while *some other* thread holds
+/// live JIT spill slots. If this scan is part of a peer-triggered STW
+/// collector's authoritative root walk, those peer roots are reachable ONLY via
+/// that peer's last-published `root_snapshot` (see the `scan_active_jit_frames`
+/// doc): if that snapshot is stale, a live root is silently dropped.
+///
+/// This is exactly the documented gap (a full cross-thread STW JIT root scan is
+/// a separate, unimplemented feature). Rather than proceed silently, we surface
+/// the condition:
+///
+/// - **Always:** a rate-limited `tracing::warn!` (first occurrence, then every
+///   power-of-two thereafter) so the gap is visible in any run without flooding
+///   the per-native-call hot path.
+/// - **Opt-in (`CRATONVM_STRICT_JIT_ROOTS`):** a panic, turning the gap into a
+///   hard failure for CI / fuzzing / bisection.
+///
+/// ## Why this is conservative (does NOT destabilize the single-thread path)
+///
+/// The detector NEVER changes the root set — it only observes and logs. The
+/// common single-thread-in-JIT path (`current_thread_jit_depth() > 0`) never
+/// trips it. A peer being in JIT while THIS thread is not is also benign in the
+/// normal flow (the peer published a fresh snapshot at its safepoint); the warn
+/// flags the *structural* window in which the unimplemented cross-thread scan
+/// would be required, which is the actionable signal for the follow-up.
+#[cold]
+#[inline(never)]
+fn warn_cross_thread_jit_gap() {
+    let hits = CROSS_THREAD_JIT_GAP_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+    // Rate-limit: log the 1st hit and every subsequent power of two so a
+    // long-running multi-threaded JIT workload does not spam the log, but the
+    // condition is never fully silent.
+    if (hits & (hits - 1)) == 0 {
+        tracing::warn!(
+            cross_thread_jit_gap_hits = hits,
+            global_jit_depth = GLOBAL_JIT_DEPTH.load(Ordering::Acquire),
+            "scan_active_jit_frames: another thread holds live JIT frames while \
+             this thread's JIT chain is empty — the thread-local scanner cannot \
+             see the peer's JIT roots. They are covered ONLY by that peer's \
+             last-published root_snapshot; a stale snapshot would drop a live \
+             root. This is the documented multi-thread-in-JIT-under-STW gap; the \
+             cross-thread STW JIT root scan is a tracked follow-up. Set \
+             CRATONVM_STRICT_JIT_ROOTS=1 to make this fatal."
+        );
+    }
+    if strict_jit_roots() {
+        panic!(
+            "CRATONVM_STRICT_JIT_ROOTS: unsupported multi-thread-in-JIT condition \
+             in scan_active_jit_frames (this thread's JIT chain is empty but \
+             GLOBAL_JIT_DEPTH={} > 0). The thread-local conservative scanner \
+             cannot enumerate a peer thread's JIT roots; a cross-thread STW JIT \
+             root scan is required and is not yet implemented.",
+            GLOBAL_JIT_DEPTH.load(Ordering::Acquire),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Scanner
 // ---------------------------------------------------------------------------
 
 /// Walk every active JIT spill region on the current thread and report each
 /// qword whose value is a valid object address as a conservative root.
 ///
-/// The scanner is **only** valid for the calling thread — the JIT entry chain
-/// is thread-local. Cross-thread root scanning during a stop-the-world pause
-/// would require a per-thread snapshot of `(JIT_ENTRY_CHAIN, current_sp)`
-/// taken at the safepoint; that is a future enhancement and is not needed
-/// today because GC runs are triggered from the same thread that is in JIT.
+/// # ⚠ THREAD-LOCALITY — known limitation and safety envelope
+///
+/// This scanner is **strictly thread-local**: the `JIT_ENTRY_CHAIN` and the
+/// captured stack pointers belong to the calling thread, so a single call
+/// only ever discovers the *calling* thread's live JIT spill roots. It does
+/// **not** and **cannot** discover the JIT roots of any *other* thread.
+///
+/// That distinction matters because two callers invoke it with different
+/// expectations:
+///
+/// - **Single-thread-in-JIT (SAFE).** A self-triggered collection runs
+///   `collect_roots` *on the same thread* whose JIT frames hold the roots
+///   (`roots.rs`), and a thread snapshotting itself runs
+///   `update_root_snapshot` *on its own thread* (`interpreter.rs`). In both
+///   cases the calling thread == the thread owning the JIT chain, so the
+///   thread-local scan is complete and correct. This is the common path.
+///
+/// - **Multi-thread-in-JIT under a peer STW (THE GAP).** A *cross-thread*
+///   stop-the-world collector marks every parked thread from that thread's
+///   `root_snapshot` (`collect_all_root_snapshots`); it does **not** call
+///   `collect_roots` — nor this scanner — *for* a non-current thread (doing
+///   so would scan the **collector's** empty JIT chain, not the parked
+///   worker's). The only mechanism that carries a parked worker's JIT roots
+///   to the collector is that worker having published a *fresh* snapshot via
+///   its own `update_root_snapshot` (which folds this scan in) **before it
+///   parked at the STW safepoint**. The STW barrier (`gc_barrier.rs`) does
+///   force every running mutator — including a thread spinning in JIT — to a
+///   safepoint before the collector proceeds, and the safepoint publishes a
+///   fresh snapshot, so in the *normal* flow the worker's current JIT roots
+///   are visible.
+///
+///   The residual gap: if a worker's *published* snapshot is ever stale
+///   relative to its current JIT spill slots (its slots changed after its
+///   last publish and it reached the STW park without re-publishing), the
+///   peer collector is **blind to those roots**. A full, correct fix is a
+///   *cross-thread STW JIT root scan* — a per-thread snapshot of
+///   `(JIT_ENTRY_CHAIN, current_sp)` captured AT the safepoint and walked by
+///   the collector. That is a hard, separate feature (precise oop maps /
+///   shadow-stack work tracks it); it is **NOT implemented here**.
+///
+/// ## Why a missed root has not been observed to corrupt the heap
+///
+/// While *any* thread is in JIT, `gc_quiescence::is_active()` is set, which
+/// forces the **non-moving** young sweep with selective promotion — objects
+/// are never relocated out from under a stale stack qword. So the failure
+/// mode of the gap is *reclamation* of a still-live object, not a wrong
+/// relocation. The published-snapshot mitigation above closes that in the
+/// normal flow; the strict guard below (see [`warn_cross_thread_jit_gap`])
+/// makes the residual unsupported condition **fail loudly** instead of
+/// silently dropping a root.
+///
+/// ## Follow-up
+///
+/// FOLLOW-UP (tracked): implement the real cross-thread STW JIT root scan so
+/// the collector enumerates each parked worker's JIT chain directly, removing
+/// the dependence on the worker's last-published snapshot being current. Until
+/// then, single-thread-in-JIT is the supported, verified path.
 ///
 /// # Filtering
 ///
@@ -735,8 +870,20 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     }
     let chain_len = JIT_ENTRY_CHAIN.with(|c| c.borrow().len());
     if chain_len == 0 {
-        // No live JIT frames — nothing to scan (the overwhelmingly common
-        // case for `update_root_snapshot`'s per-native-call invocations).
+        // Cross-thread JIT-root gap detector: this thread has no live JIT
+        // frames, so this thread-local scan contributes nothing — but if some
+        // OTHER thread is in JIT, and this scan is part of a peer-triggered STW
+        // collector's root walk, that peer's JIT roots are invisible here (they
+        // are carried only by the peer's last-published `root_snapshot`). Flag
+        // the unsupported multi-thread-in-JIT condition loudly instead of
+        // silently proceeding (see `warn_cross_thread_jit_gap` and the
+        // `scan_active_jit_frames` doc). The `any_thread_in_jit()` guard keeps
+        // the truly-quiescent common case (the overwhelming majority of
+        // `update_root_snapshot`'s per-native-call invocations) zero-cost.
+        if any_thread_in_jit() {
+            warn_cross_thread_jit_gap();
+        }
+        // No live JIT frames on THIS thread — nothing to scan.
         return;
     }
     // WS1 JIT-scan cache (see the module-level comment at `JIT_SCAN_CACHE`):
@@ -1323,6 +1470,56 @@ mod tests {
         assert!(any_thread_in_jit());
         drop(_g);
         assert_eq!(current_thread_jit_depth(), local_before);
+    }
+
+    /// Cross-thread-JIT-gap detector: when a PEER thread holds a live JIT
+    /// frame while THIS thread's chain is empty, the detector recognizes the
+    /// unsupported multi-thread-in-JIT condition and bumps its diagnostic
+    /// counter. The detector must NEVER mutate the root set — it only observes.
+    ///
+    /// We drive a peer thread into JIT via a handshake (it pushes an entry,
+    /// signals, then waits to be released), so the peer's `GLOBAL_JIT_DEPTH`
+    /// contribution is live for the duration of our assertions. The main test
+    /// thread keeps an empty chain.
+    #[test]
+    fn cross_thread_jit_gap_detector_trips_on_peer_in_jit() {
+        use std::sync::mpsc;
+        // Pre-condition: this thread must not itself be in JIT.
+        assert_eq!(current_thread_jit_depth(), 0);
+
+        let (peer_in_jit_tx, peer_in_jit_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            // Push a JIT entry on the PEER thread → bumps GLOBAL_JIT_DEPTH.
+            let _g = JitEntryGuard::enter();
+            peer_in_jit_tx.send(()).unwrap();
+            // Hold the entry live until the main thread finishes asserting.
+            release_rx.recv().unwrap();
+            // _g drops here, balancing the global counter.
+        });
+        peer_in_jit_rx.recv().unwrap();
+
+        // The unsupported condition now holds: this thread's chain is empty,
+        // but a peer is in JIT.
+        assert_eq!(current_thread_jit_depth(), 0);
+        assert!(
+            any_thread_in_jit(),
+            "peer thread should be observable via GLOBAL_JIT_DEPTH"
+        );
+
+        // The detector must increment its counter (and must not panic, since
+        // CRATONVM_STRICT_JIT_ROOTS is not set in the test environment).
+        let before = CROSS_THREAD_JIT_GAP_HITS.load(Ordering::Relaxed);
+        warn_cross_thread_jit_gap();
+        let after = CROSS_THREAD_JIT_GAP_HITS.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "detector must record the cross-thread JIT gap (before={before}, after={after})"
+        );
+
+        // Release the peer and join.
+        release_tx.send(()).unwrap();
+        handle.join().unwrap();
     }
 
     // -----------------------------------------------------------------------

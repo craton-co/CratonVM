@@ -68,6 +68,14 @@ pub struct ClassUnloadingResult {
 /// A JIT code cache entry associated with a compiled method.
 #[derive(Debug, Clone)]
 pub struct CodeCacheEntry {
+    /// Address/identity of the ClassLoader that defined the owning class.
+    ///
+    /// Class IDs are only unique *within* a loader and can be reused across
+    /// loaders, so invalidation must key on the `(loader_addr, class_id)` pair
+    /// rather than `class_id` alone (bug gc-classunload). `None` means the
+    /// owning loader was not known at registration time (e.g. the class was not
+    /// yet registered); such entries fall back to matching on `class_id` alone.
+    pub loader_addr: Option<usize>,
     /// Class that this JIT code belongs to.
     pub class_id: u32,
     /// Method name.
@@ -159,22 +167,32 @@ impl ClassUnloader {
     }
 
     /// Register JIT compiled code for a class.
+    ///
+    /// The owning loader is resolved from the registered classes so that the
+    /// resulting code-cache entry is keyed on the `(loader_addr, class_id)`
+    /// pair: class IDs may be reused across loaders, so invalidation must not
+    /// match on `class_id` alone (bug gc-classunload). If no registered class
+    /// currently owns this `class_id` the entry stores `loader_addr = None` and
+    /// later falls back to matching on `class_id` alone.
     pub fn register_jit_code(&self, class_id: u32, method_name: &str, code_size: usize) {
         let mut inner = self.inner.lock();
+        // Resolve the owning loader and mark the class as having JIT code.
+        let mut owner_loader: Option<usize> = None;
+        for loader in &mut inner.loaders {
+            for cls in &mut loader.loaded_classes {
+                if cls.class_id == class_id {
+                    cls.has_jit_code = true;
+                    owner_loader = Some(loader.loader_addr);
+                }
+            }
+        }
         inner.code_cache.push(CodeCacheEntry {
+            loader_addr: owner_loader,
             class_id,
             method_name: method_name.to_string(),
             code_size,
             valid: true,
         });
-        // Also mark the class as having JIT code.
-        for loader in &mut inner.loaders {
-            for cls in &mut loader.loaded_classes {
-                if cls.class_id == class_id {
-                    cls.has_jit_code = true;
-                }
-            }
-        }
     }
 
     /// Mark a class loader as alive (called during GC marking phase).
@@ -200,7 +218,15 @@ impl ClassUnloader {
         }
 
         // Phase 1 -- find unreachable loaders.
-        let unreachable: Vec<usize> = inner
+        //
+        // Perf (gc-classunload): collect the unreachable loader addresses into a
+        // `HashSet` once so that every later membership test
+        // (`unreachable.contains(&addr)`) in Phases 2/4, the name collections and
+        // the final `retain` is O(1) instead of an O(loaders) linear scan over a
+        // `Vec`. The previous code re-scanned a `Vec<usize>` multiple times,
+        // giving O(loaders * unreachable) total work per phase. The membership
+        // set unloaded is exactly the same as before.
+        let unreachable: std::collections::HashSet<usize> = inner
             .loaders
             .iter()
             .filter(|l| !l.is_system_loader && !l.alive && !is_loader_reachable(l.loader_addr))
@@ -221,10 +247,41 @@ impl ClassUnloader {
             .collect();
 
         // Phase 3 -- invalidate JIT code.
-        let class_ids: Vec<u32> = classes.iter().map(|c| c.class_id).collect();
+        //
+        // Key invalidation on the `(loader_addr, class_id)` pair rather than on
+        // `class_id` alone (bug gc-classunload): class IDs are only unique
+        // within a loader and can be reused across loaders, so a reused id under
+        // a *different* (still-reachable) loader must not be invalidated when an
+        // unreachable loader happens to share that id. Entries whose owning
+        // loader was unknown at registration time (`loader_addr == None`) fall
+        // back to matching on `class_id` alone, scoped to the unloaded classes.
+        let unloaded_pairs: std::collections::HashSet<(usize, u32)> = inner
+            .loaders
+            .iter()
+            .filter(|l| unreachable.contains(&l.loader_addr))
+            .flat_map(|l| {
+                let loader_addr = l.loader_addr;
+                l.loaded_classes
+                    .iter()
+                    .map(move |c| (loader_addr, c.class_id))
+            })
+            .collect();
+        let unloaded_class_ids: std::collections::HashSet<u32> =
+            unloaded_pairs.iter().map(|&(_, id)| id).collect();
         let mut jit_invalidated = 0;
         for entry in &mut inner.code_cache {
-            if entry.valid && class_ids.contains(&entry.class_id) {
+            if !entry.valid {
+                continue;
+            }
+            let should_invalidate = match entry.loader_addr {
+                // Owning loader known: only invalidate the exact pair, so a
+                // reused class_id under a different loader is left untouched.
+                Some(addr) => unloaded_pairs.contains(&(addr, entry.class_id)),
+                // Owning loader unknown: fall back to class_id matching, scoped
+                // to the classes actually being unloaded this cycle.
+                None => unloaded_class_ids.contains(&entry.class_id),
+            };
+            if should_invalidate {
                 entry.valid = false;
                 jit_invalidated += 1;
             }
@@ -279,6 +336,17 @@ impl ClassUnloader {
         for loader in &mut inner.loaders {
             if let Some(&new_addr) = pointer_map.get(&loader.loader_addr) {
                 loader.loader_addr = new_addr;
+            }
+        }
+        // Remap the owning-loader key stored on each code-cache entry in lockstep
+        // (bug gc-classunload): the `(loader_addr, class_id)` pair is the
+        // invalidation key, so a stale loader address here would make a later
+        // unload silently fail to invalidate the entry (a false negative).
+        for entry in &mut inner.code_cache {
+            if let Some(addr) = entry.loader_addr {
+                if let Some(&new_addr) = pointer_map.get(&addr) {
+                    entry.loader_addr = Some(new_addr);
+                }
             }
         }
     }
@@ -384,19 +452,38 @@ impl ClassLoaderHierarchy {
     }
 
     /// Check if `ancestor` is an ancestor of `descendant`.
+    ///
+    /// Cycle protection (bug gc-classunload): a malformed parent chain
+    /// (e.g. `A -> B -> A`) previously spun this loop forever and hung the GC
+    /// thread. We now bound the walk by the number of registered loaders and
+    /// track visited nodes; on a revisit (or once we exceed the loader count)
+    /// we bail out to `false` rather than looping. A correct, acyclic chain can
+    /// never be longer than `parents.len()`, so this never rejects a valid
+    /// ancestor relationship.
     pub fn is_ancestor(&self, ancestor: usize, descendant: usize) -> bool {
         let mut current = descendant;
-        loop {
+        let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        // Hard upper bound on iterations as a second line of defence in case a
+        // future change drops the visited-set guard.
+        let max_iterations = self.parents.len() + 1;
+        for _ in 0..max_iterations {
             match self.parents.get(&current) {
                 Some(Some(parent)) => {
                     if *parent == ancestor {
                         return true;
+                    }
+                    // Revisiting a node we've already seen means the chain is
+                    // cyclic; stop instead of spinning forever.
+                    if !visited.insert(current) {
+                        return false;
                     }
                     current = *parent;
                 }
                 _ => return false,
             }
         }
+        // Exceeded the loader-count bound -> chain is cyclic/malformed.
+        false
     }
 
     /// Get all loaders in the hierarchy.
@@ -410,11 +497,38 @@ impl ClassLoaderHierarchy {
     }
 
     /// Update addresses after GC.
+    ///
+    /// Collision rejection (bug gc-classunload): the loader address and its
+    /// parent address are remapped independently. A pathological/contended
+    /// `pointer_map` can map two distinct old loader addresses onto the same
+    /// new address, which would collapse two nodes into one and could make the
+    /// hierarchy cyclic (e.g. `A -> B` and `B -> A` both landing on the same
+    /// key), which in turn would hang `is_ancestor`. To guarantee the hierarchy
+    /// stays acyclic, we drop (do not re-insert) any entry whose remapped
+    /// loader address would collide with an entry already inserted this pass,
+    /// and we reject any self-referential parent (`new_addr == new_parent`)
+    /// produced by remapping.
     pub fn update_after_gc(&mut self, pointer_map: &HashMap<usize, usize>) {
         let old: Vec<(usize, Option<usize>)> = self.parents.drain().collect();
         for (addr, parent) in old {
             let new_addr = pointer_map.get(&addr).copied().unwrap_or(addr);
             let new_parent = parent.map(|p| pointer_map.get(&p).copied().unwrap_or(p));
+
+            // Skip an entry whose remapped loader address collides with one we
+            // already re-inserted: re-inserting would silently overwrite the
+            // earlier node and risk fusing two chains into a cycle.
+            if self.parents.contains_key(&new_addr) {
+                continue;
+            }
+
+            // Reject a parent edge that became self-referential after remapping
+            // (a one-node cycle), which would hang `is_ancestor`. Treat such a
+            // loader as having no parent rather than pointing at itself.
+            let new_parent = match new_parent {
+                Some(p) if p == new_addr => None,
+                other => other,
+            };
+
             self.parents.insert(new_addr, new_parent);
         }
     }
@@ -587,6 +701,79 @@ mod tests {
         let string_entry = cache.iter().find(|e| e.class_id == 1)
             .expect("class_unloading: expected code cache entry for class_id 1");
         assert!(string_entry.valid);
+    }
+
+    #[test]
+    fn jit_invalidation_keyed_on_loader_class_pair() {
+        // bug gc-classunload: two loaders reuse the same class_id (7). When the
+        // first loader is unloaded, ONLY its JIT code must be invalidated; the
+        // still-reachable second loader's code (same class_id) must survive.
+        let u = ClassUnloader::new();
+
+        u.register_loader(0xA00, "DeadLoader", false);
+        u.register_class(0xA00, make_class("dead/Same", 7, 128));
+        u.register_jit_code(7, "run", 4096);
+
+        u.register_loader(0xB00, "LiveLoader", false);
+        u.register_class(0xB00, make_class("live/Same", 7, 128));
+        u.register_jit_code(7, "run", 4096);
+
+        // 0xB00 stays reachable, 0xA00 does not.
+        let result = u.unload_classes(&|addr| addr == 0xB00);
+        assert_eq!(result.loaders_unloaded, 1);
+
+        // Exactly one JIT entry (the dead loader's) is invalidated despite the
+        // shared class_id.
+        assert_eq!(result.jit_entries_invalidated, 1);
+        let cache = u.code_cache_snapshot();
+        let dead = cache.iter().find(|e| e.loader_addr == Some(0xA00))
+            .expect("class_unloading: expected code cache entry for dead loader 0xA00");
+        let live = cache.iter().find(|e| e.loader_addr == Some(0xB00))
+            .expect("class_unloading: expected code cache entry for live loader 0xB00");
+        assert!(!dead.valid, "dead loader's JIT code must be invalidated");
+        assert!(live.valid, "live loader's JIT code must survive (reused class_id)");
+    }
+
+    #[test]
+    fn jit_invalidation_remaps_loader_key_after_gc() {
+        // bug gc-classunload: after relocation the code-cache loader key must be
+        // remapped in lockstep with the loader, or a later unload silently fails
+        // to invalidate the entry.
+        let u = ClassUnloader::new();
+        u.register_loader(0xA00, "Moved", false);
+        u.register_class(0xA00, make_class("m/Hot", 3, 64));
+        u.register_jit_code(3, "hot", 2048);
+
+        let mut map = HashMap::new();
+        map.insert(0xA00, 0xC00);
+        u.update_after_gc(&map);
+
+        // The code-cache entry's owning-loader key followed the relocation.
+        let cache = u.code_cache_snapshot();
+        assert_eq!(cache[0].loader_addr, Some(0xC00));
+
+        // Unloading the relocated loader still invalidates its JIT code.
+        let result = u.unload_classes(&|_| false);
+        assert_eq!(result.jit_entries_invalidated, 1);
+        assert!(u.code_cache_snapshot().iter().all(|e| !e.valid));
+    }
+
+    #[test]
+    fn jit_invalidation_unknown_owner_falls_back_to_class_id() {
+        // An entry registered before its class was registered has no known owner
+        // (loader_addr == None) and must fall back to class_id matching, scoped
+        // to the classes actually being unloaded.
+        let u = ClassUnloader::new();
+        // Register JIT code first -> owner unknown.
+        u.register_jit_code(99, "orphan", 256);
+        let cache = u.code_cache_snapshot();
+        assert_eq!(cache[0].loader_addr, None);
+
+        // A loader that owns class_id 99 becomes unreachable.
+        u.register_loader(0xA00, "Owner", false);
+        u.register_class(0xA00, make_class("own/C", 99, 64));
+        let result = u.unload_classes(&|_| false);
+        assert_eq!(result.jit_entries_invalidated, 1);
     }
 
     // -- mixed reachable/unreachable loaders --------------------------------
@@ -861,6 +1048,80 @@ mod tests {
         assert!(h.parent_of(0xB00).is_some());
         assert_eq!(h.parent_of(0xB00), Some(Some(0xA00)));
         assert!(h.parent_of(0x100).is_none()); // old address gone
+    }
+
+    // -- cycle protection (bug gc-classunload) -----------------------------
+
+    #[test]
+    fn hierarchy_is_ancestor_terminates_on_direct_cycle() {
+        // A -> B -> A is a 2-node cycle; is_ancestor must return without
+        // spinning forever and must not falsely report an ancestor.
+        let mut h = ClassLoaderHierarchy::new();
+        h.register(0xA, Some(0xB));
+        h.register(0xB, Some(0xA));
+        assert!(!h.is_ancestor(0xC, 0xA));
+        assert!(!h.is_ancestor(0xC, 0xB));
+        // The two nodes are mutual parents; querying their real relationship
+        // still terminates.
+        assert!(h.is_ancestor(0xB, 0xA));
+        assert!(h.is_ancestor(0xA, 0xB));
+    }
+
+    #[test]
+    fn hierarchy_is_ancestor_terminates_on_self_cycle() {
+        // A node that is its own parent must not hang the walk.
+        let mut h = ClassLoaderHierarchy::new();
+        h.register(0xA, Some(0xA));
+        assert!(h.is_ancestor(0xA, 0xA)); // immediate parent match
+        assert!(!h.is_ancestor(0xB, 0xA)); // unrelated, must terminate
+    }
+
+    #[test]
+    fn hierarchy_is_ancestor_terminates_on_longer_cycle() {
+        // A -> B -> C -> A: a 3-node cycle with an unrelated query target.
+        let mut h = ClassLoaderHierarchy::new();
+        h.register(0xA, Some(0xB));
+        h.register(0xB, Some(0xC));
+        h.register(0xC, Some(0xA));
+        assert!(!h.is_ancestor(0xD, 0xA));
+    }
+
+    #[test]
+    fn update_after_gc_rejects_colliding_remap() {
+        // Two distinct loaders remap onto the same new address. The collision
+        // must be dropped (not fused) so the hierarchy cannot become cyclic.
+        let mut h = ClassLoaderHierarchy::new();
+        h.register(0x100, Some(0x200));
+        h.register(0x200, Some(0x100));
+
+        let mut map = HashMap::new();
+        map.insert(0x100, 0x900);
+        map.insert(0x200, 0x900); // collision onto the same new address
+
+        h.update_after_gc(&map);
+
+        // Exactly one node survives at the collided address; no infinite loop.
+        assert_eq!(h.all_loaders().len(), 1);
+        assert!(h.all_loaders().contains(&0x900));
+        // Whatever survived, is_ancestor must terminate.
+        assert!(!h.is_ancestor(0xDEAD, 0x900));
+    }
+
+    #[test]
+    fn update_after_gc_rejects_self_referential_remap() {
+        // A loader whose parent remaps onto its own new address would become a
+        // one-node cycle; the parent edge must be cleared to None.
+        let mut h = ClassLoaderHierarchy::new();
+        h.register(0x100, Some(0x200));
+
+        let mut map = HashMap::new();
+        map.insert(0x100, 0x500);
+        map.insert(0x200, 0x500); // parent now points at the loader itself
+
+        h.update_after_gc(&map);
+
+        assert_eq!(h.parent_of(0x500), Some(None));
+        assert!(!h.is_ancestor(0x500, 0x500));
     }
 
     // -- Default impls -----------------------------------------------------

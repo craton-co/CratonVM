@@ -252,14 +252,28 @@ fn jndi_put_binding(
         _ => return Ok(()),
     };
 
-    // Check if key already exists (by string equality)
-    for i in 0..size {
-        let existing = ctx.get_array_element(keys_arr, i);
-        if let (Value::Object(Some(a)), Value::Object(Some(b))) = (existing, name) {
-            if let (Some(sa), Some(sb)) = (ctx.read_string(a), ctx.read_string(b)) {
-                if sa == sb {
-                    ctx.set_array_element(vals_arr, i, value);
-                    return Ok(());
+    // PERF: decode the lookup name ONCE before scanning instead of re-decoding
+    // it (ctx.read_string on the search key) inside every loop iteration. The
+    // original loop string-decoded both the existing key and `name` on each
+    // step → 2*n String allocations per put; this does n+1 and never re-decodes
+    // the unchanged search key. Behaviour is identical: the prior inner match
+    // only matched when read_string(name) was Some, so a non-string `name`
+    // (search_key == None) still falls straight through to the append path
+    // exactly as before (rebind of an existing key overwrites in place).
+    let search_key: Option<String> = match name {
+        Value::Object(Some(b)) => ctx.read_string(b),
+        _ => None,
+    };
+    if let Some(ref sb) = search_key {
+        // First matching slot wins, preserving the original forward-scan
+        // "existing key overwrites" semantics.
+        for i in 0..size {
+            if let Value::Object(Some(a)) = ctx.get_array_element(keys_arr, i) {
+                if let Some(sa) = ctx.read_string(a) {
+                    if &sa == sb {
+                        ctx.set_array_element(vals_arr, i, value);
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -302,11 +316,25 @@ fn jndi_get_binding(ctx: &mut dyn NativeContext, this: ObjectRef, name: Value) -
         Value::Object(Some(a)) => a,
         _ => return Value::Object(None),
     };
+    // PERF: decode the lookup name once up front rather than re-decoding it on
+    // every iteration (the old loop called read_string on BOTH the existing key
+    // and `name` each step → 2*n String allocations per lookup). A non-string
+    // `name` could never match in the old code (it required read_string(name)
+    // to be Some), so returning the not-found sentinel for that case preserves
+    // behaviour exactly.
+    let search_key = match name {
+        Value::Object(Some(b)) => match ctx.read_string(b) {
+            Some(s) => s,
+            None => return Value::Object(None),
+        },
+        _ => return Value::Object(None),
+    };
+    // Forward scan, comparing each existing key (decoded once) against the
+    // pre-decoded search key — first match wins, identical to the original.
     for i in 0..size {
-        let existing = ctx.get_array_element(keys_arr, i);
-        if let (Value::Object(Some(a)), Value::Object(Some(b))) = (existing, name) {
-            if let (Some(sa), Some(sb)) = (ctx.read_string(a), ctx.read_string(b)) {
-                if sa == sb {
+        if let Value::Object(Some(a)) = ctx.get_array_element(keys_arr, i) {
+            if let Some(sa) = ctx.read_string(a) {
+                if sa == search_key {
                     return ctx.get_array_element(vals_arr, i);
                 }
             }
@@ -334,11 +362,22 @@ fn jndi_remove_binding(
         Value::Object(Some(a)) => a,
         _ => return Ok(()),
     };
+    // PERF: decode the name to remove once instead of re-decoding it inside the
+    // scan (old loop read_string'd both sides each step). A non-string `name`
+    // never matched in the original (required read_string(name) = Some), so the
+    // early return below is behaviour-preserving (no removal, Ok(())).
+    let search_key = match name {
+        Value::Object(Some(b)) => match ctx.read_string(b) {
+            Some(s) => s,
+            None => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
     for i in 0..size {
         let existing = ctx.get_array_element(keys_arr, i);
-        if let (Value::Object(Some(a)), Value::Object(Some(b))) = (existing, name) {
-            if let (Some(sa), Some(sb)) = (ctx.read_string(a), ctx.read_string(b)) {
-                if sa == sb {
+        if let Value::Object(Some(a)) = existing {
+            if let Some(sa) = ctx.read_string(a) {
+                if sa == search_key {
                     // Shift left
                     for j in i..size - 1 {
                         ctx.set_array_element(keys_arr, j, ctx.get_array_element(keys_arr, j + 1));

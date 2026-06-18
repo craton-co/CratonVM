@@ -818,31 +818,33 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                     }
                     .into());
                 }
-                // Bounds check: offset + bytes must fit within segment size
-                // (when segment size is known, i.e., > 0)
-                if src_size > 0 {
-                    let src_end = src_offset.checked_add(bytes as i64).unwrap_or(i64::MAX);
-                    if src_offset < 0 || src_end > src_size {
-                        return Err(RuntimeError::IllegalStateException {
-                            message: format!(
-                                "source offset {} + {} bytes exceeds segment size {}",
-                                src_offset, bytes, src_size
-                            ),
-                        }
-                        .into());
+                // Bounds check: offset + bytes must fit within segment size.
+                // FIX: validate UNCONDITIONALLY (not gated on size > 0). A segment
+                // with a declared byteSize() of 0 must still reject a non-zero
+                // `bytes` copy — otherwise a 0-size segment drives an OOB
+                // read/write of up to MAX_COPY_SIZE. This mirrors the correct
+                // single-element path (`pe_segment_access_addr`), which rejects
+                // any non-zero access on a zero-size segment. Uses checked_add so
+                // a malicious offset cannot wrap past the size comparison.
+                let src_end = src_offset.checked_add(bytes as i64).unwrap_or(i64::MAX);
+                if src_offset < 0 || src_end > src_size {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: format!(
+                            "source offset {} + {} bytes exceeds segment size {}",
+                            src_offset, bytes, src_size
+                        ),
                     }
+                    .into());
                 }
-                if dst_size > 0 {
-                    let dst_end = dst_offset.checked_add(bytes as i64).unwrap_or(i64::MAX);
-                    if dst_offset < 0 || dst_end > dst_size {
-                        return Err(RuntimeError::IllegalStateException {
-                            message: format!(
-                                "destination offset {} + {} bytes exceeds segment size {}",
-                                dst_offset, bytes, dst_size
-                            ),
-                        }
-                        .into());
+                let dst_end = dst_offset.checked_add(bytes as i64).unwrap_or(i64::MAX);
+                if dst_offset < 0 || dst_end > dst_size {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: format!(
+                            "destination offset {} + {} bytes exceeds segment size {}",
+                            dst_offset, bytes, dst_size
+                        ),
                     }
+                    .into());
                 }
 
                 // Validate address arithmetic doesn't overflow
@@ -2785,6 +2787,37 @@ mod tests {
         for (name, size) in carriers {
             assert!(size > 0, "{name} must have positive size");
         }
+    }
+
+    // FIX(test): regression for the MemorySegment.copy zero-size OOB hole.
+    // The bounds check in `copy` was previously gated on `size > 0`, so a
+    // segment with a declared byteSize() of 0 skipped validation entirely and
+    // a non-zero `bytes` length drove an OOB read/write of up to MAX_COPY_SIZE.
+    // This test mirrors the exact (now-unconditional) predicate used in the
+    // production fix — `offset < 0 || offset.checked_add(bytes) > size` — and
+    // asserts that a zero-size segment with a non-zero length is rejected.
+    // Pure i64 arithmetic only, so it is independent of NativeContext.
+    #[test]
+    fn test_copy_zero_size_segment_rejects_nonzero_len() {
+        // Replicates the copy-path bounds predicate: returns true == "reject".
+        fn exceeds(offset: i64, bytes: usize, size: i64) -> bool {
+            let end = offset.checked_add(bytes as i64).unwrap_or(i64::MAX);
+            offset < 0 || end > size
+        }
+        // Zero-size segment, non-zero copy length -> must reject (the bug).
+        assert!(exceeds(0, 64, 0), "zero-size segment must reject non-zero copy");
+        // Negative offset -> reject.
+        assert!(exceeds(-1, 0, 16), "negative offset must reject");
+        // Offset+bytes overflowing i64 -> saturates to MAX, exceeds size -> reject.
+        assert!(exceeds(i64::MAX, 1, 1024), "overflowing offset must reject");
+        // Offset+bytes past the declared size -> reject.
+        assert!(exceeds(8, 16, 16), "out-of-range copy must reject");
+        // Legitimate in-bounds copy -> accept (no over-rejection).
+        assert!(!exceeds(8, 8, 16), "in-bounds copy must be accepted");
+        // Zero-length copy on a zero-size segment is harmless and the
+        // production code only enters the bounds block when bytes > 0, so the
+        // predicate for (0,0,0) staying false is the consistent invariant.
+        assert!(!exceeds(0, 0, 0), "zero-length copy is not a bounds violation");
     }
 
     #[test]

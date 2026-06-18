@@ -24,6 +24,51 @@ pub const REPLY_FLAG: u8 = 0x80;
 /// Minimum packet size (header only, no payload).
 pub const HEADER_SIZE: u32 = 11;
 
+/// Upper bound on a single packet payload (and on an individual JDWP string),
+/// in bytes.  The JDWP wire format carries lengths as a 32-bit field, so a
+/// hostile or buggy peer can declare a payload of up to ~4 GiB.  Without a
+/// cap, `read_packet`/`read_string` would `vec![0u8; declared_len]` up front
+/// and exhaust memory before a single byte is read (a trivial pre-auth DoS).
+/// We clamp to a generous-but-sane ceiling; legitimate JDWP traffic
+/// (stack frames, variable slots, class lists) is comfortably under this.
+///
+/// [VULN fix vm-jdwp] bound attacker-controlled allocation sizes.
+pub const MAX_PACKET_DATA: u32 = 64 * 1024 * 1024; // 64 MiB
+
+/// Read exactly `len` bytes from `reader` into a freshly-allocated buffer,
+/// but cap the up-front allocation at `MAX_PACKET_DATA` and grow the buffer
+/// incrementally as bytes actually arrive.  This prevents a peer from forcing
+/// a multi-gigabyte allocation merely by *declaring* a huge length: a buffer
+/// is only as large as the data the peer is actually willing to send.
+///
+/// Returns `InvalidData` if `len` exceeds `MAX_PACKET_DATA`, and
+/// `UnexpectedEof` (via `read_to_end` semantics) if the stream ends early.
+///
+/// [VULN fix vm-jdwp] bounded reader replaces `vec![0u8; len]` before read.
+fn read_bounded<R: Read>(reader: &mut R, len: usize) -> io::Result<Vec<u8>> {
+    if len > MAX_PACKET_DATA as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "declared payload length {} exceeds maximum {}",
+                len, MAX_PACKET_DATA
+            ),
+        ));
+    }
+    // `len` is now known to be <= MAX_PACKET_DATA, so the with_capacity reserve
+    // is bounded.  `take(len)` guarantees we never read past the declared size,
+    // and `read_to_end` grows the Vec only as real bytes arrive.
+    let mut buf = Vec::with_capacity(len);
+    let read = reader.take(len as u64).read_to_end(&mut buf)?;
+    if read != len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("expected {} payload bytes, got {}", len, read),
+        ));
+    }
+    Ok(buf)
+}
+
 // ---------------------------------------------------------------------------
 // JdwpPacket
 // ---------------------------------------------------------------------------
@@ -92,8 +137,10 @@ pub fn read_packet<R: Read>(reader: &mut R) -> io::Result<JdwpPacket> {
 
     if flags & REPLY_FLAG != 0 {
         let error_code = read_u16_be(reader)?;
-        let mut data = vec![0u8; data_len];
-        reader.read_exact(&mut data)?;
+        // [VULN fix vm-jdwp] bound the payload allocation: a peer declaring
+        // length=0xFFFFFFFF used to force a ~4 GiB `vec![0u8; data_len]` here
+        // before any byte was read.  read_bounded clamps + grows incrementally.
+        let data = read_bounded(reader, data_len)?;
         Ok(JdwpPacket::Reply {
             id,
             error_code,
@@ -102,8 +149,8 @@ pub fn read_packet<R: Read>(reader: &mut R) -> io::Result<JdwpPacket> {
     } else {
         let command_set = read_u8(reader)?;
         let command = read_u8(reader)?;
-        let mut data = vec![0u8; data_len];
-        reader.read_exact(&mut data)?;
+        // [VULN fix vm-jdwp] same bound for command payloads (see above).
+        let data = read_bounded(reader, data_len)?;
         Ok(JdwpPacket::Command {
             id,
             flags,
@@ -182,8 +229,10 @@ pub fn read_u64_be<R: Read>(r: &mut R) -> io::Result<u64> {
 
 pub fn read_string<R: Read>(r: &mut R) -> io::Result<String> {
     let len = read_u32_be(r)? as usize;
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
+    // [VULN fix vm-jdwp] previously `vec![0u8; len]` allocated up to ~4 GiB
+    // from an attacker-controlled wire u32 before reading.  read_bounded caps
+    // the length at MAX_PACKET_DATA and grows the buffer only as bytes arrive.
+    let buf = read_bounded(r, len)?;
     String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
@@ -441,6 +490,67 @@ mod tests {
         assert_eq!(pr.read_u64_be().unwrap(), 0x0102030405060708);
         assert_eq!(pr.read_string().unwrap(), "test");
         assert_eq!(pr.remaining(), 0);
+    }
+
+    #[test]
+    fn oversized_packet_length_rejected_without_huge_alloc() {
+        // [VULN fix vm-jdwp] A hostile peer declares length=0xFFFFFFFF.  The
+        // old code did `vec![0u8; ~4GiB]` before reading and OOM'd.  Now we
+        // must reject with InvalidData *without* allocating, even though the
+        // stream provides no payload bytes at all.
+        let mut buf = Vec::new();
+        write_u32_be(&mut buf, u32::MAX).unwrap(); // length = 0xFFFFFFFF
+        write_u32_be(&mut buf, 1).unwrap();        // id
+        buf.push(0);                               // flags (command)
+        buf.push(0);                               // command_set
+        buf.push(0);                               // command
+
+        let mut cursor = Cursor::new(&buf);
+        let err = read_packet(&mut cursor).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn truncated_payload_does_not_over_allocate() {
+        // Declared payload is exactly MAX_PACKET_DATA but the stream is short.
+        // read_bounded must surface UnexpectedEof (not allocate the full cap
+        // and not panic) because only a few bytes actually arrive.
+        let data_len = MAX_PACKET_DATA;
+        let mut buf = Vec::new();
+        write_u32_be(&mut buf, HEADER_SIZE + data_len).unwrap(); // length
+        write_u32_be(&mut buf, 1).unwrap();                      // id
+        buf.push(0);                                             // flags
+        buf.push(0);                                             // command_set
+        buf.push(0);                                             // command
+        buf.extend_from_slice(&[1, 2, 3]);                       // only 3 of N bytes
+
+        let mut cursor = Cursor::new(&buf);
+        let err = read_packet(&mut cursor).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn read_string_rejects_oversized_length() {
+        // [VULN fix vm-jdwp] read_string used the same `vec![0u8; len]` pattern.
+        let mut buf = Vec::new();
+        write_u32_be(&mut buf, u32::MAX).unwrap(); // claimed string length
+        let mut cursor = Cursor::new(&buf);
+        let err = read_string(&mut cursor).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn read_string_at_limit_boundary_is_not_rejected_for_length() {
+        // A length exactly equal to MAX_PACKET_DATA is permitted by the cap;
+        // here the stream is truncated so we expect UnexpectedEof, proving the
+        // length itself passed the bound (an oversized length would be
+        // InvalidData instead).
+        let mut buf = Vec::new();
+        write_u32_be(&mut buf, MAX_PACKET_DATA).unwrap();
+        buf.extend_from_slice(b"abc"); // far fewer bytes than declared
+        let mut cursor = Cursor::new(&buf);
+        let err = read_string(&mut cursor).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

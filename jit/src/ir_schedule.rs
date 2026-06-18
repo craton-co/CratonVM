@@ -160,9 +160,18 @@ pub fn schedule(graph: &Graph) -> Schedule {
         }
     }
 
-    // Step 4: Place data nodes into blocks
-    // Simple strategy: place each data node in the block of its earliest use's
-    // control dependency (or the entry block if no control dependency).
+    // Step 4: Place data nodes into blocks.
+    //
+    // Correctness invariant: a data node must be scheduled into a block where
+    // *every* one of its (already-placed) inputs is available — i.e. a block
+    // dominated by all of its inputs' blocks. Earlier this used raw block-index
+    // ordering (`inp_block > best`) as a dominance proxy, which is unsound: in
+    // an irreducible or reordered CFG a higher index does not imply dominance,
+    // so a use could be placed before its def. We now compute a real dominator
+    // relation over the block CFG and use it to pick a dominated home block,
+    // falling back to the entry block (which dominates everything) when no such
+    // block exists. See `find_best_block`.
+    let dom = compute_dominators(&blocks);
     for (id, node) in graph.nodes.iter().enumerate() {
         if node_to_block[id] != usize::MAX || node.op == Op::Dead {
             continue; // already placed or dead
@@ -170,8 +179,8 @@ pub fn schedule(graph: &Graph) -> Schedule {
         if node.op.is_control() {
             continue; // control nodes are block boundaries, already handled
         }
-        // Find the block by tracing control inputs
-        let block = find_best_block(graph, id as NodeId, &node_to_block, &blocks);
+        // Find a block dominated by all of this node's inputs' blocks.
+        let block = find_best_block(graph, id as NodeId, &node_to_block, &blocks, &dom);
         node_to_block[id] = block;
         blocks[block].nodes.push(id as NodeId);
     }
@@ -197,58 +206,217 @@ fn is_if(graph: &Graph, id: NodeId) -> bool {
     matches!(graph.nodes.get(id as usize), Some(n) if n.op == Op::If)
 }
 
-/// Find the best block for a data node.
-/// Uses a simple heuristic: place in the entry block (block 0) unless
-/// one of its inputs is in a later block (then use that block).
-fn find_best_block(graph: &Graph, id: NodeId, node_to_block: &[usize], blocks: &[Block]) -> usize {
-    let node = &graph.nodes[id as usize];
-    let mut best = 0; // default: entry block
-    for &inp in &node.inputs {
-        if inp != NO_NODE && (inp as usize) < node_to_block.len() {
-            let inp_block = node_to_block[inp as usize];
-            if inp_block != usize::MAX && inp_block > best {
-                best = inp_block;
+/// Compute, for every block, the set of blocks that dominate it.
+///
+/// Block 0 (the entry) is assumed to be the CFG entry: it dominates every
+/// block, and is dominated only by itself. We use the classic iterative
+/// data-flow formulation:
+///
+/// ```text
+///   dom(entry) = {entry}
+///   dom(b)     = {b} ∪ ( ⋂ over preds p of dom(p) )
+/// ```
+///
+/// iterated to a fixpoint. `dom[b]` is a bitset (one `bool` per block) where
+/// `dom[b][d]` is true iff block `d` dominates block `b`. This is O(B² · iters)
+/// in the worst case, but block counts in a single JIT'd method are small. For
+/// blocks unreachable from the entry (no path of predecessors back to block 0)
+/// the fixpoint leaves them dominated by "all blocks"; callers must therefore
+/// only rely on `dominates(a, b)` when both are reachable — `find_best_block`
+/// handles the unreachable/empty case by falling back to the entry block.
+fn compute_dominators(blocks: &[Block]) -> Vec<Vec<bool>> {
+    let n = blocks.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // Initialize: entry dominated only by itself; every other block tentatively
+    // dominated by all blocks (the conservative "top" of the lattice).
+    let mut dom: Vec<Vec<bool>> = vec![vec![true; n]; n];
+    dom[0] = vec![false; n];
+    dom[0][0] = true;
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in 1..n {
+            // new_dom = {b} ∪ ( ⋂ over preds p of dom(p) )
+            let mut new_dom: Option<Vec<bool>> = None;
+            for &p in &blocks[b].predecessors {
+                if p >= n {
+                    continue;
+                }
+                if let Some(acc) = new_dom.as_mut() {
+                    for d in 0..n {
+                        acc[d] &= dom[p][d];
+                    }
+                } else {
+                    new_dom = Some(dom[p].clone());
+                }
+            }
+            // A block with no (in-range) predecessors keeps the "top" set; only
+            // tighten when we actually intersected predecessor sets.
+            let mut new_dom = match new_dom {
+                Some(v) => v,
+                None => continue,
+            };
+            new_dom[b] = true; // a block always dominates itself
+            if new_dom != dom[b] {
+                dom[b] = new_dom;
+                changed = true;
             }
         }
     }
-    if best < blocks.len() {
-        best
-    } else {
-        0
+    dom
+}
+
+/// True iff block `a` dominates block `b` (every path from the entry to `b`
+/// passes through `a`). Both indices must be in range.
+#[inline]
+fn dominates(dom: &[Vec<bool>], a: usize, b: usize) -> bool {
+    dom.get(b).and_then(|row| row.get(a)).copied().unwrap_or(false)
+}
+
+/// Find the home block for a data node such that every one of its already-placed
+/// inputs is available there.
+///
+/// We collect the blocks of all known inputs and pick the *deepest* one that is
+/// dominated by every other input block — that block is reached only after all
+/// inputs are computed, so a use can never precede its def. (For a Phi, input[0]
+/// is its Merge/Region control node, whose block is exactly this anchor; the
+/// per-predecessor value inputs feed it via edge copies, not by being live in
+/// the Phi's home block, so they are intentionally allowed to be non-dominating.)
+///
+/// If the input blocks are not totally ordered by dominance (e.g. a value that
+/// truly depends on values from sibling branches — which a well-formed SSA graph
+/// resolves through a Phi), we fall back to the entry block (block 0), which
+/// dominates everything. This is conservative: it never schedules a use before
+/// a dominating def, and only over-anchors otherwise-floating pure nodes.
+fn find_best_block(
+    graph: &Graph,
+    id: NodeId,
+    node_to_block: &[usize],
+    blocks: &[Block],
+    dom: &[Vec<bool>],
+) -> usize {
+    let node = &graph.nodes[id as usize];
+
+    // Phi nodes are pinned to their Merge/Region's block: input[0] is that
+    // control node. The value inputs are delivered by edge copies, so they must
+    // not drag the Phi out of its merge block.
+    if matches!(node.op, Op::Phi) {
+        if let Some(&ctrl) = node.inputs.first() {
+            if ctrl != NO_NODE && (ctrl as usize) < node_to_block.len() {
+                let cb = node_to_block[ctrl as usize];
+                if cb != usize::MAX && cb < blocks.len() {
+                    return cb;
+                }
+            }
+        }
+        return 0;
+    }
+
+    // Gather the distinct, in-range, already-placed input blocks.
+    let mut input_blocks: Vec<usize> = Vec::new();
+    for &inp in &node.inputs {
+        if inp != NO_NODE && (inp as usize) < node_to_block.len() {
+            let ib = node_to_block[inp as usize];
+            if ib != usize::MAX && ib < blocks.len() && !input_blocks.contains(&ib) {
+                input_blocks.push(ib);
+            }
+        }
+    }
+
+    // No known input blocks → free to live in the entry block (params/consts).
+    if input_blocks.is_empty() {
+        return 0;
+    }
+
+    // Pick the deepest block that is dominated by every other input block. Such
+    // a block sees all inputs on every path that reaches it.
+    let mut best: Option<usize> = None;
+    for &cand in &input_blocks {
+        let dominated_by_all = input_blocks
+            .iter()
+            .all(|&other| other == cand || dominates(dom, other, cand));
+        if dominated_by_all {
+            // Among valid candidates prefer the one dominated by the most others
+            // (i.e. the latest in dominance order). Since exactly one input block
+            // can be dominated by all the rest in a totally-ordered chain, the
+            // first match is already the unique deepest; keep it.
+            best = Some(cand);
+            break;
+        }
+    }
+
+    match best {
+        Some(b) => b,
+        // Inputs span incomparable branches (no single dominated home). Fall
+        // back to the entry block, which dominates all of them. Conservative:
+        // never places a use before a def.
+        None => 0,
     }
 }
 
-/// Topological sort the data nodes within a block by their dependencies.
+/// Topological sort the data nodes within a block so every node appears after
+/// the inputs it depends on (that also live in this block).
+///
+/// This is an iterative post-order DFS using an explicit work stack. A previous
+/// version recursed over the operand chain, which could overflow the native
+/// stack on a deeply nested expression (e.g. a long left-leaning arithmetic
+/// chain produces an operand chain as deep as the expression). The explicit
+/// stack keeps memory bounded by the heap instead of the call stack.
 fn topo_sort_block(graph: &Graph, nodes: &mut Vec<NodeId>) {
     if nodes.len() <= 1 {
         return;
     }
     let set: std::collections::HashSet<NodeId> = nodes.iter().copied().collect();
     let mut sorted = Vec::with_capacity(nodes.len());
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = std::collections::HashSet::with_capacity(nodes.len());
 
-    fn visit(
-        id: NodeId,
-        graph: &Graph,
-        set: &std::collections::HashSet<NodeId>,
-        visited: &mut std::collections::HashSet<NodeId>,
-        sorted: &mut Vec<NodeId>,
-    ) {
-        if !visited.insert(id) {
-            return;
+    // Each stack frame tracks a node plus the index of the next input edge to
+    // descend into. We push a node, walk its in-block inputs one at a time, and
+    // only emit (`sorted.push`) the node once all its inputs have been emitted —
+    // reproducing the recursive post-order without recursion.
+    let mut stack: Vec<(NodeId, usize)> = Vec::new();
+
+    for &root in nodes.iter() {
+        if visited.contains(&root) {
+            continue;
         }
-        let node = &graph.nodes[id as usize];
-        for &inp in &node.inputs {
-            if set.contains(&inp) {
-                visit(inp, graph, set, visited, sorted);
+        stack.push((root, 0));
+        // Mark on push so a node already queued isn't re-entered via another
+        // edge (matches the original `visited.insert(id)` guard at entry).
+        visited.insert(root);
+
+        while let Some(&(id, _)) = stack.last() {
+            let inputs = &graph.nodes[id as usize].inputs;
+            // Advance past inputs that are not in this block or already visited,
+            // descending into the first unvisited in-block input we find. We take
+            // the edge cursor by value and write it back via indexing so the
+            // mutable borrow of `stack` does not overlap the `push`/`pop` below.
+            let frame = stack.len() - 1;
+            let mut edge = stack[frame].1;
+            let mut descended = None;
+            while edge < inputs.len() {
+                let inp = inputs[edge];
+                edge += 1;
+                if set.contains(&inp) && visited.insert(inp) {
+                    descended = Some(inp);
+                    break;
+                }
+            }
+            stack[frame].1 = edge;
+            match descended {
+                Some(inp) => stack.push((inp, 0)),
+                // All inputs processed → emit this node in post-order and pop.
+                None => {
+                    sorted.push(id);
+                    stack.pop();
+                }
             }
         }
-        sorted.push(id);
     }
 
-    for &id in nodes.iter() {
-        visit(id, graph, &set, &mut visited, &mut sorted);
-    }
     *nodes = sorted;
 }
 
@@ -257,7 +425,7 @@ fn topo_sort_block(graph: &Graph, nodes: &mut Vec<NodeId>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::IrBuilder;
+    use crate::ir::{IrBuilder, IrType};
     use crate::ir_optimize;
 
     fn build_schedule(
@@ -415,5 +583,125 @@ mod tests {
             total_data_nodes > 0,
             "Data nodes should be scheduled into blocks"
         );
+    }
+
+    // ── Helpers for the dominator / topo-sort unit tests ─────────────────
+
+    /// Build a bare block with the given predecessor list (ctrl/terminator are
+    /// irrelevant for the dominator math, which only reads `predecessors`).
+    fn blk(id: usize, preds: &[usize]) -> Block {
+        Block {
+            id,
+            ctrl: 0,
+            nodes: Vec::new(),
+            terminator: None,
+            successors: Vec::new(),
+            predecessors: preds.to_vec(),
+        }
+    }
+
+    #[test]
+    fn test_dominators_diamond() {
+        // Diamond CFG:  0 → {1,2} → 3
+        let blocks = vec![
+            blk(0, &[]),
+            blk(1, &[0]),
+            blk(2, &[0]),
+            blk(3, &[1, 2]),
+        ];
+        let dom = compute_dominators(&blocks);
+        // Entry dominates everything.
+        for b in 0..4 {
+            assert!(dominates(&dom, 0, b), "entry must dominate block {b}");
+        }
+        // The merge (3) is dominated only by 0 and itself — NOT by 1 or 2,
+        // since either side branch can be taken.
+        assert!(dominates(&dom, 3, 3));
+        assert!(!dominates(&dom, 1, 3), "branch 1 must NOT dominate merge");
+        assert!(!dominates(&dom, 2, 3), "branch 2 must NOT dominate merge");
+        // Siblings do not dominate each other.
+        assert!(!dominates(&dom, 1, 2));
+        assert!(!dominates(&dom, 2, 1));
+    }
+
+    #[test]
+    fn test_dominators_chain() {
+        // Straight-line chain 0 → 1 → 2 → 3: each block dominates all later ones.
+        let blocks = vec![
+            blk(0, &[]),
+            blk(1, &[0]),
+            blk(2, &[1]),
+            blk(3, &[2]),
+        ];
+        let dom = compute_dominators(&blocks);
+        for a in 0..4 {
+            for b in a..4 {
+                assert!(dominates(&dom, a, b), "block {a} must dominate {b}");
+            }
+            for b in 0..a {
+                assert!(!dominates(&dom, a, b), "block {a} must not dominate {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_dominators_loop_back_edge() {
+        // Loop: 0 → 1 → 2, with back-edge 2 → 1 (1 has preds {0, 2}).
+        let mut blocks = vec![blk(0, &[]), blk(1, &[0, 2]), blk(2, &[1])];
+        blocks[1].successors = vec![2];
+        blocks[2].successors = vec![1];
+        let dom = compute_dominators(&blocks);
+        // The fixpoint must terminate and yield sensible dominance despite the
+        // cycle: 0 dominates 1 and 2; 1 dominates 2.
+        assert!(dominates(&dom, 0, 1));
+        assert!(dominates(&dom, 0, 2));
+        assert!(dominates(&dom, 1, 2));
+        assert!(!dominates(&dom, 2, 1), "back-edge target not dominated by body");
+    }
+
+    #[test]
+    fn test_topo_sort_orders_inputs_before_uses() {
+        // Build a graph where node 2 = node0 + node1, all in one block, but the
+        // block list is given uses-first to force a reorder.
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: NO_NODE,
+            exit: NO_NODE,
+        };
+        let a = graph.add(Op::Const(1), IrType::Int, vec![], None); // 0
+        let b = graph.add(Op::Const(2), IrType::Int, vec![], None); // 1
+        let sum = graph.add(Op::Add, IrType::Int, vec![a, b], None); // 2
+        let mut nodes = vec![sum, a, b]; // intentionally out of order
+        topo_sort_block(&graph, &mut nodes);
+        let pos = |n: NodeId| nodes.iter().position(|&x| x == n).unwrap();
+        assert!(pos(a) < pos(sum), "input a must precede the Add");
+        assert!(pos(b) < pos(sum), "input b must precede the Add");
+        assert_eq!(nodes.len(), 3, "no nodes dropped or duplicated");
+    }
+
+    #[test]
+    fn test_topo_sort_deep_chain_no_overflow() {
+        // A left-leaning chain N levels deep would blow a recursive stack; the
+        // iterative version must handle it. Each node depends on the previous.
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: NO_NODE,
+            exit: NO_NODE,
+        };
+        let base = graph.add(Op::Const(0), IrType::Int, vec![], None);
+        let mut prev = base;
+        let depth = 50_000;
+        for _ in 0..depth {
+            prev = graph.add(Op::Neg, IrType::Int, vec![prev], None);
+        }
+        // Present the nodes in reverse (deepest first) to force full traversal.
+        let mut nodes: Vec<NodeId> = (0..=depth as NodeId).rev().collect();
+        topo_sort_block(&graph, &mut nodes);
+        // After sorting, every node must come after its single input.
+        assert_eq!(nodes.len(), depth + 1);
+        assert_eq!(nodes[0], base, "the no-input base must sort first");
+        for w in nodes.windows(2) {
+            assert!(w[0] < w[1], "chain must be in ascending dependency order");
+        }
     }
 }

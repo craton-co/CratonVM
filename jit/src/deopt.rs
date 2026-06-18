@@ -318,9 +318,30 @@ pub enum CompilationAssumption {
 /// Tracks assumptions and class dependencies so compiled code can be
 /// invalidated when the class hierarchy changes.
 /// T10.9.B: FxHashMap — internal method names and class_id keys.
+///
+/// PERF (jit-deopt-perf): `on_class_loaded` / `on_method_override` used to
+/// scan EVERY method's full assumption list on every class-load /
+/// method-override event — O(methods × assumptions) per event, i.e. a linear
+/// sweep over the entire assumption table on every single class load. We now
+/// maintain two reverse indices (`leaf_class_index`, `unique_method_index`)
+/// keyed by the class / (class, method) an assumption depends on, so an event
+/// visits only the assumptions that actually reference it. The indices are
+/// kept in lock-step with `assumptions` in `register_assumption` /
+/// `clear_assumptions`; invalidation correctness is preserved exactly (every
+/// dependent assumption that fired before still fires, with the same dedup).
 pub struct InvalidationManager {
     assumptions: FxHashMap<String, Vec<CompilationAssumption>>,
     class_dependencies: FxHashMap<u32, Vec<String>>,
+    /// Reverse index: class_id → method keys that hold a `LeafClass(class_id)`
+    /// assumption. Each method key appears at most once per class_id (matching
+    /// the old per-method `break` dedup). Mirrors the `LeafClass` entries in
+    /// `assumptions`.
+    leaf_class_index: FxHashMap<u32, Vec<String>>,
+    /// Reverse index: (class_id, method_name) → method keys that hold a
+    /// `UniqueConcreteMethod { class_id, method_name }` assumption. Each method
+    /// key appears at most once per (class_id, method_name). Mirrors the
+    /// `UniqueConcreteMethod` entries in `assumptions`.
+    unique_method_index: FxHashMap<(u32, String), Vec<String>>,
 }
 
 impl InvalidationManager {
@@ -328,6 +349,8 @@ impl InvalidationManager {
         Self {
             assumptions: FxHashMap::default(),
             class_dependencies: FxHashMap::default(),
+            leaf_class_index: FxHashMap::default(),
+            unique_method_index: FxHashMap::default(),
         }
     }
 
@@ -339,7 +362,39 @@ impl InvalidationManager {
     ///
     /// TODO(PERF-P5): take `&Arc<str>` once upstream call sites in
     /// `vm/src/vm.rs` thread the standard `Arc<str>` method-name carrier.
+    ///
+    /// PERF (jit-deopt-perf): also feed the reverse indices used by
+    /// `on_class_loaded` / `on_method_override` so those events no longer scan
+    /// the whole assumption table. The index update mirrors exactly which
+    /// `(method, assumption)` pairs the old linear scan would have matched.
     pub fn register_assumption(&mut self, method: &str, assumption: CompilationAssumption) {
+        // Maintain the reverse index for the assumption kinds queried by the
+        // invalidation events. We dedup the method key per index entry so a
+        // method appears at most once in the result — matching the old
+        // per-method `break` after the first match. (A method may register the
+        // same assumption more than once; the index must not list it twice.)
+        match &assumption {
+            CompilationAssumption::LeafClass(cid) => {
+                let entry = self.leaf_class_index.entry(*cid).or_default();
+                if !entry.iter().any(|m| m == method) {
+                    entry.push(method.to_string());
+                }
+            }
+            CompilationAssumption::UniqueConcreteMethod {
+                class_id,
+                method_name,
+            } => {
+                let key = (*class_id, method_name.clone());
+                let entry = self.unique_method_index.entry(key).or_default();
+                if !entry.iter().any(|m| m == method) {
+                    entry.push(method.to_string());
+                }
+            }
+            // Other assumption kinds are not consulted by class-load /
+            // method-override events, so they need no reverse index.
+            _ => {}
+        }
+
         if let Some(assumptions) = self.assumptions.get_mut(method) {
             assumptions.push(assumption);
             return;
@@ -354,16 +409,12 @@ impl InvalidationManager {
     pub fn on_class_loaded(&self, class_id: u32) -> Vec<String> {
         let mut invalidated = Vec::new();
 
-        // Check LeafClass assumptions across all methods.
-        for (method, assumptions) in &self.assumptions {
-            for a in assumptions {
-                if let CompilationAssumption::LeafClass(cid) = a {
-                    if *cid == class_id {
-                        invalidated.push(method.clone());
-                        break;
-                    }
-                }
-            }
+        // PERF (jit-deopt-perf): O(matches) reverse-index lookup instead of an
+        // O(methods × assumptions) sweep of the whole table. `leaf_class_index`
+        // already holds exactly the method keys whose `LeafClass(class_id)`
+        // assumption is now invalid, deduped per class_id.
+        if let Some(methods) = self.leaf_class_index.get(&class_id) {
+            invalidated.extend(methods.iter().cloned());
         }
 
         // Also include direct class dependencies.
@@ -381,24 +432,18 @@ impl InvalidationManager {
     /// Called when a method is overridden in `class_id`. Returns methods whose
     /// `UniqueConcreteMethod` assumption is now invalid.
     pub fn on_method_override(&self, class_id: u32, method_name: &str) -> Vec<String> {
-        let mut invalidated = Vec::new();
-
-        for (method, assumptions) in &self.assumptions {
-            for a in assumptions {
-                if let CompilationAssumption::UniqueConcreteMethod {
-                    class_id: cid,
-                    method_name: mn,
-                } = a
-                {
-                    if *cid == class_id && mn == method_name {
-                        invalidated.push(method.clone());
-                        break;
-                    }
-                }
-            }
-        }
-
-        invalidated
+        // PERF (jit-deopt-perf): O(matches) reverse-index lookup instead of an
+        // O(methods × assumptions) sweep. `unique_method_index` already holds
+        // exactly the method keys whose `UniqueConcreteMethod { class_id,
+        // method_name }` assumption is now invalid, deduped per key.
+        //
+        // We allocate one `String` to build the probe key — method-override is
+        // a rare, cold event, so this is dwarfed by the eliminated full-table
+        // scan (and by the work the caller does to actually invalidate code).
+        self.unique_method_index
+            .get(&(class_id, method_name.to_string()))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Get all assumptions recorded for `method`.
@@ -408,7 +453,54 @@ impl InvalidationManager {
 
     /// Clear assumptions for a method (on recompilation).
     pub fn clear_assumptions(&mut self, method: &str) {
-        self.assumptions.remove(method);
+        let removed = match self.assumptions.remove(method) {
+            Some(a) => a,
+            // Nothing recorded for this method — indices already consistent.
+            None => return,
+        };
+
+        // PERF (jit-deopt-perf): keep the reverse indices in lock-step. For
+        // each removed assumption, drop this method key from the matching
+        // index entry so `on_class_loaded` / `on_method_override` no longer
+        // report it (preserving exact invalidation correctness). We dedup the
+        // index-key work so a method that registered the same assumption twice
+        // is removed once. Empty buckets are pruned to keep lookups tight.
+        let mut leaf_seen: Vec<u32> = Vec::new();
+        let mut unique_seen: Vec<(u32, &str)> = Vec::new();
+        for a in &removed {
+            match a {
+                CompilationAssumption::LeafClass(cid) => {
+                    if leaf_seen.contains(cid) {
+                        continue;
+                    }
+                    leaf_seen.push(*cid);
+                    if let Some(entry) = self.leaf_class_index.get_mut(cid) {
+                        entry.retain(|m| m != method);
+                        if entry.is_empty() {
+                            self.leaf_class_index.remove(cid);
+                        }
+                    }
+                }
+                CompilationAssumption::UniqueConcreteMethod {
+                    class_id,
+                    method_name,
+                } => {
+                    let probe = (*class_id, method_name.as_str());
+                    if unique_seen.contains(&probe) {
+                        continue;
+                    }
+                    unique_seen.push(probe);
+                    let key = (*class_id, method_name.clone());
+                    if let Some(entry) = self.unique_method_index.get_mut(&key) {
+                        entry.retain(|m| m != method);
+                        if entry.is_empty() {
+                            self.unique_method_index.remove(&key);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Register that `method` depends on `class_id`.
@@ -563,10 +655,52 @@ pub fn reconstruct_frame_owned(mut deopt: DeoptimizationPoint) -> ReconstructedF
     frame
 }
 
-/// Materialize virtual objects back to the heap. Returns a list of
-/// `(index, heap_address)` pairs. In a real implementation the addresses
-/// would come from the GC; here we assign monotonically increasing
-/// placeholder addresses starting at `0x1000_0000`.
+/// Identify which local/stack slots hold scalar-replaced (virtual) objects
+/// that would need to be re-materialized on the heap during a deopt, and
+/// return placeholder `(index, heap_address)` pairs.
+///
+/// # ⚠ NOT WIRED TO A LIVE DEOPT PATH — placeholder addresses are NOT real objects
+///
+/// This function is **diagnostic/skeleton only**. It is currently called
+/// exclusively from the unit test `materialize_virtual_objects_count`,
+/// which validates slot-index extraction and address distinctness — it does
+/// NOT exercise a real deopt. No VM code path invokes it (verified: no
+/// references outside this module's tests). In particular the in-progress
+/// live deopt machinery (the `FrameState`/`DeoptimizationPoint` plumbing that
+/// `reconstruct_frame{,_owned}` feed) does **not** call this.
+///
+/// The returned addresses are FAKE: monotonically increasing placeholders
+/// starting at `0x1000_0000`, stepping by `0x100`. They do **not** point at
+/// GC-allocated, header-initialized, field-populated heap objects. Treating
+/// a returned address as a live object reference is **memory-unsafe** — it
+/// would hand the interpreter (and then the GC, on its next root scan) a
+/// dangling pointer into an unmapped/foreign region, almost certainly
+/// crashing or corrupting the heap.
+///
+/// ## What the real fix requires (GC-backed materialization)
+///
+/// A correct implementation cannot run against a borrowed `&FrameState`
+/// alone — re-materialization is a heap-mutating, GC-coordinated operation.
+/// It must, for each `FrameValue::VirtualObject(state)`:
+///   1. Allocate an object of `state.class_id` via the live allocator/TLAB
+///      (which may trigger a GC; the surrounding deopt frame must already be
+///      a valid GC root set so the half-built object survives).
+///   2. Write the real object header (class id, mark word, etc.).
+///   3. Recursively materialize/store each `state.field_values[i]`, resolving
+///      nested `VirtualObject`s and patching any back-references (cyclic
+///      scalar-replaced graphs).
+///   4. Return the *real* heap address from the allocator.
+/// This needs a handle to the VM heap/allocator threaded in from the deopt
+/// path, so it belongs with the live-deopt feature work in the VM crate, not
+/// here. Until then this stays a placeholder.
+///
+/// # Guard
+///
+/// To make sure the fake addresses can never be silently consumed by real
+/// VM execution, this function is hard-gated to test builds. In a non-test
+/// build it is unreachable: any accidental wiring onto a live path will fail
+/// to compile / panic loudly rather than mint bogus object references.
+#[cfg(test)]
 pub fn materialize_virtual_objects(frame: &FrameState) -> Vec<(usize, u64)> {
     let mut result = Vec::new();
     let mut next_addr: u64 = 0x1000_0000;
@@ -584,6 +718,33 @@ pub fn materialize_virtual_objects(frame: &FrameState) -> Vec<(usize, u64)> {
     collect(&frame.stack, &mut result, &mut next_addr);
 
     result
+}
+
+/// Non-test stub for [`materialize_virtual_objects`].
+///
+/// The real (test-only) implementation hands back FAKE placeholder heap
+/// addresses (see that function's docs). To guarantee those cannot leak into
+/// a live deopt and be mistaken for real objects, the placeholder body is
+/// compiled only under `cfg(test)`. If a future caller wires this onto a real
+/// deopt path before the GC-backed materialization above is implemented, this
+/// stub makes the mistake impossible to miss: it never returns a fabricated
+/// address — it panics. Replace it with the GC-allocating implementation
+/// described above when the live-deopt heap plumbing lands.
+#[cfg(not(test))]
+pub fn materialize_virtual_objects(frame: &FrameState) -> Vec<(usize, u64)> {
+    // Hard guard: virtual-object re-materialization needs a live heap/allocator
+    // (see doc above). There is intentionally no placeholder-address path in a
+    // real build — fail loud instead of producing fake object references.
+    debug_assert!(
+        false,
+        "materialize_virtual_objects is a placeholder not wired to a live deopt \
+         path; it needs GC-backed allocation before it can run for real"
+    );
+    let _ = frame;
+    panic!(
+        "materialize_virtual_objects called on a live path without GC-backed \
+         materialization — refusing to mint fake heap addresses (see deopt.rs)"
+    );
 }
 
 /// Count how many virtual objects need materialization across locals and
@@ -1022,6 +1183,75 @@ mod tests {
     fn invalidation_empty_dependencies() {
         let mgr = InvalidationManager::new();
         assert!(mgr.methods_depending_on(999).is_empty());
+    }
+
+    // -- reverse-index correctness (jit-deopt-perf) ------------------------
+
+    #[test]
+    fn invalidation_clear_removes_from_leaf_index() {
+        // After clearing, on_class_loaded must no longer report the method —
+        // this guards the reverse-index teardown in clear_assumptions.
+        let mut mgr = InvalidationManager::new();
+        mgr.register_assumption("m", CompilationAssumption::LeafClass(42));
+        assert_eq!(mgr.on_class_loaded(42), vec!["m".to_string()]);
+        mgr.clear_assumptions("m");
+        assert!(mgr.on_class_loaded(42).is_empty());
+    }
+
+    #[test]
+    fn invalidation_clear_removes_from_unique_method_index() {
+        let mut mgr = InvalidationManager::new();
+        mgr.register_assumption(
+            "caller",
+            CompilationAssumption::UniqueConcreteMethod {
+                class_id: 7,
+                method_name: "go".to_string(),
+            },
+        );
+        assert_eq!(mgr.on_method_override(7, "go"), vec!["caller".to_string()]);
+        mgr.clear_assumptions("caller");
+        assert!(mgr.on_method_override(7, "go").is_empty());
+    }
+
+    #[test]
+    fn invalidation_clear_only_affects_cleared_method() {
+        // Two methods share LeafClass(9); clearing one must leave the other.
+        let mut mgr = InvalidationManager::new();
+        mgr.register_assumption("a", CompilationAssumption::LeafClass(9));
+        mgr.register_assumption("b", CompilationAssumption::LeafClass(9));
+        mgr.clear_assumptions("a");
+        let inv = mgr.on_class_loaded(9);
+        assert!(!inv.contains(&"a".to_string()));
+        assert!(inv.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn invalidation_duplicate_assumption_listed_once() {
+        // Registering the same LeafClass twice for one method must still yield
+        // the method exactly once (matches the old per-method `break` dedup).
+        let mut mgr = InvalidationManager::new();
+        mgr.register_assumption("m", CompilationAssumption::LeafClass(3));
+        mgr.register_assumption("m", CompilationAssumption::LeafClass(3));
+        let inv = mgr.on_class_loaded(3);
+        assert_eq!(inv, vec!["m".to_string()]);
+        // And clearing once removes it fully despite the double registration.
+        mgr.clear_assumptions("m");
+        assert!(mgr.on_class_loaded(3).is_empty());
+    }
+
+    #[test]
+    fn invalidation_class_loaded_unions_leaf_and_dependencies() {
+        // A LeafClass match and a class dependency on the same class_id both
+        // appear, with no duplicate when a method is in both.
+        let mut mgr = InvalidationManager::new();
+        mgr.register_assumption("leaf_m", CompilationAssumption::LeafClass(5));
+        mgr.add_class_dependency(5, "leaf_m"); // also a dependency
+        mgr.add_class_dependency(5, "dep_only");
+        let inv = mgr.on_class_loaded(5);
+        assert!(inv.contains(&"leaf_m".to_string()));
+        assert!(inv.contains(&"dep_only".to_string()));
+        // leaf_m must not be duplicated.
+        assert_eq!(inv.iter().filter(|m| *m == "leaf_m").count(), 1);
     }
 
     // -- reconstruct_frame -------------------------------------------------

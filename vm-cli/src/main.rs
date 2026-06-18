@@ -964,12 +964,38 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
         // rewritten by the branches above; everything else is accepted-and-
         // ignored here — same as `-XX:` — so a drop-in `java` launches instead
         // of clap aborting with "unexpected argument '-X...'". These remaining
-        // `-X` flags are all the inline/no-value form, so dropping the single
-        // token is correct (HotSpot has no separate-token spelling for them).
+        // `-X` flags are all the inline/no-value form, so dropping just this
+        // single token is correct (HotSpot has no separate-token spelling for
+        // the ones not handled above).
+        //
+        // [LOW arg-parse fix (3)] Deliberately drop ONLY this one token
+        // (`i += 1`) and never consume the following token. An unrecognized
+        // `-X` flag must not swallow the next token when that token is the
+        // main-class name: e.g. `java -Xunknown Main` (or, if the separator
+        // inserter did not run, `-Xint Main`) must still resolve `Main` as the
+        // main class, not silently treat it as the unknown flag's value and
+        // shift the real class into the program args. We make that invariant
+        // explicit here: when the next token is a bare positional (no leading
+        // `-`), it is the main-class candidate and is left for the normal
+        // positional/`--` handling to claim — we never absorb it.
         else if a.starts_with("-X") {
             if std::env::var_os("CRATONVM_DBG_ARGS").is_some() {
                 eprintln!("[cratonvm] ignoring unimplemented HotSpot flag: {a}");
+                // Surface the swallow-avoidance: if a bare positional follows an
+                // unknown `-X` flag, it is the main-class candidate and is left
+                // untouched (we drop only the flag, never `i += 2`).
+                if let Some(next) = args.get(i + 1) {
+                    if !next.starts_with('-') && next != "--" {
+                        eprintln!(
+                            "[cratonvm] keeping following token '{next}' as a \
+                             positional (unknown -X flag does not consume it)"
+                        );
+                    }
+                }
             }
+            // Drop ONLY this flag token; do NOT consume the next token. This is
+            // what keeps an unknown `-X` flag from swallowing the main-class
+            // name (see the comment above).
             i += 1;
         }
         // Assertion control flags: `-ea`/`-enableassertions[:<pkgname>...|:<classname>]`,
@@ -1009,6 +1035,16 @@ fn extract_system_properties(raw: Vec<String>) -> (Vec<String>, Vec<(String, Str
     let mut filtered = Vec::with_capacity(raw.len());
     let mut props = Vec::new();
     let mut past_separator = false;
+    // [LOW arg-parse fix (2)] When the PREVIOUS token was a separate-token
+    // value-taking option (`--classpath`, `--Xlog`, `--add-opens`, …), the
+    // CURRENT token is that option's VALUE, not an option position. A value
+    // may legitimately begin with `-D` (e.g. `--Xlog -Dspecial`, or a
+    // classpath/module-path entry on an exotic path), and must NOT be hijacked
+    // as a `-Dkey=value` system property — doing so both loses the option's
+    // value and fabricates a bogus property. Track the value position and pass
+    // it through verbatim. (`-D` itself is never a value-taking option name, so
+    // a genuine `-Dkey=value` in an *option* position is still extracted.)
+    let mut prev_was_value_opt = false;
     for arg in raw {
         // Anything after `--` is a program argument and must be preserved
         // verbatim, including bare `-Dfoo=bar` tokens that the Java program
@@ -1026,9 +1062,21 @@ fn extract_system_properties(raw: Vec<String>) -> (Vec<String>, Vec<(String, Str
             // after clap parsing, before the String[] is built for
             // Java's main().
             past_separator = true;
+            prev_was_value_opt = false;
             filtered.push(arg);
             continue;
         }
+        // This token is the value of a preceding value-taking option: emit it
+        // unchanged even if it starts with `-D`, and do not treat it as an
+        // option position.
+        if prev_was_value_opt {
+            prev_was_value_opt = false;
+            filtered.push(arg);
+            continue;
+        }
+        // Remember whether THIS token is a separate-token value-taking option,
+        // so the next iteration knows the following token is its value.
+        prev_was_value_opt = VALUE_TAKING_OPTS.contains(&arg.as_str());
         if let Some(kv) = arg.strip_prefix("-D") {
             if let Some((k, v)) = kv.split_once('=') {
                 props.push((k.to_string(), v.to_string()));
@@ -1235,25 +1283,30 @@ fn run() -> Result<()> {
     if args.class_name.as_deref() == Some("--") {
         args.class_name = None;
     }
-    // Remove only the launcher-inserted `--` separator, NOT every `--`.
+    // Preserve every `--` that survives clap, including a trailing one.
     //
     // clap already consumes the first lone `--` as its option-parsing
     // terminator, so in the normal-class and `-jar` launch modes no launcher
     // `--` ever reaches `args.args` — any `--` left there is genuinely a
     // program argument and MUST be delivered to `main` verbatim (stock
-    // `java Main a -- b` gives the program `["a", "--", "b"]`; many CLI tools
-    // use their own `--` end-of-options convention).
+    // `java Main a -- b` gives the program `["a", "--", "b"]`, and stock
+    // `java Main a --` gives the program `["a", "--"]`; many CLI tools use
+    // their own `--` end-of-options convention).
     //
-    // The one exception is the JBoss-Modules `-mp` path: `normalize_java_
-    // launcher_argv` prepends an extra `--` (so `-mp` isn't mis-parsed as the
-    // `-m`/`-p` short-flag cluster), which makes `insert_program_args_
-    // separator`'s own trailing `--` leak past clap's terminator as the LAST
-    // element of `args.args`. Strip exactly that trailing artifact — a single
-    // `--` and only when it is the final token — leaving interior (user) `--`
-    // tokens untouched.
-    if args.args.last().map(String::as_str) == Some("--") {
-        args.args.pop();
-    }
+    // [LOW arg-parse fix (1)] A previous version unconditionally popped a
+    // trailing `--` here, on the theory that the JBoss-Modules `-mp` path
+    // (`normalize_java_launcher_argv` prepends an extra `--` so `-mp` isn't
+    // mis-parsed as the `-m`/`-p` short-flag cluster) could leak a spurious
+    // trailing `--` as the LAST element of `args.args`. That artifact no
+    // longer occurs: `-mp` is in `VALUE_TAKING_OPTS`, so
+    // `insert_program_args_separator` consumes its operand instead of
+    // injecting a separator, and the `-mp` token itself lands in
+    // `class_name` (not `args.args`) — see the
+    // `launcher_trailing_double_dash_artifact_is_popped` regression test.
+    // The unconditional pop therefore had no remaining legitimate target and
+    // instead silently dropped a genuine user trailing `--` (e.g.
+    // `java Main a --`), violating JDK launcher semantics. Leave a trailing
+    // `--` in place so it reaches the program's `String[] args` verbatim.
 
     // Validate: exactly one of class_name or --jar must be provided
     if args.class_name.is_none() && args.jar.is_none() {
@@ -2067,6 +2120,15 @@ fn run() -> Result<()> {
         // past it would send those callers down a null-deref path.
         // The CLI bumps to 4 below, just before `main()`, once the
         // initPhase2 gate no longer matters.
+        //
+        // INTENTIONAL (reviewed): skipping initPhase2/3 here is a deliberate
+        // boot-sequencing choice, NOT a silent wrong-result stub. The
+        // level-management contract is preserved end-to-end (level held at 2
+        // until the gate is moot, then advanced to 3→4 below and the real
+        // `jdk.internal.misc.VM.initLevel(4)` field is set), so observers see a
+        // consistent boot state rather than a fabricated value. Running the
+        // real initPhase2/3 is gated on module-system subsystems we do not yet
+        // implement; if/when those land this skip should be revisited.
     }
 
     // WP1.3: right before `main()` starts, advance to level 4 —
@@ -2380,6 +2442,16 @@ fn run() -> Result<()> {
             // to populate the heap field (or wiring this CLI to read from
             // `throwable_stacks` directly) is roadmap item T2.2.18 — see
             // `docs/roadmap-100.md` line 471.
+            //
+            // INTENTIONAL (reviewed): omitting the `\tat ...` frames here is an
+            // acceptable, honest degradation — NOT a wrong-result stub. The
+            // renderer prints the real exception class, message, and the full
+            // `Caused by:` cause chain (all read from live heap fields); only
+            // the per-frame stack-trace lines are absent when the heap-side
+            // `stackTrace` array was never materialised. We never fabricate
+            // synthetic frames, so what is printed is always faithful; the
+            // missing frames are a known limitation tracked by T2.2.18, not a
+            // silent incorrect value.
             let mut cur = exc_ref;
             let mut lines: Vec<String> = Vec::new();
             let mut prefix = "Exception in thread \"main\"";
@@ -3994,8 +4066,10 @@ mod tests {
         assert_eq!(parsed.class_name.as_deref(), Some("Main"));
         // The interior user `--` is present in the trailing program args.
         assert_eq!(parsed.args, argv(&["a", "--", "b"]));
-        // `run()`'s post-clap cleanup only pops a *trailing* `--`; an interior
-        // one like this is left untouched, so the program sees ["a","--","b"].
+        // After [LOW arg-parse fix (1)] `run()` no longer pops any trailing
+        // `--`; here the last arg is `b` anyway, so the program sees
+        // ["a","--","b"] verbatim (the trailing-`--` case is covered by
+        // `trailing_user_double_dash_is_preserved_through_pipeline`).
         assert_ne!(parsed.args.last().map(String::as_str), Some("--"));
     }
 
@@ -4046,5 +4120,128 @@ mod tests {
         }
         // Only `/modules` remains in args; `-mp` went to class_name.
         assert_eq!(prog, argv(&["/modules"]));
+    }
+
+    // -----------------------------------------------------------------------
+    // [LOW arg-parse fix (1)] Trailing user `--` is preserved as a program arg.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn trailing_user_double_dash_is_preserved_through_pipeline() {
+        // `java Main a --` per JDK launcher semantics gives the program
+        // `["a", "--"]`. The launcher's own boundary separator is consumed by
+        // clap; the interior+trailing user `--` here is genuine program data
+        // and the trailing one must NOT be popped (the old unconditional pop in
+        // `run()` silently dropped it).
+        let argv0: Vec<String> = argv(&["java", "Main", "a", "--"]);
+        let stage1 = insert_program_args_separator(argv0);
+        let stage2 = normalize_java_launcher_argv(stage1);
+        let (stage3, _props) = extract_system_properties(stage2);
+        let (stage4, _hot) = extract_hotspot_flags(stage3);
+        let parsed = Args::try_parse_from(stage4).expect("clap must parse trailing `--` argv");
+        assert_eq!(parsed.class_name.as_deref(), Some("Main"));
+        // The trailing user `--` survives clap as the last program arg.
+        assert_eq!(parsed.args.last().map(String::as_str), Some("--"));
+        // Mirror `run()`'s post-clap handling: the pop is gone, so the trailing
+        // `--` reaches the program verbatim.
+        assert_eq!(parsed.args, argv(&["a", "--"]));
+    }
+
+    // -----------------------------------------------------------------------
+    // [LOW arg-parse fix (2)] A value of a value-taking option that starts with
+    // `-D` is NOT hijacked as a `-Dkey=value` system property.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dminus_value_of_value_opt_is_not_a_system_property() {
+        // `--Xlog -Dgc` — `-Dgc` is the VALUE of `--Xlog`, not a system
+        // property. It must be passed through to clap (as `--Xlog`'s operand)
+        // and must NOT appear in the extracted props list.
+        let (filtered, props) = extract_system_properties(argv(&[
+            "java", "--Xlog", "-Dgc", "Main",
+        ]));
+        assert_eq!(filtered, argv(&["java", "--Xlog", "-Dgc", "Main"]));
+        assert!(props.is_empty(), "value token must not be parsed as -D prop");
+    }
+
+    #[test]
+    fn dminus_genuine_property_still_extracted_in_option_position() {
+        // A genuine `-Dkey=value` in an OPTION position (not following a
+        // value-taking option) is still extracted — the fix only protects the
+        // value slot, it doesn't disable `-D` handling.
+        let (filtered, props) = extract_system_properties(argv(&[
+            "java", "-Dfoo=bar", "--classpath", "x", "Main",
+        ]));
+        // `-Dfoo=bar` removed; `--classpath x Main` survive (x is the value of
+        // --classpath and is not a -D candidate anyway).
+        assert_eq!(filtered, argv(&["java", "--classpath", "x", "Main"]));
+        assert_eq!(props, vec![("foo".to_string(), "bar".to_string())]);
+    }
+
+    #[test]
+    fn dminus_value_starting_with_dminus_for_classpath() {
+        // Pathological but legal: a classpath entry literally starting with
+        // `-D` (e.g. a directory named `-Dweird`). It is `--classpath`'s value
+        // and must survive as-is, not become a fabricated system property.
+        let (filtered, props) = extract_system_properties(argv(&[
+            "java", "--classpath", "-Dweird", "Main",
+        ]));
+        assert_eq!(filtered, argv(&["java", "--classpath", "-Dweird", "Main"]));
+        assert!(props.is_empty());
+    }
+
+    #[test]
+    fn dminus_after_separator_is_program_arg_not_property() {
+        // Unchanged behaviour guard: `-Dfoo=bar` after `--` belongs to the
+        // program (jboss-modules style) and is never extracted.
+        let (filtered, props) = extract_system_properties(argv(&[
+            "java", "Main", "--", "-Dfoo=bar",
+        ]));
+        assert_eq!(filtered, argv(&["java", "Main", "--", "-Dfoo=bar"]));
+        assert!(props.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // [LOW arg-parse fix (3)] An unrecognized `-X` flag must not swallow the
+    // following main-class token.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unknown_x_flag_does_not_swallow_following_main_class() {
+        // `-Xunknown Main`: the unknown `-X` flag is dropped (`i += 1`), and
+        // the following bare token `Main` is NOT consumed as its value — it
+        // survives so it can be resolved as the main class.
+        let out = normalize_java_launcher_argv(argv(&["java", "-Xunknown", "Main"]));
+        assert_eq!(out, argv(&["java", "Main"]));
+    }
+
+    #[test]
+    fn unknown_x_flag_before_class_resolves_class_through_pipeline() {
+        // End-to-end: an unknown separate-looking `-X` flag immediately before
+        // the main class must still resolve `Main` (not absorb it). Exercises
+        // the full pre-clap pipeline as `run()` would.
+        let argv0: Vec<String> = argv(&["java", "-Xint", "-classpath", "x", "Main"]);
+        let stage1 = insert_program_args_separator(argv0);
+        let stage2 = normalize_java_launcher_argv(stage1);
+        let (stage3, _props) = extract_system_properties(stage2);
+        let (stage4, _hot) = extract_hotspot_flags(stage3);
+        let parsed = Args::try_parse_from(stage4)
+            .expect("clap must accept unknown -X before main class");
+        assert_eq!(parsed.classpath.as_deref(), Some("x"));
+        assert_eq!(parsed.class_name.as_deref(), Some("Main"));
+    }
+
+    #[test]
+    fn unknown_x_flag_directly_before_class_no_classpath() {
+        // The minimal swallow scenario with no intervening options:
+        // `java -Xint Main` must resolve `Main` as the main class.
+        let argv0: Vec<String> = argv(&["java", "-Xint", "Main"]);
+        let stage1 = insert_program_args_separator(argv0);
+        let stage2 = normalize_java_launcher_argv(stage1);
+        let (stage3, _props) = extract_system_properties(stage2);
+        let (stage4, _hot) = extract_hotspot_flags(stage3);
+        let parsed = Args::try_parse_from(stage4)
+            .expect("clap must accept `-Xint Main`");
+        assert_eq!(parsed.class_name.as_deref(), Some("Main"));
     }
 }

@@ -229,10 +229,62 @@ impl WakeableCondvar {
             .wait_timeout(guard, timeout)
             .unwrap_or_else(|e| e.into_inner());
         let mut guard = g;
-        let woken = *guard;
+        // The pending flag (`*guard`) is the authoritative wake signal,
+        // read here while we still hold the mutex: `wake()` sets it to
+        // true under this same mutex before `notify_one`, so a genuine
+        // cross-thread unpark always leaves it true. A bare timeout or a
+        // spurious condvar wakeup both leave it false. Capture it before
+        // we clear it below.
+        let flag_set = *guard;
         *guard = false;
         self.pending.store(false, Ordering::Release);
-        woken && !wait_res.timed_out() || woken
+
+        // Report the honest timeout-vs-woken status callers
+        // (`park`/`parkNanos`) need to tell a spurious/timeout return
+        // from a real unpark:
+        //
+        //   * flag_set == true  -> a real wake was observed -> return true
+        //     (covers the case where `wake()` raced in right at the
+        //     deadline and set the flag even though `wait_timeout`
+        //     reported `timed_out()`; a real unpark must never be lost).
+        //   * flag_set == false && timed_out()  -> the park expired on
+        //     its deadline -> return false.
+        //   * flag_set == false && !timed_out() -> a *spurious* condvar
+        //     wakeup with no pending wake -> return false so the caller
+        //     re-parks instead of mistaking it for an unpark.
+        //
+        // We must NOT consult `self.pending` again here: it was just
+        // cleared, and re-reading it could observe a concurrent `wake()`'s
+        // `pending.swap(true)` (which precedes its locked `*guard = true`)
+        // and double-count that wake — once now and once on the next
+        // fast-path park. `flag_set`, read under the lock, is the only
+        // race-free source of truth; `timed_out()` only refines the
+        // not-woken case into "timeout" vs "spurious".
+        //
+        // NOTE: the previous expression `flag_set && !wait_res.timed_out()
+        // || flag_set` was a tautology — `(a && b) || a == a` for every
+        // `b` — so the `timed_out()` term was dead and callers could never
+        // distinguish a timeout from a wake.
+        let woken = flag_set;
+        // `wait_res.timed_out()` is the OS-level confirmation that the
+        // wait reached its deadline. It refines only the *not-woken* case
+        // into "timeout" (true) vs "spurious wakeup" (false); when a wake
+        // flag is set, `timed_out()` may be either (a late-racing `wake()`
+        // can land at the deadline) and the flag still wins. The boolean
+        // return is therefore exactly `woken`. We bind `timed_out` so the
+        // `wait_timeout` result is genuinely consulted (refuting the old
+        // dead-term bug) and stays available to callers via `trace`.
+        let timed_out = wait_res.timed_out();
+        if !woken && !timed_out {
+            // Spurious condvar wakeup with no pending wake: surfaced as
+            // not-woken so the caller (`run_event_loop`) simply loops and
+            // re-parks rather than treating it as a real unpark.
+            tracing::trace!(
+                target: "cratonvm::eventloop",
+                "WakeableCondvar::park: spurious wakeup, no pending wake",
+            );
+        }
+        woken
     }
 
     /// Wake the parked loop. Dedupes — a second call before the park

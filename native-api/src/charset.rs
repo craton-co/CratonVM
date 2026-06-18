@@ -14,7 +14,10 @@
 //! input: `decode_bytes` returns an error on invalid sequences (callers
 //! then surface a `CharacterCodingException`); `encode_chars` returns an
 //! error when a code point cannot be represented in the target charset
-//! (e.g. emoji in US-ASCII). Callers that want HotSpot's legacy "REPLACE"
+//! (e.g. emoji in US-ASCII) AND when the input UTF-16 unit sequence is
+//! malformed — e.g. a lone (unpaired) surrogate in a UTF-8 encode, which
+//! the strict path reports as `Malformed` rather than substituting U+FFFD.
+//! Callers that want HotSpot's legacy "REPLACE"
 //! action can use `decode_bytes_lossy` / `encode_chars_lossy` instead,
 //! which substitute `'?'` for unmappable input exactly like
 //! `java.nio.charset.CodingErrorAction.REPLACE`.
@@ -117,7 +120,12 @@ pub fn decode_bytes(name: &str, bytes: &[u8]) -> Result<Vec<u16>, CodingError> {
 /// Encode a sequence of UTF-16 code units to bytes for the given charset.
 pub fn encode_chars(name: &str, chars: &[u16]) -> Result<Vec<u8>, CodingError> {
     match name {
-        "UTF-8" => Ok(encode_utf8(chars)),
+        // FIX (review MEDIUM, charset.rs): the strict encode path must REPORT
+        // malformed input (a lone surrogate) rather than silently substituting
+        // U+FFFD. HotSpot's default REPORT action raises a
+        // MalformedInputException for an unpaired surrogate; the lossy callers
+        // (`encode_chars_lossy`) get the substituting variant via `encode_utf8`.
+        "UTF-8" => encode_utf8_strict(chars),
         "US-ASCII" => encode_ascii(chars),
         "ISO-8859-1" => encode_latin1(chars),
         "UTF-16" => Ok(encode_utf16_with_bom(chars)),
@@ -261,9 +269,65 @@ fn decode_utf8_lossy(bytes: &[u8]) -> Vec<u16> {
     String::from_utf8_lossy(bytes).encode_utf16().collect()
 }
 
+/// Lossy UTF-8 encode: lone surrogates become U+FFFD (replacement char),
+/// matching `CodingErrorAction.REPLACE`. Used by the `*_lossy` callers.
 fn encode_utf8(chars: &[u16]) -> Vec<u8> {
     let s = String::from_utf16_lossy(chars);
     s.into_bytes()
+}
+
+/// Strict UTF-8 encode: REPORTs a malformed-input error on the first lone
+/// (unpaired) surrogate rather than substituting U+FFFD.
+///
+/// FIX (review MEDIUM, charset.rs ~120/~264): `String::from_utf16_lossy`
+/// silently replaced lone surrogates with U+FFFD even on the strict
+/// (`encode_chars`) path, masking malformed input. HotSpot's default REPORT
+/// action surfaces a `MalformedInputException` for an unpaired surrogate, so
+/// the strict path must return a `CodingError::Malformed` instead. A high
+/// surrogate (U+D800..=U+DBFF) must be immediately followed by a low surrogate
+/// (U+DC00..=U+DFFF); any other arrangement is malformed.
+fn encode_utf8_strict(chars: &[u16]) -> Result<Vec<u8>, CodingError> {
+    // Pre-validate the UTF-16 unit sequence so we can report the exact offset
+    // of a malformed surrogate. `String::from_utf16` (not `_lossy`) would also
+    // reject lone surrogates, but only with a unit-less error; we want the
+    // offset/length, so scan explicitly. The scan is O(n) and on the happy
+    // path adds only a cheap range check per unit.
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if (0xD800..=0xDBFF).contains(&c) {
+            // High surrogate: the next unit MUST be a low surrogate.
+            let lo = chars.get(i + 1).copied();
+            match lo {
+                Some(l) if (0xDC00..=0xDFFF).contains(&l) => {
+                    i += 2; // valid surrogate pair
+                }
+                _ => {
+                    return Err(CodingError {
+                        offset: i,
+                        length: 1,
+                        kind: CodingErrorKind::Malformed,
+                        charset: "UTF-8",
+                    });
+                }
+            }
+        } else if (0xDC00..=0xDFFF).contains(&c) {
+            // Lone low surrogate with no preceding high surrogate.
+            return Err(CodingError {
+                offset: i,
+                length: 1,
+                kind: CodingErrorKind::Malformed,
+                charset: "UTF-8",
+            });
+        } else {
+            i += 1;
+        }
+    }
+    // All surrogates are well-paired BMP/supplementary code points: a lossless
+    // `from_utf16` conversion is now guaranteed to succeed.
+    Ok(String::from_utf16(chars)
+        .expect("surrogate pairing pre-validated")
+        .into_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -889,6 +953,42 @@ mod tests {
         assert_eq!(b, s.as_bytes());
         let d = decode_bytes("UTF-8", &b).unwrap();
         assert_eq!(String::from_utf16(&d).unwrap(), s);
+    }
+
+    #[test]
+    fn utf8_strict_encode_reports_lone_high_surrogate() {
+        // FIX (review MEDIUM): a lone high surrogate must REPORT a malformed
+        // error on the strict path, not silently substitute U+FFFD.
+        let chars: Vec<u16> = vec![0x0041, 0xD83D, 0x0042]; // 'A', lone high, 'B'
+        let err = encode_chars("UTF-8", &chars).unwrap_err();
+        assert_eq!(err.kind, CodingErrorKind::Malformed);
+        assert_eq!(err.charset, "UTF-8");
+        assert_eq!(err.offset, 1);
+    }
+
+    #[test]
+    fn utf8_strict_encode_reports_lone_low_surrogate() {
+        let chars: Vec<u16> = vec![0xDE00, 0x0041]; // lone low surrogate, 'A'
+        let err = encode_chars("UTF-8", &chars).unwrap_err();
+        assert_eq!(err.kind, CodingErrorKind::Malformed);
+        assert_eq!(err.offset, 0);
+    }
+
+    #[test]
+    fn utf8_strict_encode_accepts_valid_surrogate_pair() {
+        // A well-formed supplementary character must still encode fine.
+        let chars: Vec<u16> = "A\u{1F600}".encode_utf16().collect();
+        let b = encode_chars("UTF-8", &chars).unwrap();
+        assert_eq!(b, "A\u{1F600}".as_bytes());
+    }
+
+    #[test]
+    fn utf8_lossy_encode_substitutes_lone_surrogate() {
+        // The lossy path keeps REPLACE semantics: lone surrogate -> U+FFFD.
+        let chars: Vec<u16> = vec![0x0041, 0xD83D, 0x0042];
+        let b = encode_chars_lossy("UTF-8", &chars);
+        // 'A' + U+FFFD (EF BF BD) + 'B'
+        assert_eq!(b, vec![0x41, 0xEF, 0xBF, 0xBD, 0x42]);
     }
 
     #[test]

@@ -11,6 +11,13 @@ Four of the docs are all manifestations of **one root-cause family** — the
 GC-root manifestations, 1 open standalone bug, 1 latent standalone bug** (the
 other GC-root manifestations are already fixed on `dev`).
 
+That headline covers the original GC-root cluster. The folder also holds the
+**Hibernate** standalone cluster, the **bug-06** Spring reflection/annotation
+families (F5/F6), and — added 2026-06-18 — **7 more open, distinct suite bugs**
+consolidated from the per-suite trackers (see *Consolidated suite bug docs* below).
+Two of those (`springsuite-bug-04`, `spring-bug-10`) are themselves Family A
+manifestations seen from the Spring suite.
+
 ---
 
 ## Family A — GC root coverage under JIT  *(one root cause, four manifestations)*
@@ -109,6 +116,43 @@ The history below predates the fix.
 | **B** | JUnit `@Timeout` interceptor chain `proceed()` invoked twice (cross-thread invocation / `MethodHandle` re-entry on the timeout worker). **Not GC-related.** Clears a broad band of Spring tests. | 🔴 **OPEN** | [spring-bug-04-junit-timeout-interceptor-double-proceed.md](spring-bug-04-junit-timeout-interceptor-double-proceed.md) |
 | **C** | Deep JIT→JIT recursion overruns the **native** stack (ANTLR `closure()`); the overflow path faults instead of throwing a catchable `StackOverflowError`. Only arises with an *unmerged* cold-path-throughput experiment; needs stack-banging + a fault-recovery handler. | ⚪ **LATENT** (not a current blocker) | [springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md) §6–7 |
 
+## Standalone — bug-06 assertion-mismatch family (Spring suite reflection/annotation tail)
+
+The bug-06 census (`spring-suite/crash-reports-2026-06-16/bug-06-assertion-mismatch-families.md`)
+clustered ~529 genuine assertion mismatches into 6 families. Families 1–4 are fixed
+(field-updaters `fe52db3a`; `HttpClient.executor`; synthetic-`Object` superclass `40b6d94a`;
+`findLoadedClass` no-load `4b923e86`, all on `dev`). The two open families are reflection/annotation
+**native-return-value** correctness, not GC/JIT:
+
+| # | Bug | Status | Doc |
+|---|---|---|---|
+| **F5** | Reflection native returns `null` where HotSpot returns a `Class`/`Method` (`getDeclaredMethod on null` ×28). Common paths **verified clean** (`Refl5` == HotSpot); the failing narrow generic/proxy path is not yet attributed to a test. **Do not** touch `synthetic_class_mirror` slot 0 (refuted hypothesis). | 🔴 **OPEN** — needs per-test attribution | [bug06-fam5-reflection-getdeclaredmethod-null.md](bug06-fam5-reflection-getdeclaredmethod-null.md) |
+| **F6** | Spring annotation **synthesis** (`@AliasFor`/`MergedAnnotation`/`MirrorSets`) value mismatches + `AnnotationUtilsTests` aborts with a fixed ~2 GB alloc (reproduces on the pre-fix binary → pre-existing, a wrong size computation, not the `findLoadedClass` fix). | 🔴 **OPEN** — `[[spring-bug-01]]` umbrella | [bug06-fam6-annotation-synthesis-mergedannotation.md](bug06-fam6-annotation-synthesis-mergedannotation.md) |
+
+## Consolidated suite bug docs (open & distinct — copied in 2026-06-18)
+
+Genuine open VM defects pulled in from the suite-specific trackers
+(`spring-suite/crash-reports-2026-06-16/`, `spring-suite/bugs/`,
+`docs/kafka-suite-0617/`) so this folder is the single map. **These are copies** —
+the originals remain in their suite folders (which keep their own numbering). Only
+open, distinct bugs were copied; FIXED docs (bug-03, crash-01/02/03,
+spring-bug-02/03/05/09/12, kafka bug-A) and already-consolidated ones (fam5/6,
+spring-bug-04) were left in place.
+
+| Bug | Category | Status | Doc |
+|---|---|---|---|
+| String constant corrupted → `Object` under load | VM-CORRECTNESS / GC | 🔴 **OPEN** — a **Family A** (GC-root-undercount) manifestation, load-dependent | [springsuite-bug-04-string-constant-corrupted-under-load.md](springsuite-bug-04-string-constant-corrupted-under-load.md) |
+| `MergedAnnotations` hang | VM-HANG | 🔴 **OPEN** — first hang found in the suite; annotation synthesis (cf. bug-06 F6) | [spring-bug-06-mergedannotations-hang.md](spring-bug-06-mergedannotations-hang.md) |
+| Serializable proxy round-trip | VM-CORRECTNESS (proxy + serialization) | 🔴 **OPEN** | [spring-bug-08-serializable-proxy-roundtrip.md](spring-bug-08-serializable-proxy-roundtrip.md) |
+| JUnit-platform execution `LoadError` | VM-CORRECTNESS / dispatch | 🔴 **OPEN** — JUnit platform internals; GC-race-adjacent (cf. bug-04) | [spring-bug-10-junit-platform-execution-loaderr.md](spring-bug-10-junit-platform-execution-loaderr.md) |
+| Groovy / scheduler crashes (rc=139) | VM-CRASH | 🟡 **PARTIAL** — Groovy SIGSEGV fixed via the bug-12 HashMap-layout fix; residual = a separate Groovy **hang at BEGIN** (inventory, needs per-cluster trace) | [spring-bug-11-groovy-and-scheduler-crashes.md](spring-bug-11-groovy-and-scheduler-crashes.md) |
+| Mockito `mockStatic` + mock dispatch | VM-CORRECTNESS (Mockito dispatch) | 🔴 **OPEN** — root-caused; High (Mockito pervasive in Kafka suite) | [kafka-bug-B-mockito-mockstatic-mock-dispatch.md](kafka-bug-B-mockito-mockstatic-mock-dispatch.md) |
+| `WeakHashMap` stream infinite hang | VM-HANG | 🔴 **OPEN** — 3-line repro; largest hang cluster in the Kafka suite | [kafka-bug-C-weakhashmap-stream-infinite-hang.md](kafka-bug-C-weakhashmap-stream-infinite-hang.md) |
+
+> `springsuite-bug-04` and `spring-bug-10` are **Family A** (GC-root-coverage-under-JIT)
+> manifestations seen from the Spring suite — same root cause as A1–A4 above, different
+> entry points. Fixing precise JIT stack roots should clear them; tracked there.
+
 ## The springrepos handoff (mostly fixed)
 
 [springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md)
@@ -119,6 +163,19 @@ and the root-snapshot hang are all **fixed on dev**. Its only still-relevant ope
 items are **its "defect #2" (= family A3 above)** and **bug C** (the cold-path
 deep-recursion overflow). It is kept for that context and the deep-recursion
 stack-guard design.
+
+## Standalone — Hibernate JAXB class-load storm (✅ FIXED)
+
+[hibernate-jaxb-classload-synthetic-stub-rescan-storm.md](hibernate-jaxb-classload-synthetic-stub-rescan-storm.md)
+— HIB-DEV-03. The **dominant** layer of the JAXB-XML-mapping hang. **Not** GC/JIT,
+**not** `retainAll`. Every `HashMap`/`LinkedHashMap` node insert allocates a
+`cratonvm/synthetic/AnonymousObject$N` whose synthetic-stub "upgrade" re-ran a
+**full classpath scan** (`find_class_bytes_delegated`) — O(num_jars) — on *every
+allocation*; with the ~250-JAR Hibernate classpath, map-heavy JAXB model building
+crawled to a `rc=124` timeout. ✅ **FIXED** (`fix/hib-dev-03-jaxb-classload`):
+memoize the known-absent result in `ClassManager`, re-armed on classpath
+extension. A/B: 20 000-node put loop 20 120 ms → 132 ms (now classpath-independent
+≈ HotSpot's allocation scaling). Unmasks the deeper JTA/socket cluster below.
 
 ## Standalone — Hibernate JTA cluster (Narayana XA + socket loopback)
 
@@ -151,6 +208,16 @@ zip-index hot spot. 🔴 open (handoff).
 `EntityManager`/`SessionFactory` doesn't reconnect to the live factory. Generic
 `readObject`/`readResolve` work on CV (verified); the gap is Hibernate's
 `SessionFactoryRegistry.findSessionFactory(uuid,name)` returning null after deser. 🔴 open.
+
+## Hibernate full-suite census (dev 2026-06-17) — additional docs
+
+Per-run bug reports relocated here from the (gitignored) `apps/hibernate-orm/cratonvm-bug-reports/dev-run-20260617/`:
+- [hibernate-json-function-sigsegv-al_state-foreign-receiver.md](hibernate-json-function-sigsegv-al_state-foreign-receiver.md) — ✅ **FIXED** (`al_state` ArrayList-layout guard; 4 `function.json.*` SIGSEGV classes).
+- [hibernate-throwable-stacktrace-order-reversed-FIXED.md](hibernate-throwable-stacktrace-order-reversed-FIXED.md) — ✅ **FIXED** (`getStackTrace()`/`printStackTrace()` were reversed).
+- [hibernate-jta-txcontrol-getinetaddress-per-class-report.md](hibernate-jta-txcontrol-getinetaddress-per-class-report.md) — per-class companion to the JTA Narayana known-issue (entry crash ✅ fixed; XA/socket layers 🔴 open).
+- [hibernate-hang-clusters-summary.md](hibernate-hang-clusters-summary.md) — overview of the 22 census hangs grouped by root cause (JAXB/class-load, ByteBuddy MethodGraph, JTA/socket).
+
+Also fixed on dev this run (no standalone doc — see commit): `Locale.toLanguageTag()` dropped all subtags for real Locales (`13e8c761`).
 
 ## Consolidation log
 

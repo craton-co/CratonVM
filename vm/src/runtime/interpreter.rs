@@ -5758,6 +5758,31 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                             ));
                             continue;
                         }
+                        // JVMS §aastore covariance check (mirrors the slow-path
+                        // `Instruction::Aastore` arm): a non-null element whose
+                        // runtime type is not assignment-compatible with the
+                        // array's component type throws ArrayStoreException.
+                        // `aastore_element_assignable` fails open on imprecise
+                        // type info, so this is additive and never a false ASE.
+                        if let Value::Object(Some(elem_ref)) = value {
+                            if shared.heap.kind_of(arr_ref) == cratonvm_types::ObjectKind::Array
+                                && shared.heap.element_type_of(arr_ref) == ArrayElementType::Reference
+                                && !aastore_element_assignable(shared, arr_ref, elem_ref)
+                            {
+                                let _ = frame;
+                                let elem_cls = shared
+                                    .class_manager
+                                    .read()
+                                    .get_class(shared.heap.class_id_of(elem_ref))
+                                    .map(|c| c.name.to_string())
+                                    .unwrap_or_else(|| "?".to_string());
+                                pending_runtime_error = Some((
+                                    RuntimeError::ArrayStoreException { message: elem_cls },
+                                    saved_pc,
+                                ));
+                                continue;
+                            }
+                        }
                         // SATB pre-barrier: log old array element before overwrite
                         // Widening: index conversion
                         if let Ok(old_elem) = shared.heap.get_array_element(arr_ref, index as usize) {
@@ -6970,6 +6995,28 @@ fn execute_instruction(
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
             let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || format!("aastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
+            // JVMS §aastore covariance check: a reference store into an
+            // Object[]-family array whose element's runtime type is NOT
+            // assignment-compatible with the array's component type throws
+            // ArrayStoreException. Only checked for a non-null element stored
+            // into a reference-component array (primitive arrays never reach
+            // aastore; a null element is always storable). `aastore_element_assignable`
+            // fails open (allows the store) on any imprecise type info, so this is
+            // additive and never produces a false ArrayStoreException.
+            if let Value::Object(Some(elem_ref)) = value {
+                if shared.heap.kind_of(array_ref) == cratonvm_types::ObjectKind::Array
+                    && shared.heap.element_type_of(array_ref) == ArrayElementType::Reference
+                    && !aastore_element_assignable(shared, array_ref, elem_ref)
+                {
+                    let elem_cls = shared
+                        .class_manager
+                        .read()
+                        .get_class(shared.heap.class_id_of(elem_ref))
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    return Err(RuntimeError::ArrayStoreException { message: elem_cls }.into());
+                }
+            }
             // SATB barrier: log old array element before overwriting
             // Widening: index conversion
             if let Ok(old_elem) = shared.heap.get_array_element(array_ref, index as usize) {
@@ -7580,13 +7627,17 @@ fn execute_instruction(
         }
         Instruction::Ifnull(offset) => {
             let v = thread.frames[frame_idx].stack.pop()?;
-            if v.is_null() {
+            // Use `ref_operand_is_null` (not `Value::is_null`) so a JNI jobject
+            // null carried as `Value::Long(0)` is also recognised as null.
+            if ref_operand_is_null(&v) {
                 thread.frames[frame_idx].pc = branch_target(saved_pc, *offset);
             }
         }
         Instruction::Ifnonnull(offset) => {
             let v = thread.frames[frame_idx].stack.pop()?;
-            if !v.is_null() {
+            // Mirror Ifnull: a `Value::Long(0)` jobject-null is null, so
+            // ifnonnull must NOT take the branch for it.
+            if !ref_operand_is_null(&v) {
                 thread.frames[frame_idx].pc = branch_target(saved_pc, *offset);
             }
         }
@@ -7851,6 +7902,16 @@ fn execute_instruction(
                 ),
             )?;
             let field = resolve_field_ref(shared, current_class_id, *index)?;
+            // Perf: ALL of the per-getfield diagnostic blocks below are gated
+            // behind a SINGLE cached "any field diagnostic enabled" branch, so
+            // the common no-diagnostics case (the overwhelmingly hot path) does
+            // exactly one branch instead of stepping through each individual
+            // gate. Inside, every block still re-checks its own cached gate, so
+            // behaviour is byte-for-byte identical to the original sequence —
+            // including the `CRATONVM_DBG_BADRECV` wild-pointer guard, which is
+            // only ever reachable when its var is set (and `any_field_diag()` is
+            // then `true`). See `env_cache::any_field_diag`.
+            if crate::runtime::env_cache::any_field_diag() {
             if crate::runtime::env_cache::field_addr_dbg() {
                 let field_name = resolve_field_name(shared, current_class_id, *index);
                 if let Some(fname) = field_name.as_deref() {
@@ -7939,6 +8000,7 @@ fn execute_instruction(
                               *index, field_name, field.field_index, field.is_reference, obj_ref.as_ptr(), v);
                 }
             }
+            } // end `if any_field_diag()` — consolidated getfield diagnostics
             // K2 (T10.9.E) — category-2 primitive tag hint.  `ResolvedField`
             // records only is_reference/is_volatile, so we re-read the first
             // byte of the descriptor from the constant pool to choose the
@@ -8034,6 +8096,14 @@ fn execute_instruction(
                         }
                         _ => {}
                     }
+                    // JVMS getfield: a sub-int field (byte/boolean/char/short)
+                    // loads sign/zero-extended to its declared width. Re-narrow
+                    // the read int so a slot that was widened by some other write
+                    // path still yields the spec-mandated value (B/S sign-extend,
+                    // C zero-extends, Z masks to bit 0; I is unchanged).
+                    if let Some(d) = desc_byte {
+                        value = narrow_int_to_field_type(value, d);
+                    }
                 }
                 // T1.7.1 — apply the barrier to the LOADED reference too.
                 // Loading a forwarded reference into the operand stack
@@ -8109,7 +8179,12 @@ fn execute_instruction(
                     // in vm_exec: invoke returns can sit on the stack as compact long bits.
                     match desc_byte {
                         Some(d @ (b'L' | b'[')) => coerce_value_for_return(v, d),
-                        _ => v,
+                        // JVMS putfield: narrow the popped int to the field's
+                        // declared sub-int width (byte/boolean/char/short) before
+                        // storing, so a wide int producer can't leave out-of-range
+                        // bits in a byte/short field. `I` and the rest pass through.
+                        Some(d) => narrow_int_to_field_type(v, d),
+                        None => v,
                     }
                 }
             };
@@ -8131,7 +8206,15 @@ fn execute_instruction(
             // "Cannot write field X because the object is null" family (a JIT'd
             // or misdispatched caller losing the freshly allocated receiver,
             // cf. gap-jit-fastmath-transform-miscompile.md Bug 4).
-            if obj_ref.is_err() && std::env::var_os("CRATONVM_DBG_NULLTHIS").is_some() {
+            // Perf: short-circuit on the consolidated field-diagnostics gate
+            // first (a single cached bool) so the common no-diagnostics path
+            // never even tests `obj_ref.is_err()` for this block. `any_field_diag`
+            // is `true` whenever `CRATONVM_DBG_NULLTHIS` is set, so the inner
+            // var check still selects exactly this block — semantics unchanged.
+            if crate::runtime::env_cache::any_field_diag()
+                && obj_ref.is_err()
+                && std::env::var_os("CRATONVM_DBG_NULLTHIS").is_some()
+            {
                 let field_name = resolve_field_name(shared, current_class_id, *index);
                 let fr0 = &thread.frames[frame_idx];
                 eprintln!(
@@ -8158,6 +8241,15 @@ fn execute_instruction(
                 }
             }
             let obj_ref = obj_ref?;
+            // Perf: ALL of the per-putfield diagnostic blocks below are gated
+            // behind a SINGLE cached "any field diagnostic enabled" branch, so
+            // the common no-diagnostics case (the overwhelmingly hot path) does
+            // exactly one branch instead of stepping through each individual
+            // gate (FIELDADDR, STRAYSTACK, HashtableOfInt, BAOS). Inside, every
+            // block still re-checks its own cached gate, so behaviour is
+            // byte-for-byte identical to the original sequence. See
+            // `env_cache::any_field_diag`.
+            if crate::runtime::env_cache::any_field_diag() {
             // Gated diagnostic (CRATONVM_DBG_FIELDADDR): trace put for specific
             // fields — object address + resolved slot — to localize a write
             // that doesn't reach the read site.
@@ -8247,6 +8339,7 @@ fn execute_instruction(
                     );
                 }
             }
+            } // end `if any_field_diag()` — consolidated putfield diagnostics
             // T17.Δ.4 — JVMTI FieldModification watchpoint.
             {
                 let method_id = synth_method_id(&thread.frames[frame_idx]);
@@ -9481,6 +9574,114 @@ pub(crate) fn array_is_assignable_to(shared: &SharedVm, src_desc: &str, target_n
     shared.class_manager.read().is_subclass_of(src_id, tgt_id)
 }
 
+/// JVMS §aastore covariance check: returns `true` if the (non-null) element
+/// `value_ref` may be stored into the reference array `array_ref`, `false` if
+/// the store must throw `ArrayStoreException`.
+///
+/// Shared by the interpreter `aastore` opcode and the JIT `jit_aastore` helper
+/// so both enforce the same rule. Only call this for genuine `Object[]`-family
+/// (reference-component) arrays with a non-null element; a `null` element is
+/// always storable and primitive-component arrays never reach `aastore`.
+///
+/// Conservative posture: the check is *additive correctness* — it must never
+/// produce a FALSE `ArrayStoreException`. Whenever the component or element type
+/// cannot be determined precisely (missing class entries, synthetic class ids,
+/// `java/lang/Object` component, unresolvable names) it returns `true` (allow
+/// the store), matching the lenient fallbacks already in
+/// [`array_is_assignable_to`]. It only returns `false` when both types resolve
+/// to loaded classes AND the element is provably NOT assignable to the
+/// component.
+pub(crate) fn aastore_element_assignable(
+    shared: &SharedVm,
+    array_ref: cratonvm_types::ObjectRef,
+    value_ref: cratonvm_types::ObjectRef,
+) -> bool {
+    // Determine the array's component descriptor by stripping the leading '['
+    // from its full descriptor (e.g. "[Ljava/lang/Number;" -> "Ljava/lang/Number;").
+    let array_desc = match array_descriptor_of(shared, array_ref) {
+        Some(d) => d,
+        // Unknown array shape (no descriptor) — fail open, allow the store.
+        None => return true,
+    };
+    if !array_desc.starts_with('[') {
+        return true;
+    }
+    let component = &array_desc[1..];
+
+    // Object[] (and Serializable[]/Cloneable[]) accept any reference element.
+    if component == "Ljava/lang/Object;"
+        || component == "Ljava/io/Serializable;"
+        || component == "Ljava/lang/Cloneable;"
+    {
+        return true;
+    }
+
+    // Element is itself an array → use the array-vs-array assignability rules,
+    // treating the component descriptor as the target.
+    if shared.heap.kind_of(value_ref) == cratonvm_types::ObjectKind::Array {
+        let elem_desc = match array_descriptor_of(shared, value_ref) {
+            Some(d) => d,
+            None => return true,
+        };
+        // `array_is_assignable_to` wants the target as an array descriptor or a
+        // class/interface name. A reference component "L...;" must be unwrapped
+        // to a bare class name; an array component "[..." is passed verbatim.
+        if component.starts_with('[') {
+            return array_is_assignable_to(shared, &elem_desc, component);
+        }
+        if component.starts_with('L') && component.ends_with(';') {
+            let comp_name = &component[1..component.len() - 1];
+            return array_is_assignable_to(shared, &elem_desc, comp_name);
+        }
+        return true;
+    }
+
+    // Element is a plain object. The component must be a reference type "L...;"
+    // (an array component would not accept a non-array element — but fail open
+    // rather than throw, to avoid regressions from imprecise component info).
+    if !(component.starts_with('L') && component.ends_with(';')) {
+        return true;
+    }
+    let comp_name = &component[1..component.len() - 1];
+
+    // Resolve the element's runtime class id; an unknown/synthetic class id
+    // (no loaded class entry) is treated as assignable (fail open).
+    let value_class_id = shared.heap.class_id_of(value_ref);
+    if value_class_id == ClassId::new(0) {
+        return true;
+    }
+    let comp_id = match shared.class_manager.read().find_class_by_name(comp_name) {
+        Some(id) => id,
+        // Component class not loaded yet — load it; failure to load means we
+        // cannot prove incompatibility, so allow the store.
+        None => match shared.class_manager.write().load_class(comp_name) {
+            Ok(id) => id,
+            Err(_) => return true,
+        },
+    };
+    // The element class must exist in the hierarchy; if not, fail open.
+    {
+        let cm = shared.class_manager.read();
+        if cm.get_class(value_class_id).is_none() {
+            return true;
+        }
+        // Provably assignable iff value's class is a subclass/subtype of the
+        // component class (interfaces handled by `is_subclass_of`).
+        if cm.is_subclass_of(value_class_id, comp_id) {
+            return true;
+        }
+    }
+    // Both types resolved and the element is NOT a subtype of the component:
+    // a genuine ArrayStoreException. Two narrow escape hatches keep us from
+    // regressing on the VM's own imprecise synthetic types:
+    //   - synthetic lambda/proxy class ids (>= 0x8000_0000) never appear in the
+    //     loaded hierarchy, so `is_subclass_of` cannot vouch for them.
+    if value_class_id.as_u32() >= 0x8000_0000 {
+        return true;
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Helper: walk a class's superclass chain by name to detect Proxy$Instance
 // ---------------------------------------------------------------------------
@@ -10284,6 +10485,37 @@ pub fn resolve_field_name(shared: &SharedVm, class_id: ClassId, cp_index: u16) -
         Some(name.to_string())
     } else {
         None
+    }
+}
+
+/// JVMS field-store/load semantics for sub-int fields: `byte`/`boolean`/`char`/
+/// `short` fields hold a value narrowed to the field's declared width even
+/// though the operand stack and locals carry them as a full 32-bit `int`.
+///
+/// On a `putfield`/`putstatic` the stored `int` is narrowed (and, for the
+/// signed types, sign-extended back into an `i32`); on a `getfield`/`getstatic`
+/// the read value is re-narrowed so a field whose backing slot was widened by
+/// some other path still reads back the spec-mandated value (`B` sign-extends an
+/// `i8`, `S` an `i16`, `C` zero-extends a `u16`, `Z` masks to bit 0). `I` and
+/// every non-int descriptor are returned unchanged.
+///
+/// Only the `Value::Int` carrier is narrowed; any other `Value` shape is passed
+/// through untouched (defensive — a non-int slot on a sub-int field is a
+/// separate upstream issue and must not be silently reshaped here).
+#[inline]
+fn narrow_int_to_field_type(value: Value, desc_byte: u8) -> Value {
+    match value {
+        Value::Int(x) => {
+            let narrowed = match desc_byte {
+                b'B' => x as i8 as i32,   // byte: sign-extend low 8 bits
+                b'S' => x as i16 as i32,  // short: sign-extend low 16 bits
+                b'C' => x as u16 as i32,  // char: zero-extend low 16 bits
+                b'Z' => x & 1,            // boolean: JVMS stores only bit 0
+                _ => return value,        // I and non-sub-int: unchanged
+            };
+            Value::Int(narrowed)
+        }
+        _ => value,
     }
 }
 
@@ -16288,7 +16520,11 @@ fn resolve_inline_site(
             0x14 => { has_ldc2w = true; scan_pc += 3; continue; }
             _ => {}
         }
-        scan_pc += inline_bytecode_length(code[scan_pc]);
+        // `wide`-aware length so the walk stays in sync over a `wide iinc`
+        // (6 bytes) — the bare opcode-length table treats every `wide` form as
+        // 4 bytes, which would desync the scan and mis-read the widened
+        // operands as opcodes (finding 5).
+        scan_pc += inline_instr_length(code, scan_pc);
     }
 
     let callee_class_info = cm.get_class(declaring_id)?;
@@ -16317,7 +16553,7 @@ fn resolve_inline_site(
                 }
                 fpc += 3;
             } else {
-                fpc += inline_bytecode_length(code[fpc]);
+                fpc += inline_instr_length(code, fpc);
             }
         }
     }
@@ -16338,7 +16574,7 @@ fn resolve_inline_site(
                 }
                 fpc += 3;
             } else {
-                fpc += inline_bytecode_length(code[fpc]);
+                fpc += inline_instr_length(code, fpc);
             }
         }
     }
@@ -16366,7 +16602,7 @@ fn resolve_inline_site(
                 ldc_info.push((fpc, val));
                 fpc += 3;
             } else {
-                fpc += inline_bytecode_length(code[fpc]);
+                fpc += inline_instr_length(code, fpc);
             }
         }
     }
@@ -16385,7 +16621,7 @@ fn resolve_inline_site(
                 ldc2w_info.push((fpc, val));
                 fpc += 3;
             } else {
-                fpc += inline_bytecode_length(code[fpc]);
+                fpc += inline_instr_length(code, fpc);
             }
         }
     }
@@ -16438,7 +16674,17 @@ fn resolve_inline_site(
     })
 }
 
-/// Get the bytecode length of an instruction (for inline eligibility scan).
+/// Get the bytecode length of an instruction from its opcode ALONE (for the
+/// inline eligibility scan).
+///
+/// NOTE: this is correct for every fixed-length opcode but CANNOT decide the
+/// length of `wide` (0xc4): a `wide` instruction's length depends on the
+/// FOLLOWING opcode (`wide iinc` is 6 bytes; every other `wide` form is 4). The
+/// `0xc4 => 4` arm here is a lower-bound default; byte-walk loops MUST use
+/// [`inline_instr_length`] (which peeks the next byte) so the walk stays in sync
+/// across a `wide iinc`. `tableswitch`/`lookupswitch` (0xaa/0xab) are also
+/// variable-length and are rejected up front by the eligibility scan, so they
+/// never reach a length query.
 fn inline_bytecode_length(opcode: u8) -> usize {
     match opcode {
         0x00..=0x0f | 0x1a..=0x35 | 0x3b..=0x83 | 0x85..=0x98 |
@@ -16447,9 +16693,34 @@ fn inline_bytecode_length(opcode: u8) -> usize {
         0x11 | 0x13 | 0x14 | 0x99..=0xa8 | 0xb2..=0xb8 | 0xbd | 0xc0 | 0xc1 | 0xc6 | 0xc7 | 0xbb => 3,
         0x84 => 3, // iinc
         0xb9 | 0xba | 0xc8 | 0xc9 => 5,
-        0xc4 => 4,
+        0xc4 => 4, // wide: lower bound — see inline_instr_length for the real length
         _ => 1,
     }
+}
+
+/// `wide`-aware instruction length for the inline-eligibility byte-walk.
+///
+/// Returns the full encoded length of the instruction at `code[pc]`. For the
+/// `wide` prefix (0xc4) the length is determined by the FOLLOWING opcode:
+///   - `wide iinc` (0xc4 0x84 idx1 idx2 const1 const2)               → 6 bytes
+///   - `wide <iload|…|ret>` (0xc4 <op> idx1 idx2)                     → 4 bytes
+/// Every other opcode delegates to [`inline_bytecode_length`]. This keeps the
+/// byte-walk in lock-step over a `wide iinc`, which the bare opcode-only length
+/// (fixed `4`) would land 2 bytes short of — then mis-read the iinc constant's
+/// trailing byte as an opcode.
+#[inline]
+fn inline_instr_length(code: &[u8], pc: usize) -> usize {
+    if code[pc] == 0xc4 {
+        // The modified opcode follows the 0xc4 prefix. `wide iinc` carries an
+        // extra 2-byte signed constant; all other wide forms (the *load/*store
+        // family and `ret`) are 4 bytes. If the prefix is truncated at the end
+        // of the code array, fall back to the 4-byte minimum.
+        return match code.get(pc + 1) {
+            Some(0x84) => 6, // wide iinc
+            _ => 4,          // wide iload/lload/.../ret
+        };
+    }
+    inline_bytecode_length(code[pc])
 }
 
 
@@ -16653,6 +16924,11 @@ fn execute_jit_call(
         // protected region, while still allowing typed handlers to match
         // by exception class.
         if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
+            // The exception consumes the deopt — clear the out-of-band deopt
+            // signal (MEDIUM `i64::MIN`-collision fix) so it cannot leak to the
+            // next JIT call. The dispatch helper that stashed this exception
+            // also set the deopt flag before returning `i64::MIN`.
+            let _ = crate::jit::helpers::take_jit_deopt_pending();
             let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
             return route_jit_exception_through_method(
                 shared, thread, frame_idx, cached, usize::MAX, exc, &exc_locals,
@@ -16673,6 +16949,21 @@ fn execute_jit_call(
             }
         }
     };
+
+    // MEDIUM fix (i64::MIN deopt-sentinel collision): capture and clear the
+    // out-of-band deopt/exception signal exactly ONCE, immediately after the
+    // JIT body returns and before any flag-consuming drain below. The JIT
+    // signals exception/deopt by returning `i64::MIN`, but a method that
+    // legitimately returns `Long.MIN_VALUE` (or a J/D/F/I value whose JIT-ABI
+    // bits equal `i64::MIN`) returns the same value WITHOUT setting this flag.
+    // Every JIT path that produces the genuine deopt sentinel also sets the
+    // flag (`jit_throw_aioobe` / `jit_uncommon_trap` / the dispatch helpers and
+    // their x64 stubs). Taking it here clears it for the remaining return paths
+    // so it can never leak to the next JIT call; the `result == i64::MIN` arm
+    // below consults `deopt_signaled` instead of overloading the value. (The
+    // slow-path exception drain above already early-returned for the pending-
+    // exception case and clears the flag itself.)
+    let deopt_signaled = crate::jit::helpers::take_jit_deopt_pending();
 
     // Round-8 CRIT fix (NPE leak): drain the pending-NPE flag on EVERY
     // JIT return path, not only the `i64::MIN` deopt sentinel arm. A
@@ -16743,8 +17034,13 @@ fn execute_jit_call(
     }
 
     // Deopt sentinel: i64::MIN means the method was deoptimized — fall through
-    // to the interpreter slow path to re-execute.
-    if result == i64::MIN {
+    // to the interpreter slow path to re-execute. MEDIUM fix: only when the
+    // out-of-band `deopt_signaled` flag confirms the JIT actually took the
+    // exception/deopt path. A bare `result == i64::MIN` with the flag CLEAR is a
+    // method legitimately returning `Long.MIN_VALUE` (or a J/D/F/I value whose
+    // JIT-ABI bits equal `i64::MIN`) and must be pushed as a real value below —
+    // re-running it would double-execute its side effects.
+    if result == i64::MIN && deopt_signaled {
         // Check for pending AIOOBE from JIT bounds check (now unreachable in
         // practice — the drain above takes the flag on every return path,
         // including the i64::MIN deopt case — kept as a defensive belt; the
@@ -16953,6 +17249,10 @@ fn execute_jit_call_decoded(
         }));
         crate::jit::helpers::restore_jit_thread(saved_jit_thread);
         if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
+            // Clear the out-of-band deopt signal (MEDIUM `i64::MIN`-collision
+            // fix) so it cannot leak to the next JIT call — the exception
+            // consumes the deopt. Mirrors `execute_jit_call`.
+            let _ = crate::jit::helpers::take_jit_deopt_pending();
             return route_jit_exception_through_method(
                 shared, thread, frame_idx, cached, usize::MAX, exc, args_slice,
             )
@@ -16970,6 +17270,11 @@ fn execute_jit_call_decoded(
             }
         }
     };
+
+    // MEDIUM fix (i64::MIN deopt-sentinel collision): capture+clear the
+    // out-of-band deopt signal once, before the flag-consuming drains below.
+    // See the matching block in `execute_jit_call` for the full rationale.
+    let deopt_signaled = crate::jit::helpers::take_jit_deopt_pending();
 
     // Drain pending NPE / AIOOBE set by void-return store helpers (same as
     // execute_jit_call) — route through the JIT'd method's exception table.
@@ -17008,10 +17313,13 @@ fn execute_jit_call_decoded(
 
     // Deopt sentinel → interpreter fallback. The operand stack was never
     // touched here, so the caller's `args_slice` is still valid for the
-    // interpreted frame push. (A legitimate i64::MIN long/double return collides
-    // with the sentinel; falling back just re-runs that one call interpreted —
-    // same result.)
-    if result == i64::MIN {
+    // interpreted frame push. MEDIUM fix: gate on the out-of-band
+    // `deopt_signaled` flag so a method legitimately returning `Long.MIN_VALUE`
+    // (or a J/D/F/I value whose JIT-ABI bits equal `i64::MIN`) is NOT mistaken
+    // for a deopt — re-running it interpreted would double-execute side effects
+    // (the previous "same result" claim is false for any method with side
+    // effects). With the flag clear we fall through and push the real value.
+    if result == i64::MIN && deopt_signaled {
         return Ok(None);
     }
 
@@ -18873,6 +19181,28 @@ fn value_as_object_ptr(v: &Value) -> Option<*mut u8> {
     }
 }
 
+/// JVMS `ifnull`/`ifnonnull` (and any shared reference null test): determine
+/// whether a reference operand is the null reference.
+///
+/// Beyond the obvious `Value::Object(None)` / `Value::Uninitialized`, this also
+/// treats a reference-typed `Value::Long(0)` as null — a JNI `jobject` null
+/// handle smuggled through the operand stack as raw long bits (the same
+/// `Long(0)`-is-null contract already honored by `pop_object_ref*` and
+/// `refs_equal`). A non-zero `Value::Long` whose bits form an aligned heap
+/// pointer is a live jobject and is NOT null; any non-reference numeric value
+/// cannot legally reach `ifnull`/`ifnonnull` (the verifier requires a reference
+/// operand), so only the zero case is special-cased.
+#[inline]
+fn ref_operand_is_null(v: &Value) -> bool {
+    match v {
+        Value::Object(None) | Value::Uninitialized => true,
+        // jobject-as-long: 0 is the null handle. A non-zero long is either a
+        // live jobject pointer or an honest long value — neither is null.
+        Value::Long(0) => true,
+        _ => false,
+    }
+}
+
 fn refs_equal(a: &Value, b: &Value) -> bool {
     match (value_as_object_ptr(a), value_as_object_ptr(b)) {
         (Some(pa), Some(pb)) => pa == pb,
@@ -19760,6 +20090,73 @@ mod tests {
         // Int(0) representing null in autoboxed contexts
         assert!(refs_equal(&Value::Object(None), &Value::Int(0)));
         assert!(refs_equal(&Value::Int(0), &Value::Object(None)));
+    }
+
+    // -----------------------------------------------------------------------
+    // narrow_int_to_field_type (finding 2): sub-int field store/load narrowing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn narrow_field_byte_sign_extends() {
+        // 0x1234_5680 -> low byte 0x80 -> -128 (sign-extended)
+        assert_eq!(narrow_int_to_field_type(Value::Int(0x1234_5680u32 as i32), b'B'), Value::Int(-128));
+        assert_eq!(narrow_int_to_field_type(Value::Int(127), b'B'), Value::Int(127));
+        assert_eq!(narrow_int_to_field_type(Value::Int(256), b'B'), Value::Int(0));
+    }
+
+    #[test]
+    fn narrow_field_short_sign_extends() {
+        // low 16 bits 0x8000 -> -32768
+        assert_eq!(narrow_int_to_field_type(Value::Int(0x0001_8000u32 as i32), b'S'), Value::Int(-32768));
+        assert_eq!(narrow_int_to_field_type(Value::Int(32767), b'S'), Value::Int(32767));
+    }
+
+    #[test]
+    fn narrow_field_char_zero_extends() {
+        // char is unsigned: low 16 bits 0xFFFF -> 65535 (NOT -1)
+        assert_eq!(narrow_int_to_field_type(Value::Int(-1), b'C'), Value::Int(65535));
+        assert_eq!(narrow_int_to_field_type(Value::Int(0x10000), b'C'), Value::Int(0));
+    }
+
+    #[test]
+    fn narrow_field_boolean_masks_bit0() {
+        assert_eq!(narrow_int_to_field_type(Value::Int(2), b'Z'), Value::Int(0));
+        assert_eq!(narrow_int_to_field_type(Value::Int(3), b'Z'), Value::Int(1));
+        assert_eq!(narrow_int_to_field_type(Value::Int(-1), b'Z'), Value::Int(1));
+    }
+
+    #[test]
+    fn narrow_field_int_and_others_unchanged() {
+        // 'I' and any non-sub-int descriptor pass through untouched.
+        assert_eq!(narrow_int_to_field_type(Value::Int(-1), b'I'), Value::Int(-1));
+        assert_eq!(narrow_int_to_field_type(Value::Int(0x1234_5680u32 as i32), b'L'), Value::Int(0x1234_5680u32 as i32));
+        // Non-Int carriers pass through regardless of descriptor.
+        assert_eq!(narrow_int_to_field_type(Value::Long(5), b'B'), Value::Long(5));
+        assert_eq!(narrow_int_to_field_type(Value::Object(None), b'B'), Value::Object(None));
+    }
+
+    // -----------------------------------------------------------------------
+    // ref_operand_is_null (finding 3): ifnull/ifnonnull jobject-as-Long(0)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ref_null_recognises_object_none() {
+        assert!(ref_operand_is_null(&Value::Object(None)));
+        assert!(ref_operand_is_null(&Value::Uninitialized));
+    }
+
+    #[test]
+    fn ref_null_recognises_jobject_long_zero() {
+        // A JNI jobject null handle carried as raw long bits.
+        assert!(ref_operand_is_null(&Value::Long(0)));
+    }
+
+    #[test]
+    fn ref_null_rejects_nonzero_and_live_object() {
+        // A non-zero long is either a live jobject pointer or an honest long;
+        // neither is null.
+        assert!(!ref_operand_is_null(&Value::Long(1)));
+        assert!(!ref_operand_is_null(&Value::Int(0)));
     }
 
     #[test]

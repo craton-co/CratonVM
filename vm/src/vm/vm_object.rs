@@ -99,33 +99,62 @@ fn alloc_java_string_object(shared: &SharedVm, text: &str) -> ObjectRef {
 fn alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> ObjectRef {
     // Load java/lang/String class and resolve field count (cached after first call).
     // The field count is cached in an AtomicUsize to avoid lock contention:
-    // once resolved, subsequent calls skip the class_manager lock entirely.
+    // once resolved, subsequent calls skip the class_manager *write* lock entirely.
+    //
+    // PERF (concurrency): the cached fast path MUST NOT take a write lock.
+    // Every dynamically produced String (StringBuilder.toString, substring,
+    // concat, ...) reaches here, so a write lock serialized all String
+    // creation across threads — the single biggest hot-path bottleneck.
+    // Once the field count is cached, the class is necessarily already loaded
+    // (java/lang/String is a bootstrap class resolved long before any dynamic
+    // String exists), so we resolve its ClassId through a *read* lock via the
+    // zero-allocation `get_loaded_class_id` probe. Read locks do not serialize,
+    // restoring full parallelism. The write lock is reserved for the genuine
+    // cache-miss / first-resolution path below.
     let cached = shared.cached_string_num_fields.load(std::sync::atomic::Ordering::Relaxed);
-    let (string_class_id, field_count) = {
-        let mut cm = shared.class_manager.write();
-        let id = cm.load_class("java/lang/String").unwrap_or(ClassId::new(0));
-        let count = if cached != 0 {
-            cached
-        } else {
-            let c = cm.get_class(id)
-                .map(|cls| {
-                    if cls.is_synthetic_stub {
-                        // Synthetic stub — use the hardcoded default (value + hash).
-                        STRING_NUM_FIELDS_DEFAULT
-                    } else {
-                        // Real class loaded from .class file — use its actual
-                        // field layout (JDK 25 String has 4: value, coder, hash,
-                        // hashIsZero).
-                        cls.num_total_fields
-                    }
-                })
-                .unwrap_or(STRING_NUM_FIELDS_DEFAULT);
-            // Safety net: never allocate zero fields
-            let c = if c == 0 { STRING_NUM_FIELDS_DEFAULT } else { c };
-            shared.cached_string_num_fields.store(c, std::sync::atomic::Ordering::Relaxed);
-            c
-        };
-        (id, count)
+    let resolved = if cached != 0 {
+        // Fast path: field count already known. Resolve the class id under a
+        // read lock only. If the probe misses (extremely unlikely — would mean
+        // String isn't registered under any builtin loader), fall through to
+        // the write-lock path to preserve correctness.
+        shared
+            .class_manager
+            .read()
+            .get_loaded_class_id("java/lang/String")
+            .map(|id| (id, cached))
+    } else {
+        None
+    };
+    let (string_class_id, field_count) = match resolved {
+        Some(pair) => pair,
+        None => {
+            // Slow path: first resolution (or read-probe miss). Take the write
+            // lock to load the class and compute + cache the field count.
+            let mut cm = shared.class_manager.write();
+            let id = cm.load_class("java/lang/String").unwrap_or(ClassId::new(0));
+            let count = if cached != 0 {
+                cached
+            } else {
+                let c = cm.get_class(id)
+                    .map(|cls| {
+                        if cls.is_synthetic_stub {
+                            // Synthetic stub — use the hardcoded default (value + hash).
+                            STRING_NUM_FIELDS_DEFAULT
+                        } else {
+                            // Real class loaded from .class file — use its actual
+                            // field layout (JDK 25 String has 4: value, coder, hash,
+                            // hashIsZero).
+                            cls.num_total_fields
+                        }
+                    })
+                    .unwrap_or(STRING_NUM_FIELDS_DEFAULT);
+                // Safety net: never allocate zero fields
+                let c = if c == 0 { STRING_NUM_FIELDS_DEFAULT } else { c };
+                shared.cached_string_num_fields.store(c, std::sync::atomic::Ordering::Relaxed);
+                c
+            };
+            (id, count)
+        }
     };
     let str_obj = shared.heap.alloc_object(string_class_id, field_count);
 
@@ -402,6 +431,16 @@ pub fn class_id_from_mirror(shared: &SharedVm, mirror: ObjectRef) -> Option<Clas
     shared.class_mirrors_reverse.read().get(&mirror).copied()
 }
 
+/// Whether the `CRATONVM_DBG_TOARRAY` diagnostic is enabled.
+///
+/// Resolved once from the environment and cached for the process lifetime,
+/// so the class-mirror hot path does not pay a per-call `std::env::var`
+/// (String allocation + global env-mutex acquisition) on every lookup.
+fn dbg_toarray_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("CRATONVM_DBG_TOARRAY").is_ok())
+}
+
 /// Get or create a java.lang.Class mirror object for the given ClassId.
 ///
 /// Class mirrors are cached in `SharedVm.class_mirrors` to ensure identity:
@@ -418,7 +457,12 @@ pub fn class_id_from_mirror(shared: &SharedVm, mirror: ObjectRef) -> Option<Clas
 /// `mirror_class_id` recover the ClassId without encoding it in the mirror's
 /// Java-visible fields.
 pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> ObjectRef {
-    if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+    // PERF: read the CRATONVM_DBG_TOARRAY flag once, not on every mirror
+    // lookup. `std::env::var` allocates a String and touches a global env
+    // mutex on every call; this runs on the class-mirror hot path. Cache the
+    // resolved bool in a process-wide OnceLock (the env var is fixed for the
+    // process lifetime).
+    if dbg_toarray_enabled() {
         let nm = shared.class_manager.read().get_class(class_id).map(|c| c.name.to_string());
         eprintln!("[DBG_TOARRAY] get_or_create_class_mirror cid={:?} name={:?}", class_id, nm);
     }

@@ -1,6 +1,93 @@
 # Handoff — ReflRepro GC corruption = register-resident missed JIT root (OPEN)
 
 ---
+## RE-DIAGNOSIS 2026-06-18 (worktree `CratonVM-shadowdbg`, branch `dbg/shadow-reload-probe` @ `c9b56f7d`; precise-maps default-on + shadow reload fix)
+
+A full re-investigation on the **current** binary corrects two load-bearing claims in
+the 2026-06-17 section below and re-confirms the rest. **Net: A2 is a register-resident
+missed-JIT-root use-after-free. It is NOT a sweep sizing bug and NOT closeable by the
+"8-byte stride" thread.** Read this before touching the code.
+
+### ⛔ REFUTED: the "8-byte allocator↔walker stride mismatch" is a RED HERRING — do NOT chase it
+The 2026-06-17 "refined next step" hypothesises a specific allocation kind whose
+cursor-advance is 8 bytes larger than `gen_object_total_size`. **An exhaustive static
+audit of every young-allocation path proves no such mismatch exists:**
+
+| path | size it bumps the cursor by | matches walker? |
+|---|---|---|
+| `gen_heap::alloc_array` / `try_alloc_array` / `try_alloc_array_full` | `HEADER_SIZE + array_data_size(len,elem)` (round-**8**) | ✅ identical to `gen_object_total_size` |
+| `gen_heap::try_alloc_object` | `HEADER_SIZE + num_fields*SLOT_SIZE` | ✅ |
+| interpreter `gc_alloc_array` → `try_alloc_array` | same as `alloc_array` | ✅ |
+| interpreter `tlab_alloc_object` (`thread.tlab.alloc(total,8)`) | `HEADER_SIZE + num_fields*SLOT_SIZE` | ✅ |
+| JIT inline `new` (`emit_inline_tlab_new`, x64.rs ~10011) | `HEADER_SIZE + num_fields*SLOT_SIZE`, cursor 8-aligned | ✅ |
+| JIT `jit_newarray` / `jit_anewarray_object` (helpers.rs 963/1327) | `HEADER_SIZE + array_data_size` (round-8) via `try_alloc_array` | ✅ |
+
+Every `.alloc(size, align)` site uses **align 8** (61×) or 1 (10×, byte buffers); **none
+use 16**. There is **no post-allocation write to the `array_length` (off 12) or `num_slots`
+(off 16) header fields** outside `ObjectHeader::new`. `40 mod 16 == 8` makes every *object*
+size `≡8 (mod 16)`, which is what seduced the prior author into the "round-16" theory — but
+nothing rounds to 16. **Conclusion: the 8-byte hole at the sweep desync is a downstream
+*consequence* of the wrong reclaim + free-block reuse + UAF writes, not an independent
+fixable sizing bug.**
+
+### ✅ CORRECTED: the SIGSEGV is a downstream use-after-free, NOT the sweep linear walk
+On the current binary the non-moving sweep **re-syncs successfully** (`RE-SYNCED at offset
+3072 (skipped 8 bytes)`) and does NOT itself crash. The `rc=139` is a later
+`EXCEPTION_ACCESS_VIOLATION read at <obj>+8` from **JIT/mutator code dereferencing a
+stale/reused slot** (the wrongly-reclaimed reflection oop's address, now reused as a
+different object → wild pointer). `FORCE_MOVING` avoids the crash because a semispace
+never re-uses the freed slot as a real object (→ wrong result, not a wild pointer), AND
+never linear-walks. So the prior section's "the crash IS the non-moving linear walk" is
+imprecise: the linear walk is robust now; **the crash is the UAF the reclaim creates.**
+Therefore the "crash-robustness / make the sweep stride the hole" fix (#1 below) is
+*insufficient* — it cannot stop a mutator-side UAF. Only root coverage (#2) fixes both.
+
+### Current-binary lever status (re-measured; the 2026-06-17 table is STALE — precise-maps default-on changed the landscape)
+`CRATONVM_DBG_GC_STRESS=65536 … ReflRepro 8000`:
+
+| config | result | note |
+|---|---|---|
+| default | `rc=139` | A2 (UAF SIGSEGV) |
+| `--nojit` (`CRATONVM_DISABLE_JIT=1`) | clean | JIT-only |
+| `CRATONVM_JIT_DISABLE_INLINE_NEW=1` | `rc=127` | inline-new is NOT the culprit (8-byte desync persists) |
+| `CRATONVM_JIT_SAFEPOINT_REG_SPILL=1` (blind-spill all callee-saved GPRs) | `rc=139` | missed oop is NOT in a callee-saved reg |
+| `CRATONVM_DBG_FULLSTACK_SCAN=1` | `rc=132` | **now ALSO crashes** (diverged from old handoff's "no crash, bad=1") — whole-stack scan marks garbage |
+| `CRATONVM_DBG_FORCE_MOVING=1` | no SIGSEGV, wrong results | reclaim still happens; no linear walk |
+| `CRATONVM_SHADOW_STACK=1 CRATONVM_SHADOW_PIN=1` | `rc=1`, **no SIGSEGV but still corrupts** (throws at `describeField:28`) | shadow publishes operand-stack *Reg* oops; the lost oop is NOT one of those |
+
+**No lever fixes it.** Notably `SAFEPOINT_REG_SPILL` (callee-saved blind-spill) and
+`SHADOW_PIN` (operand-stack Reg publish) both fail → the lost oop is neither a
+callee-saved-register local nor an operand-stack register entry.
+
+### Root-scan architecture (verified — so the next session doesn't re-derive it)
+- Collector while any JIT frame is live = the **non-moving sweep** (`gc_quiescence::is_active()`), default + selective-promotion. Over-retention is always SAFE for it (never relocates).
+- **Current (allocating) thread** roots come from a **fresh `collect_roots`** (`vm/src/memory/roots.rs:48`) at GC time — NOT from `thread.root_snapshot` (that is used only for *parked* threads via `collect_all_root_snapshots`). `collect_roots` = interpreter `thread.frames` (locals+operand stack, `is_object_address`-filtered; +`scan_locals_conservative` when `conservative_locals_enabled`) + statics/mirrors/interns/etc + `native_pin_roots` + `native_pending_return` + `scan_active_jit_frames` (after `invalidate_scan_cache_for_gc`).
+- `scan_active_jit_frames` per chain entry → **precise path** `scan_one_frame_precise` = (a) read all of the method's oop-map slots, **plus (b) a conservative backstop `scan_one_frame(scanner_sp, info.frame_base)`**. `frame_base` is the **entry-time SP (≈ outermost `entry_sp`)**, deliberately kept separate from `exact_rbp` (innermost) — see `conservative_roots.rs:144-154` (they already fixed an "innermost-only shrink" regression). So the backstop covers `[scanner_sp, entry_sp)` = the **entire** JIT stack region (all nested JIT frames + the native/Rust frames between them). ⇒ **any reflection oop spilled to ANY JIT frame slot, or held in any native Rust frame below entry_sp, IS conservatively rooted.**
+- `push_from_rax` (x64.rs:10217) ALWAYS spills an invoke/native object return to a `Frame` slot `[rbp-off]` (within the backstop) — so the return value is covered the instant it is consumed into the operand model.
+
+### What this leaves as the ONLY possibility
+`SWEEP_EDGES` = `root=0 young-survivor=0 old-gen=0` (no heap/root/card edge) + the whole
+JIT stack region is conservatively scanned + interpreter frames are scanned ⇒ at the GC
+safepoint the reflection result's **only** reference is in a **live machine register that
+is not spilled anywhere on the stack** (classically `rax` holding a native call's return
+before any spill, or a value the operand model holds in a caller-saved/scratch reg across a
+GC-capable call without spilling). A conservative *stack* scan — cached, fresh, per-entry,
+or whole-stack — fundamentally cannot see a live register. This is exactly the class the
+precise-JIT-stack-maps / shadow-stack work targets, and why none of the stack levers close it.
+
+### Recommended next steps (priority order; all require build+test, ~minutes each)
+1. **Decisive instrument (do FIRST):** audit `emit_oop_map_for_safepoint` / `emit_pre_safepoint_spill` for whether the operand model EVER leaves an oop in a **caller-saved / scratch GPR live across a GC-capable CALL** without spilling — and whether the just-returned `rax` of an object-returning invoke is spilled BEFORE the *next* GC-capable call (it is spilled by `push_from_rax`, but verify there is no intervening safepoint). If a live-oop reg survives a call unspilled, that reg is the lost root: spill *every* live-oop GPR (not just callee-saved `alloc_used_regs`) to a scanned frame slot before each safepoint. This is the handoff's option-3 "narrow interim" and the most contained real fix. Suspect sites: the MIC/PIC direct-`call r11` fast path, and any invoke whose result is consumed by a *following* call.
+2. **Shadow-stack-PIN completion:** `collect_live_oop_homes` only publishes operand-stack `Reg` homes. It does NOT publish (i) the `rax` native-return before `push_from_rax`, nor (ii) oop *locals* the register allocator kept in a caller-saved reg. Extend the published-home set to those, keep `SHADOW_PIN` (non-moving-safe), verify `bad=0`.
+3. Precise per-PC register maps (largest; deferred).
+
+**Verification bar (unchanged): `bad=0` on `ReflRepro 8000` under `GC_STRESS=65536` (not just
+"no crash"), no bintrees regression (`bench/BenchSuite bintrees18` must stay `68332206`), no
+WildFly/Spring regression.**
+
+Build: `build-cpu.bat` (PowerShell). JDK: `C:\Program Files\Java\jdk-25`. Repro needs the
+class compiled first: `javac wildfly-suite/repro/ReflRepro.java`.
+
+---
 ## DEFINITIVE DIAGNOSIS 2026-06-17 (4-agent workflow + verification on dev `82cf85e9`, binary with the SHADOW reload fix + precise-maps default-on)
 
 A2 is a **two-part bug** and is **NOT closed by any root-coverage mechanism** currently:
