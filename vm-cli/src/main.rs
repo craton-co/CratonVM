@@ -3168,6 +3168,10 @@ fn main() {
         .name("main-vm".into())
         .stack_size(128 * 1024 * 1024);
     let handler = builder.spawn(|| {
+        // DBG (CRATONVM_DBG_HANGWALK=<secs>): arm the native-stack-walk
+        // watchdog on THIS (main-vm) thread — the one that runs the
+        // interpreter — not the launcher thread that just joins it.
+        cratonvm_vm::runtime::stwhang_watch::arm_from_env();
         if let Err(e) = run() {
             eprintln!("{e:#}");
             std::process::exit(1);
