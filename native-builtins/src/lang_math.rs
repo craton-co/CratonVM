@@ -1676,6 +1676,18 @@ pub(crate) fn math_overflow_err() -> cratonvm_types::error::MethodCallFailed {
     .into()
 }
 
+/// Overflow for the `long`-typed exact-arithmetic ops. The JDK throws
+/// `ArithmeticException("long overflow")` from `Math.{add,subtract,multiply,
+/// negate,increment,decrement}Exact(long…)`, distinct from the int variants'
+/// "integer overflow". ES `ByteSizeValue` addition asserts on the exact
+/// message ("long overflow"), so the int message broke testAddition.
+pub(crate) fn math_overflow_err_long() -> cratonvm_types::error::MethodCallFailed {
+    cratonvm_types::error::RuntimeError::ArithmeticException {
+        message: "long overflow".to_string(),
+    }
+    .into()
+}
+
 #[inline]
 pub(crate) fn native_math_add_exact_int(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = match args.first() {
@@ -1704,7 +1716,7 @@ pub(crate) fn native_math_add_exact_long(_ctx: &mut dyn NativeContext, args: &[V
     };
     match a.checked_add(b) {
         Some(r) => Ok(Some(Value::Long(r))),
-        None => Err(math_overflow_err()),
+        None => Err(math_overflow_err_long()),
     }
 }
 
@@ -1742,7 +1754,7 @@ pub(crate) fn native_math_subtract_exact_long(
     };
     match a.checked_sub(b) {
         Some(r) => Ok(Some(Value::Long(r))),
-        None => Err(math_overflow_err()),
+        None => Err(math_overflow_err_long()),
     }
 }
 
@@ -1780,7 +1792,7 @@ pub(crate) fn native_math_multiply_exact_long(
     };
     match a.checked_mul(b) {
         Some(r) => Ok(Some(Value::Long(r))),
-        None => Err(math_overflow_err()),
+        None => Err(math_overflow_err_long()),
     }
 }
 
@@ -1810,7 +1822,7 @@ pub(crate) fn native_math_increment_exact_long(
     };
     match a.checked_add(1) {
         Some(r) => Ok(Some(Value::Long(r))),
-        None => Err(math_overflow_err()),
+        None => Err(math_overflow_err_long()),
     }
 }
 
@@ -1840,7 +1852,7 @@ pub(crate) fn native_math_decrement_exact_long(
     };
     match a.checked_sub(1) {
         Some(r) => Ok(Some(Value::Long(r))),
-        None => Err(math_overflow_err()),
+        None => Err(math_overflow_err_long()),
     }
 }
 
@@ -1864,7 +1876,7 @@ pub(crate) fn native_math_negate_exact_long(_ctx: &mut dyn NativeContext, args: 
     };
     match a.checked_neg() {
         Some(r) => Ok(Some(Value::Long(r))),
-        None => Err(math_overflow_err()),
+        None => Err(math_overflow_err_long()),
     }
 }
 

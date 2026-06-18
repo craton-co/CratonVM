@@ -294,9 +294,121 @@ fn locale_variant(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     Ok(Some(Value::Object(Some(ctx.create_string("")))))
 }
 
+/// The standard set of locales CratonVM reports from
+/// `Locale.getAvailableLocales()`. CratonVM ships no CLDR locale data, so the
+/// real JDK `getAvailableLocales()` bytecode (which walks the
+/// `LocaleProviderAdapter` → CLDR data path) returns an **empty** array. That
+/// breaks any code that picks a random locale from the list — most visibly
+/// `org.apache.lucene.tests.util.LuceneTestCase.randomLocale()`, which does
+/// `locales[random.nextInt(locales.length)]` and throws
+/// `IllegalArgumentException: bound must be positive` for `nextInt(0)` during
+/// the `@BeforeClass` setup of **every** Elasticsearch/Lucene `ESTestCase`.
+///
+/// This is the canonical JDK locale list (the COMPAT provider's set). Pairs are
+/// `(language, country)`; `("", "")` is `Locale.ROOT`. The locales are built via
+/// the `(String,String,String)` constructor — `forLanguageTag` does NOT populate
+/// the base-locale fields without CLDR data (see `essential_quarkus_locale_convert`).
+const AVAILABLE_LOCALES: &[(&str, &str)] = &[
+    ("", ""),
+    ("ar", ""), ("ar", "AE"), ("ar", "BH"), ("ar", "DZ"), ("ar", "EG"),
+    ("ar", "IQ"), ("ar", "JO"), ("ar", "KW"), ("ar", "LB"), ("ar", "LY"),
+    ("ar", "MA"), ("ar", "OM"), ("ar", "QA"), ("ar", "SA"), ("ar", "SD"),
+    ("ar", "SY"), ("ar", "TN"), ("ar", "YE"),
+    ("be", ""), ("be", "BY"),
+    ("bg", ""), ("bg", "BG"),
+    ("ca", ""), ("ca", "ES"),
+    ("cs", ""), ("cs", "CZ"),
+    ("da", ""), ("da", "DK"),
+    ("de", ""), ("de", "AT"), ("de", "CH"), ("de", "DE"), ("de", "LU"),
+    ("el", ""), ("el", "CY"), ("el", "GR"),
+    ("en", ""), ("en", "AU"), ("en", "CA"), ("en", "GB"), ("en", "IE"),
+    ("en", "IN"), ("en", "MT"), ("en", "NZ"), ("en", "PH"), ("en", "SG"),
+    ("en", "US"), ("en", "ZA"),
+    ("es", ""), ("es", "AR"), ("es", "BO"), ("es", "CL"), ("es", "CO"),
+    ("es", "CR"), ("es", "DO"), ("es", "EC"), ("es", "ES"), ("es", "GT"),
+    ("es", "HN"), ("es", "MX"), ("es", "NI"), ("es", "PA"), ("es", "PE"),
+    ("es", "PR"), ("es", "PY"), ("es", "SV"), ("es", "US"), ("es", "UY"),
+    ("es", "VE"),
+    ("et", ""), ("et", "EE"),
+    ("fi", ""), ("fi", "FI"),
+    ("fr", ""), ("fr", "BE"), ("fr", "CA"), ("fr", "CH"), ("fr", "FR"),
+    ("fr", "LU"),
+    ("ga", ""), ("ga", "IE"),
+    ("he", ""), ("he", "IL"),
+    ("hi", ""), ("hi", "IN"),
+    ("hr", ""), ("hr", "HR"),
+    ("hu", ""), ("hu", "HU"),
+    ("id", ""), ("id", "ID"),
+    ("is", ""), ("is", "IS"),
+    ("it", ""), ("it", "CH"), ("it", "IT"),
+    ("ja", ""), ("ja", "JP"),
+    ("ko", ""), ("ko", "KR"),
+    ("lt", ""), ("lt", "LT"),
+    ("lv", ""), ("lv", "LV"),
+    ("mk", ""), ("mk", "MK"),
+    ("ms", ""), ("ms", "MY"),
+    ("mt", ""), ("mt", "MT"),
+    ("nl", ""), ("nl", "BE"), ("nl", "NL"),
+    ("no", ""), ("no", "NO"),
+    ("pl", ""), ("pl", "PL"),
+    ("pt", ""), ("pt", "BR"), ("pt", "PT"),
+    ("ro", ""), ("ro", "RO"),
+    ("ru", ""), ("ru", "RU"),
+    ("sk", ""), ("sk", "SK"),
+    ("sl", ""), ("sl", "SI"),
+    ("sq", ""), ("sq", "AL"),
+    ("sr", ""), ("sr", "BA"), ("sr", "CS"), ("sr", "ME"), ("sr", "RS"),
+    ("sv", ""), ("sv", "SE"),
+    ("th", ""), ("th", "TH"),
+    ("tr", ""), ("tr", "TR"),
+    ("uk", ""), ("uk", "UA"),
+    ("vi", ""), ("vi", "VN"),
+    ("zh", ""), ("zh", "CN"), ("zh", "HK"), ("zh", "SG"), ("zh", "TW"),
+];
+
+/// `java.util.Locale.getAvailableLocales()` — return a non-empty `Locale[]`.
+/// See [`AVAILABLE_LOCALES`] for the rationale (CratonVM has no CLDR data, so
+/// the real bytecode returns empty, breaking locale randomization).
+fn get_available_locales(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let cls = "java/util/Locale";
+    let locale_cid = ctx.ensure_class_initialized(cls)?;
+    let arr = ctx.new_ref_array(locale_cid, AVAILABLE_LOCALES.len());
+    for (i, (lang, country)) in AVAILABLE_LOCALES.iter().enumerate() {
+        let loc_obj = match ctx.new_object(cls) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => continue,
+        };
+        let l = ctx.create_string(lang);
+        let c = ctx.create_string(country);
+        let v = ctx.create_string("");
+        let _ = ctx.invoke(
+            cls,
+            "<init>",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            &[
+                Value::Object(Some(loc_obj)),
+                Value::Object(Some(l)),
+                Value::Object(Some(c)),
+                Value::Object(Some(v)),
+            ],
+        );
+        ctx.set_array_element(arr, i, Value::Object(Some(loc_obj)));
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
 pub fn register(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // java.util.Locale.getAvailableLocales() — CratonVM ships no CLDR data, so
+    // the real bytecode returns an empty array, breaking locale randomization
+    // (Lucene/ES `randomLocale()` → `nextInt(0)`). Provide the standard set.
+    registry.register(
+        "java/util/Locale",
+        "getAvailableLocales",
+        "()[Ljava/util/Locale;",
+        get_available_locales,
+    );
     // java.util.Locale.getDefault() — bypass the adapter chain.
     registry.register(
         "java/util/Locale",

@@ -1370,39 +1370,81 @@ impl<'a> NativeContextImpl<'a> {
         if tg_num_fields == 0 {
             return None;
         }
-        let tg = self.shared.heap.alloc_object(tg_class, tg_num_fields);
-        crate::runtime::interpreter::init_primitive_fields(self.shared, tg, tg_class);
-
-        // Use the `private ThreadGroup()` no-arg constructor: it is the
-        // one real-JDK uses to create the root "system" group before
-        // `VM.isBooted()` returns true.  That sidesteps the
-        // `synchronizedAddWeak`/`synchronizedAddStrong` NPE path the
-        // `(ThreadGroup, String, int, boolean)` ctor would take with a
-        // null parent.  Then overwrite `name` from "system" to "main"
-        // by directly writing the resolved slot.
+        // Build the root "system" group via the `private ThreadGroup()`
+        // no-arg constructor — the one real-JDK uses to create the root
+        // "system" group before `VM.isBooted()` returns true. It sidesteps
+        // the `synchronizedAddWeak`/`synchronizedAddStrong` NPE path the
+        // `(ThreadGroup, String, int, boolean)` ctor would take with a null
+        // parent, and leaves the group named "system".
+        let system_tg = self.shared.heap.alloc_object(tg_class, tg_num_fields);
+        crate::runtime::interpreter::init_primitive_fields(self.shared, system_tg, tg_class);
         invoke_on_class_shared(
             self.shared,
             self.thread,
             tg_class,
             "<init>",
             "()V",
-            &[Value::Object(Some(tg))],
+            &[Value::Object(Some(system_tg))],
         )
         .ok()?;
-        // Rename from "system" в†’ "main" so the VM's top-level group has
-        // the conventional name for `Thread.getThreadGroup().getName()`.
-        let name_slot = {
-            let cm = self.shared.class_manager.read();
-            resolve_field_index_in_hierarchy(tg_class, "name", &cm.class_store)
-        };
-        if let Some(slot) = name_slot {
-            let main_str = super::create_java_string(self.shared, "main");
-            self.shared
-                .heap
-                .set_field(tg, slot, Value::Object(Some(main_str)));
+
+        // Build the conventional "main" group as a CHILD of "system" via the
+        // public `ThreadGroup(ThreadGroup parent, String name)` constructor
+        // (parent is non-null here, so the `synchronizedAddWeak` NPE path is
+        // not taken). This mirrors HotSpot's `system <- main` hierarchy.
+        //
+        // Why the parent matters: the JDK's `InnocuousThread.createThreadGroup()`
+        // walks `group.getParent()` up to the ROOT and creates
+        // "InnocuousThreadGroup" as a child of that root. When "main" had no
+        // parent (was itself the root), the cleaner/innocuous group landed as a
+        // child of "main", so `ThreadGroup.enumerate(main, recurse=true)` —
+        // which is exactly what randomizedtesting's `ThreadLeakControl.getThreads`
+        // calls on the main thread group — swept up the JDK's `Common-Cleaner`
+        // and per-`Cleaner` `Cleaner-N` daemon threads and reported them as
+        // leaked/zombie in EVERY Elasticsearch `ESTestCase`. With "main" parented
+        // under "system", `InnocuousThreadGroup` becomes a SIBLING of "main"
+        // (child of "system"), invisible to `enumerate(main, …)` — matching
+        // HotSpot, where these cleaner threads never trip the leak detector.
+        let main_tg = self.shared.heap.alloc_object(tg_class, tg_num_fields);
+        crate::runtime::interpreter::init_primitive_fields(self.shared, main_tg, tg_class);
+        let main_str = super::create_java_string(self.shared, "main");
+        let ctor_ok = invoke_on_class_shared(
+            self.shared,
+            self.thread,
+            tg_class,
+            "<init>",
+            "(Ljava/lang/ThreadGroup;Ljava/lang/String;)V",
+            &[
+                Value::Object(Some(main_tg)),
+                Value::Object(Some(system_tg)),
+                Value::Object(Some(main_str)),
+            ],
+        )
+        .is_ok();
+        // Fallback: if the public ctor is unavailable, populate parent/name
+        // directly so the hierarchy (and thus InnocuousThreadGroup placement)
+        // is still correct.
+        if !ctor_ok {
+            let (parent_slot, name_slot) = {
+                let cm = self.shared.class_manager.read();
+                (
+                    resolve_field_index_in_hierarchy(tg_class, "parent", &cm.class_store),
+                    resolve_field_index_in_hierarchy(tg_class, "name", &cm.class_store),
+                )
+            };
+            if let Some(slot) = parent_slot {
+                self.shared
+                    .heap
+                    .set_field(main_tg, slot, Value::Object(Some(system_tg)));
+            }
+            if let Some(slot) = name_slot {
+                self.shared
+                    .heap
+                    .set_field(main_tg, slot, Value::Object(Some(main_str)));
+            }
         }
-        *self.shared.main_thread_group.write() = Some(tg);
-        Some(tg)
+        *self.shared.main_thread_group.write() = Some(main_tg);
+        Some(main_tg)
     }
 
     /// Seed `Thread.interruptLock` with a fresh `Object` if the slot is not

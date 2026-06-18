@@ -42,15 +42,58 @@ request.
 JDK-selector test (`scratch/eshang/NioConnectTest.java`) passes identically on HotSpot and CratonVM (live echo
 via `OP_CONNECT`/`finishConnect`/`OP_READ`; refused connect reported, no hang). native-io unit tests 8/8.
 
-## Residual 2 — still open (throughput; HTTP keep-alive lever)
+## Residual 2 — still open (throughput; HTTP keep-alive BLOCKED by a pool bug)
 
-The residual-1 connect fix improved this from a hard fail to ~90 % passing, but `testManyAsyncRequests` is
-still borderline against the 10 s latch at N≈1000 (full single-host suite ~9.6–11 s; occasional 17 s timeout).
-The robust fix remains **lever #1 below: HTTP keep-alive in the synthetic `com.sun.net.httpserver` server** so
-the Apache pool reuses ~10 connections instead of one connect/accept/close per request. That is an intricate
-rework of the accept→parse-thread→VM-dispatcher split (per-connection loop + a oneshot channel to hand the
-response back to the connection thread) and must be regression-checked against every consumer of the synthetic
-`HttpServer`. NOT attempted in this pass to avoid regressing the now-green ES tests. Detail unchanged below.
+The residual-1 connect fix improved this from a hard fail to ~70–90 % passing (N-dependent), but
+`testManyAsyncRequests` is still borderline against the 10 s latch at N≈1000 (full single-host suite
+~9.6–12 s; occasional 17 s+ timeout). The robust fix is HTTP keep-alive in the synthetic server.
+
+### Keep-alive WAS implemented and works server-side — but UNMASKS a separate VM bug (reverted)
+
+A **minimal, low-risk keep-alive** was prototyped and is the recommended approach (much simpler than the
+oneshot-channel rework originally sketched): the stream already flows
+`parse → request_queue → re10_dispatch_pending → re10_send_response`, so keep-alive just makes
+`re10_send_response` **re-arm a parser on the same socket** (read the next request and re-enqueue it) instead
+of closing — reusing all existing parse/dispatch code, no struct change, no oneshot channel. Two edits in
+`native-builtins/src/net_phase_e.rs`:
+1. `re10_dispatch_pending`: compute `keep_alive = !req-has-`Connection: close` && !HEAD`; emit
+   `Connection: keep-alive` (else `close`); pass `keep_alive` + `server_id` to `re10_send_response`.
+2. `re10_send_response(server_id, stream, resp, keep_alive)`: on `keep_alive`, after `write_all`+`flush`,
+   if the server is still running call `parse_http_request(stream)` and push the result back onto
+   `request_queue()[server_id]`; else do the existing lingering close. (`Connection` is in the test's
+   ignored-standard-headers set, so `keep-alive` is safe for `testHeaders`. Limitation: does not carry
+   pipelined bytes across requests — fine, the Apache pooled client waits for each response.)
+
+**Why it was reverted:** enabling keep-alive makes the Apache client actually POOL/RETAIN connections, which
+unmasks a **CratonVM null-`PoolEntry` bug** in the httpcore-nio connection pool. Every test then fails at
+teardown with:
+
+```
+java.lang.NullPointerException: Cannot invoke "org.apache.http.pool.PoolEntry.close()" because the receiver is null
+  at org.apache.http.nio.pool.AbstractNIOConnPool.shutdown   (PoolingNHttpClientConnectionManager.shutdown → CloseableHttpAsyncClientBase.close → test stopHttpServers)
+```
+
+`AbstractNIOConnPool.shutdown` iterates `available` (`java.util.LinkedList<PoolEntry>`) at bc pc=95 and
+`leased` (`java.util.Set<PoolEntry>`) at pc=133 calling `entry.close()`; the receiver is `null`, i.e. one of
+those collections yields a **null element** on iteration under CratonVM (a collection null-hole, NOT JIT —
+repros under `--nojit`). With `Connection: close` (current default) connections are never retained, so the
+pool stays small/empty and the bug never fires; keep-alive fills `available`/`leased` and trips it. Result:
+single-host suite regressed ~90 %→~0 % (10/13 fail + 280 leaked threads). Reverted in this session;
+`net_phase_e.rs` is back to `Connection: close`.
+
+### Next step to FINISH residual 2
+
+1. **Fix the null-`PoolEntry`** first. Repro: re-apply the 2 keep-alive edits above, run
+   `RestClientSingleHostIntegTests` — every test fails at teardown with the NPE. Find why a `null` enters the
+   pool's `available` LinkedList / `leased` Set (suspect a CratonVM `LinkedList`/`HashSet` add or iterator
+   null-hole, cf. the SB-10 LinkedList-overlay and ImplicitLinkedHashCollection null-hole bugs; `--nojit` so
+   not a JIT iterator miscompile). `CRATONVM_DBG_ATHROW=1` gives the 4-frame Java stack.
+2. **Re-apply keep-alive** (the 2 edits) once the pool bug is fixed; verify `testManyAsyncRequests` N≈1000
+   within the 10 s latch, ≥5 consecutive full-suite runs, and no regression to `testAsyncRequests` /
+   `testHeaders` / other `com.sun.net.httpserver` consumers.
+
+Alternative/secondary lever if keep-alive stays blocked: cut per-request interpreted cost in
+`re10_read_headers`/`re10_build_headers` (lever #2 below) — lower impact, may not clear the 10 s margin alone.
 
 ## How to run (per class)
 
