@@ -3503,7 +3503,25 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             mic_prof::bump(&mic_prof::MIC_HIT_ENTRY);
             let rc_opt = {
                 let _g = mic_prof::CycGuard::new(&mic_prof::CYC_HIT_ENTRY_CALL);
-                try_call_compiled_entry(entry as usize, needs_ctx, vm_ptr, args_slice)
+                // DEBUG-ONLY soundness: this MIC-hit fast path re-enters a compiled
+                // callee directly while THIS frame still holds its `_jit_thread_guard`
+                // (acquired above). If the callee makes its own JIT dispatch (e.g. an
+                // `invokeinterface` to a JIT'd `Consumer.accept` whose body reaches a
+                // helper taking `jit_thread_mut`), that inner borrow is a legitimate
+                // *child reborrow* — but the fast path never told the borrow tracker, so
+                // it tripped `jit_thread_mut`'s `debug_assert!` ("sibling fabrication").
+                // The interpreter/bail re-entry path suspends the flag via
+                // `set_jit_thread`; mirror just the flag half here. Release is unaffected
+                // (the flag and these fns are `#[cfg(debug_assertions)]`; the aliasing is
+                // the accepted nested-reborrow pattern). Repro: scratch `D2` — an
+                // anonymous `Consumer` driven through an `invokeinterface` loop — panicked
+                // here before this wrap; with it, `D2` matches HotSpot.
+                #[cfg(debug_assertions)]
+                let _borrow = suspend_jit_borrow();
+                let r = try_call_compiled_entry(entry as usize, needs_ctx, vm_ptr, args_slice);
+                #[cfg(debug_assertions)]
+                restore_jit_borrow(_borrow);
+                r
             };
             if let Some(rc) = rc_opt {
                 // BUG-H: if the receiver-resolved callee threw an implicit
