@@ -1798,4 +1798,133 @@ mod tests {
             "generated proxy must emit the interface method body",
         );
     }
+
+    // ── proxy-real-classfile increment 2 ─────────────────────────────────
+
+    /// Object-method routing parity (design §2/§4): a proxy constructed via
+    /// the real path must (a) carry the synthetic `Proxy$Instance` super
+    /// constructor the generated `<init>` delegates to — so executing it does
+    /// NOT raise `NoSuchMethodError` — and (b) route `hashCode()` /
+    /// `equals(Object)` / `toString()` through the `InvocationHandler`, i.e.
+    /// each is emitted as a dispatch shim that forwards to
+    /// `Proxy$Dispatch.invokeProxy` (which calls `handler.invoke(...)`),
+    /// matching the JDK generated proxy body rather than inheriting Object's
+    /// identity implementations.
+    #[test]
+    fn real_proxy_object_methods_route_through_handler_and_ctor_resolves() {
+        use crate::{ClassLoaderId, ClassManager, DefineClassOptions};
+        use cratonvm_reader::attribute::Attribute;
+
+        let mut cm = ClassManager::new(&[], &[], &[]);
+
+        // (a) Register the synthetic super exactly as
+        // `define_or_get_proxy_class` does. Increment 2 added the
+        // `Proxy$Instance.<init>(InvocationHandler, Class[])V` method entry to
+        // `synthetic_stub_ctor_methods`, so the stub's method table now
+        // carries the ctor the generated `$ProxyN.<init>` resolves against.
+        let super_id = cm.ensure_synthetic_class("java/lang/reflect/Proxy$Instance", 3);
+        cm.ensure_synthetic_class("pkg/Greeter", 0);
+        let super_cls = cm
+            .get_class(super_id)
+            .expect("synthetic Proxy$Instance must be registered");
+        assert!(
+            super_cls.methods.iter().any(|m| {
+                &*m.name == "<init>"
+                    && &*m.descriptor
+                        == "(Ljava/lang/reflect/InvocationHandler;[Ljava/lang/Class;)V"
+            }),
+            "the super ctor the generated <init> delegates to must resolve \
+             (no NoSuchMethodError when the generated <init> executes)",
+        );
+
+        // Define the real generated proxy through the normal loader, verified.
+        let spec = canonical_single_iface_spec();
+        let bytes = emit_proxy_classfile(&spec).expect("canonical proxy emit must succeed");
+        let opts = DefineClassOptions {
+            skip_verification: false,
+            ..Default::default()
+        };
+        let cid = cm
+            .define_class_with_options(
+                "com/sun/proxy/$Proxy0",
+                &bytes,
+                ClassLoaderId::Application,
+                opts,
+            )
+            .expect("real generated $ProxyN must define+verify");
+        let defined = cm.get_class(cid).expect("defined proxy retrievable");
+
+        // (b) hashCode / equals / toString are each emitted as concrete
+        // dispatch shims on the generated class (not inherited from Object).
+        for (name, desc) in [
+            ("hashCode", "()I"),
+            ("equals", "(Ljava/lang/Object;)Z"),
+            ("toString", "()Ljava/lang/String;"),
+        ] {
+            assert!(
+                defined
+                    .methods
+                    .iter()
+                    .any(|m| &*m.name == name && &*m.descriptor == desc),
+                "generated proxy must emit an Object-method dispatch shim for \
+                 {name}{desc} (JDK routes these through the handler)",
+            );
+        }
+
+        // Each Object-method shim routes through the handler-forwarding
+        // helper: its Code references `Proxy$Dispatch.invokeProxy`. We assert
+        // the methodref is present in the generated class's constant pool by
+        // re-reading the raw bytes (UTF-8 entries for owner + name), then
+        // confirm the shims actually carry a Code body (they would inherit
+        // Object's impl otherwise).
+        let cf = read_class(&bytes).expect("generated proxy must round-trip");
+        let cp = &cf.constant_pool;
+        let mut has_dispatch_owner = false;
+        let mut has_dispatch_name = false;
+        for idx in 1..(cp.len() as u16) {
+            if let Some(cratonvm_reader::constant_pool::ConstantPoolEntry::Utf8(s)) = cp.get(idx) {
+                match &**s {
+                    "java/lang/reflect/Proxy$Dispatch" => has_dispatch_owner = true,
+                    "invokeProxy" => has_dispatch_name = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            has_dispatch_owner && has_dispatch_name,
+            "generated proxy must reference Proxy$Dispatch.invokeProxy — the \
+             handler-forwarding helper the Object-method shims route through",
+        );
+
+        // The hashCode/equals/toString shims each have a non-empty Code body
+        // (a real dispatch shim), confirming they don't fall through to
+        // Object's inherited identity implementations.
+        let mut cf2 = read_class(&bytes).expect("generated proxy must round-trip");
+        let cp = &cf2.constant_pool;
+        for m in &mut cf2.methods {
+            for attr in &mut m.attributes {
+                let _ = attr.decode(cp);
+            }
+        }
+        for name in ["hashCode", "equals", "toString"] {
+            let m = cf2
+                .methods
+                .iter()
+                .find(|m| &*m.name == name)
+                .unwrap_or_else(|| panic!("{name} shim must be present"));
+            let code = m
+                .attributes
+                .iter()
+                .find_map(|a| match a.as_decoded() {
+                    Some(Attribute::Code(c)) => Some(c),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{name} shim must carry a Code body"));
+            assert!(
+                !code.code.is_empty(),
+                "{name} dispatch shim must have a non-empty body that forwards \
+                 to the handler, not inherit Object's identity impl",
+            );
+        }
+    }
 }
