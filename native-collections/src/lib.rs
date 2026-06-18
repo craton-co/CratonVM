@@ -2101,6 +2101,26 @@ fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "set", "(ILjava/lang/Object;)Ljava/lang/Object;", native_asl_set);
     r.register(c, "iterator", "()Ljava/util/Iterator;", native_asl_iterator);
     r.register(c, "toArray", "()[Ljava/lang/Object;", native_asl_to_array);
+    // toArray(T[]) / toArray(IntFunction) — delegate through a fresh snapshot
+    // ArrayList (which registers both overloads). Without these, a caller doing
+    // `subList(..).toArray(new X[0])` (e.g. the JUnit Platform launcher) hits a
+    // NoSuchMethodError on the synthetic ASL class and aborts.
+    r.register(c, "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;", |ctx, args| {
+        asl_delegate_snapshot(ctx, args, "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;")
+    });
+    r.register(
+        c,
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+        |ctx, args| {
+            asl_delegate_snapshot(
+                ctx,
+                args,
+                "toArray",
+                "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+            )
+        },
+    );
     r.register(c, "toString", "()Ljava/lang/String;", native_asl_to_string);
     // Remaining read methods delegate to a fresh snapshot ArrayList. Without
     // these, an interface-level `Collection`/`List` native would be reached
@@ -7255,7 +7275,20 @@ fn native_collections_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let (data, size) = al_state(ctx, list);
     let data = match data {
         Some(d) => d,
-        None => return Ok(None),
+        // Non-ArrayList list (LinkedList, CopyOnWriteArrayList, …): al_state
+        // can't read its backing array. Collections.sort(list) is defined as
+        // list.sort(null) in the JDK — delegate to the receiver's own sort
+        // bytecode (sort is native only on ArrayList, so this runs the real
+        // AbstractList.sort for everything else). Was a silent no-op (kcfull
+        // #17b sibling).
+        None => {
+            return ctx.invoke_virtual(
+                list,
+                "sort",
+                "(Ljava/util/Comparator;)V",
+                &[Value::Object(None)],
+            )
+        }
     };
     let len = size as usize;
     if len <= 1 {
@@ -7788,7 +7821,20 @@ fn sort_with_comparator(
     let (data, size) = al_state(ctx, list);
     let data = match data {
         Some(d) => d,
-        None => return Ok(None),
+        // Non-ArrayList list (LinkedList, CopyOnWriteArrayList, …): al_state
+        // can't read its backing array. Collections.sort(list, c) is defined as
+        // list.sort(c) in the JDK — delegate to the receiver's own sort
+        // bytecode (sort(Comparator) is native only on ArrayList, so this runs
+        // the real AbstractList.sort for everything else). Was a silent no-op
+        // (kcfull #17b: keycloak LDAPMappersComparatorTest sorts a LinkedList).
+        None => {
+            return ctx.invoke_virtual(
+                list,
+                "sort",
+                "(Ljava/util/Comparator;)V",
+                &[Value::Object(Some(comparator))],
+            )
+        }
     };
     let len = size as usize;
     if len <= 1 {
@@ -17529,9 +17575,10 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
         // (elementData, size). The generic field probes below misread it as a
         // 2-element array → `[null, <garbage>]`, dropping every element of
         // `new ArrayList<>(list.subList(..))` / `addAll(subList)` and crashing
-        // downstream when the garbage ref is dispatched (e.g. wild call through
-        // StringBuilder.append(Object) → EXCEPTION_ACCESS_VIOLATION). Read the
-        // real slice straight out of the parent's backing array instead.
+        // downstream when the garbage ref is dispatched (kcfull #17a: keycloak
+        // LDAPDn.getParentDn → LdapName.getPrefix/toString SIGSEGV; also a wild
+        // call through StringBuilder.append(Object) → EXCEPTION_ACCESS_VIOLATION).
+        // Read the real slice straight out of the parent's backing array instead.
         if cls_name == ASL_CLASS {
             if let Some((parent, offset, size, _expected)) = asl_state(ctx, coll) {
                 if size > 0 {

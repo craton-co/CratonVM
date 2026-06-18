@@ -619,6 +619,63 @@ pub fn register(r: &mut NativeMethodRegistry) {
         let same = !a_der.is_empty() && a_der == b_der;
         Ok(Some(Value::Int(if same { 1 } else { 0 })))
     });
+
+    // sun.security.x509.X500Name.asX500Principal() — kcfull #12.
+    //
+    // The real bytecode routes through
+    // `SharedSecrets.getJavaxSecurityAccess().asX500Principal(name)`, but CV
+    // never wires `JavaxSecurityAccess` (its registrar, `X500Principal.<clinit>`,
+    // doesn't run its `SharedSecrets.setJavaxSecurityAccess(..)` under our native
+    // interception), so the access is null → the `invokeinterface` NPEs →
+    // `X509CertImpl.getSubjectX500Principal()` / `getIssuerX500Principal()`
+    // silently return null (their `catch (Exception)`). That broke keycloak
+    // `TruststoreBuilder.setCertificateEntry`, whose
+    // `x509.getSubjectX500Principal().getName()` NPE'd while merging a PEM
+    // truststore. `getSubjectDN()` worked because it does not go through this
+    // path. Build the principal directly from the (real) Name's DER — the
+    // `X500Principal([B)` ctor above round-trips the canonical Name form; fall
+    // back to the RFC2253 string if the DER is unavailable.
+    r.register(
+        "sun/security/x509/X500Name",
+        "asX500Principal",
+        "()Ljavax/security/auth/x500/X500Principal;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            // Primary: DER round-trip from the real X500Name.
+            if let Ok(Some(Value::Object(Some(arr)))) =
+                ctx.invoke_virtual(this, "getEncoded", "()[B", &[])
+            {
+                if ctx.array_length(arr) > 0 {
+                    if let Ok(p) = ctx.new_object_initialized(
+                        "javax/security/auth/x500/X500Principal",
+                        "([B)V",
+                        &[Value::Object(Some(arr))],
+                    ) {
+                        return Ok(p);
+                    }
+                }
+            }
+            // Fallback: RFC2253 name string.
+            if let Ok(Some(Value::Object(Some(s)))) =
+                ctx.invoke_virtual(this, "getName", "()Ljava/lang/String;", &[])
+            {
+                if let Some(name) = ctx.read_string(s) {
+                    let ns = ctx.create_string(&name);
+                    if let Ok(p) = ctx.new_object_initialized(
+                        "javax/security/auth/x500/X500Principal",
+                        "(Ljava/lang/String;)V",
+                        &[Value::Object(Some(ns))],
+                    ) {
+                        return Ok(p);
+                    }
+                }
+            }
+            Ok(Some(Value::Object(None)))
+        },
+    );
 }
 
 #[cfg(test)]

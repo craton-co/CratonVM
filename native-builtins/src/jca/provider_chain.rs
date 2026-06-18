@@ -941,6 +941,41 @@ fn seed_sunjsse_services() {
     put_service(S, "CertPathBuilder", "PKIX", "sun.security.provider.certpath.SunCertPathBuilder");
 }
 
+/// Mirror the JDK's `XMLDSig` provider (`org.jcp.xml.dsig.internal.dom.XMLDSigRI`)
+/// JSR-105 service table so `XMLSignatureFactory.getInstance("DOM")` /
+/// `KeyInfoFactory.getInstance("DOM")` / `TransformService.getInstance(uri,"DOM")`
+/// resolve the real pure-Java DOM SPI classes. The JDK class registers these via
+/// `putService(Provider$Service)` (not the legacy `put`/`parseLegacyPut` we
+/// intercept), so without seeding, `Provider.getService("XMLSignatureFactory",
+/// "DOM")` returns null and `XMLSignatureFactory.getInstance("DOM")` throws
+/// `NoSuchMechanismException` (kcfull #01: keycloak SAML XMLSignatureUtil.<clinit>
+/// → ExceptionInInitializerError). Class names captured from
+/// `javap -p -c org.jcp.xml.dsig.internal.dom.XMLDSigRI$2` on JDK 25; each impl
+/// has the public no-arg ctor JCA requires, so `provider_service_new_instance`'s
+/// `new_object_initialized(cls,"()V")` runs the real DOM SPI bytecode.
+fn seed_xmldsig_services() {
+    const X: &str = "XMLDSig";
+    put_service(X, "XMLSignatureFactory", "DOM", "org.jcp.xml.dsig.internal.dom.DOMXMLSignatureFactory");
+    put_service(X, "KeyInfoFactory", "DOM", "org.jcp.xml.dsig.internal.dom.DOMKeyInfoFactory");
+    // TransformService entries (algorithm == the C14N/transform URI).
+    let ts: &[(&str, &str)] = &[
+        ("http://www.w3.org/TR/2001/REC-xml-c14n-20010315", "org.jcp.xml.dsig.internal.dom.DOMCanonicalXMLC14NMethod"),
+        ("http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments", "org.jcp.xml.dsig.internal.dom.DOMCanonicalXMLC14NMethod"),
+        ("http://www.w3.org/2006/12/xml-c14n11", "org.jcp.xml.dsig.internal.dom.DOMCanonicalXMLC14N11Method"),
+        ("http://www.w3.org/2006/12/xml-c14n11#WithComments", "org.jcp.xml.dsig.internal.dom.DOMCanonicalXMLC14N11Method"),
+        ("http://www.w3.org/2001/10/xml-exc-c14n#", "org.jcp.xml.dsig.internal.dom.DOMExcC14NMethod"),
+        ("http://www.w3.org/2001/10/xml-exc-c14n#WithComments", "org.jcp.xml.dsig.internal.dom.DOMExcC14NMethod"),
+        ("http://www.w3.org/2000/09/xmldsig#base64", "org.jcp.xml.dsig.internal.dom.DOMBase64Transform"),
+        ("http://www.w3.org/2000/09/xmldsig#enveloped-signature", "org.jcp.xml.dsig.internal.dom.DOMEnvelopedTransform"),
+        ("http://www.w3.org/2002/06/xmldsig-filter2", "org.jcp.xml.dsig.internal.dom.DOMXPathFilter2Transform"),
+        ("http://www.w3.org/TR/1999/REC-xpath-19991116", "org.jcp.xml.dsig.internal.dom.DOMXPathTransform"),
+        ("http://www.w3.org/TR/1999/REC-xslt-19991116", "org.jcp.xml.dsig.internal.dom.DOMXSLTTransform"),
+    ];
+    for (uri, cls) in ts {
+        put_service(X, "TransformService", uri, cls);
+    }
+}
+
 /// Internal API: register an alias (Alg.Alias.<type>.<alias> → canonical).
 fn put_alias(provider: &str, type_str: &str, alias: &str, canonical: &str) {
     let type_n = normalize_engine(type_str);
@@ -1660,6 +1695,10 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         // TrustManagerFactory / SSLContext / KeyStore) so the JSSE connector's
         // getInstance calls resolve real provider SPIs instead of dead-ending.
         seed_sunjsse_services();
+        // Mirror the XMLDSig provider's JSR-105 DOM service table so
+        // XMLSignatureFactory/KeyInfoFactory/TransformService.getInstance("DOM")
+        // resolve the real DOM SPIs (keycloak SAML XMLSignatureUtil.<clinit>).
+        seed_xmldsig_services();
         let gi = "sun/security/jca/GetInstance";
         r.register(
             gi,

@@ -848,10 +848,7 @@ unsafe fn route_implicit_exc_through_callee(
     if rc != i64::MIN {
         return rc;
     }
-    // Did the callee raise an *implicit* runtime exception? (A general
-    // `JIT_PENDING_EXCEPTION` comes from `athrow`, whose methods-with-tables are
-    // not compiled — see the `try_compile_inner` gate — so it never reaches a
-    // direct compiled call and needs no re-route here.)
+    // Did the callee raise an *implicit* runtime exception?
     let aioobe = take_jit_pending_aioobe();
     let npe = if aioobe.is_none() {
         take_jit_pending_npe()
@@ -870,6 +867,33 @@ unsafe fn route_implicit_exc_through_callee(
         rc
     };
     if aioobe.is_none() && !npe {
+        // KCFULL-13 — *general* pending exception (an explicit `athrow`, or a
+        // native-raised throwable, originating in this compiled callee's own
+        // callee chain). The original bug-H assumption — "methods-with-tables
+        // that `athrow` are never compiled, so a general `JIT_PENDING_EXCEPTION`
+        // can't reach a direct compiled call" — only holds for a method that
+        // throws *itself*. A method that merely *catches* (declares an
+        // exception table but contains no `athrow`) passes the `has_athrow`
+        // compile gate and IS compiled; yet the JIT still cannot dispatch to
+        // its in-method handler, so an exception propagating up from an
+        // (interpreted) sub-callee silently skips its `catch` and escapes to
+        // the outermost frame. Canonical victim: keycloak's
+        // `CryptoIntegration` chain — JIT'd `getSelectedProvider` wraps an
+        // interpreted `CryptoIntegration.getProvider()` (kept interpreted by
+        // the string-ldc gate) in `try { ... } catch (IllegalStateException)`,
+        // and the ISE escaped the catch under JIT.
+        //
+        // Mirror the implicit path: if the compiled callee declares a handler,
+        // re-execute it in the interpreter so its exception table runs. The
+        // interpreter re-run regenerates and routes the exception, so the
+        // stale stashed copy is dropped first to avoid a double-drain.
+        if jit_pending_exception_is_set() && callee_has_exception_table(vm, info) {
+            if let Some((thread, _guard)) = jit_thread_mut() {
+                let _ = take_jit_pending_exception();
+                let bail_args = decode_dispatch_values(vm, info, args_slice);
+                return bail_to_interpreter(vm, thread, info, &bail_args);
+            }
+        }
         return rc;
     }
     if !callee_has_exception_table(vm, info) {
