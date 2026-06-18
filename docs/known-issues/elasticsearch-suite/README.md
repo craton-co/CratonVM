@@ -8,6 +8,12 @@
 
 ---
 
+> **Getting `:server` tests to actually *pass*** is a multi-fix effort tracked in
+> [EPIC-server-suite-green.md](EPIC-server-suite-green.md) — every `ESTestCase`
+> hits an independent CratonVM gap at each layer of Lucene/randomizedtesting
+> suite setup. 4 layers fixed (ES-FAIL-04/05/06 + the dev ES-HANG-01); chain
+> continues.
+
 ## Distinct CratonVM defects
 
 | ID | Kind | Title | Status |
