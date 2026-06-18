@@ -737,6 +737,15 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
             }
         }
         let _ = st.init_epoll();
+        // Sticky wakeup (see the Windows path / selector_wakeup contract): a
+        // wakeup() that landed before this epoll_wait — or whose self-pipe write
+        // was lost — must still return immediately so a missed reactor-shutdown
+        // wakeup can't leave the worker blocked in epoll forever.
+        if st.woken {
+            st.woken = false;
+            st.drain_wakeup_pipe();
+            return Ok(0);
+        }
         let efd = match st.epoll_fd {
             Some(v) => v,
             None => return Err(ioex("Selector.select: epoll init failed")),
@@ -879,6 +888,19 @@ fn kernel_select_windows(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFail
 
         // Lazy-init wakeup pair (UDP loopback).
         let _ = st.init_wakeup_udp();
+
+        // Sticky wakeup: a wakeup() that arrived BEFORE we entered the kernel
+        // wait (or whose UDP nudge was dropped) must still make this select()
+        // return immediately — the contract documented on selector_wakeup()
+        // ("the woken flag still gets observed at top of select()"). Without
+        // this, a reactor's shutdown wakeup() could be missed, leaving the I/O
+        // worker blocked in WSAPoll forever: an uninterruptible RUNNABLE thread
+        // leaked at client teardown (ES RestClient ThreadLeakError).
+        if st.woken {
+            st.woken = false;
+            st.drain_wakeup_udp();
+            return Ok(0);
+        }
 
         let mut pollfds: Vec<Wsapollfd> = Vec::with_capacity(st.keys.len() + 1);
         let mut key_index: Vec<(i32, i32, bool)> = Vec::with_capacity(st.keys.len());
@@ -1060,6 +1082,13 @@ fn kernel_select_poll(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed>
         }
         st.keys.retain(|_, v| !v.cancelled);
         let _ = st.init_wakeup_udp();
+
+        // Sticky wakeup (see the Windows path / selector_wakeup contract).
+        if st.woken {
+            st.woken = false;
+            st.drain_wakeup_udp();
+            return Ok(0);
+        }
 
         let mut pollfds: Vec<libc::pollfd> = Vec::with_capacity(st.keys.len() + 1);
         let mut key_index: Vec<(i32, i32, bool)> = Vec::with_capacity(st.keys.len());
