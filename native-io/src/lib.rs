@@ -65,6 +65,8 @@ pub mod zip_real_jar;
 pub mod file_channel;
 // WP3.4 — non-blocking SocketChannel / ServerSocketChannel with EAGAIN semantics.
 pub mod socket_channel;
+// Real non-blocking TCP connect with a pollable OS fd (ES-HANG-02 residual 1).
+pub mod nb_connect;
 // WP3.2 — AsynchronousSocketChannel / AsynchronousServerSocketChannel + AsynchronousChannelGroup.
 pub mod async_socket;
 // Task #16 — SSRF outbound-policy hook + configurable connect timeout shared

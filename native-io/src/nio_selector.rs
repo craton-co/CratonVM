@@ -991,8 +991,8 @@ fn kernel_select_windows(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFail
             continue;
         };
         let revents = pfd.revents;
-        let in_ready =
-            revents & (WSAPOLLRDNORM | WSAPOLLHUP | WSAPOLLERR) != 0;
+        let err_ready = revents & (WSAPOLLHUP | WSAPOLLERR) != 0;
+        let in_ready = revents & WSAPOLLRDNORM != 0 || err_ready;
         let out_ready = revents & WSAPOLLWRNORM != 0;
         let mut ready = 0;
         if is_listener {
@@ -1006,7 +1006,13 @@ fn kernel_select_windows(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFail
             if out_ready && interest & OP_WRITE != 0 {
                 ready |= OP_WRITE;
             }
-            if out_ready && interest & OP_CONNECT != 0 {
+            // A non-blocking connect that FAILED signals via WSAPOLLERR /
+            // WSAPOLLHUP (the OS exceptfds set), not WSAPOLLWRNORM. Surface
+            // OP_CONNECT in that case too so the reactor calls finishConnect(),
+            // which reads SO_ERROR and reports the failure (onFailure / a
+            // ConnectException) instead of waiting for a readiness that the
+            // OS will never deliver on the writable set.
+            if (out_ready || err_ready) && interest & OP_CONNECT != 0 {
                 ready |= OP_CONNECT;
             }
         }
