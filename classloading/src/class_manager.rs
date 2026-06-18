@@ -3650,7 +3650,12 @@ impl ClassManager {
                     });
                 }
             }
-            // 4c — field set (counts, order, name+desc+modifiers).
+            // 4c — field set (counts + name+desc+modifiers as a SET). Like
+            // methods (4d), JVMTI matches fields by name+descriptor and is
+            // order-insensitive; fields are not swapped by redefine (the live
+            // instance layout is retained), so this is a pure equivalence
+            // check. Field (name, desc) pairs are unique within a class per
+            // JVMS §4.5.
             if new_class_file.fields.len() != existing_field_sigs.len() {
                 return Err(LinkageError::UnsupportedClassRedefinitionError {
                     class_name: existing_name.clone(),
@@ -3661,28 +3666,48 @@ impl ClassManager {
                     ),
                 });
             }
-            for (i, ((old_name, old_desc, old_flags), new_field)) in existing_field_sigs
+            let existing_field_map: FxHashMap<(&str, &str), u16> = existing_field_sigs
                 .iter()
-                .zip(new_class_file.fields.iter())
-                .enumerate()
-            {
+                .map(|(n, d, f)| ((n.as_str(), d.as_str()), *f))
+                .collect();
+            for new_field in &new_class_file.fields {
                 let new_name: &str = &new_field.name;
                 let new_desc: &str = &new_field.descriptor;
                 let new_flags = new_field.access_flags.bits();
-                if old_name != new_name
-                    || old_desc != new_desc
-                    || *old_flags != new_flags
-                {
-                    return Err(LinkageError::UnsupportedClassRedefinitionError {
-                        class_name: existing_name.clone(),
-                        message: format!(
-                            "field[{i}] changed: was {old_name}:{old_desc} flags={old_flags:#x} \
-                             now {new_name}:{new_desc} flags={new_flags:#x}",
-                        ),
-                    });
+                match existing_field_map.get(&(new_name, new_desc)) {
+                    None => {
+                        return Err(LinkageError::UnsupportedClassRedefinitionError {
+                            class_name: existing_name.clone(),
+                            message: format!(
+                                "field set changed: {new_name}:{new_desc} not present in the \
+                                 loaded class (JEP 109 forbids add/remove/rename)",
+                            ),
+                        });
+                    }
+                    Some(&old_flags) if old_flags != new_flags => {
+                        return Err(LinkageError::UnsupportedClassRedefinitionError {
+                            class_name: existing_name.clone(),
+                            message: format!(
+                                "field {new_name}:{new_desc} modifiers changed: was \
+                                 flags={old_flags:#x} now flags={new_flags:#x}",
+                            ),
+                        });
+                    }
+                    Some(_) => {}
                 }
             }
-            // 4d — method declarations (counts, order, name+desc+modifiers).
+            // 4d — method declarations (counts + name+desc+modifiers as a
+            // SET). JVMTI RedefineClasses/RetransformClasses matches methods
+            // by name+descriptor, NOT by position: a transformer is free to
+            // re-emit the method table in a different order (ByteBuddy's
+            // inline mock maker re-derives the class from its original bytes
+            // and routinely reorders constructors/methods). HotSpot accepts
+            // this; an order-sensitive check here spuriously rejects the
+            // redefine, the woven advice is never installed, and Mockito
+            // inline mocks of concrete classes silently fail to intercept.
+            // We therefore validate that the (name, descriptor, flags) MULTISET
+            // is identical and defer the actual body swap to a name+desc match
+            // that preserves the existing method order (see Step 5 below).
             if new_class_file.methods.len() != existing_method_sigs.len() {
                 return Err(LinkageError::UnsupportedClassRedefinitionError {
                     class_name: existing_name.clone(),
@@ -3693,27 +3718,42 @@ impl ClassManager {
                     ),
                 });
             }
-            for (i, ((old_name, old_desc, old_flags), new_method)) in existing_method_sigs
+            // Map existing (name, desc) -> flags. Method (name, desc) pairs are
+            // unique within a class per JVMS §4.5/§4.6, so a plain map is a
+            // faithful key set.
+            let existing_method_map: FxHashMap<(&str, &str), u16> = existing_method_sigs
                 .iter()
-                .zip(new_class_file.methods.iter())
-                .enumerate()
-            {
+                .map(|(n, d, f)| ((n.as_str(), d.as_str()), *f))
+                .collect();
+            for new_method in &new_class_file.methods {
                 let new_name: &str = &new_method.name;
                 let new_desc: &str = &new_method.descriptor;
                 let new_flags = new_method.access_flags.bits();
-                if old_name != new_name
-                    || old_desc != new_desc
-                    || *old_flags != new_flags
-                {
-                    return Err(LinkageError::UnsupportedClassRedefinitionError {
-                        class_name: existing_name.clone(),
-                        message: format!(
-                            "method[{i}] changed: was {old_name}{old_desc} flags={old_flags:#x} \
-                             now {new_name}{new_desc} flags={new_flags:#x}",
-                        ),
-                    });
+                match existing_method_map.get(&(new_name, new_desc)) {
+                    None => {
+                        return Err(LinkageError::UnsupportedClassRedefinitionError {
+                            class_name: existing_name.clone(),
+                            message: format!(
+                                "method set changed: {new_name}{new_desc} not present in the \
+                                 loaded class (JEP 109 forbids add/remove/rename)",
+                            ),
+                        });
+                    }
+                    Some(&old_flags) if old_flags != new_flags => {
+                        return Err(LinkageError::UnsupportedClassRedefinitionError {
+                            class_name: existing_name.clone(),
+                            message: format!(
+                                "method {new_name}{new_desc} modifiers changed: was \
+                                 flags={old_flags:#x} now flags={new_flags:#x}",
+                            ),
+                        });
+                    }
+                    Some(_) => {}
                 }
             }
+            // Counts are equal and every new (name, desc) maps to a distinct
+            // existing key (new keys are themselves unique), so the match is a
+            // bijection — no existing method is left unmatched.
         }
 
         // ---- Step 5: in-place swap ----
@@ -3758,7 +3798,49 @@ impl ClassManager {
             }
         }
 
-        let new_methods = new_class_file.methods;
+        // Reorder the incoming method bodies to match the EXISTING method
+        // order before the swap. The structural check (Step 4d) matches
+        // methods by (name, descriptor) as a set and tolerates reordering,
+        // but the live `Class.methods` vec is index-stable: vtable slots, the
+        // JIT's per-method compilation records, and the per-thread resolution
+        // caches all key off a method's position in this vec. Installing the
+        // transformer's (possibly reordered) vec verbatim would silently remap
+        // those indices and corrupt dispatch. Instead we rebuild the vec in
+        // the existing order, taking each existing method's replacement body
+        // by name+descriptor. `skip_structural_check` redefines (trusted
+        // hidden/proxy classes) keep the verbatim order — they have no stable
+        // vtable contract to honour.
+        let new_methods = if options.skip_structural_check {
+            new_class_file.methods
+        } else {
+            // Owned keys so `incoming` does not borrow `new_class_file.methods`
+            // (we move that vec below). This is the cold JVMTI redefine path.
+            let mut incoming: FxHashMap<(String, String), usize> = FxHashMap::default();
+            for (idx, m) in new_class_file.methods.iter().enumerate() {
+                incoming.insert((m.name.to_string(), m.descriptor.to_string()), idx);
+            }
+            // Resolve each existing method (in order) to its index in the
+            // incoming vec. Step 4d already proved this is a bijection, so
+            // every lookup succeeds; fall back defensively to identity order
+            // if some invariant is violated rather than panicking.
+            let order: Option<Vec<usize>> = existing_method_sigs
+                .iter()
+                .map(|(n, d, _)| incoming.get(&(n.clone(), d.clone())).copied())
+                .collect();
+            match order {
+                Some(order) => {
+                    // Permute `new_class_file.methods` into `order`. Move each
+                    // method out exactly once via `Option::take`.
+                    let mut slots: Vec<Option<_>> =
+                        new_class_file.methods.into_iter().map(Some).collect();
+                    order
+                        .into_iter()
+                        .map(|idx| slots[idx].take().expect("bijection guarantees one take"))
+                        .collect()
+                }
+                None => new_class_file.methods,
+            }
+        };
         let new_constant_pool = new_class_file.constant_pool;
         let new_attributes = new_class_file.attributes;
 
