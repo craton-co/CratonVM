@@ -19,6 +19,7 @@ pub mod value_stack;
 
 pub mod container;
 pub mod crash_handler;
+pub mod stwhang_watch;
 pub mod diagnostics;
 pub mod unified_logging;
 pub mod gc_integration;
