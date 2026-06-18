@@ -90,14 +90,14 @@ fn lenient_clinit() -> bool {
 /// their true origin instead of being hidden behind a stamped-`Initialized`
 /// class with null statics.
 fn clinit_swallow_has_recovery(class_name: &str) -> bool {
-    // real-cdi-bean-container increment 2 (Step 2, gated): under
-    // `CRATONVM_REAL_SPRING_STARTUP` the Spring `ApplicationStartup` startup-
-    // metrics subsystem runs its REAL bytecode, so its `<clinit>` must NOT be
-    // swallowed + backfilled by `post_clinit_fixup`. Drop it from the recovery
-    // allowlist when the gate is ON; any genuine `<clinit>` failure then
-    // surfaces per JVMS §5.5 instead of being masked by a synthetic `DEFAULT`.
-    // Default OFF: the arm below stays active so the working shimmed path is
-    // unchanged.
+    // real-cdi-bean-container increment 3 (Step 2 → default flip): the Spring
+    // `ApplicationStartup` startup-metrics subsystem now runs its REAL bytecode
+    // by DEFAULT, so its `<clinit>` must NOT be swallowed + backfilled by
+    // `post_clinit_fixup`. Drop it from the recovery allowlist unless the
+    // `CRATONVM_SYNTHETIC_SPRING_STARTUP` opt-out is active; any genuine
+    // `<clinit>` failure then surfaces per JVMS §5.5 instead of being masked by
+    // a synthetic `DEFAULT`. (Opt-out ON: the arm below stays active so the
+    // legacy shimmed path is unchanged.)
     if (class_name == "org/springframework/core/metrics/ApplicationStartup"
         || class_name == "org/springframework/core/metrics/DefaultApplicationStartup")
         && crate::runtime::env_cache::real_spring_startup()
@@ -2345,13 +2345,14 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
         // natively by spring_startup_bootstrap.rs so the object doesn't need
         // real field layout.
         "org/springframework/core/metrics/ApplicationStartup" => {
-            // real-cdi-bean-container increment 2 (Step 2, gated): under
-            // `CRATONVM_REAL_SPRING_STARTUP` the real `ApplicationStartup.<clinit>`
-            // runs and populates `DEFAULT` itself, so the synthetic backfill must
-            // NOT fire. (With the gate on, `clinit_swallow_has_recovery` already
-            // declines the swallow so this arm is normally unreachable for a
-            // failed `<clinit>`; the explicit guard keeps the fixup off even if a
-            // future caller invokes `post_clinit_fixup` for this class directly.)
+            // real-cdi-bean-container increment 3 (Step 2 → default flip): the
+            // real `ApplicationStartup.<clinit>` now runs by DEFAULT and
+            // populates `DEFAULT` itself, so the synthetic backfill must NOT fire
+            // unless the `CRATONVM_SYNTHETIC_SPRING_STARTUP` opt-out is active.
+            // (When real, `clinit_swallow_has_recovery` already declines the
+            // swallow so this arm is normally unreachable for a failed
+            // `<clinit>`; the explicit guard keeps the fixup off even if a future
+            // caller invokes `post_clinit_fixup` for this class directly.)
             if crate::runtime::env_cache::real_spring_startup() {
                 return;
             }

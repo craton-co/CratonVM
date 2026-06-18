@@ -145,10 +145,15 @@ fn get_out_of_bounds_throws_aioobe() {
             "expected AIOOBE(-1), got {err:?}");
 }
 
+// Backed-view class returned by `ArrayList.subList(int,int)` (fix item 6: a
+// view sharing the parent's backing array, NOT a detached copy). It carries its
+// own size/get/set natives; `size()`/`get()` on the returned object dispatch on
+// THIS class, not on ArrayList.
+const ASL: &str = "cratonvm/internal/ArrayListSubList";
+
 #[test]
 fn sublist_returns_a_smaller_list() {
-    // subList(fromIndex, toIndex) returns a new view (in our synthetic
-    // impl, a fresh ArrayList carrying the slice).
+    // subList(fromIndex, toIndex) returns a backed view over the parent slice.
     let reg = build_registry();
     let mut ctx = MockCtx::new();
     let al = new_arraylist(&reg, &mut ctx);
@@ -167,12 +172,13 @@ fn sublist_returns_a_smaller_list() {
         Some(Value::Object(Some(o))) => o,
         other => panic!("subList returned {:?}", other),
     };
-    let sub_size = call(&reg, &mut ctx, AL, "size", "()I",
+    // The view is an ArrayListSubList instance — query it via its own natives.
+    let sub_size = call(&reg, &mut ctx, ASL, "size", "()I",
                         &[Value::Object(Some(sub_obj))]).unwrap();
     assert_eq!(sub_size, Some(Value::Int(5)),
                "subList(2, 7) covers 5 elements");
 
-    let sub0 = call(&reg, &mut ctx, AL, "get", "(I)Ljava/lang/Object;",
+    let sub0 = call(&reg, &mut ctx, ASL, "get", "(I)Ljava/lang/Object;",
                     &[Value::Object(Some(sub_obj)), Value::Int(0)]).unwrap();
     assert_eq!(sub0, Some(vals[2]),
                "subList(2,7).get(0) is the original element at index 2");

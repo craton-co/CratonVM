@@ -3622,6 +3622,31 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
+    fn thread_run_state(&self, thread_obj: ObjectRef) -> u8 {
+        // Resolve the thread's registry id (synthetic stores it at field 2;
+        // real-JDK threads are looked up by object identity). The registry
+        // RETAINS dead threads' entries (mark_dead only flips `alive`), so a
+        // present-but-not-alive entry is TERMINATED, while a missing entry is a
+        // thread that was never started (NEW).
+        let tid = match self.shared.heap.get_field(thread_obj, 2) {
+            Value::Long(id) => Some(ThreadId(id as u64)),
+            _ => self
+                .shared
+                .thread_registry
+                .find_thread_id_by_thread_obj(thread_obj),
+        };
+        match tid {
+            None => 0, // NEW — never started
+            Some(id) => {
+                if self.shared.thread_registry.is_alive(id) {
+                    1 // RUNNABLE
+                } else {
+                    2 // TERMINATED
+                }
+            }
+        }
+    }
+
     fn current_thread_object(&mut self) -> ObjectRef {
         if let Some(obj) = self.thread.java_thread_obj {
             return obj;
@@ -9405,10 +9430,11 @@ fn invoke_on_class_shared_inner(
                         // null when ApplicationStartup.DEFAULT fails to initialize (nested-JAR
                         // classloading). Force the native that returns a no-op synthetic object.
                         //
-                        // real-cdi-bean-container increment 2 (Step 2, gated): under
-                        // `CRATONVM_REAL_SPRING_STARTUP` the no-op natives are not
-                        // registered and the real `ApplicationStartup.DEFAULT`
-                        // `<clinit>` runs, so do NOT force-shadow the real getter.
+                        // real-cdi-bean-container increment 3 (Step 2 → default flip):
+                        // by DEFAULT the no-op natives are not registered and the real
+                        // `ApplicationStartup.DEFAULT` `<clinit>` runs, so do NOT
+                        // force-shadow the real getter. Only the
+                        // `CRATONVM_SYNTHETIC_SPRING_STARTUP` opt-out re-enables this arm.
                         || (!crate::runtime::env_cache::real_spring_startup()
                             && matches!(
                                 class_name,
@@ -9447,11 +9473,12 @@ fn invoke_on_class_shared_inner(
                         // and StartupStep.tag/end. The real bytecode requires DefaultApplicationStartup
                         // which may not be loadable from nested JARs.
                         //
-                        // real-cdi-bean-container increment 2 (Step 2, gated): under
-                        // `CRATONVM_REAL_SPRING_STARTUP` the no-op startup-metrics
-                        // natives are not registered and the real
-                        // `DefaultApplicationStartup` / `DefaultStartupStep` bytecode
-                        // runs, so do NOT force-shadow those methods.
+                        // real-cdi-bean-container increment 3 (Step 2 → default flip):
+                        // by DEFAULT the no-op startup-metrics natives are not
+                        // registered and the real `DefaultApplicationStartup` /
+                        // `DefaultStartupStep` bytecode runs, so do NOT force-shadow
+                        // those methods. Only the `CRATONVM_SYNTHETIC_SPRING_STARTUP`
+                        // opt-out re-enables this arm.
                         || (!crate::runtime::env_cache::real_spring_startup()
                             && matches!(
                                 class_name,

@@ -87,9 +87,52 @@ per-framework native short-circuits by making the real container bytecode run.
 >   without the shim; the flag-OFF test (subprocess, env-isolated, skips if the
 >   binary is unbuilt) asserts the existing shim + swallow + fixup fallback still
 >   completes the probe.
-> - **Not yet done (deferred):** flipping the gate default to ON and deleting the
->   startup-metrics natives + the `post_clinit_fixup` ApplicationStartup arm (Step
->   3) — gated on validating the Spring Boot battery with the flag ON.
+> - **Superseded by Increment 3 (below):** flipping the gate default to the real
+>   path is now DONE; deleting the startup-metrics natives + the
+>   `post_clinit_fixup` ApplicationStartup arm outright (full Step 3) remains
+>   deferred until a Spring Boot **fat-jar** battery exists.
+
+> **Increment 3 (Step 2 → default flip) — LANDED (branch `feat/real-spring-startup-default`).**
+> Scope: make the real startup-metrics path the DEFAULT, retaining the no-op shim
+> only as an opt-out fallback. This removes the synthetic startup-metrics stub
+> from the common Spring path (the no-stubs-policy goal) without taking the
+> unvalidated risk of deleting the fat-jar fallback.
+>
+> - **Validation (the live suite the prior session lacked).** Ran the Spring Boot
+>   functional battery (`apps/spring-boot/cratonvm-suite`, real Spring Boot 4.0.6
+>   + Spring Framework 7.0.7 on jdk-25) three ways with one binary:
+>     - gate ON (`CRATONVM_REAL_SPRING_STARTUP=1`, pre-flip binary): **10/10
+>       scenarios, 95/95 checks == HotSpot**; the `ApplicationStartup` synthetic
+>       backfill never fired (logs show only BigInteger / PosixFilePermission
+>       post-clinit fixups), and S01_Context refresh output is byte-for-byte
+>       identical to HotSpot — so the real `ApplicationStartup.<clinit>` →
+>       `DefaultApplicationStartup` → `DefaultStartupStep` → `DefaultTags` chain
+>       ran on its own.
+>     - default, no env var (post-flip binary): **10/10 == HotSpot**, no backfill
+>       — the real path is now the default. It is also *faster*: S01 ≈3.3 s vs the
+>       shim's ≈6.2 s, since the force-override native overhead is gone.
+>     - opt-out (`CRATONVM_SYNTHETIC_SPRING_STARTUP=1`, post-flip binary): **10/10
+>       == HotSpot** — the legacy shim still works as a fallback.
+> - **The flip.** `crate::runtime::env_cache::real_spring_startup()` and its
+>   `native-builtins` twin now return `true` by DEFAULT; opt out with
+>   `CRATONVM_SYNTHETIC_SPRING_STARTUP=1` (legacy `CRATONVM_REAL_SPRING_STARTUP`
+>   still honored as a now-redundant explicit opt-in; wins if both are set).
+>   Mirrors the `CRATONVM_SYNTHETIC_AQS` opt-out precedent. The four use-sites
+>   (register-guard in `spring_startup_bootstrap.rs`, two `vm_exec.rs`
+>   `check_override` arms, `vm_util.rs` swallow allowlist + `post_clinit_fixup`
+>   arm) are logically unchanged — the semantics flip is centralized in the
+>   accessor. `vm/tests/nested_clinit_startup.rs` flag-OFF was updated to drive
+>   the shim via the new opt-out var.
+> - **Blast radius.** All four use-sites are guarded by Spring `core.metrics`
+>   class names, so only Spring apps are affected. Keycloak (Quarkus) is provably
+>   unaffected: its universal classpath carries **zero** spring-core jars, so it
+>   never loads `org.springframework.core.metrics.*`.
+> - **Still deferred (full Step 3 = outright deletion):** deleting the
+>   startup-metrics no-op natives + the `post_clinit_fixup` ApplicationStartup arm
+>   requires a Spring Boot **fat-jar** battery (nested-JAR classloading), which the
+>   exploded-classpath functional battery does not exercise. The fat-jar nested
+>   `<clinit>` *shape* is already pinned by `vm/tests/nested_clinit_startup.rs`,
+>   but an end-to-end fat-jar boot run is needed before removing the fallback.
 
 ## Goal
 

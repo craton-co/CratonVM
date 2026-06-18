@@ -418,13 +418,17 @@ pub fn strict_swallows() -> bool {
     })
 }
 
-// ── `CRATONVM_REAL_SPRING_STARTUP` — Spring startup-metrics real-path gate ──
+// ── Spring startup-metrics real-path: DEFAULT real, opt-out synthetic ──────
 
-/// `CRATONVM_REAL_SPRING_STARTUP` — opt-in gate (default OFF) that routes
-/// Spring's `org.springframework.core.metrics` startup-metrics subsystem to its
-/// **real** bytecode instead of the `spring_startup_bootstrap.rs` no-op shim.
+/// Whether Spring's `org.springframework.core.metrics` startup-metrics
+/// subsystem runs its **real** bytecode (now the default) rather than the
+/// `spring_startup_bootstrap.rs` no-op shim.
 ///
-/// real-cdi-bean-container increment 2 (Step 2). When this is set:
+/// real-cdi-bean-container increment 3 (Step 2 → default flip). The real path —
+/// validated 10/10 == HotSpot on the Spring Boot functional battery
+/// (`apps/spring-boot/cratonvm-suite`) and pinned by
+/// `vm/tests/nested_clinit_startup.rs` — is now the DEFAULT. When this returns
+/// `true` (the default):
 ///   * the no-op `getApplicationStartup` / `start` / `tag` / `end` / `getName` /
 ///     `getTags` / `getId` / `getParentId` natives are NOT registered (see
 ///     `native-builtins/src/lib.rs`), so the real `DefaultApplicationStartup` /
@@ -439,14 +443,22 @@ pub fn strict_swallows() -> bool {
 ///     surfaces per JVMS §5.5 instead of being backfilled with a synthetic
 ///     `DEFAULT`.
 ///
-/// **Default OFF**: when unset the existing swallow + `post_clinit_fixup`
-/// ApplicationStartup arm and the functional no-op natives remain the default
-/// behavior byte-for-byte, so the working Spring Boot path cannot regress.
-/// Cached once for the process lifetime.
+/// **Opt out** with `CRATONVM_SYNTHETIC_SPRING_STARTUP=1` to restore the legacy
+/// no-op shim + `<clinit>` swallow + `post_clinit_fixup` backfill — retained as
+/// a fallback for the Spring Boot fat-jar / nested-JAR path, which the exploded
+/// battery does not exercise (full deletion of the shim awaits a fat-jar
+/// battery). The historical explicit opt-in `CRATONVM_REAL_SPRING_STARTUP` is
+/// still accepted (now redundant) and wins if both are set. Mirrors the
+/// `CRATONVM_SYNTHETIC_AQS` opt-out precedent. Cached once for the process
+/// lifetime.
 #[inline]
 pub fn real_spring_startup() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_REAL_SPRING_STARTUP").is_some())
+    *CACHE.get_or_init(|| {
+        let synthetic = std::env::var_os("CRATONVM_SYNTHETIC_SPRING_STARTUP").is_some();
+        let force_real = std::env::var_os("CRATONVM_REAL_SPRING_STARTUP").is_some();
+        force_real || !synthetic
+    })
 }
 
 // ── `CRATONVM_REAL` — synthetic-stub differential switch ─────────────────

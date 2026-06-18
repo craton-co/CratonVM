@@ -163,10 +163,12 @@ fn cratonvm_binary() -> Option<PathBuf> {
     None
 }
 
-/// FLAG OFF — `CRATONVM_REAL_SPRING_STARTUP` unset: the existing default path
+/// OPT-OUT — `CRATONVM_SYNTHETIC_SPRING_STARTUP=1`: the legacy fallback path
 /// (no-op startup-metrics shim + lenient `<clinit>` swallow + `post_clinit_fixup`
-/// backfill) must still complete the probe. Driven as a subprocess so its
-/// environment is isolated from the in-process gate cache above.
+/// backfill) must still complete the probe. real-cdi-bean-container increment 3
+/// flipped the real path to the DEFAULT, so the shim is now reached only via
+/// this opt-out. Driven as a subprocess so its environment is isolated from the
+/// in-process gate cache above.
 ///
 /// Skips gracefully when the `cratonvm` binary has not been built (the
 /// orchestrator builds centrally) — matching `cluster_a_aqs_chm.rs`.
@@ -202,11 +204,13 @@ fn shimmed_startup_still_works_when_flag_off() {
         .arg("-c")
         .arg(&dir)
         .arg("cratonvm.NestedClinitStartup")
-        // Belt-and-suspenders: explicitly clear the gate so the default
-        // shimmed + swallow + fixup path is exercised even if the harness
-        // happened to export it.
+        // real-cdi-bean-container increment 3: the real startup-metrics path is
+        // now the DEFAULT, so opt OUT to the legacy shim with
+        // CRATONVM_SYNTHETIC_SPRING_STARTUP, and clear the (now-redundant) real
+        // opt-in so a stray export can't override the opt-out.
         .env_remove("CRATONVM_REAL_SPRING_STARTUP")
-        // The default Spring path relies on the lenient <clinit> swallow.
+        .env("CRATONVM_SYNTHETIC_SPRING_STARTUP", "1")
+        // The legacy shimmed Spring path relies on the lenient <clinit> swallow.
         .env("CRATONVM_LENIENT_CLINIT", "1")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
