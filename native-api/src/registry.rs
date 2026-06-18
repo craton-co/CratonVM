@@ -770,6 +770,12 @@ pub trait NativeContext {
     /// Set a system property. Returns the old value if any.
     fn set_system_property(&mut self, key: &str, value: &str) -> Option<String>;
 
+    /// Remove a system property from the global store. Returns the old value if
+    /// any. Default no-op (mock contexts have no live store); the VM overrides it.
+    fn remove_system_property(&mut self, _key: &str) -> Option<String> {
+        None
+    }
+
     /// Allocate an object with the given class_id and number of fields,
     /// without loading a class (for synthetic objects).
     fn alloc_object(&mut self, class_id: ClassId, num_fields: usize) -> ObjectRef;

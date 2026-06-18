@@ -1296,6 +1296,13 @@ fn native_properties_remove(
         return Ok(Some(Value::Object(None)));
     }
     let removed = remove_kv(ctx, this, &key);
+    // The system-properties view must propagate removal to the global store,
+    // mirroring how `setProperty`/`put` propagate writes — otherwise
+    // `System.getProperties().remove(k)` (keycloak ExportImportConfig.reset)
+    // leaves `System.getProperty(k)` returning the stale value.
+    if is_system_props(ctx, this) {
+        let _ = ctx.remove_system_property(&key);
+    }
     // Keep the real JDK `map` CHM backing in sync with the side-table: `put`/
     // `setProperty` mirror INTO it, so a `remove` that touched only the
     // side-table would let generic Map walkers (HashMap.putAll /
