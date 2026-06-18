@@ -876,7 +876,10 @@ pub fn decode_attribute_with_source_arc(
     let body_offset = range.start;
     let bytes = &source[range.clone()];
     let mut buf = ClassFileBuffer::new(bytes);
-    let attr = decode_attribute_body(name, bytes.len(), &mut buf, cp, source, body_offset)?;
+    // Top-level (per field/method/class) attribute decoding starts at depth 0;
+    // `decode_attribute_body` increments as it descends nested attribute tables
+    // and rejects past `MAX_ATTRIBUTE_DEPTH` (audit fix MED: nested-attribute DoS).
+    let attr = decode_attribute_body(name, bytes.len(), &mut buf, cp, source, body_offset, 0)?;
 
     // Enforce that the body parser consumed exactly `bytes.len()` bytes.
     // Anything else indicates a malformed attribute (over-read would have
@@ -895,10 +898,29 @@ pub fn decode_attribute_with_source_arc(
     Ok(attr)
 }
 
+/// Maximum nesting depth for the `decode_attribute_body` ⇄
+/// `decode_attributes_vec` (and `decode_code_body`) recursion. A crafted
+/// `.class` can nest a `Code` attribute inside a `Code` body, or a
+/// `Record` inside a `Record` component's attribute table, arbitrarily
+/// deep; without a cap that recursion overflows the native stack and
+/// aborts the process (a DoS on untrusted input). 64 far exceeds any
+/// attribute nesting a real compiler emits (a `Code` body holds leaf
+/// attributes like `LineNumberTable`/`StackMapTable`; legitimate
+/// `Record`/`Code` nesting is never more than one or two levels). Mirrors
+/// [`MAX_ANNOTATION_DEPTH`] used for the annotation/element-value recursion
+/// below.
+const MAX_ATTRIBUTE_DEPTH: usize = 64;
+
 /// Decode dispatch — switches on attribute name. Kept separate from
 /// [`decode_attribute_with_source`] so the post-parse length check lives
 /// in exactly one place. `length` is the total body length, needed by
 /// attributes that store raw bytes (`StackMapTable`, `Unknown`).
+///
+/// `depth` tracks how many nested attribute tables (`Code` → inner table,
+/// `Record` → component tables) we've descended through so far. It is
+/// checked against [`MAX_ATTRIBUTE_DEPTH`] before recursing to bound the
+/// stack on crafted self-nesting input. Top-level (per-field/method/class)
+/// attribute decoding starts at depth 0.
 ///
 /// `source` + `body_offset` together pin payload locations inside the
 /// shared class file buffer. **Invariant**: `body_offset` is the absolute
@@ -932,7 +954,21 @@ fn decode_attribute_body(
     cp: &ConstantPool,
     source: &Arc<[u8]>,
     body_offset: usize,
+    depth: usize,
 ) -> Result<Attribute, ClassReaderError> {
+    // Audit fix (MED): bound nested-attribute recursion. A crafted
+    // `.class` can self-nest `Code`-in-`Code` or `Record`-in-`Record`
+    // arbitrarily deep (the `Code`/`Record` arms below recurse through
+    // `decode_attributes_vec` back into this function). Without a cap that
+    // overflows the native stack — a stack-overflow DoS on untrusted
+    // input. Reject before recursing, mirroring `MAX_ANNOTATION_DEPTH`.
+    if depth >= MAX_ATTRIBUTE_DEPTH {
+        return Err(ClassReaderError::InvalidClassData {
+            message: format!(
+                "attribute '{name}' nesting depth exceeds limit {MAX_ATTRIBUTE_DEPTH}"
+            ),
+        });
+    }
     // Round 7 audit fix (MED #7): Arc-pointer-equality fast path
     // against canonical interned attribute names. Round-3 made the
     // constant pool intern every Utf8 into the global `intern_arc`
@@ -1021,7 +1057,7 @@ fn decode_attribute_body(
     };
 
     let attr = match dispatch_name {
-        "Code" => decode_code_body(buf, cp, source, body_offset)?,
+        "Code" => decode_code_body(buf, cp, source, body_offset, depth)?,
         "SourceFile" => {
             let source_file_index = buf.read_u16()?;
             // Fetch the interned `Arc<str>` straight from the constant pool —
@@ -1174,8 +1210,11 @@ fn decode_attribute_body(
                 // is the same buffer; absolute offsets are always
                 // `body_offset + buf.position()`. See the comment on
                 // [`decode_attribute_body`] for the invariant.
+                // Audit fix (MED): `depth + 1` — descending into a Record
+                // component's nested attribute table is one more level of
+                // nesting; bounds Record-in-Record self-nesting.
                 let comp_attributes =
-                    decode_attributes_vec(buf, cp, source, body_offset)?;
+                    decode_attributes_vec(buf, cp, source, body_offset, depth + 1)?;
                 components.push(RecordComponent {
                     name_index: comp_name_index,
                     descriptor_index: comp_descriptor_index,
@@ -1447,6 +1486,7 @@ fn decode_attributes_vec(
     cp: &ConstantPool,
     source: &Arc<[u8]>,
     outermost_body_offset: usize,
+    depth: usize,
 ) -> Result<Vec<Attribute>, ClassReaderError> {
     // INVARIANT (round-11 fix): `outermost_body_offset` is the absolute
     // offset in `source` that corresponds to *buf-position 0* — i.e. the
@@ -1496,8 +1536,12 @@ fn decode_attributes_vec(
         // payload's absolute offset as
         // `outermost_body_offset + buf.position()` exactly the same way
         // the top-level decoder does.
+        // Audit fix (MED): thread `depth` through unchanged — the caller
+        // already incremented it when descending into this nested table, so
+        // each nested body is decoded at that level. `decode_attribute_body`
+        // rejects once it exceeds `MAX_ATTRIBUTE_DEPTH`.
         let attr =
-            decode_attribute_body(&name, length, buf, cp, source, outermost_body_offset)?;
+            decode_attribute_body(&name, length, buf, cp, source, outermost_body_offset, depth)?;
         let consumed = buf.position() - start_pos;
         if consumed != length {
             return Err(ClassReaderError::InvalidClassData {
@@ -1529,6 +1573,7 @@ fn decode_code_body(
     cp: &ConstantPool,
     source: &Arc<[u8]>,
     body_offset: usize,
+    depth: usize,
 ) -> Result<Attribute, ClassReaderError> {
     let max_stack = buf.read_u16()?;
     let max_locals = buf.read_u16()?;
@@ -1585,7 +1630,9 @@ fn decode_code_body(
     // — see the invariant comment on [`decode_attributes_vec`]. The nested
     // decoder will compute absolute offsets as `body_offset + buf.position()`
     // exactly the same way this function does.
-    let attributes = decode_attributes_vec(buf, cp, source, body_offset)?;
+    // Audit fix (MED): `depth + 1` — the Code body's nested attribute
+    // table is one more level of nesting; bounds Code-in-Code self-nesting.
+    let attributes = decode_attributes_vec(buf, cp, source, body_offset, depth + 1)?;
 
     Ok(Attribute::Code(CodeAttribute {
         max_stack,
@@ -3283,6 +3330,113 @@ mod tests {
         assert!(
             res.is_err(),
             "malformed Code body must return Err, never panic",
+        );
+    }
+
+    /// Audit fix (MED) regression: a crafted `.class` can self-nest a
+    /// `Code` attribute inside a `Code` body's attribute table arbitrarily
+    /// deep. Before the `MAX_ATTRIBUTE_DEPTH` cap, decoding such a body
+    /// recursed `decode_attribute_body` → `decode_code_body` →
+    /// `decode_attributes_vec` → `decode_attribute_body` once per level and
+    /// overflowed the native stack (a DoS that aborts the whole process).
+    /// With the cap it must return a typed `InvalidClassData` error instead.
+    #[test]
+    fn deeply_nested_code_attribute_is_rejected() {
+        // CP: [0]=Tombstone, [1]=Utf8("Code")
+        let cp = ConstantPool::new(vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Utf8(cratonvm_types::intern_arc("Code")),
+        ]);
+
+        // Build a Code body whose attribute table holds exactly one nested
+        // attribute — another Code — recursively, `levels` deep. The
+        // innermost Code is a valid leaf with an empty attribute table.
+        //
+        // One Code body layout (JVMS §4.7.3):
+        //   max_stack(u2) max_locals(u2) code_length(u4) code(code_length)
+        //   exception_table_length(u2)=0 attributes_count(u2) <attrs…>
+        // A nested-attribute record is: name_index(u2) length(u4) body(length).
+        fn code_body(inner: Option<Vec<u8>>) -> Vec<u8> {
+            let mut b = Vec::<u8>::new();
+            b.extend_from_slice(&1u16.to_be_bytes()); // max_stack
+            b.extend_from_slice(&1u16.to_be_bytes()); // max_locals
+            b.extend_from_slice(&1u32.to_be_bytes()); // code_length = 1
+            b.push(0xB1); // code = [return]
+            b.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
+            match inner {
+                Some(nested) => {
+                    b.extend_from_slice(&1u16.to_be_bytes()); // attributes_count = 1
+                    b.extend_from_slice(&1u16.to_be_bytes()); // name_index -> "Code"
+                    b.extend_from_slice(&(nested.len() as u32).to_be_bytes()); // length
+                    b.extend_from_slice(&nested); // nested Code body
+                }
+                None => {
+                    b.extend_from_slice(&0u16.to_be_bytes()); // attributes_count = 0
+                }
+            }
+            b
+        }
+
+        // 200 levels — comfortably above MAX_ATTRIBUTE_DEPTH (64) and small
+        // enough that *building* the bytes here does not itself overflow.
+        let mut body = code_body(None);
+        for _ in 0..200 {
+            body = code_body(Some(body));
+        }
+
+        let source: Arc<[u8]> = Arc::from(body.as_slice());
+        let res = decode_attribute_with_source("Code", &source, 0..source.len(), &cp);
+        assert!(
+            matches!(res, Err(ClassReaderError::InvalidClassData { .. })),
+            "deeply self-nested Code must be rejected with InvalidClassData, got {res:?}",
+        );
+    }
+
+    /// Audit fix (MED) regression: the same self-nesting DoS via `Record`.
+    /// A `Record` component's attribute table can hold a nested `Record`,
+    /// recursively. Verify the depth cap rejects it.
+    #[test]
+    fn deeply_nested_record_attribute_is_rejected() {
+        // CP: [0]=Tombstone, [1]=Utf8("Record")
+        let cp = ConstantPool::new(vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Utf8(cratonvm_types::intern_arc("Record")),
+        ]);
+
+        // One Record body layout (JVMS §4.7.30):
+        //   components_count(u2) then per component:
+        //     name_index(u2) descriptor_index(u2)
+        //     attributes_count(u2) <attrs…>
+        // A nested-attribute record is: name_index(u2) length(u4) body(length).
+        fn record_body(inner: Option<Vec<u8>>) -> Vec<u8> {
+            let mut b = Vec::<u8>::new();
+            b.extend_from_slice(&1u16.to_be_bytes()); // components_count = 1
+            b.extend_from_slice(&0u16.to_be_bytes()); // component name_index
+            b.extend_from_slice(&0u16.to_be_bytes()); // component descriptor_index
+            match inner {
+                Some(nested) => {
+                    b.extend_from_slice(&1u16.to_be_bytes()); // attributes_count = 1
+                    b.extend_from_slice(&1u16.to_be_bytes()); // name_index -> "Record"
+                    b.extend_from_slice(&(nested.len() as u32).to_be_bytes()); // length
+                    b.extend_from_slice(&nested); // nested Record body
+                }
+                None => {
+                    b.extend_from_slice(&0u16.to_be_bytes()); // attributes_count = 0
+                }
+            }
+            b
+        }
+
+        let mut body = record_body(None);
+        for _ in 0..200 {
+            body = record_body(Some(body));
+        }
+
+        let source: Arc<[u8]> = Arc::from(body.as_slice());
+        let res = decode_attribute_with_source("Record", &source, 0..source.len(), &cp);
+        assert!(
+            matches!(res, Err(ClassReaderError::InvalidClassData { .. })),
+            "deeply self-nested Record must be rejected with InvalidClassData, got {res:?}",
         );
     }
 }

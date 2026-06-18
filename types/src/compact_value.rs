@@ -535,6 +535,17 @@ impl CompactValue {
     // -- Accessors -----------------------------------------------------------
 
     /// Extract an i32 if this value is tagged as Int.
+    ///
+    /// Returns `None` for a SUB_INT *bit-pattern* whose payload has any bit at
+    /// position 32..46 set: `CompactValue::int` only ever stores a 32-bit
+    /// payload (`v as u32 as u64`), so such a slot cannot be a genuine int —
+    /// it is a primitive `long` whose verbatim bits collided into the SUB_INT
+    /// sub-tag space (BC safegcd `0xFFFC_…` accumulators). Returning a
+    /// truncated low-32-bits `i32` would silently corrupt that long, so we
+    /// decline. This mirrors the SUB_INT collision guard now applied by
+    /// [`to_value`](Self::to_value) and matches
+    /// [`int_tag_collision_long`](Self::int_tag_collision_long), which exposes
+    /// the i64 value for exactly these slots.
     #[inline]
     pub fn as_int(&self) -> Option<i32> {
         if !is_nan_tagged(self.0) {
@@ -543,8 +554,15 @@ impl CompactValue {
         if self.subtag() != SUB_INT {
             return None;
         }
+        let payload = self.0 & PAYLOAD_MASK;
+        // SUB_INT long-collision guard (MEDIUM, 2026-06-17): a real int has
+        // payload < 2^32; a payload with bits 32..46 set is a colliding long,
+        // not an int — return None rather than a truncated value.
+        if payload >> 32 != 0 {
+            return None;
+        }
         // Payload is the zero-extended u32; reinterpret as i32.
-        Some((self.0 & PAYLOAD_MASK) as u32 as i32)
+        Some(payload as u32 as i32)
     }
 
     /// Extract an i64.
@@ -837,8 +855,34 @@ impl CompactValue {
         }
         let payload = self.0 & PAYLOAD_MASK;
         match (self.0 >> SUBTAG_SHIFT) & SUBTAG_MASK {
-            SUB_INT => Value::Int(payload as u32 as i32),
-            SUB_FLOAT => Value::Float(f32::from_bits(payload as u32)),
+            // SUB_INT/SUB_FLOAT long-collision guard (MEDIUM, 2026-06-17):
+            // `CompactValue::int`/`float` only ever store a 32-bit payload
+            // (`v as u32 as u64` / `v.to_bits() as u64`), so a genuine int or
+            // float always has payload bits 32-46 clear. A SUB_INT/SUB_FLOAT
+            // bit pattern whose payload has any bit at position 32..46 set
+            // (`payload >> 32 != 0`) cannot be a real int/float — it is a
+            // primitive `long` whose verbatim bits (CompactValue::long stores
+            // them unmodified) collided into the SUB_INT/SUB_FLOAT sub-tag
+            // space. Without this guard `to_value()` would `payload as u32`
+            // and silently truncate such a long to its low 32 bits. Mirror the
+            // identical discrimination already applied by
+            // `decode_by_descriptor(b'J')` / `int_tag_collision_long` and by
+            // the SUB_NULL/SUB_UNINIT/SUB_RETADDR collision arms below:
+            // preserve the long bit-exact instead of truncating.
+            SUB_INT => {
+                if payload >> 32 == 0 {
+                    Value::Int(payload as u32 as i32)
+                } else {
+                    Value::Long(self.0 as i64)
+                }
+            }
+            SUB_FLOAT => {
+                if payload >> 32 == 0 {
+                    Value::Float(f32::from_bits(payload as u32))
+                } else {
+                    Value::Long(self.0 as i64)
+                }
+            }
             SUB_OBJECT => {
                 // BC SM2 fix (2026-05-28): `CompactValue::long` now stores
                 // long bits verbatim, so a slot with NaN-tagged bits and
@@ -1605,6 +1649,53 @@ mod tests {
         // Residual ambiguous case: payload < 2^32 with SUB_INT pattern is
         // indistinguishable from a real int → None (documented limitation).
         assert_eq!(CompactValue::long(NANBOX as i64).int_tag_collision_long(), None);
+    }
+
+    /// MEDIUM (2026-06-17): `to_value()` / `as_int()` SUB_INT/SUB_FLOAT
+    /// long-collision guard. A primitive long whose verbatim bits collide
+    /// into the SUB_INT/SUB_FLOAT sub-tag space with payload bits 32..46 set
+    /// must NOT be truncated to a 32-bit Int/Float — it must be preserved
+    /// bit-exact as `Value::Long`, and `as_int()` must decline it.
+    #[test]
+    fn to_value_int_float_collision_preserves_long() {
+        // Genuine ints / floats (32-bit payload) still decode normally and
+        // round-trip via as_int / as_float.
+        for n in [0i32, 1, -1, 42, i32::MIN, i32::MAX] {
+            let cv = CompactValue::int(n);
+            assert_eq!(cv.to_value(), Value::Int(n), "real int {n}");
+            assert_eq!(cv.as_int(), Some(n), "as_int real int {n}");
+        }
+        for f in [0.0f32, 1.5, -3.25, f32::MAX] {
+            assert_eq!(CompactValue::float(f).to_value(), Value::Float(f), "real float {f}");
+        }
+
+        // Colliding longs: SUB_INT / SUB_FLOAT sub-tag with payload bits
+        // 32..46 set. These cannot be real int/float slots, so to_value()
+        // must preserve the full i64 bit pattern (not truncate to 32 bits),
+        // and as_int() must return None for the SUB_INT case.
+        for &low in &[1u64 << 32, 0x7FFF_FFFF_FFFF, 0x1_ABCD_1234, 0x5555_5555_5555] {
+            if low >> 32 == 0 {
+                continue; // not actually a collision payload
+            }
+            for &sub in &[SUB_INT, SUB_FLOAT] {
+                let v = collide_with_subtag(sub, low);
+                let cv = CompactValue::long(v);
+                assert_eq!(
+                    cv.to_value(),
+                    Value::Long(v),
+                    "collision long must be preserved bit-exact (sub={sub}, low={low:#x})",
+                );
+                // as_int must decline a SUB_INT-patterned collision long
+                // rather than hand back a truncated low-32-bits int.
+                if sub == SUB_INT {
+                    assert_eq!(
+                        cv.as_int(),
+                        None,
+                        "as_int must decline SUB_INT collision long (low={low:#x})",
+                    );
+                }
+            }
+        }
     }
 
     // -- Float round-trips ---------------------------------------------------
