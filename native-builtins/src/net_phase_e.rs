@@ -5463,6 +5463,22 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
             let ni_cid = ctx
                 .class_id_by_name("java/net/NetworkInterface")
                 .unwrap_or(ClassId::new(0));
+            // The package-private `(String,int,InetAddress[])` ctor leaves the
+            // `childs` field null — the real JDK's native `getAll0` is what
+            // populates it. `NetworkInterface.getSubInterfaces()` returns an
+            // anonymous Enumeration whose `hasMoreElements()` reads
+            // `childs.length`, so a null `childs` throws
+            // `NullPointerException: arraylength null` (NetworkInterface$1).
+            // That kills `NetworkUtils.<clinit>` (its `addAllInterfaces`
+            // recursion calls `Collections.list(intf.getSubInterfaces())`) with
+            // an ExceptionInInitializerError in every Elasticsearch ESTestCase
+            // that touches networking. Set an empty `NetworkInterface[]` so
+            // sub-interface enumeration yields zero elements (a loopback
+            // interface has no sub-interfaces). Done before allocating `arr` so
+            // `empty_childs` stays GC-rooted via `iface.childs`.
+            let empty_childs = ctx.new_ref_array(ni_cid, 0);
+            let iface = ctx.read_native_pin(iface_pin, iface);
+            ctx.set_field_by_name(iface, "childs", Value::Object(Some(empty_childs)));
             let arr = ctx.new_ref_array(ni_cid, 1);
             let iface = ctx.read_native_pin(iface_pin, iface);
             ctx.set_array_element(arr, 0, Value::Object(Some(iface)));
