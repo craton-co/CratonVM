@@ -243,10 +243,14 @@ pub fn execute_invokedynamic(
     } else if info.bsm_class == OBJECT_METHODS && info.bsm_method == BOOTSTRAP {
         bootstrap_record_object_method(shared, thread, frame_idx, cp_index, &info)
     } else {
-        // Graceful fallback for unrecognized bootstrap methods: pop the expected
-        // arguments from the operand stack (based on the invokedynamic descriptor)
-        // and push a null result. This prevents stack corruption that would otherwise
-        // cascade into stack underflow errors in <clinit> and other callers.
+        // Unrecognized bootstrap method. JVMS §5.4.3.6 / §6.5 (invokedynamic)
+        // require that a bootstrap method which cannot produce a usable CallSite
+        // raises `java.lang.BootstrapMethodError`. Previously this path popped the
+        // descriptor arguments and pushed a silent null/zero default, which kept
+        // the operand stack balanced but corrupted the *calling* method with a
+        // wrong value (a bogus null String, a 0 int, etc.) that then flows into
+        // arbitrary downstream logic — a silent-wrong-result that is far worse to
+        // diagnose than a loud failure. Fail loud instead.
         let nat_str = format!("{}{}", info.target_name, info.target_descriptor);
         let caller = {
             let f = &thread.frames[frame_idx];
@@ -261,61 +265,48 @@ pub fn execute_invokedynamic(
                 info.bsm_class, info.bsm_method, nat_str, caller
             ),
         );
-        fallback_unrecognized_bsm(shared, thread, frame_idx, &info)
+        raise_bootstrap_method_error(shared, thread, &info, &caller)
     }
 }
 
-/// Graceful fallback for unrecognized bootstrap methods.
+/// Raise `java.lang.BootstrapMethodError` for a bootstrap method outside the
+/// supported set (StringConcatFactory, LambdaMetafactory, SwitchBootstraps,
+/// ObjectMethods).
 ///
-/// Pops the expected arguments from the operand stack (based on the invokedynamic
-/// descriptor) and pushes an appropriate default result. For reference return types
-/// this is `null`; for primitives, the zero value. This prevents stack corruption
-/// that would otherwise cascade into stack underflow errors.
-fn fallback_unrecognized_bsm(
-    _shared: &SharedVm,
+/// Per JVMS §5.4.3.6, when the bootstrap method invocation completes
+/// abnormally (here: it is not implemented), the linkage of the `invokedynamic`
+/// instruction throws `BootstrapMethodError` carrying the original failure as
+/// its cause. We do not have a Java `Throwable` cause to wrap, so the detail
+/// message identifies the offending bootstrap method and call site. This is a
+/// loud, catchable error — callers that wrap `invokedynamic` in
+/// `catch (Throwable)` / `catch (Error)` observe it normally — instead of a
+/// silent wrong value that corrupts the caller's computation.
+#[cold]
+fn raise_bootstrap_method_error(
+    shared: &SharedVm,
     thread: &mut JvmThread,
-    frame_idx: usize,
     info: &IndyInfo,
+    caller: &str,
 ) -> Result<(), MethodCallFailed> {
-    let arg_types = parse_descriptor_args(&info.target_descriptor);
-
-    // Pop all arguments that the caller pushed for this invokedynamic
-    for _ in 0..arg_types.len() {
-        let _ = thread.frames[frame_idx].stack.pop()?;
+    let msg = format!(
+        "unsupported bootstrap method {}.{} for call site {}{} at {}",
+        info.bsm_class, info.bsm_method, info.target_name, info.target_descriptor, caller
+    );
+    match crate::runtime::exceptions::create_exception_object(
+        shared,
+        thread,
+        "java/lang/BootstrapMethodError",
+        Some(&msg),
+    ) {
+        Ok(obj_ref) => Err(MethodCallFailed::ExceptionThrown(obj_ref)),
+        // If we cannot even construct the Java error object (e.g. rt.jar absent),
+        // surface a loud internal error rather than falling back to a silent
+        // null/zero push — the whole point of this path is to never return a
+        // wrong value to the caller.
+        Err(_) => Err(MethodCallFailed::InternalError(VmError::Internal {
+            message: msg,
+        })),
     }
-
-    // Determine return type and push appropriate default
-    let ret_type = info
-        .target_descriptor
-        .rsplit(')')
-        .next()
-        .unwrap_or("V");
-
-    match ret_type.as_bytes().first() {
-        Some(b'V') | None => {
-            // void — push nothing
-        }
-        Some(b'I') | Some(b'B') | Some(b'C') | Some(b'S') | Some(b'Z') => {
-            thread.frames[frame_idx].stack.push(Value::Int(0))?;
-        }
-        Some(b'J') => {
-            thread.frames[frame_idx].stack.push(Value::Long(0))?;
-        }
-        Some(b'F') => {
-            thread.frames[frame_idx].stack.push(Value::Float(0.0))?;
-        }
-        Some(b'D') => {
-            thread.frames[frame_idx].stack.push(Value::Double(0.0))?;
-        }
-        _ => {
-            // Reference type (L...; or [...) — push null
-            thread.frames[frame_idx]
-                .stack
-                .push(Value::Object(None))?;
-        }
-    }
-
-    Ok(())
 }
 
 /// Execute a previously cached call site (fast path).
@@ -643,6 +634,33 @@ fn execute_string_concat(
     }
     arg_values.reverse();
 
+    // GC-root safety: the reference-typed args now live only in the Rust
+    // `arg_values` Vec — they are no longer on the (scanned) operand stack.
+    // `value_to_string` invokes each object's `toString()` (real Java bytecode),
+    // which is a safepoint and can trigger a young GC that *moves* the heap.
+    // After a move, the raw `ObjectRef`s captured in `arg_values` are stale: a
+    // later iteration would read a wrong/garbage object (e.g. concatenating two
+    // non-String objects, where the first `toString()` relocates the second
+    // arg). Pin every object arg in `thread.native_pin_roots`, which the
+    // collector both scans as a root and forwards in place (see memory/gc.rs and
+    // memory/roots.rs). We then re-read the up-to-date address from the pin slot
+    // immediately before each `toString()` call. Mirrors the push/re-read/
+    // truncate idiom used by the native-call and `new`/`<init>` paths in
+    // vm/vm_exec.rs.
+    let pin_base = thread.native_pin_roots.len();
+    // arg index -> pin slot index (only present for non-null object args).
+    let mut arg_pin: Vec<Option<usize>> = Vec::with_capacity(arg_values.len());
+    for v in &arg_values {
+        match v {
+            Value::Object(Some(obj_ref)) => {
+                let slot = thread.native_pin_roots.len();
+                thread.native_pin_roots.push(*obj_ref);
+                arg_pin.push(Some(slot));
+            }
+            _ => arg_pin.push(None),
+        }
+    }
+
     // Walk the recipe and build the result string
     let mut result = String::new();
     let mut arg_idx = 0;
@@ -653,7 +671,23 @@ fn execute_string_concat(
             // Argument placeholder
             if arg_idx < arg_values.len() {
                 let arg_type = arg_types.get(arg_idx).copied().unwrap_or('L');
-                let s = value_to_string(shared, Some(thread), &arg_values[arg_idx], arg_type);
+                // Re-read the (possibly forwarded) object reference from its pin
+                // slot so a GC move during a prior `toString()` doesn't leave us
+                // formatting a stale pointer. Non-object args keep their value.
+                let arg_val = match arg_pin.get(arg_idx).copied().flatten() {
+                    Some(slot) => Value::Object(Some(
+                        thread
+                            .native_pin_roots
+                            .get(slot)
+                            .copied()
+                            .unwrap_or_else(|| match arg_values[arg_idx] {
+                                Value::Object(Some(o)) => o,
+                                _ => unreachable!("pinned slot maps to a non-object arg"),
+                            }),
+                    )),
+                    None => arg_values[arg_idx],
+                };
+                let s = value_to_string(shared, Some(thread), &arg_val, arg_type);
                 result.push_str(&s);
                 arg_idx += 1;
             }
@@ -667,6 +701,12 @@ fn execute_string_concat(
             result.push(ch);
         }
     }
+
+    // All `toString()` safepoints are behind us — the concatenated text is now
+    // plain Rust data. Release the temporary GC pins (no early `?` returns
+    // occurred between `pin_base` and here, so a single truncate restores the
+    // root set exactly).
+    thread.native_pin_roots.truncate(pin_base);
 
     // `StringConcatFactory` (the `"a" + b` bytecode shape) produces a brand
     // new String per the JVM spec — it must NOT be interned, otherwise `==`

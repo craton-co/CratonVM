@@ -784,6 +784,15 @@ fn resolve_field_index_in_hierarchy(
 /// The `None` return is the signal for the caller to fall back to the
 /// legacy descriptor-unaware heap access вЂ” see `NativeContextImpl::get_field`.
 ///
+/// Memoization: positive results cache the descriptor first byte. CONFIRMED
+/// misses (a fully-walked real, non-stub hierarchy whose slot has no
+/// descriptor) cache the reserved `0u8` (NUL) sentinel — NUL is never a valid
+/// descriptor first byte — so repeated lookups short-circuit instead of
+/// re-walking the hierarchy on every miss. TRANSIENT misses (unloaded
+/// class/ancestor, or a synthetic stub that may be promoted) are NOT cached.
+/// `NativeContextImpl::redefine_class` clears the cache as a conservative
+/// guard, though JVMTI redefinition is required to preserve field layout.
+///
 /// Concurrency: the cache write is guarded by `field_descriptor_cache`'s
 /// own `RwLock`; we take a read-first fast path so the hot case (cache
 /// hit) is lock-free beyond the shared read lock.
@@ -793,10 +802,21 @@ fn resolve_field_descriptor_byte_cached(
     slot_index: usize,
 ) -> Option<u8> {
     // Fast path: read lock, hash lookup, early return on hit.
+    //
+    // PERF (negative-result memoization): the cache value `0u8` (NUL) is a
+    // RESERVED SENTINEL meaning "resolved, but this (class, slot) has no
+    // descriptor-aware type" — i.e. a CONFIRMED miss on a real, fully-loaded
+    // hierarchy (the slot lands on no field, or its field carries no
+    // descriptor byte). NUL is never a legitimate descriptor first byte (valid
+    // JVM field descriptors begin with one of `B C D F I J S Z L [`), so this
+    // overload is unambiguous. Caching the negative lets repeated lookups of
+    // such a slot skip the class-hierarchy re-walk that the slow path performs
+    // on every miss. TRANSIENT misses (unloaded class/ancestor, or a synthetic
+    // stub that may be promoted) are deliberately NOT cached — see below.
     {
         let cache = shared.field_descriptor_cache.read();
         if let Some(&b) = cache.get(&(class_id, slot_index)) {
-            return Some(b);
+            return if b == 0 { None } else { Some(b) };
         }
     }
 
@@ -813,10 +833,19 @@ fn resolve_field_descriptor_byte_cached(
     // native caller's view. The only safe short-circuit is to return
     // `None` immediately so the caller uses the raw descriptor-unaware
     // heap access вЂ” matching pre-T10.9.E behaviour for the stub case.
+    // `cacheable` distinguishes a CONFIRMED miss (the hierarchy was fully
+    // walked over real, non-stub classes and the slot legitimately has no
+    // descriptor) from a TRANSIENT miss (the class — or an ancestor — is not
+    // yet loaded, or is a synthetic stub that may later be promoted to the
+    // real class). Only confirmed misses are memoized via the `0u8` sentinel;
+    // transient misses must re-walk on the next call so they pick up the real
+    // descriptor once the class is loaded/promoted.
+    let mut cacheable = false;
     let desc_byte = {
         let cm = shared.class_manager.read();
         if let Some(concrete_cls) = cm.get_class(class_id) {
             if concrete_cls.is_synthetic_stub {
+                // Transient: stub may be promoted to the real class later.
                 None
             } else {
                 // Walk the class hierarchy вЂ” the slot may belong to an
@@ -843,9 +872,20 @@ fn resolve_field_descriptor_byte_cached(
                 // the same logic used by `resolve_field_index_in_hierarchy`.
                 let mut cid_opt = Some(class_id);
                 let mut found: Option<u8> = None;
-                while let Some(cid) = cid_opt {
+                loop {
+                    let Some(cid) = cid_opt else {
+                        // Walked off the top of a fully-real hierarchy
+                        // (e.g. `java/lang/Object.superclass == None`) without
+                        // the slot landing in any class. This is a confirmed
+                        // miss against the immutable real layout вЂ” memoize it.
+                        cacheable = true;
+                        break;
+                    };
                     if let Some(cls) = cm.get_class(cid) {
                         if cls.is_synthetic_stub {
+                            // Transient: an ancestor stub's descriptors are
+                            // unreliable and may change on promotion. Do NOT
+                            // memoize вЂ” `cacheable` stays false.
                             break;
                         }
                         // Slot is in this class iff slot >= first_field_index.
@@ -868,10 +908,16 @@ fn resolve_field_descriptor_byte_cached(
                                 }
                                 instance_idx += 1;
                             }
+                            // Owning class resolved on a real (non-stub) class:
+                            // whether or not a descriptor byte was present, this
+                            // is a definitive result against an immutable layout.
+                            cacheable = true;
                             break;
                         }
                         cid_opt = cls.superclass;
                     } else {
+                        // Transient: an ancestor class is not loaded yet; it may
+                        // load later and supply the slot's real descriptor.
                         break;
                     }
                 }
@@ -882,12 +928,36 @@ fn resolve_field_descriptor_byte_cached(
         }
     };
 
-    // Write-back on hit. Skip cache-write on miss so repeat misses re-run
-    // the class-store walk and pick up descriptors that become available
-    // later (e.g. when a synthetic stub is promoted to the real class).
-    if let Some(b) = desc_byte {
-        let mut cache = shared.field_descriptor_cache.write();
-        cache.insert((class_id, slot_index), b);
+    // Write-back. A positive hit caches the real descriptor byte. A CONFIRMED
+    // miss (`cacheable`) caches the `0u8` sentinel so the next lookup short-
+    // circuits in the fast path instead of re-walking the hierarchy вЂ” this is
+    // the common case for any real field/slot with no descriptor mapping, which
+    // previously re-walked under the read lock on every single access. A
+    // TRANSIENT miss (`!cacheable`: class/ancestor not loaded, or a synthetic
+    // stub that may be promoted) is NOT cached, so it re-walks and picks up the
+    // real descriptor once the class is loaded/promoted.
+    //
+    // Correctness under class redefinition: JEP 109 / JVMTI redefinition
+    // performs an in-place method-body swap and MUST preserve field layout, so
+    // a cached descriptor (positive or negative) remains valid. As a belt-and-
+    // braces guard, `NativeContextImpl::redefine_class` clears this cache.
+    match desc_byte {
+        Some(b) => {
+            // Defensive: a real descriptor first byte is never NUL, so it can
+            // never collide with the negative sentinel.
+            debug_assert_ne!(b, 0, "descriptor first byte must not be NUL");
+            shared
+                .field_descriptor_cache
+                .write()
+                .insert((class_id, slot_index), b);
+        }
+        None if cacheable => {
+            shared
+                .field_descriptor_cache
+                .write()
+                .insert((class_id, slot_index), 0u8);
+        }
+        None => {}
     }
     desc_byte
 }
@@ -2974,17 +3044,25 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 wait_dur.as_nanos() as u64,
             );
         }
-        // T16.7: If interrupted during wait, throw InterruptedException but
-        // leave the flag observable. Strict JLS В§17.2.1 would have us clear
-        // the flag here; tests (`p86_interrupt_unblocks_monitor_wait`) require
-        // the cross-thread interrupt signal to remain visible to the caller's
-        // post-wait check, so we let the throw+catch path in the Java layer
-        // do the clearing via an explicit `Thread.interrupted()` call.
-        let post_check = self
+        // JLS В§17.2.1 / Object.wait spec: when wait() throws
+        // InterruptedException, the thread's interrupt status MUST be cleared
+        // (the exception consumes the interrupt). This mirrors the entry-time
+        // check above, which already `swap(false)`s the flag before throwing.
+        //
+        // We atomically read-and-clear the flag with `swap(false)`: if it was
+        // set (interrupted during the wait), we consume it and throw. This is
+        // race-safe under concurrency вЂ” a cross-thread interrupt that lands
+        // *after* this swap simply re-sets the flag, and the next blocking
+        // call (or an explicit `Thread.interrupted()`/`isInterrupted()` check)
+        // observes it, exactly as the JLS prescribes. `was_interrupted` is set
+        // by `monitors.wait` when the interrupt is what woke us; that layer only
+        // *reads* the flag (never clears it), so here is the single authoritative
+        // consume point. We throw on either signal and clear regardless.
+        let flag_was_set = self
             .thread
             .interrupted
-            .load(std::sync::atomic::Ordering::Acquire);
-        if was_interrupted || post_check {
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
+        if was_interrupted || flag_was_set {
             return Err(crate::error::MethodCallFailed::InternalError(
                 crate::error::VmError::Runtime(
                     crate::error::RuntimeError::InterruptedException,
@@ -5393,6 +5471,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             cm.redefine_class(class_id, new_bytes.to_vec(), RedefineOptions::default())
                 .map_err(|e| format!("{e:?}"))?;
         }
+        // PERF-cache correctness: `resolve_field_descriptor_byte_cached`
+        // memoizes per-(ClassId, slot) field descriptors (incl. negative
+        // results). JEP 109 redefinition is required to preserve field layout
+        // so cached entries SHOULD stay valid, but clear the cache here as a
+        // conservative guard against any future relaxation of that invariant.
+        // Redefinition is rare, so the rebuild cost is negligible.
+        self.shared.field_descriptor_cache.write().clear();
         // Best-effort JIT cache eviction by name (the
         // `fire_jit_invalidate_hook` call inside `redefine_class` already
         // notifies the registered hook keyed by `class_id`; this catches
@@ -11517,6 +11602,42 @@ mod tests {
         assert_eq!(
             before, after,
             "cache must not record an entry on miss (would mask later class loads)"
+        );
+    }
+
+    #[test]
+    fn t10_9_e_negative_sentinel_decodes_to_none() {
+        // PERF negative-result memoization: a `0u8` sentinel pre-seeded into
+        // the cache must read back as `None` (a confirmed miss), NOT as the
+        // descriptor byte `0`. This is the fast-path decode of the sentinel
+        // introduced for confirmed misses on real, fully-loaded hierarchies.
+        let shared = test_shared();
+        let key = (ClassId::new(4242), 7usize);
+        shared.field_descriptor_cache.write().insert(key, 0u8);
+        let result = resolve_field_descriptor_byte_cached(&shared, key.0, key.1);
+        assert_eq!(
+            result, None,
+            "the 0u8 sentinel must decode to None, not Some(0)"
+        );
+        // The lookup must NOT mutate the cached sentinel.
+        assert_eq!(shared.field_descriptor_cache.read().get(&key).copied(), Some(0u8));
+    }
+
+    #[test]
+    fn t10_9_e_unloaded_class_miss_still_uncached() {
+        // Regression guard for the negative-cache change: a TRANSIENT miss
+        // (concrete class not loaded) must still NOT be cached, so a later
+        // class load is observed. Only CONFIRMED misses on real hierarchies
+        // get the sentinel.
+        let shared = test_shared();
+        let before = shared.field_descriptor_cache.read().len();
+        let result =
+            resolve_field_descriptor_byte_cached(&shared, ClassId::new(31337), 0);
+        assert_eq!(result, None);
+        assert_eq!(
+            before,
+            shared.field_descriptor_cache.read().len(),
+            "an unloaded-class miss is transient and must not be memoized"
         );
     }
 

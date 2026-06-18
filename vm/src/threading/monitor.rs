@@ -596,6 +596,24 @@ impl Monitor {
                     if let Some(flag) = interrupted {
                         if flag.load(std::sync::atomic::Ordering::Acquire) {
                             was_interrupted = true;
+                            // LOST-WAKEUP FIX: a notify_one() wakes exactly ONE
+                            // waiter. If this thread was both notified and
+                            // interrupted, breaking out here to throw
+                            // InterruptedException would CONSUME that single
+                            // notification — another waiter the notify was meant
+                            // for would never wake (lost wakeup). `wait_for`
+                            // reports `!timed_out()` when a signal (notify /
+                            // notifyAll / spurious) woke us within the slice; in
+                            // that case forward the notification to one other
+                            // waiter so the JLS/HotSpot guarantee that a notify
+                            // wakes *some* waiter still holds. A spurious wakeup
+                            // can trigger an extra notify_one() with no waiter to
+                            // receive it, which is harmless (condvars do not
+                            // accumulate permits). Done while still holding the
+                            // monitor state lock, exactly like notify().
+                            if !result.timed_out() {
+                                self.wait_condvar.notify_one();
+                            }
                             break;
                         }
                     }
@@ -626,6 +644,16 @@ impl Monitor {
                         let result = self.wait_condvar.wait_for(&mut state, poll_interval);
                         if flag.load(std::sync::atomic::Ordering::Acquire) {
                             was_interrupted = true;
+                            // LOST-WAKEUP FIX (see the timed branch above): if a
+                            // notify woke us in the same slice we observed the
+                            // interrupt, forward the single notification to one
+                            // other waiter so it is not swallowed by the
+                            // InterruptedException throw. `!timed_out()` means a
+                            // signal (notify/notifyAll/spurious) arrived within
+                            // the poll slice. Re-notify under the held state lock.
+                            if !result.timed_out() {
+                                self.wait_condvar.notify_one();
+                            }
                             break;
                         }
                         if !frames_dumped
