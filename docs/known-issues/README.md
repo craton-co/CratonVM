@@ -18,6 +18,15 @@ consolidated from the per-suite trackers (see *Consolidated suite bug docs* belo
 Two of those (`springsuite-bug-04`, `spring-bug-10`) are themselves Family A
 manifestations seen from the Spring suite.
 
+There is also a **second umbrella family** distinct from the GC-root one:
+[**JIT regalloc callee-saved-register clobber**](jit-regalloc-callee-saved-clobber-family.md)
+— the single root cause behind the ~30+ targeted JIT method bans in
+`vm/src/jit/skip_list.rs` (HashMap/WeakHashMap/`Integer.valueOf`/`String.toLowerCase`/j.u.c./
+BouncyCastle/Spring-boot/ByteBuddy/kafka-bug-C). Manifests as either `rc=139` corruption or
+`rc=124` hangs, always JIT-only. Individual members are lifted as fixed; the general fix is the
+deferred precise-JIT-maps / regalloc project. **Do not conflate it with Family A** — that one is
+about root-*scanning* completeness, this one about register *clobber*.
+
 ---
 
 ## Family A — GC root coverage under JIT  *(one root cause, four manifestations)*
