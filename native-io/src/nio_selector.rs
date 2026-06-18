@@ -1874,6 +1874,9 @@ fn channel_register_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Value::Object(Some(o)) => Some(o),
         _ => None,
     };
+    if std::env::var_os("CRATONVM_DBG_SK").is_some() {
+        eprintln!("[SK] register key_hash={key_hash} net_fd={net_fd} sel_id={sel_id} ops={ops}");
+    }
     sk_table().write().insert(
         key_hash,
         SkState {
@@ -2076,11 +2079,22 @@ fn sk_is_valid(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Int(0)));
     };
-    let valid = sk_state_get_field(ctx, this, |s| {
+    let state = sk_state_get_field(ctx, this, |s| {
         Value::Int(if s.cancelled { 0 } else { 1 })
-    })
-    .unwrap_or(Value::Int(0));
-    Ok(Some(valid))
+    });
+    if std::env::var_os("CRATONVM_DBG_SK").is_some() {
+        match &state {
+            Some(Value::Int(0)) => {
+                eprintln!("[SK] isValid hash={} -> CANCELLED", ctx.identity_hash_code(this))
+            }
+            None => eprintln!(
+                "[SK] isValid hash={} -> MISSING (no sk_table entry)",
+                ctx.identity_hash_code(this)
+            ),
+            _ => {}
+        }
+    }
+    Ok(Some(state.unwrap_or(Value::Int(0))))
 }
 
 fn sk_attach(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2123,6 +2137,9 @@ fn sk_cancel_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         return Ok(None);
     };
     let key_hash = ctx.identity_hash_code(this);
+    if std::env::var_os("CRATONVM_DBG_SK").is_some() {
+        eprintln!("[SK] cancel key_hash={key_hash}");
+    }
     sk_state_with_mut(ctx, this, |s| {
         s.cancelled = true;
         s.ready_ops = 0;
