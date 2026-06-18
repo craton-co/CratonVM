@@ -17537,10 +17537,10 @@ fn execute_jit_call_decoded(
     // without setting `JIT_DEOPT_PENDING`, so consume the stashed frame here too
     // (clearing it) and re-run the method from entry. Precise mid-bci resume is
     // wired at the fast sink; this slow path falls back to re-run, which is
-    // correct for the side-effect-free methods that deopt today. Detection runs
-    // unconditionally (an undetected IR deopt would push i64::MIN as a real
-    // return); the resume gate only matters at the fast sink.
-    if cratonvm_jit::deopt::take_last_deopt().is_some() {
+    // correct for the side-effect-free methods that deopt today. Gated on
+    // `result == i64::MIN` (a deopt always returns it) so the common path skips
+    // the thread-local access while never missing an IR deopt.
+    if result == i64::MIN && cratonvm_jit::deopt::take_last_deopt().is_some() {
         return Ok(None);
     }
 
