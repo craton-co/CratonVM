@@ -1,44 +1,34 @@
 # CratonVM — Elasticsearch full unit-test suite triage
 
-**Suite:** Elasticsearch 9.5.0 (`apps/elasticsearch`, source tree), scope = **`libs/*` + `:server` unit tests** (the JUnit test classes, run per-class).
-**VM:** `C:\craton\CratonVM-esrun\target\release\cratonvm.exe` — built from `dev` @ `16b69363`, worktree branch `suite/elasticsearch-run`.
-**Baseline:** HotSpot JDK 25.0.1 (same classpath, same flags, same 600 s wall-budget).
-**Method:** each compiled test class is run standalone via `org.junit.runner.JUnitCore <FQCN>` under both VMs; a class is a **CratonVM bug** only when HotSpot completes (pass or test-failure) but CratonVM crashes or hangs. Two configs are run: **default (JIT on)** and **`--nojit`** (JIT workaround, to surface the bugs hidden behind the dominant JIT hang).
+**Suite:** Elasticsearch 9.5.0 (`apps/elasticsearch`), scope = **`libs/*` + `:server` unit tests** (2701 JUnit classes), run per-class.
+**VM:** `C:\craton\CratonVM-esrun\target\release\cratonvm.exe`, built from `dev` @ `16b69363`.
+**Baseline:** HotSpot JDK 25.0.1 (same classpath, flags, 600 s budget). A class is a CratonVM bug only when HotSpot completes but CratonVM crashes/hangs.
+**Method:** each compiled test class run standalone via `org.junit.runner.JUnitCore <FQCN>` under both VMs, in two configs — default (JIT on) and `--nojit`. Harness + gradle trims under `apps/elasticsearch/cratonvm-suite/`.
 **Date:** 2026-06-18
 
-How the suite was made compilable/runnable, the exact launcher flags, and the per-class harness live under `apps/elasticsearch/cratonvm-suite/` (`run-one.sh`, `run-all.sh`, `run-all-nojit.sh`, `summarize.sh`). The gradle `settings.gradle`/`build.gradle` trims (to compile only the in-scope subgraph of a partial x-pack checkout) are commented `// CRATONVM SUITE TRIM`.
+---
+
+> **Getting `:server` tests to actually *pass*** is a multi-fix effort tracked in
+> [EPIC-server-suite-green.md](EPIC-server-suite-green.md) — every `ESTestCase`
+> hits an independent CratonVM gap at each layer of Lucene/randomizedtesting
+> suite setup. 4 layers fixed (ES-FAIL-04/05/06 + the dev ES-HANG-01); chain
+> continues.
+
+## Distinct CratonVM defects
+
+| ID | Kind | Title | Status |
+|----|------|-------|--------|
+| [ES-HANG-01](ES-HANG-01-lucenetestcase-suite-livelock.md) | HANG (JIT livelock) | Every `LuceneTestCase`/`ESTestCase` suite hangs in setup — JIT miscompile of `WeakHashMap$ValueSpliterator.tryAdvance`. | ✅ **FIXED on dev** (`1cd0ab26`, = kafka-bug-C); suite binary `16b69363` predated it. Confirmed independently here. |
+| [ES-FAIL-04](ES-FAIL-04-arraylist-sublist-toarray-missing.md) | linkage (synthetic gap) | **Dominant `:server` blocker** — synthetic `ArrayList.subList().toArray(T[])` missing → `NoSuchMethodError` on ~every `ESTestCase`. | ✅ **FIXED** (`fix/es-fail-04-arraylist-sublist-toarray`, `ec979daf`); byte-identical to HotSpot. Not yet merged. |
+| [ES-HANG-02](ES-HANG-02-restclient-integ-http-server.md) | HANG (socket/HTTP) | `RestClient*IntegTests` hang against an embedded HTTP server (not Lucene, not JIT). | **HANDOFF** (socket layer, ~3 classes). |
+| [ES-FAIL-03](ES-FAIL-03-RETRACTED-nativeaccess-not-a-bug.md) | ~~exception-dispatch~~ | ❌ **RETRACTED** — misdiagnosis. The native-access `catch (LinkageError)` works fine on CratonVM (logs "Unable to load native provider" → Noop, same as HotSpot). | n/a |
+
+**Residual (open, not yet a separate doc):** with ES-FAIL-04 fixed, server `ESTestCase` suites *execute* but some still end with a suite-level `RandomizedRunner` failure (`1) <ClassName>`, no method) — a downstream issue (likely thread-leak / `@AfterClass`), needs its own investigation. No genuine hard crashes (SIGSEGV/panic) were found in 2701 classes; the `rc=127` "crashes" were a parallel-load artifact of ES-FAIL-04.
 
 ---
 
-## Headline numbers
+## Run order of the investigation (for context)
 
-Total in-scope classes: **2701** (2477 `:server` + 224 across `libs/*`, `client/rest`, `modules/transport-netty4`). Numbers below are the **partial** totals at ~76% through both runs; final totals will be updated when both runs reach 2701 (the pattern is fully deterministic — see "Key facts").
-
-| Config | classes run | clean pass (cv=0) | ran-but-failed (cv=1) | HANG | CRASH |
-|--------|--------:|---------:|-----:|------:|------:|
-| **default (JIT on)** | 884 | 20¹ | 0 | **864** (ES-HANG-01) | 0 |
-| **`--nojit`** | 1178 | 11² | **1168** (ES-FAIL-03) | 3 (ES-HANG-02) | 0 |
-
-¹ the 20 default-config non-hangs are all plain-JUnit (non-`ESTestCase`) classes: `client/rest`, `libs/geo`, `libs/native`, `libs/tdigest`.
-² the 11 `--nojit` clean passes are likewise the plain-JUnit classes. The 1168 `cv=1` are `ESTestCase`-derived classes that *run* (no hang, no crash) but fail at `ESTestCase.<clinit>` for ES-FAIL-03.
-
-**No segfault-class crashes were observed in either config** — CratonVM hangs (ES-HANG-01/02) or mis-dispatches an exception (ES-FAIL-03); it does not crash.
-
----
-
-## Distinct CratonVM defects (one doc each)
-
-| ID | Kind | Config | Title | Fix vs handoff |
-|----|------|--------|-------|----------------|
-| ES-HANG-01 *(doc removed — resolved)* | HANG (JIT livelock) | default | Every `LuceneTestCase`/`ESTestCase` suite hangs in setup. Pinned to a JIT miscompile of `WeakHashMap$ValueSpliterator.tryAdvance`. | ✅ **FIXED on dev** by `1cd0ab26` (same bug as kafka-bug-C); suite binary `16b69363` predated it. Doc deleted 2026-06-18 (stale). |
-| ES-FAIL-03 *(doc removed — resolved)* | exception-dispatch correctness | `--nojit` | `NativeAccessHolder`'s `catch (LinkageError)` not honored → every `ESTestCase` fails at `<clinit>` | ✅ **RESOLVED on current dev** — re-verified 2026-06-18: the catch *is* honored, bootstrap continues to `NoopNativeAccess`, tests run. Doc deleted (stale). (Residual: `BuildTests` still reports 1 unrelated failure — separate, untracked.) |
-| [ES-HANG-02](ES-HANG-02-restclient-integ-http-server.md) | HANG (socket/HTTP) | both | `RestClient*IntegTests` hang against an embedded HTTP server (not Lucene, not JIT) | **HANDOFF** (socket layer, low blast radius) |
-| [ES-FAIL-04](ES-FAIL-04-arraylist-sublist-toarray-missing.md) | linkage (synthetic gap) | `--nojit` | synthetic `cratonvm/internal/ArrayListSubList` missing `toArray(T[])` → 7 search/sort tests (recorded as `rc=127` under parallel load; deterministically a `NoSuchMethodError` in isolation) | **HANDOFF** (add the overload) |
-
----
-
-## Key facts for triage
-
-- The **default-config picture is dominated by one bug**, ES-HANG-01: a JIT miscompile that infinite-loops in Lucene's test class-env setup. It is **permanent** (process still hung at 650 s) and hits essentially every `ESTestCase`. So under default settings the vast majority of the 2701 classes `HANG` for this single reason.
-- Tests that do **not** extend `LuceneTestCase` (e.g. `client/rest`, some `libs/geo`) run fine under default settings — proving the hang is specific to the Lucene test base, not the launcher.
-- The **`--nojit` run is the one that exposes the breadth of distinct defects**, because tests actually execute. Those are written up individually above.
+1. Default (JIT-on) run: ~all `ESTestCase` classes HANG (ES-HANG-01). Non-`LuceneTestCase` tests (`client/rest`, some `libs`) run.
+2. `--nojit` run: gets past the JIT hang; ~all `:server` then fail at the `ArrayList.subList().toArray(T[])` `NoSuchMethodError` (ES-FAIL-04). The native-access EIIE seen in logs is caught/benign (ES-FAIL-03 retraction).
+3. Fixes: ES-HANG-01 already on dev; ES-FAIL-04 fixed here.

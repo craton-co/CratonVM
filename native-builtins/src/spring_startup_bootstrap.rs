@@ -16,36 +16,47 @@
 //! `startup` endpoint, or a custom `ApplicationStartup` exporter) will see an
 //! empty / inert timeline; that is the documented limitation of this shim.
 //!
-//! Why the shim exists (the underlying VM bug it works around):
+//! Why the shim exists (the underlying VM bugs it works around):
 //!   Spring Boot's `AbstractApplicationContext` has an instance field:
 //!     `private ApplicationStartup applicationStartup = ApplicationStartup.DEFAULT;`
 //!   `ApplicationStartup.DEFAULT` is a `static final` field on an interface; its
 //!   value is set in `ApplicationStartup.<clinit>` as
-//!   `new DefaultApplicationStartup()`.  In CratonVM's partial bootstrap,
-//!   `DefaultApplicationStartup.<clinit>` (which itself creates a
-//!   `DefaultStartupStep` singleton) NPEs, the error gets swallowed, and the
-//!   `DEFAULT` field stays null.  Consequently every `AbstractApplicationContext`
-//!   instance has `applicationStartup = null`, and the very first call to
-//!   `getApplicationStartup().start(name)` crashes with
-//!   "Cannot invoke start on null".  A loud failure here would abort every
-//!   Spring Boot application before its context can refresh, so we deliberately
-//!   keep the no-op behavior rather than failing loudly (see the no-stubs
-//!   policy carve-out for app-enabling shims).
+//!   `new DefaultApplicationStartup()`.
 //!
-//! THE REAL FIX (so this shim can eventually be deleted):
+//!   There were historically TWO distinct gaps stacked here:
+//!     (1) GENERAL — a non-constant `static final` field on an *interface* must
+//!         be initialised by running that interface's `<clinit>` lazily on the
+//!         first `getstatic` that reads it (JVMS §5.5 / §5.4.3.2). This general
+//!         interface-static-final init path is verified working in the
+//!         interpreter (the `getstatic` opcode calls
+//!         `ensure_class_initialized_shared(field.declaring_class_id)` and
+//!         `initialize_class_shared` runs `<clinit>` regardless of interface
+//!         status), pinned by the framework-independent regression test
+//!         `vm/tests/iface_static_final_init.rs` (real-cdi-bean-container
+//!         increment 1). The pure-observability warning that announced this
+//!         gap's workaround has been RETIRED accordingly.
+//!     (2) NESTED CONCRETE CLASS — `DefaultApplicationStartup.<clinit>` (which
+//!         itself creates a `DefaultStartupStep` singleton) still NPEs in
+//!         CratonVM's partial bootstrap; the error is swallowed and the
+//!         `DEFAULT` field is then backfilled by `post_clinit_fixup`. THIS gap
+//!         is what the remaining functional natives below (and the
+//!         `post_clinit_fixup` carrier write) continue to cover. Without them,
+//!         every `AbstractApplicationContext` would have `applicationStartup =
+//!         null` and the very first `getApplicationStartup().start(name)` would
+//!         crash with "Cannot invoke start on null", aborting Spring Boot
+//!         before its context can refresh. A loud failure here would abort
+//!         every Spring Boot application, so we deliberately keep the no-op
+//!         behavior (see the no-stubs policy carve-out for app-enabling shims).
+//!
+//! THE REMAINING REAL FIX (so this shim can eventually be deleted):
 //!   Make `DefaultApplicationStartup.<clinit>` succeed under CratonVM's
 //!   bootstrap so the real `ApplicationStartup` subsystem runs.  That requires
 //!   getting the static initializer's `DefaultStartupStep` singleton creation
 //!   to complete without NPE — i.e. fixing whichever underlying VM/bootstrap
-//!   gap currently makes that `<clinit>` throw.  Once the real `<clinit>`
-//!   works, the `getApplicationStartup`/`start`/`tag`/`end` natives below (and
-//!   the `post_clinit_fixup` carrier write) become unnecessary and should be
+//!   gap currently makes that nested `<clinit>` throw.  Once that works, the
+//!   `getApplicationStartup`/`start`/`tag`/`end` natives below (and the
+//!   `post_clinit_fixup` carrier write) become unnecessary and should be
 //!   removed.
-//!
-//! Visibility: the first time the no-op singleton is materialized, a one-line
-//! warning is emitted when `CRATONVM_DBG_SPRING_STARTUP` is set (see
-//! `warn_shim_first_use`), so the shim's activation is observable in
-//! diagnostics without breaking apps in the default (quiet) build.
 //!
 //! Fix strategy (the shim's moving parts):
 //! 1. Native override for `getApplicationStartup()` in `AbstractApplicationContext`
@@ -78,37 +89,21 @@ fn noop_step() -> &'static Mutex<Option<ObjectRef>> {
     S.get_or_init(|| Mutex::new(None))
 }
 
-/// Debug-gated, one-time visibility hook for the no-op ApplicationStartup
-/// compatibility shim (see the module doc comment).  This does NOT change
-/// runtime behavior — it only emits a single line, exactly once per process,
-/// when `CRATONVM_DBG_SPRING_STARTUP` is set, so the shim's activation is
-/// observable in diagnostics without spamming or breaking apps in the default
-/// (quiet) build.
-fn warn_shim_first_use() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    // First-use guard: only the thread that flips false→true logs.
-    if WARNED.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    if std::env::var_os("CRATONVM_DBG_SPRING_STARTUP").is_some() {
-        tracing::warn!(
-            "[spring-startup-shim] using no-op ApplicationStartup/StartupStep \
-             (DefaultApplicationStartup.<clinit> NPE workaround) — startup \
-             metrics are discarded; real fix = make that <clinit> succeed"
-        );
-    }
-}
-
 /// Get-or-create the global no-op `ApplicationStartup` singleton.
 /// Uses `DefaultApplicationStartup` as the carrier class so virtual dispatch
 /// on `start(String)` hits our registered native override.
+///
+/// NOTE (real-cdi-bean-container increment 1): the previous debug-gated
+/// `warn_shim_first_use()` first-use warning has been RETIRED. It announced the
+/// shim as a workaround for the "static-final on an interface not initialised"
+/// gap — but that general interpreter path is now verified working and pinned
+/// by `vm/tests/iface_static_final_init.rs`. This singleton remains only to
+/// cover the separate `DefaultApplicationStartup.<clinit>` NPE (the nested
+/// concrete-class init failure), so the stale workaround banner is gone.
 pub fn get_noop_startup(ctx: &mut dyn NativeContext) -> ObjectRef {
     if let Some(obj) = *noop_startup().lock() {
         return obj;
     }
-    // First materialization of the shim — surface it under CRATONVM_DBG_*.
-    warn_shim_first_use();
     // 8 slots — conservative over-allocation for DefaultApplicationStartup's
     // real-JDK field count (it's a simple class with very few fields).
     let obj = crate::alloc_concurrent_synthetic(
@@ -125,10 +120,6 @@ pub fn get_noop_step(ctx: &mut dyn NativeContext) -> ObjectRef {
     if let Some(obj) = *noop_step().lock() {
         return obj;
     }
-    // First materialization of the shim — surface it under CRATONVM_DBG_*.
-    // The process-global guard inside dedups against get_noop_startup, so this
-    // never double-logs regardless of which singleton is created first.
-    warn_shim_first_use();
     // DefaultApplicationStartup$DefaultStartupStep in Spring Framework 5.3.x
     // (used by Spring Boot 2.7.x).  If not found, fall back to allocating a
     // bare java/lang/Object — the methods are all overridden natively anyway.

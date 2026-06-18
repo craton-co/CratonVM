@@ -1,8 +1,32 @@
 # Real-Bytecode CDI / Bean Container (retire the per-framework shim cluster)
 
-Status: design / not started. XL, and policy-sensitive (intersects the
-"no synthetic stubs" project rule). The goal is to delete a cluster of
+Status: in progress (increment 1 landed). XL, and policy-sensitive (intersects
+the "no synthetic stubs" project rule). The goal is to delete a cluster of
 per-framework native short-circuits by making the real container bytecode run.
+
+> **Increment 1 (interface static-final init; observability shim retired) — LANDED.**
+> Scope: the lowest-risk first scalp of Step 1's general fix.
+> - Verified that the GENERAL VM path for a non-constant `static final` field on
+>   an *interface* is correct: the `getstatic` opcode resolves the field to its
+>   declaring interface and calls `ensure_class_initialized_shared`, and
+>   `initialize_class_shared` runs the interface `<clinit>` regardless of
+>   interface status (JVMS §5.5 / §5.4.3.2). No interpreter change was needed —
+>   the gap the Spring shim *named* (interface static-final not initialised) is
+>   not the operative failure; the operative one is the NESTED concrete-class
+>   `DefaultApplicationStartup.<clinit>` NPE (swallow + `post_clinit_fixup`
+>   backfill), which remains covered by the Spring shim and is the next scalp.
+> - Added a framework-independent regression test pinning the general behavior:
+>   `vm/tests/iface_static_final_init.rs` (fixture
+>   `vm/tests/resources/cratonvm/IfaceStaticFinalInit.java`). It reads a
+>   non-constant `static final int VALUE = compute()` on an interface via a
+>   single `getstatic` and asserts the value is the computed `42`, not the
+>   prepared default `0`.
+> - Retired the pure-observability piece of the Spring shim: the debug-gated
+>   `warn_shim_first_use()` first-use warning in
+>   `native-builtins/src/spring_startup_bootstrap.rs` (it announced the
+>   now-verified general gap). The functional `getApplicationStartup`/`start`/
+>   `tag`/`end` natives and the `post_clinit_fixup` carrier write are RETAINED —
+>   removing them would re-expose the nested-`<clinit>` NPE and abort Spring Boot.
 
 ## Goal
 

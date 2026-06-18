@@ -10984,6 +10984,100 @@ fn execute_invoke(
     execute_invoke_kind(shared, thread, frame_idx, cp_index, is_special, false)
 }
 
+/// JEP 358 — a [`CpResolver`] backed by the live constant pool of
+/// `current_class_id`. Acquires `class_manager.read_recursive()` per query; the
+/// whole helpful-NPE analysis runs once per thrown NPE (cold path), so the
+/// per-call lock cost is irrelevant.
+///
+/// [`CpResolver`]: crate::runtime::exceptions::helpful_npe::CpResolver
+struct CpPoolResolver<'a> {
+    shared: &'a SharedVm,
+    class_id: ClassId,
+}
+
+impl crate::runtime::exceptions::helpful_npe::CpResolver for CpPoolResolver<'_> {
+    fn field_ref(
+        &self,
+        cp_index: u16,
+    ) -> Option<crate::runtime::exceptions::helpful_npe::CpRef> {
+        use crate::runtime::exceptions::helpful_npe::CpRef;
+        let cm = self.shared.class_manager.read_recursive();
+        let class = cm.get_class(self.class_id)?;
+        if let Some(ConstantPoolEntry::FieldReference {
+            class_index,
+            name_and_type_index,
+        }) = class.constant_pool.get(cp_index)
+        {
+            let owner = class.constant_pool.get_class_name(*class_index)?.to_string();
+            let (name, _) = class.constant_pool.get_name_and_type(*name_and_type_index)?;
+            Some(CpRef::Field {
+                owner_internal: owner,
+                name: name.to_string(),
+            })
+        } else {
+            None
+        }
+    }
+
+    fn method_ref(
+        &self,
+        cp_index: u16,
+    ) -> Option<crate::runtime::exceptions::helpful_npe::CpRef> {
+        use crate::runtime::exceptions::helpful_npe::CpRef;
+        let cm = self.shared.class_manager.read_recursive();
+        let class = cm.get_class(self.class_id)?;
+        let (class_index, nat_index) = match class.constant_pool.get(cp_index) {
+            Some(ConstantPoolEntry::MethodReference {
+                class_index,
+                name_and_type_index,
+            })
+            | Some(ConstantPoolEntry::InterfaceMethodReference {
+                class_index,
+                name_and_type_index,
+            }) => (*class_index, *name_and_type_index),
+            _ => return None,
+        };
+        let owner = class.constant_pool.get_class_name(class_index)?.to_string();
+        let (name, desc) = class.constant_pool.get_name_and_type(nat_index)?;
+        Some(CpRef::Method {
+            owner_internal: owner,
+            name: name.to_string(),
+            descriptor: desc.to_string(),
+        })
+    }
+}
+
+/// JEP 358 — synthesize the HotSpot-style extended message for a null-receiver
+/// `invoke*` at the current bci. Always returns at least the action half
+/// (`Cannot invoke "Owner.name(params)"`); appends `because "<expr>" is null`
+/// when the bounded backward analysis can name the null expression.
+fn helpful_npe_invoke_message(
+    shared: &SharedVm,
+    thread: &JvmThread,
+    frame_idx: usize,
+    owner_internal: &str,
+    method_name: &str,
+    method_descriptor: &str,
+    num_params: usize,
+) -> String {
+    use crate::runtime::exceptions::helpful_npe;
+    let action = helpful_npe::action_invoke(owner_internal, method_name, method_descriptor);
+    let frame = &thread.frames[frame_idx];
+    // `last_instr_pc` is set by the dispatch loop to the bci of the opcode
+    // currently executing (here, the trapping invoke) — `pc` may already be
+    // advanced. This is the deopt-independent trapping bci the design doc
+    // relies on for the interpreter path.
+    let invoke_bci = frame.last_instr_pc;
+    let code = Arc::clone(&frame.code);
+    let resolver = CpPoolResolver {
+        shared,
+        class_id: frame.class_id,
+    };
+    let expr =
+        helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, num_params, &resolver);
+    helpful_npe::combine(&action, expr.as_deref())
+}
+
 /// Variant of `execute_invoke` that knows whether the source bytecode was
 /// `invokeinterface`. Only invokeinterface call sites pass `is_interface=true`;
 /// invokevirtual / invokespecial pass `false`. The flag gates γ's CP-resolved-
@@ -11696,8 +11790,25 @@ fn execute_invoke_kind(
                             eprintln!("  [{i}] {}.{}{} pc={}", cn, f.method_name(), f.method_descriptor(), f.pc);
                         }
                     }
+                    // JEP 358: build the HotSpot-style extended NPE message —
+                    // `Cannot invoke "Owner.name(params)" because "<expr>" is
+                    // null`. The action half is always present; the `because`
+                    // clause is added when the bounded backward bytecode
+                    // analysis can name the null receiver expression
+                    // (aload local/param, getfield, getstatic, aaload). The
+                    // trapping bci is `last_instr_pc`, always known here in the
+                    // interpreter, so this is deopt-independent.
+                    let npe_msg = helpful_npe_invoke_message(
+                        shared,
+                        thread,
+                        frame_idx,
+                        &method_class_name,
+                        &method_name,
+                        &method_descriptor,
+                        num_params,
+                    );
                     return Err(RuntimeError::NullPointerException {
-                        message: Some(format!("Cannot invoke {method_name} on null")),
+                        message: Some(npe_msg),
                     }
                     .into());
                 }
@@ -14365,7 +14476,39 @@ fn execute_invokestatic_cached(
                 cached.method_name.as_ref(),
                 cached.method_descriptor.as_ref(),
             );
-            let _recommended_tier = shared.tiered_manager.on_method_invocation(&tiered_key);
+            // wire-tiered-manager increment 1: start the background compile
+            // thread once (idempotent) so enqueued tasks are drained OFF the
+            // mutator thread. `on_method_invocation` increments the per-method
+            // counter and, when the tiered thresholds are crossed, ENQUEUES a
+            // CompilationTask at the recommended tier (instead of the old code
+            // discarding the tier into `_`). The background worker consumes that
+            // queue. For this increment the worker uses a drain-only compile
+            // closure and the mutator keeps its existing inline upgrade below;
+            // moving compilation fully off-mutator is increment 2.
+            crate::jit::tiered::ensure_background_compiler(&shared.tiered_manager, || {
+                Box::new(|_task: &crate::jit::tiered::CompilationTask| -> u64 {
+                    // Increment-1 placeholder: real codegen wiring (which needs
+                    // VM-init / class-metadata access outside this item's
+                    // subsystem boundary) lands in a later increment. Draining
+                    // here proves tasks flow off-thread and clears the queued
+                    // flag via `complete_task`.
+                    0
+                })
+            });
+            let recommended_tier =
+                shared.tiered_manager.on_method_invocation(&tiered_key);
+            if let Some(tier) = recommended_tier {
+                if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+                    eprintln!(
+                        "[cratonvm-jitc] tiered-enqueue {}.{}{} tier={:?} invoc_count={}",
+                        cached.class_name,
+                        cached.method_name,
+                        cached.method_descriptor,
+                        tier,
+                        invoc_count
+                    );
+                }
+            }
             // WP2.4-F1: pass the bytecode entry's gate to inherit
             // the staleness binding — the JIT'd body executes the same
             // declaring class, so a future `redefine_class` must
@@ -17229,13 +17372,18 @@ fn execute_jit_call(
     // never leak to the next JIT call): precise-resume at the trapping bci when
     // enabled + mappable, else re-run the method from entry (`CacheMiss`),
     // restoring the popped args first exactly like the `i64::MIN` arm below.
-    // Gated by the cached flag first, so the default-OFF path adds no
-    // thread-local access to the hot JIT-return path (no production IR method
-    // emits a deopt guard yet, so `LAST_DEOPT` is always empty regardless).
-    if ir_deopt_resume_enabled() {
+    // The detection MUST run whenever a deopt could have stashed a frame (the
+    // IR div-by-zero guard, and any future guard); the resume *gate* only
+    // chooses precise mid-bci resume vs re-run. `ir_deopt_entry` always returns
+    // `i64::MIN` when it stashes, so gating on `result == i64::MIN` keeps the
+    // common JIT-return path free of the thread-local access while never missing
+    // a deopt (an undetected i64::MIN would be pushed as a real return == 0).
+    if result == i64::MIN {
         if let Some(rframe) = cratonvm_jit::deopt::take_last_deopt() {
-            if let Some(r) = resume_from_ir_deopt(shared, thread, cached, &rframe) {
-                return Ok(r);
+            if ir_deopt_resume_enabled() {
+                if let Some(r) = resume_from_ir_deopt(shared, thread, cached, &rframe) {
+                    return Ok(r);
+                }
             }
             for i in 0..np {
                 let (cv, is_long) = saved_args[i];
@@ -17532,9 +17680,10 @@ fn execute_jit_call_decoded(
     // without setting `JIT_DEOPT_PENDING`, so consume the stashed frame here too
     // (clearing it) and re-run the method from entry. Precise mid-bci resume is
     // wired at the fast sink; this slow path falls back to re-run, which is
-    // correct for the side-effect-free methods that deopt today. Gated first so
-    // the default-OFF path adds nothing to the hot JIT-return path.
-    if ir_deopt_resume_enabled() && cratonvm_jit::deopt::take_last_deopt().is_some() {
+    // correct for the side-effect-free methods that deopt today. Gated on
+    // `result == i64::MIN` (a deopt always returns it) so the common path skips
+    // the thread-local access while never missing an IR deopt.
+    if result == i64::MIN && cratonvm_jit::deopt::take_last_deopt().is_some() {
         return Ok(None);
     }
 

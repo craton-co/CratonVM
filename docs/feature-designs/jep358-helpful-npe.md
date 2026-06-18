@@ -1,5 +1,38 @@
 # JEP 358 — Helpful NullPointerException Messages
 
+> **Increment 1 landed (2026-06-18).** Steps 1–5 of this doc are implemented;
+> step 6 (JIT-NPE parity) is intentionally skipped (deopt-gated). What shipped:
+> - **Action half + null-expression half at the interpreter null-receiver
+>   invoke site** (`vm/src/runtime/interpreter.rs`, `execute_invoke_kind` ~ the
+>   `Object(None)` receiver arm). The old half-message
+>   `Cannot invoke <method> on null` is replaced with the HotSpot shape
+>   `Cannot invoke "Owner.name(params)" because "<expr>" is null` (action-only
+>   when the expression can't be classified).
+> - **Bounded backward bytecode analysis** in a new in-`exceptions.rs` module
+>   `helpful_npe`: a linear operand-stack simulation from bci 0 to the trapping
+>   bci (`last_instr_pc`, always known in the interpreter → deopt-independent)
+>   that locates the receiver-slot producer and classifies it. Covered
+>   producers: `aload` local/param (incl. `aload_0` → `this`), `getfield`
+>   (recurses on its receiver, depth-capped at 4), `getstatic`, `aaload`
+>   (`arr[...]`), `aconst_null`. Conservative: any unmodeled stack effect or a
+>   nested invoke makes it bail to the action-only message (never fabricates a
+>   wrong expression).
+> - **`getExtendedNPEMessage` un-stubbed** (`native-builtins/src/lib.rs`): the
+>   message is computed *eagerly* at the throw site and stored in
+>   `Throwable.detailMessage`; the native now surfaces that String (null when
+>   absent), matching `getMessage()`/the JDK accessor shape.
+> - **Tests:** `vm/src/runtime/exceptions.rs` → `mod helpful_npe_tests`
+>   (rt.jar-free, pure syntactic logic): getfield-of-`this`, getfield-of-local,
+>   bare-local, getstatic, action-half shape, and external-name formatting.
+>
+> **Not yet done (next increments):** route the field/array/`arraylength`/
+> `athrow`/`monitor` null-deref opcodes through an equivalent action helper
+> (currently only the invoke site emits the JEP-358 shape; getfield still uses
+> the older ad-hoc `pop_object_ref_ctx_with` message); real
+> `LocalVariableTable` name resolution (step 4 — currently always `<localN>`);
+> the `-XX:±ShowCodeDetailsInExceptionMessages` opt-out flag (step 5b); and the
+> deopt-gated JIT parity (step 6).
+
 Status: design / not started (foundation partially present). M. Synthesize
 HotSpot-style "Cannot invoke `String.length()` because `<expr>` is null"
 messages by analyzing the bytecode at the NPE throw site.

@@ -1,41 +1,36 @@
-# ES-FAIL-04 — synthetic `cratonvm/internal/ArrayListSubList` missing `toArray(T[])`
+# ES-FAIL-04 — synthetic `cratonvm/internal/ArrayListSubList` missing `toArray(T[])` (DOMINANT server-test blocker)
 
-**Status:** OPEN
-**Severity:** LOW — 7 `:server` search/sort test classes; deterministic; a missing synthetic-method overload, not a hard crash.
-**VM:** `cratonvm.exe` from `dev` @ 16b69363. **Baseline:** HotSpot JDK 25.0.1 runs them fine.
+**Status:** ✅ FIXED — branch `fix/es-fail-04-arraylist-sublist-toarray` (commit `ec979daf`, worktree `C:\craton\CratonVM-jitfix`). Not yet merged (see note).
+**Severity:** HIGH — this is the **actual dominant blocker** for `:server` unit tests under CratonVM (every `ESTestCase` reaches a `subList(...).toArray(T[])`), *not* the native-access issue first hypothesised in the now-retracted ES-FAIL-03.
+**VM:** `cratonvm.exe` from `dev`. **Baseline:** HotSpot JDK 25.0.1.
 **Date:** 2026-06-18
 
 ## Symptom
 
 ```
-NoSuchMethodError method="cratonvm/internal/ArrayListSubList.toArray([Ljava/lang/Object;)[Ljava/lang/Object;"
-Thread Thread-1 terminated with error: InternalError(Linkage(NoSuchMethodError { ... ArrayListSubList ... toArray ... }))
-linkage error: no such method: cratonvm/internal/ArrayListSubList.toArray([Ljava/lang/Object;)[Ljava/lang/Object;
+NoSuchMethodError: cratonvm/internal/ArrayListSubList.toArray([Ljava/lang/Object;)[Ljava/lang/Object;
 ```
 
-CratonVM's **synthetic `ArrayList.subList()` view** class (`cratonvm/internal/ArrayListSubList`) implements `toArray()` but **not the generic `toArray(T[])` overload**. Code that does `list.subList(a, b).toArray(new T[n])` throws `NoSuchMethodError`.
+CratonVM's synthetic `ArrayList.subList()` view class (`cratonvm/internal/ArrayListSubList`) registered only the 0-arg `toArray()` native — not the generic `toArray(T[])` overload. Any `list.subList(a,b).toArray(new T[n])` throws `NoSuchMethodError`. ES test bootstrap hits this on essentially every `ESTestCase`.
 
-## Affected classes (deterministic, isolated re-run, `--nojit`, rc=1)
-- `org.elasticsearch.search.slice.TermsSliceQueryTests`
-- `org.elasticsearch.search.sort.BucketedSortForDoublesTests`
-- `org.elasticsearch.search.sort.BucketedSortForFloatsTests`
-- `org.elasticsearch.search.sort.BucketedSortForIntsTests`
-- `org.elasticsearch.search.sort.BucketedSortForLongsTests`
-- `org.elasticsearch.search.sort.FieldSortBuilderTests`
-- `org.elasticsearch.search.sort.GeoDistanceSortBuilderTests`
+## Scope (confirmed)
+Every diverse server test sampled in isolation terminally fails with this exact `NoSuchMethodError` (`BuildTests`, `ByteSizeValueTests`, `ClusterNameExpressionResolverTests`, `KeywordFieldTypeTests`, `GeoUtilTests`, `TransportInfoTests`, the `BucketedSortFor*Tests`, …). In the parallel suite run the same classes also appeared as `rc=127` (a load artifact) — same root cause.
 
-## Note on the suite numbers (load artifact)
+## Fix
+Register the typed overload on the synthetic SubList as a snapshot delegation (the existing pattern for `contains`/`indexOf`/`stream`/`forEach`), forwarding to a fresh `ArrayList` built from the live parent slice → `native_al_to_array_typed`:
 
-In the parallel suite run these 7 were recorded as **CRASH (rc=127)** with only the `JUnit version` banner printed. On isolated re-run (×4, fixed binary) they are **deterministically rc=1 with the `ArrayListSubList.toArray(T[])` `NoSuchMethodError`** — i.e. the silent `rc=127` was an artifact of the ~28-way parallel load on the box (process died early under contention), not a genuine hard crash. There were **no reproducible hard crashes (SIGSEGV/panic) in the whole suite** — every CratonVM failure is a hang (ES-HANG-01/02) or a wrong-behavior linkage/exception issue (ES-FAIL-03/04). The load-sensitive `rc=127` early exit is itself worth a glance (robustness under many concurrent VMs) but is secondary.
-
-## Reproduce
-```bash
-export CLASSPATH="$(cat server/build/craton-testcp.txt)"
-export CRATONVM_DISABLE_DEFAULT_WATCHDOG=1
-cratonvm.exe --nojit -Djava.awt.headless=true -Dtests.asserts=false --Xmx 2g \
-  --add-opens=java.base/java.util=ALL-UNNAMED \
-  org.junit.runner.JUnitCore org.elasticsearch.search.sort.BucketedSortForLongsTests
+```rust
+// native-collections/src/lib.rs, ASL_CLASS registration
+r.register(c, "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;", |ctx, args| {
+    asl_delegate_snapshot(ctx, args, "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;")
+});
 ```
 
-## Fix vs handoff
-**Handoff** — add the `toArray([Ljava/lang/Object;)[Ljava/lang/Object;` overload to the synthetic `cratonvm/internal/ArrayListSubList` (the class is generated at runtime — grep the VM for where `cratonvm/internal/ArrayListSubList` / the `ArrayList.subList` synthetic view is built and register `toArray(T[])` alongside the existing `toArray()`/`size`/`get`). Small, self-contained. Independent of ES-HANG-01.
+**Verified:** `subList(1,4).toArray(new String[0])` and the oversized `new String[5]` form are byte-identical to HotSpot (length, contents, null terminator). With the fix, the `NoSuchMethodError` is gone and the affected server tests **execute** instead of dying immediately.
+
+## Residual (separate, not this bug)
+
+After this fix, server `ESTestCase` suites run but some still end with a **suite-level failure** (RandomizedRunner `1) <ClassName>`, no method) *after* executing. That is a *separate* downstream issue (not the native-access EIIE — which is correctly caught/logged "Unable to load native provider" → Noop fallback, identical to HotSpot; and not `ArrayListSubList`). Likely a thread-leak / `@AfterClass` check; needs its own investigation. ES-FAIL-04 is nonetheless the gating fix that lets execution proceed.
+
+## Merge note
+The fix touches `native-collections/src/lib.rs`, which currently has **uncommitted changes from another agent in the main worktree** — so merging into the main worktree's `dev` is blocked until that work is committed. The fix is preserved on its branch and is a single, cherry-pickable commit.
