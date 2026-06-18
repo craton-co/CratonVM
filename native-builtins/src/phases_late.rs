@@ -13406,6 +13406,15 @@ pub(crate) fn register_p59_management(r: &mut NativeMethodRegistry) {
     r.register(tmx, "isThreadCpuTimeSupported", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
+    // ES-FAIL-05 — `HotThreads.initializeRuntimeMonitoring()` (ESTestCase.<clinit>)
+    // calls isThreadContentionMonitoringSupported(); unregistered → AbstractMethodError
+    // blocking ~every server test. Report false (HotThreads then no-ops).
+    r.register(tmx, "isThreadContentionMonitoringSupported", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(tmx, "isThreadContentionMonitoringEnabled", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
 
     // RuntimeMXBean = 0-field synthetic — wire to real uptime
     let rmx = "java/lang/management/RuntimeMXBean";

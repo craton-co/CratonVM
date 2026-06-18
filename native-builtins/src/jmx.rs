@@ -1500,6 +1500,24 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
+    // ES-FAIL-05 — Elasticsearch `HotThreads.initializeRuntimeMonitoring()` (run
+    // from `ESTestCase.<clinit>`) calls `isThreadContentionMonitoringSupported()`;
+    // it was unregistered on the synthetic ThreadMXBean → AbstractMethodError
+    // ("no Code attribute"), failing ~every server unit test. Report `false`
+    // (not supported): HotThreads then just logs "not supported" and returns,
+    // never touching setThreadContentionMonitoringEnabled.
+    r.register(
+        cls,
+        "isThreadContentionMonitoringSupported",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    r.register(
+        cls,
+        "isThreadContentionMonitoringEnabled",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
     r.register(cls, "getAllThreadIds", "()[J", |ctx, _args| {
         use cratonvm_types::ArrayElementType;
         let arr = ctx.new_array(ArrayElementType::Long, 1);
