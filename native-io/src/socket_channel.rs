@@ -799,30 +799,29 @@ fn sc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         Some(o) => o,
         None => return Err(ioex("socket: null channel")),
     };
-    // Under CRATONVM_REAL_NET_SOCKETS the central registry filter drops every
-    // java/net/Socket native, so the real java.net.Socket bytecode runs. A bare
-    // `new java/net/Socket` allocated WITHOUT its <init> leaves `socketLock`
-    // (a `final Object` instance-initializer field) null, so the first real
-    // Socket method that does `synchronized (socketLock)` — e.g. getImpl() from
-    // Socket.connect() — throws "monitorenter ... null". This is exactly the
-    // path Gradle's TcpOutgoingConnector takes: socketChannel.socket().connect().
-    //
-    // Mirror the real SocketChannelImpl.socket() (return SocketAdaptor.create(this)):
-    // the adaptor is a proper java.net.Socket subclass whose connect/getInputStream/
-    // getOutputStream/options delegate to the channel, and whose construction runs
-    // the Socket instance initializers (socketLock = new Object()).
-    if std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some() {
-        match ctx.invoke(
-            "sun/nio/ch/SocketAdaptor",
-            "create",
-            "(Lsun/nio/ch/SocketChannelImpl;)Ljava/net/Socket;",
-            &[Value::Object(Some(this))],
-        ) {
-            Ok(Some(v @ Value::Object(Some(_)))) => return Ok(Some(v)),
-            // Fall through to the bare-Socket fallback on any failure so the
-            // non-real-net callers (Tomcat option getters) still get an object.
-            _ => {}
-        }
+    // Mirror the real `SocketChannelImpl.socket()` → `SocketAdaptor.create(this)`:
+    // the adaptor is a proper `java.net.Socket` subclass whose option getters
+    // (`getKeepAlive`/`getTcpNoDelay`/…), `connect`, `getInputStream`/
+    // `getOutputStream` are OVERRIDDEN to delegate to the channel — so they never
+    // touch `Socket.getImpl()` / the `socketLock` monitor. A bare
+    // `new java/net/Socket` (no `<init>`) leaves `socketLock` (a `final Object`
+    // instance-initializer field) null, so the FIRST real `Socket` method that
+    // does `synchronized (socketLock)` — e.g. `getKeepAlive()`→`getImpl()` —
+    // throws "monitorenter ... null". The Apache httpasyncclient I/O reactor
+    // (`BaseIOReactor`) inspects `channel.socket()` options on every accepted
+    // session, so that NPE kills the reactor worker → every request's future
+    // hangs (ES-HANG-02). The adaptor is correct regardless of the
+    // `CRATONVM_REAL_NET_SOCKETS` gate, so build it unconditionally.
+    match ctx.invoke(
+        "sun/nio/ch/SocketAdaptor",
+        "create",
+        "(Lsun/nio/ch/SocketChannelImpl;)Ljava/net/Socket;",
+        &[Value::Object(Some(this))],
+    ) {
+        Ok(Some(v @ Value::Object(Some(_)))) => return Ok(Some(v)),
+        // Fall through to the bare-Socket fallback on any failure so callers
+        // still get an object.
+        _ => {}
     }
     let sock = ctx
         .new_object("java/net/Socket")
@@ -832,6 +831,16 @@ fn sc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             _ => None,
         })
         .ok_or_else(|| ioex("socket: could not allocate Socket"))?;
+    // Safety net: the bare Socket skipped <init>, so seed `socketLock` with a
+    // live monitor object so any `synchronized (socketLock)` method doesn't NPE.
+    if !matches!(
+        ctx.get_field_by_name(sock, "socketLock"),
+        Value::Object(Some(_))
+    ) {
+        if let Ok(Some(Value::Object(Some(lock)))) = ctx.new_object("java/lang/Object") {
+            ctx.set_field_by_name(sock, "socketLock", Value::Object(Some(lock)));
+        }
+    }
     Ok(Some(Value::Object(Some(sock))))
 }
 

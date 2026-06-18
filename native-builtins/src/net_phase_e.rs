@@ -6004,6 +6004,14 @@ fn re10_spawn_dispatcher(
             Value::Object(Some(name)),
         ],
     );
+    // Daemon so a server left unstopped never wedges VM shutdown after main()
+    // returns (it normally exits on stop() when `running` clears).
+    let _ = ctx.invoke(
+        "java/lang/Thread",
+        "setDaemon",
+        "(Z)V",
+        &[Value::Object(Some(worker)), Value::Int(1)],
+    );
     // Best-effort: if the VM has no thread registry (e.g. test mocks) the
     // start is a no-op; start()/stop() still drain the queue as a fallback.
     let res = ctx.thread_start(worker);
