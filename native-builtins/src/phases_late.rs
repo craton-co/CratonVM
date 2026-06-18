@@ -10493,6 +10493,89 @@ pub(crate) fn p58_new_cf(ctx: &mut dyn NativeContext, result: Value, done: bool)
     cf
 }
 
+/// DF07: a COMPLETED `Future` for the synchronous async-channel ops. Returns a
+/// real `CompletableFuture.completedFuture(result)` — its real `get()`/
+/// `get(timeout)` return immediately (encoding done-with-null via the internal
+/// NIL sentinel). A synthetic `FutureTask` does NOT work here: in real-JDK mode
+/// `FutureTask.get()` runs the real bytecode (reads the real `state` field,
+/// stuck NEW) → the websocket client's `fConnect.get(timeout)` TimeoutException.
+fn aio_completed_future(ctx: &mut dyn NativeContext, result: Value) -> MethodCallResult {
+    ctx.invoke(
+        "java/util/concurrent/CompletableFuture",
+        "completedFuture",
+        "(Ljava/lang/Object;)Ljava/util/concurrent/CompletableFuture;",
+        &[result],
+    )
+}
+
+/// DF07: box an int into `java.lang.Integer` for an `Integer`-typed Future result.
+fn aio_box_int(ctx: &mut dyn NativeContext, n: i32) -> Value {
+    match ctx.invoke(
+        "java/lang/Integer",
+        "valueOf",
+        "(I)Ljava/lang/Integer;",
+        &[Value::Int(n)],
+    ) {
+        Ok(Some(v)) => v,
+        _ => Value::Int(n),
+    }
+}
+
+/// DF07: decode a ByteBuffer's heap-array region for the async-channel I/O,
+/// handling BOTH the real-JDK `HeapByteBuffer` layout (fields
+/// `position`/`limit`/`hb`/`offset` by name, inherited from `java.nio.Buffer`)
+/// and the synthetic slot layout (array@0, position@1, limit@2). Reading slots
+/// 0/1/2 directly is WRONG for a real HeapByteBuffer (slot 0 is `mark`, not the
+/// array) — the cause of the garbled websocket handshake. Returns
+/// (backing_array, absolute_offset, remaining_len); None for a direct buffer or
+/// an undecodable buffer.
+fn aio_bb_region(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Option<(ObjectRef, usize, usize)> {
+    // Real-JDK: `position` resolves as a named int field. A synthetic ByteBuffer
+    // has no named fields, so `position` reads back as Object(None) → slot path.
+    if let Value::Int(pos) = ctx.get_field_by_name(bb, "position") {
+        let pos = pos.max(0);
+        let limit = match ctx.get_field_by_name(bb, "limit") {
+            Value::Int(v) if v >= 0 => v,
+            _ => match ctx.get_field_by_name(bb, "capacity") {
+                Value::Int(v) if v >= 0 => v,
+                _ => pos,
+            },
+        };
+        if let Value::Object(Some(arr)) = ctx.get_field_by_name(bb, "hb") {
+            let base = match ctx.get_field_by_name(bb, "offset") {
+                Value::Int(v) if v >= 0 => v,
+                _ => 0,
+            };
+            let len = (limit - pos).max(0) as usize;
+            return Some((arr, (base + pos) as usize, len));
+        }
+        return None; // real direct buffer — not handled on this synchronous path
+    }
+    if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
+        let pos = ctx.get_field(bb, 1).as_int().unwrap_or(0).max(0);
+        let limit = ctx
+            .get_field(bb, 2)
+            .as_int()
+            .unwrap_or_else(|| ctx.array_length(arr) as i32)
+            .max(0);
+        let len = (limit - pos).max(0) as usize;
+        return Some((arr, pos as usize, len));
+    }
+    None
+}
+
+/// DF07: advance a ByteBuffer's position by `n` after async I/O (named
+/// `position` for real-JDK, slot 1 for synthetic — same discriminator as
+/// `aio_bb_region`).
+fn aio_bb_advance(ctx: &mut dyn NativeContext, bb: ObjectRef, n: i32) {
+    if let Value::Int(pos) = ctx.get_field_by_name(bb, "position") {
+        ctx.set_field_by_name(bb, "position", Value::Int(pos.saturating_add(n)));
+    } else {
+        let pos = ctx.get_field(bb, 1).as_int().unwrap_or(0);
+        ctx.set_field(bb, 1, Value::Int(pos.saturating_add(n)));
+    }
+}
+
 fn p58_cf_then_compose(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let func = obj_arg(args, 1)?;
@@ -26597,11 +26680,8 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             ctx.set_field(this, 0, Value::Int(1));  // connected
             ctx.set_field(this, 2, Value::Int(fd_id as i32));
             ctx.set_field(this, 3, args.get(1).copied().unwrap_or(Value::Object(None)));
-            // Return completed Future<Void>
-            let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2);
-            ctx.set_field(future, 0, Value::Object(None));
-            ctx.set_field(future, 1, Value::Int(1)); // done
-            Ok(Some(Value::Object(Some(future))))
+            // DF07: completed Future<Void> via real CompletableFuture (see helper).
+            aio_completed_future(ctx, Value::Object(None))
         },
     );
     r.register(
@@ -26612,35 +26692,29 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let fd_id = ctx.get_field(this, 2).as_int().unwrap_or(-1);
             let bb = obj_arg(args, 1)?;
+            // DF07: decode the destination buffer via the real-or-synthetic
+            // accessor (a real HeapByteBuffer's array is `hb`, not slot 0).
             let bytes_read = if fd_id >= 0 {
-                let bb_pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
-                let bb_lim = ctx.get_field(bb, 2).as_int().unwrap_or(0) as usize;
-                let remaining = bb_lim.saturating_sub(bb_pos);
-                if remaining > 0 {
-                    let mut tmp = vec![0u8; remaining];
-                    match ctx.fd_table().tcp_read(fd_id as u32, &mut tmp) {
-                        Ok(0) => -1,
-                        Ok(n) => {
-                            if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
-                                for i in 0..n {
-                                    ctx.set_array_element(arr, bb_pos + i, Value::Int(tmp[i] as i8 as i32));
-                                }
+                match aio_bb_region(ctx, bb) {
+                    Some((arr, off, remaining)) if remaining > 0 => {
+                        let mut tmp = vec![0u8; remaining];
+                        match ctx.fd_table().tcp_read(fd_id as u32, &mut tmp) {
+                            Ok(0) => -1,
+                            Ok(n) => {
+                                ctx.write_byte_array_from(arr, off, &tmp[..n]);
+                                aio_bb_advance(ctx, bb, n as i32);
+                                n as i32
                             }
-                            ctx.set_field(bb, 1, Value::Int((bb_pos + n) as i32));
-                            n as i32
+                            Err(_) => -1,
                         }
-                        Err(_) => -1,
                     }
-                } else {
-                    0
+                    _ => 0,
                 }
             } else {
                 -1
             };
-            let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2);
-            ctx.set_field(future, 0, Value::Int(bytes_read));
-            ctx.set_field(future, 1, Value::Int(1));
-            Ok(Some(Value::Object(Some(future))))
+            let boxed = aio_box_int(ctx, bytes_read);
+            aio_completed_future(ctx, boxed)
         },
     );
     r.register(
@@ -26651,34 +26725,27 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let fd_id = ctx.get_field(this, 2).as_int().unwrap_or(-1);
             let bb = obj_arg(args, 1)?;
+            // DF07: source the bytes via the real-or-synthetic accessor (see read).
             let bytes_written = if fd_id >= 0 {
-                let bb_pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
-                let bb_lim = ctx.get_field(bb, 2).as_int().unwrap_or(0) as usize;
-                let remaining = bb_lim.saturating_sub(bb_pos);
-                if remaining > 0 {
-                    let mut data = vec![0u8; remaining];
-                    if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
-                        for i in 0..remaining {
-                            data[i] = ctx.get_array_element(arr, bb_pos + i).as_int().unwrap_or(0) as u8;
+                match aio_bb_region(ctx, bb) {
+                    Some((arr, off, remaining)) if remaining > 0 => {
+                        let mut data = vec![0u8; remaining];
+                        ctx.read_byte_array_into(arr, off, &mut data);
+                        match ctx.fd_table().tcp_write(fd_id as u32, &data) {
+                            Ok(n) => {
+                                aio_bb_advance(ctx, bb, n as i32);
+                                n as i32
+                            }
+                            Err(_) => -1,
                         }
                     }
-                    match ctx.fd_table().tcp_write(fd_id as u32, &data) {
-                        Ok(n) => {
-                            ctx.set_field(bb, 1, Value::Int((bb_pos + n) as i32));
-                            n as i32
-                        }
-                        Err(_) => -1,
-                    }
-                } else {
-                    0
+                    _ => 0,
                 }
             } else {
                 -1
             };
-            let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2);
-            ctx.set_field(future, 0, Value::Int(bytes_written));
-            ctx.set_field(future, 1, Value::Int(1));
-            Ok(Some(Value::Object(Some(future))))
+            let boxed = aio_box_int(ctx, bytes_written);
+            aio_completed_future(ctx, boxed)
         },
     );
     r.register(asc, "close", "()V", |ctx, args| {
