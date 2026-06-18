@@ -1815,6 +1815,41 @@ fn native_al_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let from = from_i32 as usize;
     let to = to_i32 as usize;
     let sub_size = to.saturating_sub(from);
+
+    // Preferred path (real-JDK): return a genuine `java.util.ArrayList$SubList`
+    // VIEW backed by `this`, so structural and positional mutations through the
+    // sublist (`set`/`add`/`remove`/`subList().clear()`) write through to the
+    // parent — the `List.subList` live-view contract. A snapshot copy (the
+    // synthetic fallback below) silently dropped every such mutation: e.g.
+    // `list.subList(1, n).clear()` was a no-op, corrupting any caller that uses
+    // the idiomatic range-delete (Kafka `Acknowledgements.getAcknowledgementBatches`).
+    //
+    // The view shares `this`'s `elementData` backing array, and SubList's own
+    // bytecode delegates reads/writes back to the parent (whose other methods
+    // are native), so all operations stay consistent. We only build it when the
+    // real-JDK SubList class is present (probed via its `root` field); in
+    // synthetic-JDK mode that class does not exist and we keep the copy.
+    if ctx
+        .resolve_field_index("java/util/ArrayList$SubList", "root")
+        .is_some()
+    {
+        if let Ok(Some(Value::Object(Some(view)))) = ctx.new_object("java/util/ArrayList$SubList") {
+            let mod_count = ctx.get_field_by_name(this, "modCount");
+            ctx.set_field_by_name(view, "root", Value::Object(Some(this)));
+            // Top-level sublist: `parent` is null (the SubList's
+            // `updateSizeAndModCount` walk terminates on a null parent).
+            ctx.set_field_by_name(view, "parent", Value::Object(None));
+            ctx.set_field_by_name(view, "offset", Value::Int(from_i32));
+            ctx.set_field_by_name(view, "size", Value::Int(sub_size as i32));
+            // Seed expectedModCount so the view's comodification check matches
+            // the parent until the next structural change.
+            ctx.set_field_by_name(view, "modCount", mod_count);
+            return Ok(Some(Value::Object(Some(view))));
+        }
+    }
+
+    // Fallback (synthetic-JDK / SubList class unavailable): snapshot copy. This
+    // does NOT honour the live-view contract but preserves prior behaviour.
     let __al_n_fields = al_slots(ctx).2;
     let new_list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
     let new_buf = alloc_ref_array(ctx, std::cmp::max(sub_size, AL_DEFAULT_CAPACITY));
