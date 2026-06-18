@@ -677,6 +677,73 @@ fn net_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
 
+// ---------- Read availability (FIONREAD) ----------
+//
+// `sun.nio.ch.Net.available(FileDescriptor)` reports how many bytes can be read
+// without blocking — the `ioctl FIONREAD` / `ioctlsocket(FIONREAD)` equivalent.
+// `NioSocketImpl.available()` (i.e. `Socket.getInputStream().available()`) calls
+// it, and many Tomcat server tests do (DF04). `std::net::TcpStream` exposes no
+// such query, so we issue the syscall directly: `ioctlsocket` via raw
+// `#[link(name = "Ws2_32")]` FFI on Windows (matching the WSAPoll pattern in
+// nio_selector.rs — no extra crate), `libc::ioctl` on Unix.
+
+#[cfg(windows)]
+#[link(name = "Ws2_32")]
+extern "system" {
+    // int ioctlsocket(SOCKET s, long cmd, u_long *argp);
+    //   SOCKET = UINT_PTR (usize), long = c_long (i32 on Win64), u_long = u32.
+    fn ioctlsocket(s: usize, cmd: i32, argp: *mut u32) -> i32;
+}
+
+/// FIONREAD on a raw OS socket handle. `None` on error / unsupported.
+#[cfg(windows)]
+fn fionread(raw: std::os::windows::io::RawSocket) -> Option<i32> {
+    // FIONREAD = _IOR('f', 127, u_long) = 0x4004667F on Windows.
+    const FIONREAD: i32 = 0x4004_667F;
+    let mut n: u32 = 0;
+    // SAFETY: `raw` is a live SOCKET owned by a TcpStream we currently hold;
+    // `n` is a valid out-pointer for the u_long result.
+    let rc = unsafe { ioctlsocket(raw as usize, FIONREAD, &mut n) };
+    if rc == 0 {
+        Some(n.min(i32::MAX as u32) as i32)
+    } else {
+        None
+    }
+}
+
+#[cfg(unix)]
+fn fionread(raw: std::os::unix::io::RawFd) -> Option<i32> {
+    let mut n: libc::c_int = 0;
+    // SAFETY: `raw` is a live fd owned by a TcpStream we currently hold;
+    // `n` is a valid out-pointer for the int result.
+    let rc = unsafe { libc::ioctl(raw, libc::FIONREAD, &mut n) };
+    if rc == 0 {
+        Some((n as i32).max(0))
+    } else {
+        None
+    }
+}
+
+/// Bytes readable without blocking on a `TcpStream` (the FIONREAD count), or
+/// `None` on error. Shared with `socket_channel::tcp_stream_available`.
+pub(crate) fn socket_available_stream(s: &TcpStream) -> Option<i32> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        fionread(s.as_raw_socket())
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        fionread(s.as_raw_fd())
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = s;
+        None
+    }
+}
+
 // ---------- I/O ----------
 
 /// `read0(FileDescriptor fd, long address, int len) -> int`
@@ -768,6 +835,42 @@ fn net_write0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
     socket_capture('w', fd, &buf[..n]);
     Ok(Some(Value::Int(n as i32)))
+}
+
+/// `available(FileDescriptor fd) -> int`
+///
+/// Report the number of bytes that can be read from the socket without
+/// blocking (FIONREAD). Used by `NioSocketImpl.available()`, i.e.
+/// `Socket.getInputStream().available()` — the path many Tomcat server tests
+/// exercise (DF04). Returns 0 for an unknown / closed / non-stream fd rather
+/// than throwing: `available()` returning 0 ("no data buffered") is always a
+/// legal answer, whereas a missing native would UnsatisfiedLinkError.
+fn net_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let fd_obj = obj_arg(args, 0)?;
+    let Some(fd) = net_fd_from_descriptor(ctx, fd_obj) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    dbgnet!("available fd={fd:#x}");
+
+    // Primary path: a stream registered through sun/nio/ch/Net (socket0 /
+    // connect0 / accept) — what NioSocketImpl (java.net.Socket) uses. Clone the
+    // per-stream Arc under a brief map read-lock, then issue the syscall.
+    let stream_handle = {
+        let map = net_sockets().read();
+        match map.get(&fd) {
+            Some(NetSocketHandle::Stream(s)) => Some(Arc::clone(s)),
+            _ => None,
+        }
+    };
+    if let Some(handle) = stream_handle {
+        let s = handle.lock();
+        return Ok(Some(Value::Int(socket_available_stream(&s).unwrap_or(0))));
+    }
+
+    // Fallback: a SocketChannel-backed stream (socket_channel.rs registry).
+    // The Net path's fds never land there today, but cover it defensively.
+    let avail = crate::socket_channel::tcp_stream_available(fd).unwrap_or(0);
+    Ok(Some(Value::Int(avail)))
 }
 
 // ---------- Socket options ----------
@@ -1067,6 +1170,9 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     // in case JDK dispatch reaches them directly).
     r.register(net, "read0", "(Ljava/io/FileDescriptor;JI)I", net_read0);
     r.register(net, "write0", "(Ljava/io/FileDescriptor;JI)I", net_write0);
+    // DF04: bytes-readable query (ioctl FIONREAD). NioSocketImpl.available()
+    // → Socket.getInputStream().available() dispatches here.
+    r.register(net, "available", "(Ljava/io/FileDescriptor;)I", net_available);
     // NIO-SERVER-SOCKET: the blocking `NioSocketImpl` read/write path goes
     // through `sun/nio/ch/SocketDispatcher.read0/write0` (nd.read/nd.write),
     // NOT `Net.read0`. Wire those to the same handlers so a real
