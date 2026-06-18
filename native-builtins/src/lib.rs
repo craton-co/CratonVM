@@ -19861,6 +19861,12 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
         native_cond_await_timeout,
     );
     registry.register(cond, "awaitNanos", "(J)J", native_cond_await_nanos);
+    registry.register(
+        cond,
+        "awaitUntil",
+        "(Ljava/util/Date;)Z",
+        native_cond_await_until,
+    );
     registry.register(cond, "signal", "()V", native_cond_signal);
     registry.register(cond, "signalAll", "()V", native_cond_signal_all);
     } // end if !real_aqs
@@ -22142,6 +22148,18 @@ fn native_cond_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(1))),
     };
+    cond_await_millis(ctx, this, timeout_ms)
+}
+
+/// Shared core for timed `Condition` waits (`await(time,unit)` and
+/// `awaitUntil(Date)`): release the owning lock, monitor-wait up to
+/// `timeout_ms`, then re-acquire. Returns Z — 1 if signaled before the
+/// deadline, 0 if the wait timed out.
+fn cond_await_millis(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    timeout_ms: u64,
+) -> MethodCallResult {
     let lock_ref = match ctx.get_field(this, COND_FIELD_LOCK) {
         Value::Object(Some(o)) => o,
         _ => return Ok(Some(Value::Int(1))),
@@ -22180,6 +22198,37 @@ fn native_cond_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     reacquire_lock_after_await(ctx, lock_ref, lock_key, tid, saved_hold)?;
     wr?;
     Ok(Some(Value::Int(if timed_out { 0 } else { 1 })))
+}
+
+/// `Condition.awaitUntil(Date deadline)` — wait until the absolute deadline.
+/// Returns Z: false (0) if the deadline has already elapsed, otherwise the
+/// timed-wait result. Without this the synthetic `Condition` had no body for
+/// `awaitUntil` and the abstract interface method raised `AbstractMethodError`
+/// (keycloak `WaitConditionShutdownListenerTest`).
+fn native_cond_await_until(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let deadline_ms = match args.get(1) {
+        Some(Value::Object(Some(d))) => match ctx.invoke_virtual(*d, "getTime", "()J", &[])? {
+            Some(Value::Long(t)) => t,
+            _ => 0,
+        },
+        // null deadline → behave as an immediate timeout (false).
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let remaining = deadline_ms - now_ms;
+    if remaining <= 0 {
+        // Deadline already passed — never wait (Some(0) means "wait forever"
+        // to monitor_wait), just report the timeout.
+        return Ok(Some(Value::Int(0)));
+    }
+    cond_await_millis(ctx, this, remaining as u64)
 }
 
 /// Re-acquire a `ReentrantLock` after a condition `await()` returns,

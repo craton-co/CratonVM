@@ -602,9 +602,24 @@ fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // would read the wrong slot and return null. Resolve those via their real
     // data instead.
     let this_cid = ctx.class_id_of_object(this);
-    let is_synthetic =
-        ctx.class_name_of_id(this_cid).as_deref() == Some("java/util/ResourceBundle");
+    let this_cname = ctx.class_name_of_id(this_cid);
+    let is_synthetic = this_cname.as_deref() == Some("java/util/ResourceBundle");
     if !is_synthetic {
+        // Real PropertyResourceBundle keeps its entries in the `lookup` Map
+        // field (populated by its real constructor from the .properties stream),
+        // NOT in field 0 and NOT via getContents() (which it doesn't override).
+        // Reading field 0 returned a wrong/empty slot → getString gave null, and
+        // the getContents() probe raised NoSuchMethodError (keycloak
+        // PropertiesUtilTest). Resolve via `lookup`.
+        if this_cname.as_deref() == Some("java/util/PropertyResourceBundle") {
+            return match ctx.get_field_by_name(this, "lookup") {
+                Value::Object(Some(lookup)) => cratonvm_native_collections::native_map_get_pub(
+                    ctx,
+                    &[Value::Object(Some(lookup)), Value::Object(Some(key))],
+                ),
+                _ => Ok(Some(Value::Object(None))),
+            };
+        }
         // ListResourceBundle subclasses expose their entries via the overridden
         // `getContents()` (an `Object[][]` of `{key, value}` rows). Look the key
         // up there. `getContents` has no native, so this cannot recurse back
@@ -669,6 +684,17 @@ fn rb_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(k))) => *k,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // Real PropertyResourceBundle: keys live in the `lookup` Map, not field 0.
+    let this_cid = ctx.class_id_of_object(this);
+    if ctx.class_name_of_id(this_cid).as_deref() == Some("java/util/PropertyResourceBundle") {
+        return match ctx.get_field_by_name(this, "lookup") {
+            Value::Object(Some(lookup)) => cratonvm_native_collections::native_map_contains_key_pub(
+                ctx,
+                &[Value::Object(Some(lookup)), Value::Object(Some(key))],
+            ),
+            _ => Ok(Some(Value::Int(0))),
+        };
+    }
     let map = match ctx.get_field(this, 0) {
         Value::Object(Some(m)) => m,
         _ => return Ok(Some(Value::Int(0))),
