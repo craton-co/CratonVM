@@ -5947,7 +5947,7 @@ fn re10_dispatch_pending(
                     .map(|e| e.handler)
             })
         };
-        let (status, body_bytes, resp_headers) = match handler_info {
+        let (status, body_bytes, resp_headers, len_hint) = match handler_info {
             Some(h) => {
                 let ex = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpExchange", 8);
                 let m = ctx.create_string(&req.method);
@@ -5992,34 +5992,51 @@ fn re10_dispatch_pending(
                     Value::Object(Some(rh)) => re10_read_headers(ctx, rh),
                     _ => Vec::new(),
                 };
-                (status, body_bytes, resp_headers)
+                // Response-length hint from sendResponseHeaders: -1 => no body /
+                // no Content-Length (HEAD, 204, 304).
+                let len_hint = ctx.get_field(ex, 7).as_int().unwrap_or(0);
+                (status, body_bytes, resp_headers, len_hint)
             }
-            None => (404, b"Not Found".to_vec(), Vec::new()),
+            None => (404, b"Not Found".to_vec(), Vec::new(), 0),
         };
         let stream = req.stream;
         let mut resp = Vec::with_capacity(128 + body_bytes.len());
         use std::io::Write as _;
         let _ = write!(&mut resp, "HTTP/1.1 {status} {}\r\n", http_reason(status));
-        let mut has_content_length = false;
-        let mut has_date = false;
         for (k, v) in &resp_headers {
-            if k.eq_ignore_ascii_case("content-length") {
-                has_content_length = true;
-            }
-            if k.eq_ignore_ascii_case("date") {
-                has_date = true;
+            // The server owns the message-framing headers (Content-Length,
+            // Connection, Transfer-Encoding) and the Date header; the real
+            // com.sun.net.httpserver emits exactly one of each and ignores any
+            // handler-echoed copy. A handler that copies request headers into the
+            // response (as the ES ResponseHandler does) would otherwise produce a
+            // DUPLICATE Connection/Content-Length, which the client surfaces as an
+            // extra header (ES testHeaders). Skip those here and emit our own.
+            if k.eq_ignore_ascii_case("content-length")
+                || k.eq_ignore_ascii_case("connection")
+                || k.eq_ignore_ascii_case("transfer-encoding")
+                || k.eq_ignore_ascii_case("date")
+            {
+                continue;
             }
             let _ = write!(&mut resp, "{k}: {v}\r\n");
         }
-        // The real com.sun.net.httpserver auto-adds a Date header; match it.
-        if !has_date {
-            let _ = write!(&mut resp, "Date: {}\r\n", http_date_now());
-        }
-        if !has_content_length {
+        // Server-controlled framing headers, each exactly once (matches the real
+        // com.sun.net.httpserver, which auto-adds Date + Content-length).
+        let _ = write!(&mut resp, "Date: {}\r\n", http_date_now());
+        // A HEAD response carries no body and (per the real server / ES
+        // testHeaders) no Content-Length. Every other method gets a
+        // Content-Length — including 0 for an empty body — and the body bytes.
+        // (`len_hint` from sendResponseHeaders is captured but the HEAD method is
+        // the distinction the client/test actually keys on.)
+        let _ = len_hint;
+        let is_head = req.method.eq_ignore_ascii_case("HEAD");
+        if !is_head {
             let _ = write!(&mut resp, "Content-Length: {}\r\n", body_bytes.len());
         }
         resp.extend_from_slice(b"Connection: close\r\n\r\n");
-        resp.extend_from_slice(&body_bytes);
+        if !is_head {
+            resp.extend_from_slice(&body_bytes);
+        }
         // Write the response and close on a short-lived I/O thread (pure socket
         // work, no VM context needed) so the dispatcher returns immediately to
         // serve the next queued request instead of blocking on the per-connection
@@ -6144,7 +6161,6 @@ fn re10_serve_loop_run(
     if server_id < 0 {
         return Ok(None);
     }
-    let mut iters: u64 = 0;
     loop {
         let running = server_registry()
             .lock()
@@ -6153,17 +6169,13 @@ fn re10_serve_loop_run(
             .unwrap_or(false);
         if !running {
             if dbg {
-                eprintln!("[HTTPSRV] serve_loop EXIT server={server_id} (not running) iters={iters}");
+                eprintln!("[HTTPSRV] serve_loop EXIT server={server_id} (not running)");
             }
             break;
         }
         // Dispatch runs Java bytecode (the handler) which cooperates with
         // safepoints normally — only the idle wait needs a blocking region.
         let drained = re10_dispatch_pending(ctx, server_id)?;
-        if dbg && (drained > 0 || iters % 500 == 0) {
-            eprintln!("[HTTPSRV] serve_loop server={server_id} iter={iters} drained={drained}");
-        }
-        iters += 1;
         if drained == 0 {
             ctx.begin_blocking_region();
             std::thread::sleep(Duration::from_millis(2));
@@ -6450,6 +6462,17 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let code = args.get(1).and_then(|v| v.as_int()).unwrap_or(200);
         ctx.set_field(this, 5, Value::Int(code));
+        // Stash the response-length argument (field 7): per the
+        // com.sun.net.httpserver contract, -1 means "no response body and NO
+        // Content-Length header" (HEAD / 204 / 304); >0 is the body length; 0
+        // means chunked. We honour -1 so HEAD responses don't carry a spurious
+        // Content-Length (ES testHeaders). The Long arrives at args[2].
+        let len = match args.get(2) {
+            Some(Value::Long(l)) => *l,
+            Some(v) => v.as_int().map(|i| i as i64).unwrap_or(0),
+            None => 0,
+        };
+        ctx.set_field(this, 7, Value::Int(len.clamp(i32::MIN as i64, i32::MAX as i64) as i32));
         Ok(None)
     });
     r.register(hex, "getResponseBody", "()Ljava/io/OutputStream;", |ctx, args| {

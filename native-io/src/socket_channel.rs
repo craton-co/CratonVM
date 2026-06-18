@@ -48,15 +48,6 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
-/// Gated NIO op tracing (CRATONVM_DBG_NIO=1) for diagnosing reactor flows.
-macro_rules! nio_trace {
-    ($($a:tt)*) => {
-        if std::env::var_os("CRATONVM_DBG_NIO").is_some() {
-            eprintln!($($a)*);
-        }
-    };
-}
-
 fn ipc_dbg_enabled() -> bool {
     std::env::var("CRATONVM_SUREFIRE_IPC_DBG")
         .map(|v| {
@@ -315,8 +306,45 @@ fn bool_arg(args: &[Value], idx: usize) -> bool {
 /// the `alloc_t16` helper in `nio_native.rs`.
 fn alloc_obj(ctx: &mut dyn NativeContext, class_name: &str, nfields: usize) -> ObjectRef {
     match ctx.ensure_class_initialized(class_name) {
-        Ok(cid) => ctx.alloc_object(cid, nfields),
+        Ok(cid) => {
+            // Allocate the FULL real field layout (not just the synthetic
+            // `nfields`) so the inherited `AbstractInterruptibleChannel.closeLock`
+            // / `AbstractSelectableChannel.keyLock`/`regLock` monitor fields
+            // actually exist and can be seeded by `init_channel_locks`. The
+            // synthetic per-channel state lives in the `chan_fields` side-table
+            // (keyed by identity, see cf_set), so the extra real slots are inert
+            // for the natives but let any real channel bytecode that runs (e.g.
+            // `close()` reached from the Apache NIO reactor) find non-null locks.
+            let real = ctx.class_num_total_fields(cid);
+            ctx.alloc_object(cid, real.max(nfields))
+        }
         Err(_) => ctx.alloc_object(ClassId::new(0), nfields),
+    }
+}
+
+/// Seed the `AbstractInterruptibleChannel` / `AbstractSelectableChannel` monitor
+/// fields the real JDK `close()`/`register()` bytecode does `synchronized(...)`
+/// on. CratonVM creates channels without running those constructors, leaving the
+/// `final` locks null → `monitorenter ... null` NPE on any path that reaches the
+/// real bytecode. The Apache httpasyncclient I/O reactor closes each session's
+/// `SocketChannel` via the final `AbstractInterruptibleChannel.close()` (not the
+/// overridable `SocketChannelImpl.close`), so a null `closeLock` killed the
+/// reactor worker under load → "I/O reactor has been shut down" (ES
+/// testManyAsyncRequests). Idempotent; safe to call on any channel.
+fn init_channel_locks(ctx: &mut dyn NativeContext, ch: ObjectRef) {
+    // Seed each monitor field with the channel object ITSELF rather than a fresh
+    // `new Object()`. The fields only need to be a non-null, stable monitor; the
+    // channel is one, and using it avoids the allocation entirely — which matters
+    // because `new_object` can trigger a moving GC that relocates `ch`, and under
+    // concurrent load (the Apache reactor opening hundreds of channels) that race
+    // left `closeLock` null for a few channels → reactor-killing NPE on close (ES
+    // testManyAsyncRequests). `synchronized(closeLock)` then `synchronized(keyLock)`
+    // both lock the same channel monitor reentrantly (same thread) — correct, and
+    // distinct channels still use distinct monitors.
+    for f in ["closeLock", "keyLock", "regLock"] {
+        if !matches!(ctx.get_field_by_name(ch, f), Value::Object(Some(_))) {
+            ctx.set_field_by_name(ch, f, Value::Object(Some(ch)));
+        }
     }
 }
 
@@ -697,6 +725,7 @@ fn buffer_write_bytes(ctx: &mut dyn NativeContext, bb: ObjectRef, data: &[u8]) -
 /// or connect yet; that happens on `connect`.
 fn sc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let ch = alloc_obj(ctx, "java/nio/channels/SocketChannel", N_FIELDS);
+    init_channel_locks(ctx, ch);
     cf_set(ctx, ch, F_OPEN, Value::Int(1));
     cf_set(ctx, ch, F_BLOCKING, Value::Int(1));
     cf_set(ctx, ch, F_REG_ID, Value::Int(-1));
@@ -786,7 +815,6 @@ fn sc_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(this) = obj_or_none(args, 0) {
         if let Some(id) = read_reg_id(ctx, this) {
-            nio_trace!("[NIO] close id={id}");
             tcp_remove(id);
         }
         // Drop the synthetic state entirely: a later isOpen()/isConnected()
@@ -1113,7 +1141,6 @@ fn sc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
     let blocking = read_blocking_flag(ctx, this);
     let ok = sc_connect_inner(ctx, this, sa, blocking)?;
-    nio_trace!("[NIO] connect blocking={blocking} -> immediate={ok}");
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 
@@ -1149,7 +1176,6 @@ fn sc_finish_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(v) => v,
         None => return Ok(Some(Value::Int(0))),
     };
-    nio_trace!("[NIO] finishConnect id={id}");
 
     // Check the current state of the registry entry.
     let res_kind = {
@@ -1290,7 +1316,6 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         let written = buffer_write_bytes(ctx, bb, &buf[..n as usize]);
         buffer_advance(ctx, bb, written);
     }
-    nio_trace!("[NIO] read id={id} -> {n}");
     Ok(Some(Value::Int(n)))
 }
 
@@ -1326,7 +1351,6 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         crate::net::socket_capture('w', id, &data[..n as usize]);
         buffer_advance(ctx, bb, n);
     }
-    nio_trace!("[NIO] write id={id} len={} -> {n}", data.len());
     Ok(Some(Value::Int(n)))
 }
 
@@ -1643,6 +1667,7 @@ fn box_socket_option(
 
 fn ssc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let ch = alloc_obj(ctx, "java/nio/channels/ServerSocketChannel", N_FIELDS);
+    init_channel_locks(ctx, ch);
     cf_set(ctx, ch, F_OPEN, Value::Int(1));
     cf_set(ctx, ch, F_BLOCKING, Value::Int(1));
     cf_set(ctx, ch, F_REG_ID, Value::Int(-1));
@@ -1745,6 +1770,7 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     tcp_blocking_state().write().insert(new_id, blocking);
 
     let child = alloc_obj(ctx, "java/nio/channels/SocketChannel", N_FIELDS);
+    init_channel_locks(ctx, child);
     cf_set(ctx, child, F_OPEN, Value::Int(1));
     cf_set(ctx, child, F_BLOCKING, Value::Int(if blocking { 1 } else { 0 }));
     cf_set(ctx, child, F_REG_ID, Value::Int(new_id));
@@ -1832,6 +1858,16 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             sc_configure_blocking,
         );
         r.register(c, "close", "()V", sc_close);
+        // The reactor (and JDK code) often closes via the FINAL
+        // `AbstractInterruptibleChannel.close()` rather than the overridable
+        // `SocketChannel.close()`. That bytecode runs (closeLock seeded by
+        // init_channel_locks) and calls the abstract `implCloseSelectableChannel()`
+        // — which our synthetic SocketChannel class does not implement. Register
+        // it as the actual socket teardown so the close completes instead of
+        // hitting an AbstractMethodError. (`AbstractSelectableChannel.implCloseChannel`
+        // then cancels keys under keyLock with keyCount==0 — a no-op for us.)
+        r.register(c, "implCloseSelectableChannel", "()V", sc_close);
+        r.register(c, "implCloseChannel", "()V", sc_close);
         r.register(
             c,
             "connect",
@@ -1907,6 +1943,10 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             sc_configure_blocking,
         );
         r.register(c, "close", "()V", ssc_close);
+        // See the SocketChannel loop: handle the real-close abstract hooks so a
+        // close via the final AbstractInterruptibleChannel.close() completes.
+        r.register(c, "implCloseSelectableChannel", "()V", ssc_close);
+        r.register(c, "implCloseChannel", "()V", ssc_close);
         r.register(
             c,
             "bind",
