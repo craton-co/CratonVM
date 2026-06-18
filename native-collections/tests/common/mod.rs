@@ -261,6 +261,22 @@ impl NativeContext for MockCtx {
                     return Ok(Some(Value::Object(Some(obj))));
                 }
             }
+            // The other int-field boxers (Character / Byte / Short / Boolean):
+            // slot 0 carries the Int value, class_id carries the wrapper name —
+            // exactly the layout `tree_key_to_value` produces, so a reboxed
+            // TreeMap key round-trips to the correct wrapper class.
+            (
+                "java/lang/Character" | "java/lang/Byte" | "java/lang/Short"
+                | "java/lang/Boolean",
+                "valueOf",
+            ) => {
+                if let Some(Value::Int(v)) = a.first().copied() {
+                    let cid = self.ensure_class_initialized(class)?;
+                    let obj = self.alloc_object(cid, 1);
+                    self.set_field(obj, 0, Value::Int(v));
+                    return Ok(Some(Value::Object(Some(obj))));
+                }
+            }
             _ => {}
         }
         Ok(None)
@@ -746,4 +762,17 @@ pub fn boxed_int(ctx: &mut MockCtx, v: i32) -> Value {
     let obj = ctx.alloc_object(cid, 1);
     ctx.set_field(obj, 0, Value::Int(v));
     Value::Object(Some(obj))
+}
+
+/// Box a `char` as a synthetic `java.lang.Character` (slot 0 = Int code unit).
+pub fn boxed_char(ctx: &mut MockCtx, c: char) -> Value {
+    let cid = ctx.ensure_class_initialized("java/lang/Character").unwrap();
+    let obj = ctx.alloc_object(cid, 1);
+    ctx.set_field(obj, 0, Value::Int(c as i32));
+    Value::Object(Some(obj))
+}
+
+/// Return the class name (e.g. `"java/lang/Character"`) of a heap object.
+pub fn class_name_of(ctx: &MockCtx, obj: ObjectRef) -> Option<String> {
+    ctx.class_name_of_id(ctx.class_id_of_object(obj))
 }
