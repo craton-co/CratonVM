@@ -1865,6 +1865,15 @@ fn channel_register_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             _ => None,
         })
         .ok_or_else(|| ioex("register: could not allocate SelectionKeyImpl"))?;
+    // `AbstractSelectionKey.isValid()` is FINAL and reads the `valid` field
+    // directly; its `ensureValid()` (called from `SelectionKeyImpl.interestOps`
+    // etc.) throws `CancelledKeyException` when `valid` is false. We build the key
+    // via `new_object` without running `<init>` (which sets `valid = true`), so
+    // the field defaults to 0 → a freshly-registered key the Apache NIO reactor
+    // configures (`processNewChannels`) spuriously threw, abandoning that session
+    // and losing the request (ES MultipleHosts testAsyncRequests). Seed it true;
+    // `cancel()` flips it false (see key_cancel/sk_cancel_public).
+    ctx.set_field_by_name(key_obj, "valid", Value::Int(1));
     // C27: stash the key state in a side-table keyed by the
     // SelectionKey's GC-stable identity hash code (i32). The embedded
     // ObjectRefs are stored directly so a future post-GC hook can
@@ -1874,9 +1883,6 @@ fn channel_register_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Value::Object(Some(o)) => Some(o),
         _ => None,
     };
-    if std::env::var_os("CRATONVM_DBG_SK").is_some() {
-        eprintln!("[SK] register key_hash={key_hash} net_fd={net_fd} sel_id={sel_id} ops={ops}");
-    }
     sk_table().write().insert(
         key_hash,
         SkState {
@@ -1965,6 +1971,13 @@ fn key_cancel_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let Some(Value::Object(Some(key))) = args.first().copied() else {
         return Ok(None);
     };
+    // Mirror cancellation into the real `valid` field (final
+    // AbstractSelectionKey.isValid reads it directly) and the sk_table.
+    ctx.set_field_by_name(key, "valid", Value::Int(0));
+    sk_state_with_mut(ctx, key, |s| {
+        s.cancelled = true;
+        s.ready_ops = 0;
+    });
     let Some(fd) = key_fd(ctx, key) else {
         return Ok(None);
     };
@@ -2079,22 +2092,13 @@ fn sk_is_valid(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Int(0)));
     };
-    let state = sk_state_get_field(ctx, this, |s| {
+    // A registered key with no side-table row is treated as valid: it was just
+    // created by channel_register and only an explicit cancel() marks it invalid.
+    let valid = sk_state_get_field(ctx, this, |s| {
         Value::Int(if s.cancelled { 0 } else { 1 })
-    });
-    if std::env::var_os("CRATONVM_DBG_SK").is_some() {
-        match &state {
-            Some(Value::Int(0)) => {
-                eprintln!("[SK] isValid hash={} -> CANCELLED", ctx.identity_hash_code(this))
-            }
-            None => eprintln!(
-                "[SK] isValid hash={} -> MISSING (no sk_table entry)",
-                ctx.identity_hash_code(this)
-            ),
-            _ => {}
-        }
-    }
-    Ok(Some(state.unwrap_or(Value::Int(0))))
+    })
+    .unwrap_or(Value::Int(1));
+    Ok(Some(valid))
 }
 
 fn sk_attach(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2137,9 +2141,9 @@ fn sk_cancel_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         return Ok(None);
     };
     let key_hash = ctx.identity_hash_code(this);
-    if std::env::var_os("CRATONVM_DBG_SK").is_some() {
-        eprintln!("[SK] cancel key_hash={key_hash}");
-    }
+    // Reflect cancellation in the real `valid` field too (final
+    // AbstractSelectionKey.isValid reads it directly).
+    ctx.set_field_by_name(this, "valid", Value::Int(0));
     sk_state_with_mut(ctx, this, |s| {
         s.cancelled = true;
         s.ready_ops = 0;

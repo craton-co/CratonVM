@@ -98,6 +98,7 @@ pub(crate) fn tcp_registry() -> &'static RwLock<HashMap<i32, TcpHandle>> {
     REG.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+
 /// Try to clone a registered handle out of the tcp_registry. Returns
 /// None if the id is unknown / Closed / Connecting. Used by the selector
 /// to obtain a `SelectableKind` it can poll without taking ownership of
@@ -998,6 +999,20 @@ fn resolve_and_vet(target: &str) -> Result<Vec<SocketAddr>, MethodCallFailed> {
 /// wait for the connection to succeed/fail. In non-blocking mode we kick
 /// off the connect on a background thread and return false immediately;
 /// `finishConnect()` later polls the result.
+/// A connect error that is a definitive "this peer will not answer" result (as
+/// opposed to TimedOut/WouldBlock, which may just be a slow host). For these we
+/// report the failure immediately rather than deferring to the background-connect
+/// pool, whose pending state the selector cannot surface as OP_CONNECT.
+fn is_definitive_connect_failure(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::AddrNotAvailable
+    )
+}
+
 fn sc_connect_inner(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -1083,21 +1098,43 @@ fn sc_connect_inner(
             ))
         })
     };
-    if let Ok(stream) = immediate {
-        let _ = stream.set_nonblocking(true);
-        let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
-        let id = tcp_register(TcpHandle::Stream(stream));
-        tcp_blocking_state().write().insert(id, false);
-        cf_set(ctx, this, F_REG_ID, Value::Int(id));
-        cf_set(ctx, this, F_CONNECTED, Value::Int(1));
-        cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
-        let host_str = ctx.create_string(&host);
-        cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
-        cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
-        ipc_dbg(format!(
-            "connect success(nonblocking-fastpath) id={id} local_port={local_port}"
-        ));
-        return Ok(true);
+    match immediate {
+        Ok(stream) => {
+            let _ = stream.set_nonblocking(true);
+            let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
+            let id = tcp_register(TcpHandle::Stream(stream));
+            tcp_blocking_state().write().insert(id, false);
+            cf_set(ctx, this, F_REG_ID, Value::Int(id));
+            cf_set(ctx, this, F_CONNECTED, Value::Int(1));
+            cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
+            let host_str = ctx.create_string(&host);
+            cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
+            cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
+            ipc_dbg(format!(
+                "connect success(nonblocking-fastpath) id={id} local_port={local_port}"
+            ));
+            return Ok(true);
+        }
+        // A non-blocking connect that is DEFINITIVELY refused/reset (a stopped
+        // host on loopback) must fail now, not park in the background-connect
+        // "Connecting" state below — that state has no OS handle the selector can
+        // poll, so an Apache-NIO-reactor client registering OP_CONNECT would wait
+        // forever, time the session request out, and lose the request (the
+        // CancelledKeyException in ES MultipleHosts testAsyncRequests). Surfacing
+        // it makes SocketChannel.connect() throw, so the reactor fails the request
+        // fast and the RestClient retries another node. Only INDETERMINATE errors
+        // (e.g. TimedOut — the host may just be slow) fall through to the pool.
+        // A definitively-refused connect is surfaced now (the peer is dead).
+        // Everything else (incl. a loopback fast-path TIMEOUT — the peer may be
+        // slow OR dead) is deferred to the background pool below, which dials with
+        // its own short loopback bound and whose result the selector surfaces as
+        // OP_CONNECT; that keeps a slow-but-live loopback peer working (it succeeds
+        // via the pool) while a dead one fails fast WITHOUT blocking the caller.
+        Err(e) if is_definitive_connect_failure(&e) => {
+            ipc_dbg(format!("connect refused(nonblocking-fastpath) target={target}: {e}"));
+            return Err(map_err(&target, e));
+        }
+        Err(_) => {}
     }
 
     // Round-7 HIGH-5 fix: fallback uses a small fixed-size connect
