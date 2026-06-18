@@ -2103,8 +2103,9 @@ fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "toArray", "()[Ljava/lang/Object;", native_asl_to_array);
     // toArray(T[]) / toArray(IntFunction) — delegate through a fresh snapshot
     // ArrayList (which registers both overloads). Without these, a caller doing
-    // `subList(..).toArray(new X[0])` (e.g. the JUnit Platform launcher) hits a
-    // NoSuchMethodError on the synthetic ASL class and aborts.
+    // `subList(..).toArray(new X[0])` (e.g. the JUnit Platform launcher, and
+    // ~every ESTestCase via ES-FAIL-04) hits a NoSuchMethodError on the
+    // synthetic ASL class and aborts.
     r.register(c, "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;", |ctx, args| {
         asl_delegate_snapshot(ctx, args, "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;")
     });
