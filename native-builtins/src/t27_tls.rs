@@ -63,6 +63,17 @@ use cratonvm_types::{ObjectRef, Value};
 use crate::alloc_concurrent_synthetic;
 use crate::servlet;
 
+thread_local! {
+    // Re-entrancy guard for the interface-level `HostnameVerifier.verify`
+    // native. When we re-dispatch a custom verifier's `verify()` via
+    // `ctx.invoke`, the VM's interface resolution could (in the degenerate
+    // case of a subclass that defines no bytecode override) route back into
+    // this same native. The guard breaks that loop: a re-entrant call falls
+    // back to the default "accept — rustls already validated SNI" behavior
+    // instead of recursing forever.
+    static HOSTNAME_VERIFY_REENTRANT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 // -----------------------------------------------------------------------------
 // Test cert/key fixtures
 // -----------------------------------------------------------------------------
@@ -1181,14 +1192,78 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
-    // HostnameVerifier.verify — default to true when the underlying
-    // rustls/native-tls handshake has already validated the hostname. A
-    // caller wiring a custom verifier would override this in Java code.
+    // HostnameVerifier.verify — this native is registered on the *interface*
+    // `javax/net/ssl/HostnameVerifier`, so it can be reached two ways:
+    //
+    //   1. The VM's OWN default verifier, allocated above via
+    //      `alloc_concurrent_synthetic(ctx, "javax/net/ssl/HostnameVerifier", 0)`.
+    //      Its runtime class is the bare interface itself (no concrete
+    //      subclass). For that object we short-circuit `true`: the underlying
+    //      rustls/native-tls handshake already validated the SNI hostname
+    //      against the peer certificate, so the default JDK verifier is a
+    //      no-op here.
+    //
+    //   2. An APP-SUPPLIED custom `HostnameVerifier`. Normally the interpreter
+    //      dispatches `verifier.verify(host, session)` straight to the
+    //      subclass's bytecode and never reaches this native. But if interface
+    //      resolution lands on this interface-registered native instead of the
+    //      concrete impl, hardcoding `true` would silently BYPASS the app's
+    //      verifier (a security hole). So for any receiver whose concrete class
+    //      is NOT the bare interface, we re-dispatch to the receiver's real
+    //      `verify()` so the application's logic actually runs.
+    //
+    // A thread-local guard prevents unbounded recursion in the degenerate case
+    // where re-dispatch resolves back to this same native for the same call.
     r.register(
         "javax/net/ssl/HostnameVerifier",
         "verify",
         "(Ljava/lang/String;Ljavax/net/ssl/SSLSession;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
+        |ctx, args| {
+            // args[0] = receiver, args[1] = hostname String, args[2] = SSLSession.
+            let receiver = match args.first() {
+                Some(Value::Object(Some(r))) => *r,
+                // Null/garbage receiver: nothing to dispatch to. The handshake
+                // already validated the hostname, so treat as the default
+                // verifier and accept.
+                _ => return Ok(Some(Value::Int(1))),
+            };
+
+            // Determine whether this is the VM's own default verifier (whose
+            // runtime class is the bare interface) or an app-supplied concrete
+            // subclass.
+            let cid = ctx.class_id_of_object(receiver);
+            let concrete = ctx.class_name_of_id(cid);
+            let is_default_verifier = match concrete.as_deref() {
+                // Bare interface instance == our default synthetic verifier.
+                Some("javax/net/ssl/HostnameVerifier") | None => true,
+                _ => false,
+            };
+
+            if is_default_verifier || HOSTNAME_VERIFY_REENTRANT.with(|f| f.get()) {
+                // Default verifier, OR we are already inside a re-dispatch for
+                // this thread (avoid infinite recursion): accept, since rustls
+                // already validated the SNI hostname.
+                return Ok(Some(Value::Int(1)));
+            }
+
+            // App-supplied custom verifier: run ITS real verify() rather than
+            // hardcoding true. Forward the original (host, session) arguments.
+            let cls = concrete.expect("concrete verifier class name");
+            let call_args = [
+                Value::Object(Some(receiver)),
+                args.get(1).copied().unwrap_or(Value::Object(None)),
+                args.get(2).copied().unwrap_or(Value::Object(None)),
+            ];
+            HOSTNAME_VERIFY_REENTRANT.with(|f| f.set(true));
+            let result = ctx.invoke(
+                &cls,
+                "verify",
+                "(Ljava/lang/String;Ljavax/net/ssl/SSLSession;)Z",
+                &call_args,
+            );
+            HOSTNAME_VERIFY_REENTRANT.with(|f| f.set(false));
+            result
+        },
     );
     // Cipher suite / peer principal accessors come from the underlying
     // SSLSession/SSLSocket registrations in phases_late; we do not duplicate

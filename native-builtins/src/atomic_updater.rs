@@ -479,20 +479,25 @@ fn native_arfu_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let target = require_target(args, 1)?;
     let new_val = arg_value(args, 2);
     let slot = impl_slot(ctx, this).unwrap_or(0);
-    // Bounded retry loop guards against pathological starvation.
-    for _ in 0..1024 {
+    // Linearizable getAndSet: read+CAS until the swap commits. The CAS
+    // primitive (`compare_and_swap_field`) holds the per-object CAS lock
+    // across its own load+compare+store, so each iteration's
+    // read-then-CAS pair is atomic against concurrent updaters.
+    //
+    // We must NOT fall through to a bare `set_field_volatile` after a
+    // bounded number of tries: a non-atomic read-then-store loses the
+    // update of any concurrent writer that committed between our read
+    // and our store, and would return a "previous" value that was never
+    // the one actually replaced — breaking getAndSet's contract. Real
+    // HotSpot (`Unsafe.getAndSetReference`) loops until success, so we do
+    // too. The CAS only fails when another writer made progress, which
+    // guarantees system-wide progress (lock-free), not livelock.
+    loop {
         let current = ctx.get_field_volatile(target, slot);
         if ctx.compare_and_swap_field(target, slot, current, new_val) {
             return Ok(Some(current));
         }
     }
-    // Final attempt — if it still fails we fall through to a volatile
-    // store, matching the JDK's "definitely write the value" semantics
-    // on a heavily contended single field.  CAS-failure here is benign:
-    // we return the most recent observed value.
-    let current = ctx.get_field_volatile(target, slot);
-    ctx.set_field_volatile(target, slot, new_val);
-    Ok(Some(current))
 }
 
 fn native_arfu_get_and_update(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -503,7 +508,13 @@ fn native_arfu_get_and_update(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let target = require_target(args, 1)?;
     let op = arg_obj_or_npe(args, 2, "op")?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
-    for _ in 0..1024 {
+    // The UnaryOperator is arbitrary Java code and cannot run inside the
+    // CAS lock, so we recompute-and-CAS-retry until the swap commits —
+    // exactly HotSpot's getAndUpdate. The loop must be unbounded: bailing
+    // after a fixed retry count (the previous behaviour) abandoned the
+    // update under contention, leaving the field unchanged but pretending
+    // success — a lost update.
+    loop {
         let prev = ctx.get_field_volatile(target, slot);
         let new_val = ctx
             .invoke_virtual(op, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;", &[prev])?
@@ -512,7 +523,6 @@ fn native_arfu_get_and_update(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             return Ok(Some(prev));
         }
     }
-    Ok(Some(ctx.get_field_volatile(target, slot)))
 }
 
 fn native_arfu_update_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -520,7 +530,10 @@ fn native_arfu_update_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let target = require_target(args, 1)?;
     let op = arg_obj_or_npe(args, 2, "op")?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
-    for _ in 0..1024 {
+    // Unbounded recompute-and-CAS-retry (see native_arfu_get_and_update):
+    // bailing after a fixed retry count would abandon the update and
+    // return a value never actually stored.
+    loop {
         let prev = ctx.get_field_volatile(target, slot);
         let new_val = ctx
             .invoke_virtual(op, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;", &[prev])?
@@ -529,7 +542,6 @@ fn native_arfu_update_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             return Ok(Some(new_val));
         }
     }
-    Ok(Some(ctx.get_field_volatile(target, slot)))
 }
 
 // ---------------------------------------------------------------------------
@@ -590,7 +602,11 @@ fn native_aifu_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => 0,
     };
     let slot = impl_slot(ctx, this).unwrap_or(0);
-    for _ in 0..1024 {
+    // Linearizable getAndSet — read+CAS until commit, never a non-atomic
+    // read-then-store fallthrough (which would lose a concurrent writer's
+    // update and return a bogus "previous" value). See the reference
+    // variant `native_arfu_get_and_set` for the full rationale.
+    loop {
         let current = match ctx.get_field_volatile(target, slot) {
             Value::Int(v) => v,
             _ => 0,
@@ -604,12 +620,6 @@ fn native_aifu_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             return Ok(Some(Value::Int(current)));
         }
     }
-    let current = match ctx.get_field_volatile(target, slot) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    ctx.set_field_volatile(target, slot, Value::Int(new_val));
-    Ok(Some(Value::Int(current)))
 }
 
 fn native_aifu_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -620,67 +630,36 @@ fn native_aifu_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => 0,
     };
     let slot = impl_slot(ctx, this).unwrap_or(0);
-    for _ in 0..1024 {
-        let current = match ctx.get_field_volatile(target, slot) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        let new_val = current.wrapping_add(delta);
-        if ctx.compare_and_swap_field(
-            target,
-            slot,
-            Value::Int(current),
-            Value::Int(new_val),
-        ) {
-            return Ok(Some(Value::Int(current)));
-        }
-    }
-    Ok(Some(Value::Int(0)))
+    // Use the VM's dedicated atomic fetch-add primitive: a single
+    // `LOCK XADD` (one trait dispatch, no CAS spin) returning the
+    // *previous* value, exactly matching getAndAdd. The previous bounded
+    // CAS loop silently returned 0 (and applied no update) after 1024
+    // contended retries — a lost update. atomic_fetch_add_int loops until
+    // commit and surfaces a field-type mismatch as a catchable exception.
+    let prev = ctx.atomic_fetch_add_int(target, slot, delta)?;
+    Ok(Some(Value::Int(prev)))
 }
 
 fn native_aifu_increment_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // incrementAndGet(target) ≡ getAndAdd(target, 1) + 1
+    // incrementAndGet(target) ≡ getAndAdd(target, 1) + 1.
+    // atomic_fetch_add_int returns the previous value via a single atomic
+    // fetch-add; we add the delta back to yield the post-increment value.
+    // Replaces a bounded CAS loop that returned 0 (no update applied)
+    // under contention — a lost update.
     let this = arg_obj_or_npe(args, 0, "updater")?;
     let target = require_target(args, 1)?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
-    for _ in 0..1024 {
-        let current = match ctx.get_field_volatile(target, slot) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        let new_val = current.wrapping_add(1);
-        if ctx.compare_and_swap_field(
-            target,
-            slot,
-            Value::Int(current),
-            Value::Int(new_val),
-        ) {
-            return Ok(Some(Value::Int(new_val)));
-        }
-    }
-    Ok(Some(Value::Int(0)))
+    let prev = ctx.atomic_fetch_add_int(target, slot, 1)?;
+    Ok(Some(Value::Int(prev.wrapping_add(1))))
 }
 
 fn native_aifu_decrement_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // decrementAndGet(target) ≡ getAndAdd(target, -1) - 1.
     let this = arg_obj_or_npe(args, 0, "updater")?;
     let target = require_target(args, 1)?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
-    for _ in 0..1024 {
-        let current = match ctx.get_field_volatile(target, slot) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        let new_val = current.wrapping_sub(1);
-        if ctx.compare_and_swap_field(
-            target,
-            slot,
-            Value::Int(current),
-            Value::Int(new_val),
-        ) {
-            return Ok(Some(Value::Int(new_val)));
-        }
-    }
-    Ok(Some(Value::Int(0)))
+    let prev = ctx.atomic_fetch_add_int(target, slot, -1)?;
+    Ok(Some(Value::Int(prev.wrapping_sub(1))))
 }
 
 // ---------------------------------------------------------------------------
@@ -741,7 +720,11 @@ fn native_alfu_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => 0,
     };
     let slot = impl_slot(ctx, this).unwrap_or(0);
-    for _ in 0..1024 {
+    // Linearizable getAndSet — read+CAS until commit, never a non-atomic
+    // read-then-store fallthrough (which would lose a concurrent writer's
+    // update and return a bogus "previous" value). See the reference
+    // variant `native_arfu_get_and_set` for the full rationale.
+    loop {
         let current = match ctx.get_field_volatile(target, slot) {
             Value::Long(v) => v,
             _ => 0,
@@ -755,12 +738,6 @@ fn native_alfu_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             return Ok(Some(Value::Long(current)));
         }
     }
-    let current = match ctx.get_field_volatile(target, slot) {
-        Value::Long(v) => v,
-        _ => 0,
-    };
-    ctx.set_field_volatile(target, slot, Value::Long(new_val));
-    Ok(Some(Value::Long(current)))
 }
 
 fn native_alfu_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -771,22 +748,11 @@ fn native_alfu_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => 0,
     };
     let slot = impl_slot(ctx, this).unwrap_or(0);
-    for _ in 0..1024 {
-        let current = match ctx.get_field_volatile(target, slot) {
-            Value::Long(v) => v,
-            _ => 0,
-        };
-        let new_val = current.wrapping_add(delta);
-        if ctx.compare_and_swap_field(
-            target,
-            slot,
-            Value::Long(current),
-            Value::Long(new_val),
-        ) {
-            return Ok(Some(Value::Long(current)));
-        }
-    }
-    Ok(Some(Value::Long(0)))
+    // Dedicated atomic fetch-add (LOCK XADD), returning the previous
+    // value — matches getAndAdd and replaces a bounded CAS loop that
+    // dropped the update (returned 0) under contention.
+    let prev = ctx.atomic_fetch_add_long(target, slot, delta)?;
+    Ok(Some(Value::Long(prev)))
 }
 
 // ---------------------------------------------------------------------------

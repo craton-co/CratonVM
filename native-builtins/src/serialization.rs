@@ -149,6 +149,12 @@ pub(crate) struct ObjectInputFilterState {
     pub(crate) rejected: bool,
     /// Reason string used to build the `IOException` message.
     pub(crate) reason: String,
+    /// Compiled class-name pattern clauses (FQCN / glob / `!`-reject) from
+    /// the same filter string the numeric limits came from. `None` means the
+    /// spec carried no pattern clauses (limits-only). The synthetic read path
+    /// consults this via `evaluate_serial_filters` so per-stream pattern
+    /// filters are honored, not just the four resource limits.
+    pub(crate) patterns: Option<SerialFilter>,
 }
 
 impl ObjectInputFilterState {
@@ -340,10 +346,13 @@ fn synthetic_read_class_rejected(addr: usize, class_name: &str) -> bool {
 /// Parse a JEP-290 serial-filter string into an `ObjectInputFilterState`.
 ///
 /// Recognises the four resource-limit clauses (`maxdepth=N`, `maxrefs=N`,
-/// `maxbytes=N`, `maxarray=N`). Pattern clauses (FQCN, glob, `!`-prefixed
-/// reject patterns) are accepted lexically and discarded — limit
-/// enforcement is the load-bearing part of this parser and the pattern
-/// matcher lives in the existing `ObjectInputFilter` plumbing.
+/// `maxbytes=N`, `maxarray=N`) AND the class-name pattern clauses (FQCN,
+/// glob, `!`-prefixed reject patterns). The numeric limits drive the
+/// running per-stream counters; the pattern clauses are compiled into a
+/// `SerialFilter` (the same FQCN/glob/`!`-reject matcher used for the
+/// process-wide `jdk.serialFilter`) and stored in `patterns` so the
+/// synthetic read path can honor per-stream class-name filters — not just
+/// the resource limits — via `evaluate_serial_filters`.
 ///
 /// Multiple clauses are separated by `;`. Whitespace is trimmed.
 /// Unknown clauses are silently ignored so the parser is forward-
@@ -358,10 +367,11 @@ pub(crate) fn parse_serial_filter(spec: &str) -> ObjectInputFilterState {
         if clause.is_empty() {
             continue;
         }
-        // `key=N` clauses are the only ones we enforce.
+        // `key=N` clauses are the only ones we enforce here as limits; every
+        // other (non-`=`) clause is a class-name pattern handled below.
         let (key, value) = match clause.split_once('=') {
             Some((k, v)) => (k.trim(), v.trim()),
-            None => continue, // pattern clause — preserved for downstream matcher
+            None => continue, // pattern clause — compiled below via SerialFilter::parse
         };
         match key {
             "maxdepth" => {
@@ -388,6 +398,21 @@ pub(crate) fn parse_serial_filter(spec: &str) -> ObjectInputFilterState {
                 // Unknown limit clause — silently ignore.
             }
         }
+    }
+    // Compile the class-name pattern clauses with the existing glob matcher.
+    // `SerialFilter::parse` walks the whole spec but only retains the
+    // `FilterEntry::Class` rules for matching (limit clauses become inert
+    // `FilterEntry::Limit` entries `check()` skips), so we feed it the raw
+    // spec instead of re-tokenising. Store the result only when at least one
+    // class-name rule is present — a limits-only spec yields no patterns and
+    // leaves `patterns` as `None` (no behavioural change for those callers).
+    let compiled = SerialFilter::parse(spec);
+    if compiled
+        .entries
+        .iter()
+        .any(|e| matches!(e, FilterEntry::Class { .. }))
+    {
+        state.patterns = Some(compiled);
     }
     state
 }
@@ -3248,9 +3273,25 @@ fn process_serial_filter_obj() -> &'static Mutex<Option<ObjectRef>> {
 /// Returns the merged decision per JEP-290 (UNDECIDED ⇒ allow at
 /// resolveClass time, REJECTED ⇒ throw).
 fn evaluate_serial_filters(ois_addr: usize, class_name: &str) -> FilterStatus {
+    // Per-stream filter installed via `setObjectInputFilter` (synthetic
+    // ALLOW/REJECT objects compiled to `SerialFilter`).
     {
         let map = ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(f) = map.get(&ois_addr) {
+            match f.check(class_name) {
+                FilterStatus::Rejected => return FilterStatus::Rejected,
+                FilterStatus::Allowed => return FilterStatus::Allowed,
+                FilterStatus::Undecided => { /* fall through */ }
+            }
+        }
+    }
+    // Per-stream class-name patterns parsed from a filter *string* (the
+    // `parse_serial_filter` path, installed via `ois_set_filter_state`).
+    // Still a per-stream filter, so it precedes the process-wide one but
+    // follows any explicit `setObjectInputFilter` install above.
+    {
+        let map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(f) = map.get(&ois_addr).and_then(|s| s.patterns.as_ref()) {
             match f.check(class_name) {
                 FilterStatus::Rejected => return FilterStatus::Rejected,
                 FilterStatus::Allowed => return FilterStatus::Allowed,
@@ -4795,8 +4836,8 @@ mod serialization_tests {
 
     #[test]
     fn jep290_parse_mixed_with_class_patterns() {
-        // Class-name patterns are accepted lexically and ignored;
-        // limit clauses are still picked up.
+        // Class-name patterns are now compiled into `patterns` (no longer a
+        // silent no-op); limit clauses are still picked up alongside them.
         let s = parse_serial_filter(
             "!com.evil.*;java.util.*;maxdepth=5;maxbytes=1024;com.example.Foo",
         );
@@ -4805,6 +4846,59 @@ mod serialization_tests {
         // Pattern-only clauses leave maxrefs/maxarray unbounded.
         assert_eq!(s.max_refs, 0);
         assert_eq!(s.max_array, 0);
+
+        // The class-name clauses are compiled and matchable (first match
+        // wins, left-to-right, dot/slash agnostic — same matcher used for
+        // the process-wide `jdk.serialFilter`).
+        let pats = s.patterns.as_ref().expect("class patterns compiled");
+        assert_eq!(pats.check("com.evil.Gadget"), FilterStatus::Rejected);
+        assert_eq!(pats.check("com/evil/Gadget"), FilterStatus::Rejected);
+        assert_eq!(pats.check("java.util.HashMap"), FilterStatus::Allowed);
+        assert_eq!(pats.check("com.example.Foo"), FilterStatus::Allowed);
+        // No matching clause => undecided (falls through to process-wide).
+        assert_eq!(pats.check("org.other.Thing"), FilterStatus::Undecided);
+    }
+
+    #[test]
+    fn jep290_limits_only_spec_has_no_patterns() {
+        // A spec with only `=N` clauses must leave `patterns` as `None` so
+        // limits-only callers see no behavioural change.
+        let s = parse_serial_filter("maxdepth=4;maxrefs=2;maxbytes=32;maxarray=8");
+        assert!(s.patterns.is_none());
+    }
+
+    #[test]
+    fn jep290_perstream_pattern_filter_routed_on_synthetic_read_path() {
+        // Regression: per-stream class-name pattern filters installed from a
+        // filter STRING (via `parse_serial_filter` + `ois_set_filter_state`)
+        // must now be honored by `evaluate_serial_filters` — the decision
+        // point the synthetic read path consults — not just the numeric
+        // limits. Before the fix the patterns were discarded and every class
+        // was UNDECIDED (silently allowed).
+        let addr = 0x4A45_5070_usize;
+        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+
+        ois_set_filter_state(addr, parse_serial_filter("!com.evil.**;java.util.*;maxdepth=10"));
+
+        // Reject pattern fires (recursive `**`).
+        assert_eq!(
+            evaluate_serial_filters(addr, "com/evil/sub/Gadget"),
+            FilterStatus::Rejected
+        );
+        // Allow pattern fires.
+        assert_eq!(
+            evaluate_serial_filters(addr, "java/util/HashMap"),
+            FilterStatus::Allowed
+        );
+        // No clause matches => undecided (no process-wide filter installed
+        // in this unit test).
+        assert_eq!(
+            evaluate_serial_filters(addr, "org/other/Thing"),
+            FilterStatus::Undecided
+        );
+
+        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
     }
 
     #[test]
