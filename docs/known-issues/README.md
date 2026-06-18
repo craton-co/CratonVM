@@ -120,6 +120,18 @@ items are **its "defect #2" (= family A3 above)** and **bug C** (the cold-path
 deep-recursion overflow). It is kept for that context and the deep-recursion
 stack-guard design.
 
+## Standalone — Hibernate JTA cluster (Narayana XA + socket loopback)
+
+[hibernate-jta-narayana-xa-completion-and-socket-loopback.md](hibernate-jta-narayana-xa-completion-and-socket-loopback.md)
+— found in the full Hibernate ORM 8.0 suite census (dev, 2026-06-17). **Not** a
+GC/JIT issue. Three layers: (0) `ServerSocket.getInetAddress()` → null →
+`TxControl.<clinit>` NPE — **fixed** (`net_phase_e.rs` `getInetAddress` native);
+(1) Narayana **XA transaction completion** doesn't commit/release the enlisted H2
+connection → `@AfterEach truncate` blocks on H2 lock timeout → hang (🔴 open);
+(2) default-mode synthetic `ServerSocket` accept/connect **loopback** doesn't pair
+→ `TransactionStatusManager` bring-up hangs (🔴 open). Layers 1–2 are a deep
+JTA/XA + socket-subsystem handoff.
+
 ## Consolidation log
 
 - **2026-06-17:** Merged `precise-jit-stack-maps-multithread-fjp-worker-testcase.md`
