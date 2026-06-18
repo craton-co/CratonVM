@@ -11099,6 +11099,12 @@ fn register_int_stream_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "toArray", "()[I", native_int_stream_to_array);
     r.register(
         c,
+        "collect",
+        "(Ljava/util/function/Supplier;Ljava/util/function/ObjIntConsumer;Ljava/util/function/BiConsumer;)Ljava/lang/Object;",
+        native_int_stream_collect,
+    );
+    r.register(
+        c,
         "sorted",
         "()Ljava/util/stream/IntStream;",
         native_int_stream_sorted,
@@ -11316,6 +11322,52 @@ fn native_int_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     Ok(None)
 }
 
+/// `IntStream.collect(Supplier, ObjIntConsumer, BiConsumer)` — the 3-arg
+/// mutable-reduction terminal op. The synthetic IntStream (range/of/map/…)
+/// never registered it, so the call resolved to the abstract `IntStream.collect`
+/// interface declaration → `AbstractMethodError ("… has no Code attribute")`.
+/// carrotsearch randomizedtesting's `RandomizedRunner.invoke` calls this on
+/// EVERY test-method invocation, so the uncaught error killed the forked test
+/// thread before it set `completed`, and every Elasticsearch `ESTestCase` was
+/// abandoned with a spurious "suite timeout" after the first method. Our streams
+/// are sequential, so the `combiner` (arg 3, used only to merge parallel splits)
+/// is unused: build the container via `supplier.get()` then fold each int
+/// through `accumulator.accept(container, value)`. The container is pinned
+/// across the accumulator calls (each may allocate and trigger a moving GC).
+fn native_int_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let supplier = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let accumulator = match args.get(2) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // Read primitive elements up front (Value::Int — no GC roots needed).
+    let elements = int_stream_elements(ctx, this);
+    let container = match ctx.invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[])? {
+        Some(Value::Object(Some(c))) => c,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let pin = ctx.pin_native_root(container);
+    for elem in &elements {
+        let c = ctx.read_native_pin(pin, container);
+        ctx.invoke_virtual(
+            accumulator,
+            "accept",
+            "(Ljava/lang/Object;I)V",
+            &[Value::Object(Some(c)), *elem],
+        )?;
+    }
+    let c = ctx.read_native_pin(pin, container);
+    ctx.unpin_native_roots(pin);
+    Ok(Some(Value::Object(Some(c))))
+}
+
 /// `IntStream.sorted()` — natural ascending order. The synthetic IntStream
 /// created by `range`/`rangeClosed`/`map`/etc. (this handler set) had no
 /// `sorted`, so it dispatched to the abstract `IntStream.sorted()` → "has no
@@ -11489,6 +11541,12 @@ fn register_long_stream_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(c, "sum", "()J", native_long_stream_sum);
     r.register(c, "count", "()J", native_long_stream_count);
+    r.register(
+        c,
+        "collect",
+        "(Ljava/util/function/Supplier;Ljava/util/function/ObjLongConsumer;Ljava/util/function/BiConsumer;)Ljava/lang/Object;",
+        native_long_stream_collect,
+    );
     r.register(
         c,
         "min",
@@ -11723,6 +11781,42 @@ fn native_long_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(None)
 }
 
+/// `LongStream.collect(Supplier, ObjLongConsumer, BiConsumer)` — see
+/// `native_int_stream_collect` for the rationale (missing 3-arg collect →
+/// AbstractMethodError). `accept` takes `(Object, long)`.
+fn native_long_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let supplier = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let accumulator = match args.get(2) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let elements = stream_elements(ctx, this);
+    let container = match ctx.invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[])? {
+        Some(Value::Object(Some(c))) => c,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let pin = ctx.pin_native_root(container);
+    for elem in &elements {
+        let c = ctx.read_native_pin(pin, container);
+        ctx.invoke_virtual(
+            accumulator,
+            "accept",
+            "(Ljava/lang/Object;J)V",
+            &[Value::Object(Some(c)), *elem],
+        )?;
+    }
+    let c = ctx.read_native_pin(pin, container);
+    ctx.unpin_native_roots(pin);
+    Ok(Some(Value::Object(Some(c))))
+}
+
 fn native_long_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
@@ -11829,6 +11923,12 @@ fn register_double_stream_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(c, "sum", "()D", native_double_stream_sum);
     r.register(c, "count", "()J", native_double_stream_count);
+    r.register(
+        c,
+        "collect",
+        "(Ljava/util/function/Supplier;Ljava/util/function/ObjDoubleConsumer;Ljava/util/function/BiConsumer;)Ljava/lang/Object;",
+        native_double_stream_collect,
+    );
     r.register(
         c,
         "min",
@@ -12007,6 +12107,41 @@ fn native_double_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) ->
         ctx.invoke_virtual(consumer, "accept", "(D)V", &[*elem])?;
     }
     Ok(None)
+}
+
+/// `DoubleStream.collect(Supplier, ObjDoubleConsumer, BiConsumer)` — see
+/// `native_int_stream_collect` for rationale. `accept` takes `(Object, double)`.
+fn native_double_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let supplier = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let accumulator = match args.get(2) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let elements = stream_elements(ctx, this);
+    let container = match ctx.invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[])? {
+        Some(Value::Object(Some(c))) => c,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let pin = ctx.pin_native_root(container);
+    for elem in &elements {
+        let c = ctx.read_native_pin(pin, container);
+        ctx.invoke_virtual(
+            accumulator,
+            "accept",
+            "(Ljava/lang/Object;D)V",
+            &[Value::Object(Some(c)), *elem],
+        )?;
+    }
+    let c = ctx.read_native_pin(pin, container);
+    ctx.unpin_native_roots(pin);
+    Ok(Some(Value::Object(Some(c))))
 }
 
 fn native_double_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -13526,6 +13661,19 @@ fn native_random_next_int_bound(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         _ => 1,
     };
     if bound <= 0 {
+        // CRATONVM_DBG_NEXTINT=1 — dump the Java caller chain. See the twin
+        // diagnostic in native-builtins securerandom.rs for rationale (locating
+        // the empty-collection divergence in ES/Lucene test-framework setup).
+        if std::env::var("CRATONVM_DBG_NEXTINT").is_ok() {
+            eprintln!("NEXTINT-BAD(coll) bound={bound} caller-chain (inner→outer):");
+            let frames = ctx.capture_stack_trace(0);
+            for f in frames.iter().rev().take(20) {
+                eprintln!(
+                    "  NEXTINT-STK {}.{} line={} bci={}",
+                    f.class_name, f.method_name, f.line_number, f.byte_code_index
+                );
+            }
+        }
         return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: "bound must be positive".to_string(),
         }
@@ -24159,6 +24307,27 @@ fn unmod_delegate(
     ctx.invoke_virtual(backing, method, descriptor, &args[1..])
 }
 
+/// Forward a read-only NavigableMap/SortedMap *view* call to the backing
+/// (e.g. `headMap`, `subMap`, `descendingMap`) and re-wrap the returned map as
+/// unmodifiable, mirroring the JDK's UnmodifiableNavigableMap which returns
+/// unmodifiable submaps. A non-map / null result is passed through unchanged.
+fn unmod_delegate_rewrap_map(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+    descriptor: &str,
+) -> MethodCallResult {
+    let res = unmod_delegate(ctx, args, method, descriptor)?;
+    match res {
+        Some(Value::Object(Some(m))) => Ok(Some(Value::Object(Some(alloc_unmod_wrapper(
+            ctx,
+            UNMOD_MAP_CLASS,
+            m,
+        ))))),
+        other => Ok(other),
+    }
+}
+
 fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -24385,6 +24554,108 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
             "(Ljava/util/function/BiFunction;)V",
             native_unmod_throw,
         );
+
+        // ---- NavigableMap / SortedMap read surface ------------------------
+        // `Collections.unmodifiableNavigableMap` / `unmodifiableSortedMap`
+        // reuse this same wrapper class, but only the plain Map methods were
+        // registered. Any NavigableMap/SortedMap call (e.g. `floorEntry`,
+        // dispatched from a `NavigableMap`-typed reference and retargeted to
+        // the concrete wrapper) hit NoSuchMethodError — a dominant Elasticsearch
+        // suite-setup blocker. Delegate every read to the backing (a real
+        // NavigableMap such as TreeMap); re-wrap map-view returns as read-only;
+        // the `poll*` views are mutators → throw. (`NativeCallback` is a bare
+        // fn pointer, so each closure must inline its own name/descriptor — no
+        // captures — matching the ASL `toArray` delegation pattern above.)
+        r.register(c, "comparator", "()Ljava/util/Comparator;", |ctx, args| {
+            unmod_delegate(ctx, args, "comparator", "()Ljava/util/Comparator;")
+        });
+        r.register(c, "firstKey", "()Ljava/lang/Object;", |ctx, args| {
+            unmod_delegate(ctx, args, "firstKey", "()Ljava/lang/Object;")
+        });
+        r.register(c, "lastKey", "()Ljava/lang/Object;", |ctx, args| {
+            unmod_delegate(ctx, args, "lastKey", "()Ljava/lang/Object;")
+        });
+        r.register(c, "firstEntry", "()Ljava/util/Map$Entry;", |ctx, args| {
+            unmod_delegate(ctx, args, "firstEntry", "()Ljava/util/Map$Entry;")
+        });
+        r.register(c, "lastEntry", "()Ljava/util/Map$Entry;", |ctx, args| {
+            unmod_delegate(ctx, args, "lastEntry", "()Ljava/util/Map$Entry;")
+        });
+        r.register(c, "floorEntry", "(Ljava/lang/Object;)Ljava/util/Map$Entry;", |ctx, args| {
+            unmod_delegate(ctx, args, "floorEntry", "(Ljava/lang/Object;)Ljava/util/Map$Entry;")
+        });
+        r.register(c, "ceilingEntry", "(Ljava/lang/Object;)Ljava/util/Map$Entry;", |ctx, args| {
+            unmod_delegate(ctx, args, "ceilingEntry", "(Ljava/lang/Object;)Ljava/util/Map$Entry;")
+        });
+        r.register(c, "higherEntry", "(Ljava/lang/Object;)Ljava/util/Map$Entry;", |ctx, args| {
+            unmod_delegate(ctx, args, "higherEntry", "(Ljava/lang/Object;)Ljava/util/Map$Entry;")
+        });
+        r.register(c, "lowerEntry", "(Ljava/lang/Object;)Ljava/util/Map$Entry;", |ctx, args| {
+            unmod_delegate(ctx, args, "lowerEntry", "(Ljava/lang/Object;)Ljava/util/Map$Entry;")
+        });
+        r.register(c, "floorKey", "(Ljava/lang/Object;)Ljava/lang/Object;", |ctx, args| {
+            unmod_delegate(ctx, args, "floorKey", "(Ljava/lang/Object;)Ljava/lang/Object;")
+        });
+        r.register(c, "ceilingKey", "(Ljava/lang/Object;)Ljava/lang/Object;", |ctx, args| {
+            unmod_delegate(ctx, args, "ceilingKey", "(Ljava/lang/Object;)Ljava/lang/Object;")
+        });
+        r.register(c, "higherKey", "(Ljava/lang/Object;)Ljava/lang/Object;", |ctx, args| {
+            unmod_delegate(ctx, args, "higherKey", "(Ljava/lang/Object;)Ljava/lang/Object;")
+        });
+        r.register(c, "lowerKey", "(Ljava/lang/Object;)Ljava/lang/Object;", |ctx, args| {
+            unmod_delegate(ctx, args, "lowerKey", "(Ljava/lang/Object;)Ljava/lang/Object;")
+        });
+        r.register(c, "navigableKeySet", "()Ljava/util/NavigableSet;", |ctx, args| {
+            unmod_delegate(ctx, args, "navigableKeySet", "()Ljava/util/NavigableSet;")
+        });
+        r.register(c, "descendingKeySet", "()Ljava/util/NavigableSet;", |ctx, args| {
+            unmod_delegate(ctx, args, "descendingKeySet", "()Ljava/util/NavigableSet;")
+        });
+        // Map-returning views — re-wrap read-only.
+        r.register(c, "descendingMap", "()Ljava/util/NavigableMap;", |ctx, args| {
+            unmod_delegate_rewrap_map(ctx, args, "descendingMap", "()Ljava/util/NavigableMap;")
+        });
+        r.register(c, "headMap", "(Ljava/lang/Object;Z)Ljava/util/NavigableMap;", |ctx, args| {
+            unmod_delegate_rewrap_map(ctx, args, "headMap", "(Ljava/lang/Object;Z)Ljava/util/NavigableMap;")
+        });
+        r.register(c, "tailMap", "(Ljava/lang/Object;Z)Ljava/util/NavigableMap;", |ctx, args| {
+            unmod_delegate_rewrap_map(ctx, args, "tailMap", "(Ljava/lang/Object;Z)Ljava/util/NavigableMap;")
+        });
+        r.register(
+            c,
+            "subMap",
+            "(Ljava/lang/Object;ZLjava/lang/Object;Z)Ljava/util/NavigableMap;",
+            |ctx, args| {
+                unmod_delegate_rewrap_map(
+                    ctx,
+                    args,
+                    "subMap",
+                    "(Ljava/lang/Object;ZLjava/lang/Object;Z)Ljava/util/NavigableMap;",
+                )
+            },
+        );
+        r.register(c, "headMap", "(Ljava/lang/Object;)Ljava/util/SortedMap;", |ctx, args| {
+            unmod_delegate_rewrap_map(ctx, args, "headMap", "(Ljava/lang/Object;)Ljava/util/SortedMap;")
+        });
+        r.register(c, "tailMap", "(Ljava/lang/Object;)Ljava/util/SortedMap;", |ctx, args| {
+            unmod_delegate_rewrap_map(ctx, args, "tailMap", "(Ljava/lang/Object;)Ljava/util/SortedMap;")
+        });
+        r.register(
+            c,
+            "subMap",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/SortedMap;",
+            |ctx, args| {
+                unmod_delegate_rewrap_map(
+                    ctx,
+                    args,
+                    "subMap",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/SortedMap;",
+                )
+            },
+        );
+        // Mutating navigable views.
+        r.register(c, "pollFirstEntry", "()Ljava/util/Map$Entry;", native_unmod_throw);
+        r.register(c, "pollLastEntry", "()Ljava/util/Map$Entry;", native_unmod_throw);
     }
 
     // ---- UnmodifiableItr — read-only iterator -----------------------------
