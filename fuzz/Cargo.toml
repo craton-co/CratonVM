@@ -11,13 +11,22 @@ edition = "2021"
 # correct for production crates. Keeping this manifest standalone lets
 # the rest of the workspace stay lint-clean.
 
+# Declare an empty workspace so this crate is its own workspace root and the
+# root `cargo check --workspace` never builds it (it was previously listed in
+# the root `members`, which contradicted the comment above and forced
+# `--exclude cratonvm-fuzz`). Build targets via `cargo +nightly fuzz build`.
+[workspace]
+
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
 cratonvm-reader = { path = "../reader" }
-cratonvm-native-builtins = { path = "../native-builtins" }
+# `legacy-synthetic-crypto` exposes `native-builtins::tls::tls_impl`, the TLS
+# record-layer parser that `fuzz_tls_record` targets (otherwise its import is
+# unresolved in the default feature set).
+cratonvm-native-builtins = { path = "../native-builtins", features = ["legacy-synthetic-crypto"] }
 cratonvm-classloading = { path = "../classloading" }
 
 # -----------------------------------------------------------------------
