@@ -148,6 +148,31 @@ pub struct MarkQueue {
 /// Number of shards for the mark queue. Must be a power of two for fast modulo.
 const MARK_QUEUE_SHARDS: usize = 8;
 
+// gc-concmark MEDIUM fix — the `nonempty_shards` hint is an `AtomicU8`, so it
+// has exactly one bit per shard for at most 8 shards. The hint is set/cleared
+// with `1u8 << idx` where `idx` ranges over `0..MARK_QUEUE_SHARDS`. If anyone
+// bumps `MARK_QUEUE_SHARDS` above 8 while tuning, every `1u8 << idx` for
+// `idx >= 8` overflows the shift width: in debug builds it panics, and in
+// release builds the shift amount wraps mod 8, so shards >= 8 silently alias
+// the low shards' bits — the hint becomes wrong and `pop` can skip a populated
+// shard (the full-probe fallback still keeps it *correct*, just slower, but the
+// hint is also actively corrupted for shards 0..8). Turn that latent landmine
+// into a compile error: if you raise the shard count past 8, you must also
+// widen `nonempty_shards` to `AtomicU16`/`U32`/`U64` (and the `1u8 <<` /
+// `!(1u8 <<` masks below) to match. The shift expressions are written
+// `1u8 << idx`, so the matching atomic width is `u8` ⇒ 8 shards max.
+const _: () = assert!(
+    MARK_QUEUE_SHARDS <= 8,
+    "nonempty_shards is AtomicU8 (8 bits); widen it (and the `1u8 <<` masks in \
+     push/pop) to AtomicU16/U32/U64 before raising MARK_QUEUE_SHARDS above 8"
+);
+// Sanity: the shard count must also be a power of two, because both
+// `shard_for` and the round-robin `pop` cursor index with `& (SHARDS - 1)`.
+const _: () = assert!(
+    MARK_QUEUE_SHARDS.is_power_of_two(),
+    "MARK_QUEUE_SHARDS must be a power of two (masked with `& (SHARDS - 1)`)"
+);
+
 /// Round-5 HIGH #6 — defensive cap on a single mark-queue shard.
 ///
 /// The original `MarkQueue::push` was an unbounded `Vec` (well, `VecDeque`)

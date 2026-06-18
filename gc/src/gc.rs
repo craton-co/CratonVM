@@ -209,6 +209,27 @@ pub fn collect(from_space: &mut Arena, to_space: &mut Arena, roots: &mut [Object
         let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
         let total_size = object_total_size(header);
 
+        // Defensive: a corrupt header in to-space (implausible / zero-size)
+        // would desynchronise the linear Cheney walk. `object_total_size`
+        // returns 0 for an overflowing array header, and a 0 stride would spin
+        // this loop forever. Every object here was copied by `forward_object`,
+        // which rejects corrupt headers before copying, so this should be
+        // unreachable — but never advance the cursor by an implausible amount.
+        // Stop the walk with a diagnostic rather than aborting the process.
+        if total_size < HEADER_SIZE || scan_cursor + total_size > to_space.used() {
+            tracing::warn!(
+                "gc::collect: stopping Cheney scan at offset {} — implausible object \
+                 size {} (kind=0x{:02x}, num_slots={}, array_len={}); to_space.used()={}",
+                scan_cursor,
+                total_size,
+                header.kind as u8,
+                header.num_slots,
+                header.array_length,
+                to_space.used(),
+            );
+            break;
+        }
+
         // Scan all reference-containing slots
         if header.kind == ObjectKind::Array {
             // Reference arrays use compact 8-byte pointer storage (REF_ELEMENT_SIZE).
@@ -486,10 +507,40 @@ fn try_forward_object(
 /// Compute the total size of a heap object (header + data).
 ///
 /// Objects use num_slots * SLOT_SIZE. Arrays use compact element sizes.
+///
+/// Defensive corruption handling (gc-gc fix): a corrupt / implausible array
+/// header (e.g. a stale `array_length` so large that `header + length *
+/// element_size` overflows `usize`) must NOT abort the whole VM. The moving
+/// collector previously `.expect()`-panicked here, killing the process on a
+/// bad header, whereas the non-moving sweep (`gen_heap.rs::gen_object_total_size`)
+/// returns a `0` sentinel and lets its walker re-sync. Mirror that behavior:
+/// on overflow, log a diagnostic and return `0`. `0 < HEADER_SIZE`, so every
+/// caller's existing corruption guard treats it as a bad header:
+///   - `try_forward_object` (the `total_size < HEADER_SIZE` check) surfaces a
+///     recoverable `GcError` instead of copying garbage;
+///   - the Cheney-scan loops (in `collect` / `collect_with_finalizers`) detect
+///     the implausible stride and stop the walk defensively rather than
+///     advancing the cursor by 0 and spinning forever.
+///
+/// This does not mask genuine bugs silently — the corruption is logged — but
+/// it converts a hard process abort into a recoverable / fail-safe path.
 pub fn object_total_size(header: &ObjectHeader) -> usize {
     if header.kind == ObjectKind::Array {
-        HEADER_SIZE + array_data_size(header.array_length as usize, header.element_type)
-            .expect("array_data_size overflow in gc object_total_size")
+        match array_data_size(header.array_length as usize, header.element_type) {
+            Ok(data) => HEADER_SIZE + data,
+            Err(_) => {
+                // Implausible array header — treat as corrupt. Return 0 so the
+                // caller's `total_size < HEADER_SIZE` guard fires (matching the
+                // non-moving sweep's re-sync contract) instead of panicking.
+                tracing::warn!(
+                    "gc: implausible array_length {} (element_type={:?}) in moving-collector \
+                     object header — treating as corrupt; caller will skip/stop the walk",
+                    header.array_length,
+                    header.element_type,
+                );
+                0
+            }
+        }
     } else {
         HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
     }
@@ -544,6 +595,24 @@ pub fn collect_with_finalizers(
         let obj_ptr = unsafe { to_space.base_ptr_mut().add(scan_cursor) };
         let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
         let total_size = object_total_size(header);
+
+        // Defensive: see the matching guard in `collect`. A corrupt header
+        // yields total_size 0 (or an implausibly large stride); never advance
+        // the cursor by it — stop the walk with a diagnostic instead of
+        // spinning forever / aborting the VM.
+        if total_size < HEADER_SIZE || scan_cursor + total_size > to_space.used() {
+            tracing::warn!(
+                "gc::collect_with_finalizers: stopping Cheney scan at offset {} — implausible \
+                 object size {} (kind=0x{:02x}, num_slots={}, array_len={}); to_space.used()={}",
+                scan_cursor,
+                total_size,
+                header.kind as u8,
+                header.num_slots,
+                header.array_length,
+                to_space.used(),
+            );
+            break;
+        }
 
         if header.kind == ObjectKind::Array {
             if header.element_type == ArrayElementType::Reference {
@@ -645,6 +714,29 @@ pub fn collect_with_finalizers(
             let obj_ptr = unsafe { to_space.base_ptr_mut().add(scan_cursor) };
             let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
             let total_size = object_total_size(header);
+
+            // Defensive: see the matching guard in `collect`. Stop the inner
+            // scan on an implausible / zero-size header rather than advancing
+            // by a 0 stride (infinite loop) or aborting the VM. Force the
+            // cursor to the end so the abandoned tail is not re-scanned and the
+            // OUTER `loop`'s `scan_made_progress` (re-evaluated as
+            // `scan_cursor < to_space.used()`) goes false on the next pass —
+            // otherwise a stuck cursor below `used` spins the outer loop forever.
+            if total_size < HEADER_SIZE || scan_cursor + total_size > to_space.used() {
+                tracing::warn!(
+                    "gc::collect_with_finalizers: stopping Phase-3b Cheney scan at offset {} — \
+                     implausible object size {} (kind=0x{:02x}, num_slots={}, array_len={}); \
+                     to_space.used()={}",
+                    scan_cursor,
+                    total_size,
+                    header.kind as u8,
+                    header.num_slots,
+                    header.array_length,
+                    to_space.used(),
+                );
+                scan_cursor = to_space.used();
+                break;
+            }
 
             if header.kind == ObjectKind::Array {
                 if header.element_type == ArrayElementType::Reference {

@@ -485,26 +485,60 @@ impl ReferenceProcessor {
             .collect();
 
         for idx in candidate_indices {
-            let entry = &mut self.soft_refs[idx];
-            if entry.cleared {
-                continue;
-            }
-            if is_marked(entry.referent) {
-                continue; // referent still live
-            }
-            // Double-check LRU policy (the BTreeMap range is an approximation
-            // since we key on insertion time; re-verify the exact idle window).
-            let idle_ms = current_time_ms.saturating_sub(entry.last_access_time_ms);
-            if idle_ms > threshold_ms {
-                entry.cleared = true;
-                self.stats.soft_refs_cleared += 1;
-                if let Some(q) = entry.queue_addr {
-                    self.pending_queues
-                        .entry(q)
-                        .or_default()
-                        .push(entry.reference_obj);
-                    entry.enqueued = true;
+            // MEDIUM FIX (LRU-index leak): collect the LRU keys to drop in this
+            // pass and remove them from the BTreeMap *after* the `entry` borrow
+            // of `self.soft_refs[idx]` is released — `soft_ref_lru_index` and
+            // `soft_refs` are disjoint fields, but the borrow checker can't see
+            // that across the index's `&mut self` method call while `entry`
+            // (a borrow of `self.soft_refs`) is live.
+            let stale_lru_key: Option<(u64, usize)>;
+            {
+                let entry = &mut self.soft_refs[idx];
+                if entry.cleared {
+                    // A previously-cleared entry whose key the range query still
+                    // returned. Its referent is dead and it will never become a
+                    // clear candidate again, so drop its key — a defensive sweep
+                    // in case some other path set `cleared` without pruning.
+                    stale_lru_key = Some((entry.last_access_time_ms, idx));
+                } else if is_marked(entry.referent) {
+                    continue; // referent still live; keep its LRU key intact
+                } else {
+                    // Double-check LRU policy (the BTreeMap range is an
+                    // approximation since we key on insertion time; re-verify the
+                    // exact idle window).
+                    let idle_ms =
+                        current_time_ms.saturating_sub(entry.last_access_time_ms);
+                    if idle_ms > threshold_ms {
+                        entry.cleared = true;
+                        self.stats.soft_refs_cleared += 1;
+                        if let Some(q) = entry.queue_addr {
+                            self.pending_queues
+                                .entry(q)
+                                .or_default()
+                                .push(entry.reference_obj);
+                            entry.enqueued = true;
+                        }
+                        // A cleared/enqueued soft ref will never be a clear
+                        // candidate again (the `entry.cleared` guard skips it).
+                        // Leaving its `(timestamp, idx)` key in the BTreeMap
+                        // means the range scan in every subsequent GC re-walks
+                        // it (and `touch_soft_reference` would scan it), so the
+                        // index grew unbounded relative to live soft refs. Drop
+                        // its key so the LRU index stays in sync with the *live*
+                        // (uncleared) soft refs. Surviving entries keep their
+                        // keys untouched, so LRU ordering for them is preserved.
+                        // The key must use the entry's current
+                        // `last_access_time_ms` (what `touch_soft_reference`
+                        // last inserted).
+                        stale_lru_key = Some((entry.last_access_time_ms, idx));
+                    } else {
+                        // Not idle enough this cycle; keep its LRU key.
+                        stale_lru_key = None;
+                    }
                 }
+            }
+            if let Some(key) = stale_lru_key {
+                self.soft_ref_lru_index.remove(&key);
             }
         }
     }
@@ -1668,5 +1702,67 @@ mod tests {
         let result = proc.process_references(&always_dead, 64, 0);
         assert_eq!(result.stats.weak_refs_cleared, 1);
         assert!(proc.weak_refs[0].cleared);
+    }
+
+    // ======================================================================
+    // LRU-index leak fix: cleared soft refs are pruned from soft_ref_lru_index
+    // ======================================================================
+
+    // 54. Clearing a soft ref removes its key from the LRU index so the index
+    //     stays in sync with the live (uncleared) soft refs and is not
+    //     re-scanned on subsequent GCs.
+    #[test]
+    fn soft_ref_lru_index_pruned_on_clear() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        proc.discover_reference(ReferenceType::Soft, 100, 200, Some(300));
+        // One live key in the index after discovery.
+        assert_eq!(proc.soft_ref_lru_index.len(), 1);
+        // threshold = 1000 * 2 = 2000; idle = 5000 > 2000 => clear.
+        let result = proc.process_references(&always_dead, 2, 5000);
+        assert_eq!(result.stats.soft_refs_cleared, 1);
+        assert!(proc.soft_refs[0].cleared);
+        // The cleared entry's key must have been removed from the LRU index.
+        assert_eq!(
+            proc.soft_ref_lru_index.len(),
+            0,
+            "cleared soft ref left a stale LRU-index entry"
+        );
+    }
+
+    // 55. A surviving soft ref keeps its LRU key while a sibling is cleared;
+    //     ordering/keys of survivors are preserved.
+    #[test]
+    fn soft_ref_lru_index_keeps_survivors() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        // idx 0 referent dead, idx 1 referent live.
+        proc.discover_reference(ReferenceType::Soft, 100, 200, Some(300));
+        proc.discover_reference(ReferenceType::Soft, 101, 201, Some(301));
+        assert_eq!(proc.soft_ref_lru_index.len(), 2);
+        // Only referent 201 stays live; threshold small so the dead one clears.
+        let live = [201usize];
+        let result = proc.process_references(&live_set(&live), 1, 5000);
+        assert_eq!(result.stats.soft_refs_cleared, 1);
+        assert!(proc.soft_refs[0].cleared);
+        assert!(!proc.soft_refs[1].cleared);
+        // Exactly one (survivor) key remains, and it is the survivor's key.
+        assert_eq!(proc.soft_ref_lru_index.len(), 1);
+        assert!(proc
+            .soft_ref_lru_index
+            .contains_key(&(proc.soft_refs[1].last_access_time_ms, 1)));
+    }
+
+    // 56. Re-processing after a clear does not re-walk the cleared entry: the
+    //     index no longer contains its key, and a second pass is a no-op.
+    #[test]
+    fn soft_ref_lru_index_no_rescan_after_clear() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        proc.discover_reference(ReferenceType::Soft, 100, 200, Some(300));
+        let r1 = proc.process_references(&always_dead, 2, 5000);
+        assert_eq!(r1.stats.soft_refs_cleared, 1);
+        assert_eq!(proc.soft_ref_lru_index.len(), 0);
+        // Second pass: nothing to clear (already cleared) and index stays empty.
+        let r2 = proc.process_references(&always_dead, 2, 5000);
+        assert_eq!(r2.stats.soft_refs_cleared, 0);
+        assert_eq!(proc.soft_ref_lru_index.len(), 0);
     }
 }

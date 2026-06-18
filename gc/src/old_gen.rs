@@ -523,6 +523,31 @@ impl OldGen {
         let base = self.data.as_mut_ptr();
         let objects = self.walk_objects();
 
+        // Phase 0 (dangling-ref guard): close the live set under "referenced
+        // by a live old-gen object".
+        //
+        // Phase 1 assigns a `forwarding_ptr` only to MARKED objects, and Phase
+        // 2 rewrites a referrer's slot only when the target's `forwarding_ptr`
+        // is non-null. For an in-old-gen target, a null `forwarding_ptr` after
+        // Phase 1 means exactly one thing: the target was UNMARKED (floating
+        // garbage). Previously Phase 2 silently skipped such slots, leaving the
+        // live referrer pointing at the target's *old* location — which Phase 3
+        // then slides another object onto (or Phase 4 zeroes), turning the slot
+        // into a dangling pointer that the mutator later dereferences.
+        //
+        // That situation should not arise if the marker is transitively
+        // correct (a live referrer's targets are themselves live). But the
+        // compactor must not *corrupt the heap* when the marker under-marks:
+        // GC correctness is fail-safe here. So we conservatively promote any
+        // unmarked old-gen object reachable from a marked one to live (a small
+        // mark-closure fixpoint restricted to old-gen), guaranteeing every slot
+        // a live object can hold gets a forwarding address in Phase 1. This
+        // retains a little floating garbage until the next cycle (cheap, safe)
+        // rather than producing a dangling pointer (fatal). It is task option
+        // (a) — "treat any object reachable from a live referrer as live" —
+        // applied locally and bounded to the objects we are about to walk.
+        Self::close_live_set_over_old_gen(&objects, &self.data);
+
         // Phase 1: Compute forwarding addresses for live objects.
         // `write_cursor` tracks the next available byte offset (8-byte aligned).
         let mut write_cursor: usize = 0;
@@ -593,11 +618,132 @@ impl OldGen {
         pointer_map
     }
 
+    /// Invoke `f` once for each in-old-gen reference target of `obj_ptr`.
+    ///
+    /// Mirrors the slot-walking logic in [`Self::update_refs_in_object`]
+    /// (object fields are 16-byte `Value` slots; reference arrays are 8-byte
+    /// compact pointers) but only *reads* targets — it never writes the slot.
+    /// Targets outside `[data_start, data_end)` (young gen, metaspace, native)
+    /// are filtered out, matching the bounds gate Phase 2 uses, so a caller
+    /// only ever sees old-gen referents.
+    ///
+    /// The header is *not* borrowed across the `f` callback: the four scalar
+    /// fields needed to drive the walk are copied out up front via
+    /// `read_unaligned` on raw field pointers. This matters because a caller
+    /// (e.g. the Phase 0 closure) may write to the *referent's* header from
+    /// inside `f`, and for a self-referential object the referent is this very
+    /// header — holding a live `&ObjectHeader` across that write would alias a
+    /// `&mut` to the same bytes. Reading scalars up front keeps the borrow
+    /// short and the walk sound under a self-loop.
+    fn for_each_old_gen_ref(obj_ptr: *mut u8, data: &[u8], mut f: impl FnMut(usize)) {
+        let data_start = data.as_ptr() as usize;
+        let data_end = data_start + data.len();
+
+        // Snapshot the layout-driving fields, then drop the reference before
+        // any callback runs (see the aliasing note above).
+        let (kind, element_type, array_length, num_slots) = unsafe {
+            let h = &*(obj_ptr as *const ObjectHeader);
+            (h.kind, h.element_type, h.array_length, h.num_slots)
+        };
+
+        if kind == ObjectKind::Array {
+            if element_type == ArrayElementType::Reference {
+                for i in 0..array_length as usize {
+                    let slot = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                    let raw: u64 = unsafe { std::ptr::read(slot as *const u64) };
+                    if raw != 0 {
+                        let ref_ptr = raw as usize;
+                        if ref_ptr >= data_start && ref_ptr < data_end {
+                            f(ref_ptr);
+                        }
+                    }
+                }
+            }
+        } else {
+            for slot_idx in 0..num_slots as usize {
+                let slot = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
+                let value = unsafe { std::ptr::read(slot as *const Value) };
+                if let Value::Object(Some(ref_obj)) = value {
+                    let ref_ptr = ref_obj.as_ptr() as usize;
+                    if ref_ptr >= data_start && ref_ptr < data_end {
+                        f(ref_ptr);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Promote any UNMARKED old-gen object reachable from a MARKED old-gen
+    /// object to live (set `GC_FLAG_MARKED`), iterating to a fixpoint.
+    ///
+    /// This is the dangling-reference guard described in [`Self::compact`]
+    /// Phase 0. After this returns, the marked set is closed under the
+    /// old-gen reference relation, so every reference a live object holds to
+    /// an in-old-gen target will see a non-null `forwarding_ptr` in Phase 2 —
+    /// no live referrer can be left pointing at an un-relocated (and about to
+    /// be overwritten/zeroed) target.
+    ///
+    /// `objects` is the address-ordered `(ptr, size)` list from
+    /// [`Self::walk_objects`]; it is treated as the complete set of old-gen
+    /// objects. The closure is conservative (it only ever *adds* survivors)
+    /// so it can never drop a live object or corrupt the heap; the worst case
+    /// is retaining a little floating garbage for one extra cycle.
+    ///
+    /// Cost: in the normal case (a transitively-correct marker) the first pass
+    /// promotes nothing — every target of a live object is already live — so
+    /// this is a single O(objects) walk and returns. Additional passes only
+    /// occur when the marker under-marked (the exact failure this guards), and
+    /// the fixpoint is bounded by the longest under-marked chain.
+    fn close_live_set_over_old_gen(objects: &[(*mut u8, usize)], data: &[u8]) {
+        // Fixpoint: keep re-scanning marked objects until a pass promotes
+        // nothing. `objects` is finite and each pass can only flip flags
+        // from 0→1, so this terminates in at most `objects.len()` passes.
+        loop {
+            let mut promoted_any = false;
+            for &(obj_ptr, _size) in objects {
+                // Snapshot the marked bit; don't hold a header borrow while the
+                // closure below may write the same header (self-loop case).
+                let is_marked = unsafe {
+                    (*(obj_ptr as *const ObjectHeader)).gc_flags & GC_FLAG_MARKED != 0
+                };
+                if !is_marked {
+                    continue; // only trace *live* referrers
+                }
+                Self::for_each_old_gen_ref(obj_ptr, data, |ref_ptr| {
+                    // SAFETY: `ref_ptr` is in-bounds (filtered by
+                    // `for_each_old_gen_ref`) and points at an old-gen object
+                    // header. The pre-pass runs before any relocation, so the
+                    // referent is still at its original address. No outstanding
+                    // borrow of this header is live here (fields were copied
+                    // out before the walk), so the `&mut` does not alias.
+                    let ref_header = unsafe { &mut *(ref_ptr as *mut ObjectHeader) };
+                    if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
+                        ref_header.gc_flags |= GC_FLAG_MARKED;
+                        promoted_any = true;
+                    }
+                });
+            }
+            if !promoted_any {
+                break;
+            }
+        }
+    }
+
     /// Update reference slots within a single live old-gen object so they point
     /// to forwarding addresses of moved objects.
     ///
     /// Handles both regular object fields (16-byte `Value` slots) and reference
     /// arrays (8-byte compact pointers).
+    ///
+    /// Dangling-ref invariant: by the time this runs, Phase 0
+    /// ([`Self::close_live_set_over_old_gen`]) has promoted every in-old-gen
+    /// target of a live object to live, and Phase 1 has stamped a forwarding
+    /// address on every live object. Therefore any in-bounds target read here
+    /// MUST have a non-null `forwarding_ptr`; a null one would mean a live
+    /// referrer points at floating garbage and the rewrite below would be
+    /// skipped, leaving a dangling pointer. We `debug_assert!` against that to
+    /// catch a regression in the closure, and in release simply leave the slot
+    /// untouched (the closure makes this case unreachable in practice).
     fn update_refs_in_object(obj_ptr: *mut u8, header: &ObjectHeader, data: &[u8]) {
         let data_start = data.as_ptr() as usize;
         let data_end = data_start + data.len();
@@ -632,6 +778,19 @@ impl OldGen {
                                         ref_header.forwarding_ptr as u64,
                                     )
                                 };
+                            } else {
+                                // Dangling-ref guard: an in-old-gen target with
+                                // a null forwarding pointer is an UNMARKED
+                                // object that Phase 0 should have promoted. If
+                                // this fires, the live closure missed an edge
+                                // and leaving the slot as-is would dangle.
+                                debug_assert!(
+                                    false,
+                                    "old_gen.compact: live array holder@0x{:x} arr[{}] -> \
+                                     unmarked old-gen referent@0x{:x} (no forwarding addr); \
+                                     close_live_set_over_old_gen missed an edge",
+                                    obj_ptr as usize, i, ref_ptr,
+                                );
                             }
                         }
                     }
@@ -663,6 +822,20 @@ impl OldGen {
                                 ObjectRef::from_raw(ref_header.forwarding_ptr)
                             }));
                             unsafe { std::ptr::write(slot as *mut Value, new_value) };
+                        } else {
+                            // Dangling-ref guard (see the array branch above):
+                            // an in-old-gen field target with a null forwarding
+                            // pointer is unmarked floating garbage that Phase 0
+                            // should have promoted. Leaving the field as-is
+                            // would dangle once Phase 3/4 reuse the target's
+                            // bytes.
+                            debug_assert!(
+                                false,
+                                "old_gen.compact: live holder@0x{:x} fld[{}] -> \
+                                 unmarked old-gen referent@0x{:x} (no forwarding addr); \
+                                 close_live_set_over_old_gen missed an edge",
+                                obj_ptr as usize, slot_idx, ref_ptr,
+                            );
                         }
                     }
                 }
@@ -846,5 +1019,78 @@ mod tests {
         assert_eq!(objects[0].1, obj_size1);
         assert_eq!(objects[1].0, p2);
         assert_eq!(objects[1].1, obj_size2);
+    }
+
+    /// Dangling-ref guard (Phase 0): a MARKED object that references an
+    /// UNMARKED old-gen object must not be left pointing at floating garbage
+    /// after compaction. The closure promotes the target to live and relocates
+    /// it; the referrer's field must end up pointing at the target's *new*,
+    /// still-valid location — never at zeroed/overwritten bytes.
+    #[test]
+    fn compact_promotes_unmarked_target_of_live_ref() {
+        let mut og = OldGen::new(4096);
+
+        // Object A: live, one reference field.
+        let a_size = HEADER_SIZE + SLOT_SIZE;
+        let a = og.alloc(a_size, 8).unwrap();
+
+        // Dead filler between A and B so that, once it is reclaimed, B must
+        // actually slide to a lower address during compaction (giving it a
+        // pointer-map entry and exercising the relocation path).
+        let filler_size = HEADER_SIZE + 4 * SLOT_SIZE;
+        let filler = og.alloc(filler_size, 8).unwrap();
+        unsafe {
+            (*(filler as *mut ObjectHeader)).num_slots = 4;
+            // left UNMARKED -> dead -> reclaimed.
+        }
+
+        // Object B: the (initially unmarked) target. Tag it with a distinctive
+        // identity hash so we can prove we land on real B data, not zeroes.
+        const B_TAG: i32 = 0x5EED_BEEF_u32 as i32;
+        let b_size = HEADER_SIZE + SLOT_SIZE;
+        let b = og.alloc(b_size, 8).unwrap();
+
+        unsafe {
+            // A is live, references B in field 0.
+            let a_hdr = &mut *(a as *mut ObjectHeader);
+            a_hdr.num_slots = 1;
+            a_hdr.gc_flags |= GC_FLAG_MARKED;
+            let a_field0 = a.add(HEADER_SIZE) as *mut Value;
+            std::ptr::write(a_field0, Value::Object(Some(ObjectRef::from_raw(b))));
+
+            // B is left UNMARKED (would be floating garbage without the guard).
+            let b_hdr = &mut *(b as *mut ObjectHeader);
+            b_hdr.num_slots = 1;
+            b_hdr.identity_hash_code = B_TAG;
+        }
+
+        let map = og.compact();
+
+        // A is the lowest-address live object, so it stays put (no map entry);
+        // B must have been promoted and relocated, hence present in the map.
+        let b_new = *map.get(&(b as usize)).expect(
+            "unmarked target reachable from a live ref must be promoted + relocated",
+        );
+
+        unsafe {
+            // A's field must now point at B's NEW location, in-bounds.
+            let a_field0 = a.add(HEADER_SIZE) as *const Value;
+            let field_val = std::ptr::read(a_field0);
+            let Value::Object(Some(target)) = field_val else {
+                panic!("A's reference field was clobbered: {field_val:?}");
+            };
+            assert_eq!(
+                target.as_ptr() as usize, b_new,
+                "A's field must be forwarded to B's new location, not left dangling",
+            );
+
+            // The forwarded B must still hold real B data (tag preserved),
+            // proving we did not leave the slot pointing at zeroed memory.
+            let b_hdr = &*(b_new as *const ObjectHeader);
+            assert_eq!(b_hdr.identity_hash_code, B_TAG, "B data lost across compaction");
+            // GC metadata cleared on the survivor.
+            assert!(b_hdr.forwarding_ptr.is_null());
+            assert_eq!(b_hdr.gc_flags & GC_FLAG_MARKED, 0);
+        }
     }
 }

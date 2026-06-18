@@ -5326,16 +5326,55 @@ impl GenerationalHeap {
         // a dirty card range. Preserves the original semantics (an object
         // is a root iff the card containing its *header* is dirty).
         let objects = old_gen.walk_objects_in_card_ranges(&dirty_ranges);
-        for (obj_ptr, _total_size) in objects {
+        for (obj_ptr, total_size) in objects {
             // SAFETY: `obj_ptr` is from `old_gen.walk_objects_in_card_ranges()`, pointing to a valid old-gen object header.
             let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+
+            // [LOW gc-genheap-cards] Plausibility cap, mirroring the non-moving
+            // sweep walker (gen_object_total_size + the `num_slots <= 1<<24` /
+            // `array_length <= i32::MAX` re-sync checks ~4239-4246). Previously
+            // the ref-slot loops below trusted `header.num_slots` /
+            // `header.array_length` verbatim, so a corrupt old-gen header (e.g.
+            // an inline-alloc path that left a garbage slot count, or a header
+            // straddling a buffer that walk_objects_in_card_ranges mis-bounded)
+            // would drive an out-of-range slot scan reading past the object.
+            //
+            // `gen_object_total_size` returns 0 for an implausible header
+            // (oversized num_slots, kind=Object-with-array_length, bad array
+            // length); skip such an object with a diagnostic rather than
+            // scanning bogus slots. Then bound the per-object iteration to the
+            // ref-slot count that actually fits in `total_size` (the object's
+            // region size as established by the walker), so even a header that
+            // passes the coarse plausibility gate but reports more slots than
+            // its bytes hold cannot read out of bounds.
+            let safe_size = gen_object_total_size(header);
+            if safe_size < HEADER_SIZE || safe_size != total_size {
+                tracing::warn!(
+                    "GC scan_dirty_cards: implausible/inconsistent old-gen header \
+                     (class_id={} kind=0x{:02x} num_slots={} array_length={} \
+                     gen_size={} walker_size={}) — skipping ref-slot scan",
+                    header.class_id.as_u32(),
+                    header.kind as u8,
+                    header.num_slots,
+                    header.array_length,
+                    safe_size,
+                    total_size,
+                );
+                continue;
+            }
+            // Field/element bytes available in this object's region (total
+            // minus header). Used to cap the slot/element count.
+            let body_bytes = total_size - HEADER_SIZE;
 
             // Scan ref slots: ref arrays use compact 8-byte pointers,
             // object fields use 16-byte Value.
             if header.kind == ObjectKind::Array {
                 if header.element_type == ArrayElementType::Reference {
-                    for i in 0..header.array_length as usize {
-                        // SAFETY: `i` < `array_length`; offset within array data region.
+                    // Cap element count at what the array's data region holds.
+                    let max_elems = body_bytes / REF_ELEMENT_SIZE;
+                    let elems = (header.array_length as usize).min(max_elems);
+                    for i in 0..elems {
+                        // SAFETY: `i` < capped element count; offset within array data region.
                         let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
                         let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
                         if raw != 0 {
@@ -5349,8 +5388,11 @@ impl GenerationalHeap {
                     }
                 }
             } else {
-                for slot_idx in 0..header.num_slots as usize {
-                    // SAFETY: `slot_idx` is within `num_slots`; offset within the object's field region.
+                // Cap slot count at what the object's field region holds.
+                let max_slots = body_bytes / SLOT_SIZE;
+                let slots = (header.num_slots as usize).min(max_slots);
+                for slot_idx in 0..slots {
+                    // SAFETY: `slot_idx` < capped slot count; offset within the object's field region.
                     let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
                     let value = unsafe { std::ptr::read(s_ptr as *const Value) };
                     if let Value::Object(Some(ref_obj)) = value {
