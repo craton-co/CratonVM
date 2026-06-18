@@ -511,12 +511,56 @@ impl ModuleRegistry {
     // Dynamic mutations (JPMS §5.4.4, java.lang.Module API)
     // -----------------------------------------------------------------------
 
+    /// Collect the `requires transitive` closure of `module`, i.e. every module
+    /// that becomes readable *implicitly* when some other module gains a reads
+    /// edge to `module`.
+    ///
+    /// Per JPMS: a reads edge to M implies reading every module M `requires
+    /// transitive`, and (recursively) every module those modules `requires
+    /// transitive`. `module` itself is *not* included — only its implied
+    /// dependencies.
+    ///
+    /// A local `visited` set bounds the iterative walk so it terminates on
+    /// cyclic `requires transitive` graphs (JPMS permits cycles in the requires
+    /// graph).
+    fn collect_transitive_requires(&self, module: &str, out: &mut FxHashSet<String>) {
+        let mut stack: Vec<String> = vec![module.to_string()];
+        let mut visited: FxHashSet<String> = FxHashSet::default();
+        visited.insert(module.to_string());
+
+        while let Some(cur) = stack.pop() {
+            let Some(desc) = self.modules.get(&cur) else {
+                continue;
+            };
+            for req in &desc.requires {
+                // Only `requires transitive` edges propagate implied readability;
+                // `requires static` are compile-time only and never readable.
+                if req.is_transitive && !req.is_static {
+                    let dep = &req.module_name;
+                    // `insert` returns false if already present → already walked,
+                    // so we never re-push it (cycle-safe).
+                    if visited.insert(dep.clone()) {
+                        out.insert(dep.clone());
+                        stack.push(dep.clone());
+                    }
+                }
+            }
+        }
+    }
+
     /// Add a dynamic read edge: `reader` module reads `provider`.
     ///
     /// This is the backing store for `java.lang.Module.addReads()` and the
     /// `--add-reads` CLI flag. If the readability graph has already been built
     /// the edge is inserted directly; otherwise it will be picked up on the
     /// next `build_readability_graph` call via the `extra_reads` list.
+    ///
+    /// Per JPMS semantics, a reads edge to `provider` also makes `reader` read
+    /// everything `provider` (transitively) `requires transitive`. We patch that
+    /// implied closure into the cached graph here so a freshly-added edge has the
+    /// same readability fan-out it would get from a full rebuild. (The full
+    /// rebuild in `build_readability_graph` already propagates this via its
+    /// fixpoint, so the un-built `extra_reads` path needs no extra work.)
     pub fn add_reads(&mut self, reader: &str, provider: &str) {
         self.extra_reads
             .entry(reader.to_string())
@@ -524,10 +568,17 @@ impl ModuleRegistry {
             .insert(provider.to_string());
         // Patch the cached graph if it was already computed.
         if self.graph_built {
-            self.readable
-                .entry(reader.to_string())
-                .or_default()
-                .insert(provider.to_string());
+            // Compute the implied `requires transitive` closure of `provider`
+            // before borrowing `readable` mutably (avoids a borrow conflict and
+            // is cycle-safe via the visited set inside the helper).
+            let mut implied: FxHashSet<String> = FxHashSet::default();
+            self.collect_transitive_requires(provider, &mut implied);
+
+            let set = self.readable.entry(reader.to_string()).or_default();
+            set.insert(provider.to_string());
+            for m in implied {
+                set.insert(m);
+            }
         }
     }
 
@@ -1184,6 +1235,92 @@ mod tests {
 
         reg.add_reads("modA", "modB");
         assert!(reg.reads("modA", "modB"));
+    }
+
+    #[test]
+    fn add_reads_propagates_requires_transitive() {
+        // modB `requires transitive` modC, and modC `requires transitive` modD.
+        // After modA dynamically `addReads modB`, modA must also read modC and
+        // modD (implied transitive closure), matching a full rebuild.
+        let mut desc_b = sample_desc("modB");
+        desc_b.requires.push(ModuleRequiresEntry {
+            module_name: "modC".to_string(),
+            is_transitive: true,
+            is_static: false,
+        });
+        let mut desc_c = sample_desc("modC");
+        desc_c.requires.push(ModuleRequiresEntry {
+            module_name: "modD".to_string(),
+            is_transitive: true,
+            is_static: false,
+        });
+
+        let mut reg = ModuleRegistry::new();
+        reg.register(sample_desc("modA"), vec![]);
+        reg.register(desc_b, vec![]);
+        reg.register(desc_c, vec![]);
+        reg.register(sample_desc("modD"), vec![]);
+        reg.build_readability_graph();
+
+        // Before addReads, modA reads none of B/C/D.
+        assert!(!reg.reads("modA", "modB"));
+        assert!(!reg.reads("modA", "modC"));
+        assert!(!reg.reads("modA", "modD"));
+
+        reg.add_reads("modA", "modB");
+        assert!(reg.reads("modA", "modB"));
+        assert!(reg.reads("modA", "modC")); // implied by modB requires transitive
+        assert!(reg.reads("modA", "modD")); // implied transitively via modC
+    }
+
+    #[test]
+    fn add_reads_requires_transitive_cycle_terminates() {
+        // Cyclic `requires transitive`: modB ⇄ modC. add_reads must not loop
+        // forever and must include both in the implied closure.
+        let mut desc_b = sample_desc("modB");
+        desc_b.requires.push(ModuleRequiresEntry {
+            module_name: "modC".to_string(),
+            is_transitive: true,
+            is_static: false,
+        });
+        let mut desc_c = sample_desc("modC");
+        desc_c.requires.push(ModuleRequiresEntry {
+            module_name: "modB".to_string(),
+            is_transitive: true,
+            is_static: false,
+        });
+
+        let mut reg = ModuleRegistry::new();
+        reg.register(sample_desc("modA"), vec![]);
+        reg.register(desc_b, vec![]);
+        reg.register(desc_c, vec![]);
+        reg.build_readability_graph();
+
+        reg.add_reads("modA", "modB");
+        assert!(reg.reads("modA", "modB"));
+        assert!(reg.reads("modA", "modC")); // via modB requires transitive (cycle-safe)
+    }
+
+    #[test]
+    fn add_reads_requires_static_not_propagated() {
+        // `requires static` is compile-time only — a reads edge to modB must
+        // NOT pull in modB's `requires static` dependency.
+        let mut desc_b = sample_desc("modB");
+        desc_b.requires.push(ModuleRequiresEntry {
+            module_name: "modC".to_string(),
+            is_transitive: true,
+            is_static: true, // transitive + static → still compile-time only
+        });
+
+        let mut reg = ModuleRegistry::new();
+        reg.register(sample_desc("modA"), vec![]);
+        reg.register(desc_b, vec![]);
+        reg.register(sample_desc("modC"), vec![]);
+        reg.build_readability_graph();
+
+        reg.add_reads("modA", "modB");
+        assert!(reg.reads("modA", "modB"));
+        assert!(!reg.reads("modA", "modC")); // static dep not implied
     }
 
     #[test]

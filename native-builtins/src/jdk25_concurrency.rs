@@ -29,7 +29,9 @@
 //! - `ScopedValue.orElseThrow()` invokes the Supplier
 //! - `throwIfFailed(Function)` and `result(Function)` invoke the Function mapper
 //! - `exception()` returns proper `Optional`
-//! - `joinUntil()` checks deadline against system time
+//! - `joinUntil()` honours the deadline (seconds + nanos): it polls the forked
+//!   workers and throws a real `java.util.concurrent.TimeoutException` if they
+//!   do not all finish before the supplied `Instant` (nb-jdk25-joinuntil)
 //! - `Subtask.get()` validates state before returning
 //! - `Snapshot.capture()` records actual binding count
 //! - Forked tasks inherit scoped value bindings from parent
@@ -515,9 +517,14 @@ fn take_scope_forks(scope: ObjectRef) -> Vec<(ObjectRef, ObjectRef)> {
         .unwrap_or_default()
 }
 
-/// Peek at the recorded forks for a scope without clearing them. Test-only
-/// (the production paths always drain via `take_scope_forks`).
-#[cfg(test)]
+/// Peek at the recorded forks for a scope without clearing them.
+///
+/// `joinUntil()` (nb-jdk25-joinuntil) needs this so it can poll the workers
+/// against a deadline WITHOUT draining the side-table: if the deadline elapses
+/// before the workers finish, the forks must stay registered so a later
+/// `close()` can still reap them (the spec keeps the scope open on timeout).
+/// `join()` (and the success path of `joinUntil`) still drain via
+/// `take_scope_forks`.
 fn peek_scope_forks(scope: ObjectRef) -> Vec<(ObjectRef, ObjectRef)> {
     let key = scope.as_ptr() as usize;
     SCOPE_FORKS
@@ -824,41 +831,147 @@ fn native_sts_join(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     Ok(Some(Value::Object(Some(this))))
 }
 
+/// nb-jdk25-joinuntil — construct and throw a real
+/// `java.util.concurrent.TimeoutException` (NOT an `IllegalStateException` with
+/// a misleading message). The `(String)` constructor is registered for this
+/// class (see `register_common_exceptions` in lib.rs), so
+/// `new_object_initialized` yields a properly-typed Throwable that a Java
+/// `catch (TimeoutException e)` will actually catch.
+fn throw_timeout_exception(ctx: &mut dyn NativeContext, msg: &str) -> cratonvm_types::error::MethodCallFailed {
+    let jmsg = ctx.create_string(msg);
+    match ctx.new_object_initialized(
+        "java/util/concurrent/TimeoutException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(jmsg))],
+    ) {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc)
+        }
+        // If the TimeoutException class is somehow unavailable, fail loud rather
+        // than silently returning normally (which would hide a missed deadline).
+        _ => cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: format!("TimeoutException (class unavailable): {msg}"),
+        }
+        .into(),
+    }
+}
+
 /// `StructuredTaskScope.joinUntil(Ljava/time/Instant;)StructuredTaskScope`
 ///
-/// Like `join()` but with a deadline. We honour the deadline only as an
-/// up-front check: if the supplied `Instant` is already in the past we throw a
-/// TimeoutException immediately. Otherwise we delegate to `join()`, which now
-/// actually BLOCKS on the worker threads.
+/// Like `join()` but bounded by a deadline. nb-jdk25-joinuntil fix: the
+/// deadline is now genuinely HONOURED — we poll the forked workers and, if the
+/// deadline elapses before they all finish, throw a real
+/// `java.util.concurrent.TimeoutException` (previously this threw an
+/// `IllegalStateException` and only did an up-front past-deadline check, then
+/// blocked indefinitely on the untimed `thread_join`).
 ///
-/// nb-jdk25-concurrency gap: `join()` uses the VM's untimed `thread_join`, so
-/// once the deadline check passes we wait for the workers to finish rather
-/// than abandoning them when the deadline elapses mid-wait. A fully faithful
-/// `joinUntil` would need a timed thread-join primitive on `NativeContext`
-/// (cross-file follow-up). For the common case (deadline comfortably exceeds
-/// the actual work) the observable result is identical.
+/// Deadline computation reads BOTH `Instant.seconds` (field 0) and
+/// `Instant.nanos` (field 1) — the nanos component was previously ignored —
+/// and compares against wall-clock `SystemTime` (the Java `Instant` is an
+/// epoch-relative wall-clock time). Once inside the wait loop we measure the
+/// remaining budget with a monotonic `Instant` to avoid clock-adjustment skew.
+///
+/// On timeout the scope is deliberately left OPEN with its forks still
+/// registered: the spec does not close the scope on `joinUntil` timeout, and a
+/// later `close()` reaps the still-running workers (it drains the same
+/// side-table). On success the behaviour matches `join()` exactly: drain the
+/// forks, aggregate each subtask's outcome on the owner thread, mark joined.
 fn native_sts_join_until(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Check deadline: if the Instant represents a time in the past, throw TimeoutException.
-    // Instant is stored as (seconds, nanos). We compare against system time.
-    if let Some(Value::Object(Some(instant))) = args.get(1) {
-        // Read Instant.seconds (field 0) and Instant.nanos (field 1)
-        let deadline_secs = match ctx.get_field(*instant, 0) {
-            Value::Long(s) => s,
-            Value::Int(s) => s as i64,
-            _ => i64::MAX,
-        };
-        let now_millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        if now_millis > deadline_secs {
-            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
-                message: "java.util.concurrent.TimeoutException: deadline exceeded".to_string(),
-            }.into());
+    let this = obj_arg(args, 0)?;
+    let state = sts_get_int(ctx, this, STS_FIELD_STATE);
+    if state == STS_STATE_CLOSED {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "StructuredTaskScope is closed".to_string(),
+        }
+        .into());
+    }
+
+    // Compute how long we are allowed to wait. The Java `Instant` is an absolute
+    // epoch wall-clock time (seconds + nanos), so derive a remaining `Duration`
+    // by subtracting the current wall-clock time. A missing/garbage Instant is
+    // treated as "no bound" (wait like join()).
+    let now_wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(std::time::Duration::ZERO);
+    let deadline_budget: Option<std::time::Duration> = match args.get(1) {
+        Some(Value::Object(Some(instant))) => {
+            let secs = match ctx.get_field(*instant, 0) {
+                Value::Long(s) => s,
+                Value::Int(s) => s as i64,
+                _ => i64::MAX,
+            };
+            // nb-jdk25-joinuntil: honour the nanos component (field 1) too —
+            // it was previously dropped entirely.
+            let nanos = match ctx.get_field(*instant, 1) {
+                Value::Int(n) => n.max(0) as u32,
+                Value::Long(n) => n.max(0) as u32,
+                _ => 0,
+            };
+            if secs < 0 {
+                // Deadline before the epoch — already elapsed.
+                Some(std::time::Duration::ZERO)
+            } else {
+                let deadline = std::time::Duration::new(secs as u64, nanos);
+                // Remaining = deadline - now; saturating to ZERO if already past.
+                Some(deadline.saturating_sub(now_wall))
+            }
+        }
+        // null Instant (or absent) — unbounded, behave exactly like join().
+        _ => None,
+    };
+
+    // Already past the deadline (zero budget): throw immediately, leaving the
+    // scope open and the workers registered for a later close() to reap.
+    if matches!(deadline_budget, Some(d) if d.is_zero()) {
+        return Err(throw_timeout_exception(ctx, "deadline exceeded"));
+    }
+
+    match deadline_budget {
+        // No deadline bound: identical to join() — block until all workers done.
+        None => native_sts_join(ctx, args),
+        Some(budget) => {
+            // Poll the workers against a monotonic deadline. We PEEK (do not
+            // drain) the forks so that, on timeout, they stay registered for
+            // close() to reap. On success we fall through to the normal
+            // drain+aggregate path.
+            //
+            // `Instant + Duration` PANICS on overflow, and a Java `Instant` can
+            // legitimately encode a deadline decades/eons in the future (e.g.
+            // Instant.MAX). If the budget can't be represented on the monotonic
+            // clock it is effectively unbounded — fall back to the untimed
+            // join() rather than risk a panic.
+            let mono_deadline = match std::time::Instant::now().checked_add(budget) {
+                Some(d) => d,
+                None => return native_sts_join(ctx, args),
+            };
+            loop {
+                let forks = peek_scope_forks(this);
+                let all_done = forks
+                    .iter()
+                    .all(|(_subtask, worker)| !ctx.thread_is_alive(*worker));
+                if all_done {
+                    // All workers finished in time — reap + aggregate exactly
+                    // like join() (thread_join returns immediately for the
+                    // already-dead workers).
+                    return native_sts_join(ctx, args);
+                }
+                if std::time::Instant::now() >= mono_deadline {
+                    // Deadline elapsed with workers still running. Leave the
+                    // scope OPEN and the forks registered; throw a real
+                    // TimeoutException.
+                    return Err(throw_timeout_exception(ctx, "deadline exceeded"));
+                }
+                // Wait a short, deadline-bounded slice before re-polling. `park`
+                // integrates with the VM's thread machinery (safepoint-aware)
+                // and a spurious early wakeup is harmless — we just re-check the
+                // workers and the deadline. Cap the slice so we never overshoot
+                // the deadline by more than ~2ms.
+                let remaining = mono_deadline.saturating_duration_since(std::time::Instant::now());
+                let slice = remaining.min(std::time::Duration::from_millis(2));
+                ctx.park(Some(slice));
+            }
         }
     }
-    // Deadline not yet exceeded — block on the workers via join().
-    native_sts_join(ctx, args)
 }
 
 /// `StructuredTaskScope.close()V`
@@ -3626,7 +3739,44 @@ mod jdk25_concurrency_tests {
             &mut ctx,
             &[Value::Object(Some(scope)), Value::Object(Some(instant))],
         );
-        assert!(result.is_err(), "joinUntil with past deadline should throw TimeoutException");
+        // nb-jdk25-joinuntil: a past deadline must throw a REAL
+        // java.util.concurrent.TimeoutException (ExceptionThrown), not an
+        // IllegalStateException with a misleading message.
+        match result {
+            Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc)) => {
+                let cid = ctx.class_id_of_object(exc);
+                assert_eq!(
+                    ctx.class_name_of_id(cid).as_deref(),
+                    Some("java/util/concurrent/TimeoutException"),
+                    "joinUntil past-deadline must throw a real TimeoutException"
+                );
+            }
+            other => panic!("expected ExceptionThrown(TimeoutException), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn p82_join_until_past_deadline_honours_nanos() {
+        // nb-jdk25-joinuntil: the nanos component (Instant field 1) must be read
+        // — a deadline of {epoch-second 0, nanos 0} is unambiguously in the past
+        // and must time out. (Pre-fix the nanos field was dropped entirely; this
+        // guards the read path against regressing to "seconds only".)
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        native_sts_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
+
+        let instant = alloc_concurrent_synthetic(&mut ctx, "java/time/Instant", 2);
+        ctx.set_field(instant, 0, Value::Long(0));
+        ctx.set_field(instant, 1, Value::Int(500_000_000)); // 0.5s past the epoch — still long past
+
+        let result = native_sts_join_until(
+            &mut ctx,
+            &[Value::Object(Some(scope)), Value::Object(Some(instant))],
+        );
+        assert!(
+            result.is_err(),
+            "joinUntil with an epoch-relative past deadline (with nanos) should time out"
+        );
     }
 
     #[test]

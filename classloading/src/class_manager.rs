@@ -160,6 +160,14 @@ struct ClassStoreHierarchy<'a> {
     loaded_classes: &'a LoadedClassesMap,
     /// The class currently being verified (not yet in `class_store`).
     in_flight: Option<&'a Class>,
+    /// The defining/initiating loader of the class being verified, used to
+    /// make `lookup` loader-aware (CL-CLASSMANAGER fix). When `Some`, a
+    /// name is resolved by walking that loader's parent-delegation chain
+    /// first, so two loaders that define the same name resolve to the
+    /// *correct* `ClassId` for the requesting loader rather than a global
+    /// first-match. `None` falls back to the legacy delegation-chain probe
+    /// (used only where no requesting loader is available).
+    requesting_loader: Option<ClassLoaderId>,
 }
 
 impl<'a> ClassStoreHierarchy<'a> {
@@ -171,6 +179,15 @@ impl<'a> ClassStoreHierarchy<'a> {
                 return Some(inflight.id);
             }
         }
+        // CL-CLASSMANAGER fix: loader-aware resolution. The previous code
+        // probed the built-in delegation chain and then fell back to a
+        // *global first-match-by-name* scan over every loader. That
+        // first-match could bind a referenced name to the WRONG class when
+        // two distinct loaders define the same name (the JVMS "class loader
+        // constraint" / runtime-package identity is keyed on the
+        // *defining* loader, not the bare name). We now resolve through the
+        // requesting class's loader-delegation order first.
+        //
         // C34 audit fix (HIGH): zero-allocation probe. The previous
         // `Arc::from(name)` minted a fresh `Arc<str>` on EVERY lookup
         // (round-9 CRIT-2 carry — class lookup happens at every dynamic
@@ -179,24 +196,103 @@ impl<'a> ClassStoreHierarchy<'a> {
         // API we hash the borrowed `(loader_id, &str)` tuple directly and
         // probe the bucket using a custom equality closure — no `Arc<str>`
         // is allocated unless we are about to insert.
+        if let Some(req) = self.requesting_loader {
+            // Build the requesting loader's resolution order: by the JVM
+            // parent-delegation model, a name is sought in the parents
+            // first, then in the loader itself.
+            //
+            //   * Bootstrap / Extension / Application — the prefix of
+            //     BUILTIN_LOADER_DELEGATION_CHAIN up to and including the
+            //     requesting loader (parents-first, then self).
+            //   * UserDefined(_) — delegate to the full built-in chain
+            //     (its parent in our simplified hierarchy is the
+            //     application loader), then probe the user loader itself.
+            //
+            // The FIRST loader in that order that has defined `name` is the
+            // class this reference resolves to — exactly the loader-faithful
+            // answer, with no ambiguity from same-named classes defined by
+            // unrelated loaders further down the global map.
+            //
+            // Round 9 audit fix (HIGH #6): the built-in prefix is taken
+            // from the canonical `BUILTIN_LOADER_DELEGATION_CHAIN` constant
+            // rather than re-inlining (Bootstrap, Extension, Application);
+            // adding a new built-in loader only requires editing that
+            // constant in `loaders.rs`.
+            match req {
+                ClassLoaderId::Bootstrap
+                | ClassLoaderId::Extension
+                | ClassLoaderId::Application => {
+                    for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
+                        if let Some(id) =
+                            loaded_classes_probe(self.loaded_classes, *loader_id, name)
+                        {
+                            return Some(id);
+                        }
+                        // Stop once we have probed the requesting loader
+                        // itself: a builtin loader never delegates *down* to
+                        // its children, so classes a child (e.g. the app
+                        // loader) defined must not satisfy a parent's
+                        // reference.
+                        if *loader_id == req {
+                            break;
+                        }
+                    }
+                }
+                ClassLoaderId::UserDefined(_) => {
+                    // Parents first (the entire built-in chain) …
+                    for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
+                        if let Some(id) =
+                            loaded_classes_probe(self.loaded_classes, *loader_id, name)
+                        {
+                            return Some(id);
+                        }
+                    }
+                    // … then the user-defined loader's own definitions.
+                    if let Some(id) = loaded_classes_probe(self.loaded_classes, req, name) {
+                        return Some(id);
+                    }
+                }
+            }
+            // Not found along the requesting loader's delegation path. Per
+            // the loader-faithful model this reference is unresolved here
+            // (the caller — `is_subclass` — then falls back to the static
+            // JDK hierarchy / optimism for genuinely-unloaded forward
+            // references). Do NOT scan unrelated loaders: a same-named
+            // class defined by a loader outside this delegation path is a
+            // *different* runtime type and must not satisfy the reference.
+            return None;
+        }
+        // No requesting loader available (e.g. a redefine path that did not
+        // supply one). Fall back to the legacy built-in delegation-chain
+        // probe.
         //
         // Round 9 audit fix (HIGH #6): iterate over the canonical
         // `BUILTIN_LOADER_DELEGATION_CHAIN` constant instead of re-inlining
         // the same 3-element array (Bootstrap, Extension, Application).
-        // Adding a new built-in loader (e.g. JEP-261 platform loader) now
-        // only requires editing the constant in `loaders.rs`.
         for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
             if let Some(id) = loaded_classes_probe(self.loaded_classes, *loader_id, name) {
                 return Some(id);
             }
         }
-        // Fall back to scanning every loader (custom loaders).
+        // Last-resort fallback for custom loaders when no requesting loader
+        // was supplied. NARROWED (CL-CLASSMANAGER): only resolve by bare
+        // name when the definition is *unique* across all loaders. If two
+        // or more loaders defined this name we cannot pick a correct one
+        // without the requesting loader's identity, so we return `None`
+        // (unresolved) rather than silently binding to an arbitrary
+        // first-match — which could be the wrong runtime type.
+        let mut found: Option<ClassId> = None;
         for ((_, class_name), &id) in self.loaded_classes.iter() {
             if &**class_name == name {
-                return Some(id);
+                if found.is_some() {
+                    // Ambiguous: more than one loader defines this name and
+                    // we have no requesting-loader context to disambiguate.
+                    return None;
+                }
+                found = Some(id);
             }
         }
-        None
+        found
     }
 
     /// Resolve a `ClassId` to its `Class`, transparently returning the
@@ -2752,6 +2848,10 @@ impl ClassManager {
                 // in `class_store`; pass it explicitly so self-references
                 // (its own name / id) resolve during verification.
                 in_flight: Some(&class),
+                // CL-CLASSMANAGER fix: make type resolution loader-aware —
+                // referenced names resolve through this class's defining
+                // loader's delegation order, not a global first-match.
+                requesting_loader: Some(class.loader_id),
             };
             if let Err(verify_err) = crate::verifier::verify_class(
                 &class,
@@ -3933,6 +4033,14 @@ impl ClassManager {
                     // Redefine verifies a class already resident in the
                     // store (in-place mutation), so no in-flight class.
                     in_flight: None,
+                    // CL-CLASSMANAGER fix: the redefined class is resident
+                    // at `class_id`; resolve referenced names through its
+                    // own defining loader's delegation order so two loaders
+                    // defining the same name do not cross-resolve.
+                    requesting_loader: self
+                        .class_store
+                        .get(class_id)
+                        .map(|c| c.loader_id),
                 };
                 // SAFETY-shape: the class we just mutated is at
                 // `class_id` in `self.class_store`. `get` returns `Some`

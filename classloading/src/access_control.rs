@@ -43,14 +43,21 @@ pub fn check_class_access(accessor: &Class, target: &Class) -> Result<(), Linkag
 /// Per JVM spec 5.4.4:
 /// - `PUBLIC` в†’ accessible from anywhere
 /// - `PRIVATE` в†’ accessible only from declaring class
-/// - `PROTECTED` в†’ accessible from same package OR subclasses
+/// - `PROTECTED` в†’ accessible from same package OR subclasses (with the
+///   additional receiver-subtype requirement below for cross-package access)
 /// - Package-private (no access modifier) в†’ accessible from same package only
+///
+/// `receiver` is the *static type* of the object/expression through which the
+/// member is being accessed (`None` for a static field, or when the caller does
+/// not track it). It is only consulted for the JVMS В§5.4.4 cross-package
+/// protected receiver-subtype check (see [`receiver_ok_for_protected`]).
 #[inline]
 pub fn check_field_access(
     accessor: &Class,
     declaring: &Class,
     flags: FieldAccessFlags,
     store: &ClassStore,
+    receiver: Option<&Class>,
 ) -> Result<(), LinkageError> {
     // Public fields are always accessible
     if flags.contains(FieldAccessFlags::PUBLIC) {
@@ -75,8 +82,25 @@ pub fn check_field_access(
         if same_runtime_package(accessor, declaring) {
             return Ok(());
         }
+        // Cross-package protected access: the accessor C must be a subclass of
+        // the class D declaring the member (JVMS В§5.4.4).
         if accessor.is_subclass_of(declaring.id, store) {
-            return Ok(());
+            // ...AND the access must be *through a receiver* whose static type
+            // is C or a subclass of C (JVMS В§5.4.4). A protected member of a
+            // superclass in another package is NOT reachable through an
+            // unrelated sibling-type receiver. When the caller does not supply
+            // a receiver (e.g. a static field, or a context that does not track
+            // it) the receiver clause does not apply and access is permitted.
+            if receiver_ok_for_protected(accessor, receiver, store) {
+                return Ok(());
+            }
+            return Err(LinkageError::IllegalAccessError {
+                message: format!(
+                    "class {} cannot access protected field in {} \
+                     (different package; receiver is not a subtype of {})",
+                    accessor.name, declaring.name, accessor.name
+                ),
+            });
         }
         return Err(LinkageError::IllegalAccessError {
             message: format!(
@@ -101,13 +125,17 @@ pub fn check_field_access(
 
 /// Check whether `accessor` can access a method in `declaring` class with given flags.
 ///
-/// Same rules as field access (JVM spec 5.4.4).
+/// Same rules as field access (JVM spec 5.4.4), including the cross-package
+/// protected receiver-subtype requirement. `receiver` is the static type of the
+/// object through which the method is invoked (`None` for a static method, or
+/// when the caller does not track it).
 #[inline]
 pub fn check_method_access(
     accessor: &Class,
     declaring: &Class,
     flags: MethodAccessFlags,
     store: &ClassStore,
+    receiver: Option<&Class>,
 ) -> Result<(), LinkageError> {
     // Public methods are always accessible
     if flags.contains(MethodAccessFlags::PUBLIC) {
@@ -132,8 +160,23 @@ pub fn check_method_access(
         if same_runtime_package(accessor, declaring) {
             return Ok(());
         }
+        // Cross-package protected access: the accessor C must be a subclass of
+        // the class D declaring the member (JVMS В§5.4.4).
         if accessor.is_subclass_of(declaring.id, store) {
-            return Ok(());
+            // ...AND the access must be *through a receiver* whose static type
+            // is C or a subclass of C (JVMS В§5.4.4). See `check_field_access`
+            // for the rationale; `None` receiver (static invocation / untracked)
+            // skips the receiver clause.
+            if receiver_ok_for_protected(accessor, receiver, store) {
+                return Ok(());
+            }
+            return Err(LinkageError::IllegalAccessError {
+                message: format!(
+                    "class {} cannot access protected method in {} \
+                     (different package; receiver is not a subtype of {})",
+                    accessor.name, declaring.name, accessor.name
+                ),
+            });
         }
         return Err(LinkageError::IllegalAccessError {
             message: format!(
@@ -154,6 +197,42 @@ pub fn check_method_access(
             accessor.name, declaring.name
         ),
     })
+}
+
+/// Enforce the JVMS В§5.4.4 *receiver-subtype* clause for cross-package
+/// `protected` access.
+///
+/// When code in class `C` (the `accessor`) accesses a `protected` member that
+/// is declared in a class `D` belonging to a *different* run-time package, the
+/// access is only permitted if `C` is a subclass of `D` **and** the access is
+/// performed through a reference whose static type is `C` or a subclass of `C`.
+///
+/// The classic example (JLS В§6.6.2): given `package p; public class C` and a
+/// subclass `package q; class S extends C` with a `protected` member `m`
+/// inherited from `C` вЂ” actually declared in `p` вЂ” code in `S` may use
+/// `this.m` or `((S) other).m`, but may NOT reach `m` through a bare `C`
+/// receiver (`someC.m`) because `C` is in a different package. This stops a
+/// subclass from using its inherited access to reach a *sibling's* protected
+/// state.
+///
+/// `receiver` is the static type of the expression the member is accessed
+/// through. `None` means there is no receiver subject to this clause (a static
+/// member, or a caller that does not model the receiver type); in that case the
+/// clause is vacuously satisfied вЂ” the preceding subclass check already gated
+/// access. When a receiver *is* supplied, it must be `accessor` itself or a
+/// subclass of `accessor`.
+#[inline]
+fn receiver_ok_for_protected(
+    accessor: &Class,
+    receiver: Option<&Class>,
+    store: &ClassStore,
+) -> bool {
+    match receiver {
+        // No tracked receiver (static access, or untracked) в†’ clause N/A.
+        None => true,
+        // Receiver static type must be C or a subtype of C.
+        Some(r) => r.is_subclass_of(accessor.id, store),
+    }
 }
 
 /// Check if two classes are nestmates (JEP 181, Java 11+).
@@ -317,26 +396,34 @@ pub fn check_class_access_with_modules(
 }
 
 /// Module-aware variant of [`check_field_access`].
+///
+/// `receiver` is the static type of the access receiver; see
+/// [`check_field_access`] for the JVMS В§5.4.4 cross-package protected rule.
 pub fn check_field_access_with_modules(
     accessor: &Class,
     declaring: &Class,
     flags: FieldAccessFlags,
     store: &ClassStore,
     registry: &ModuleRegistry,
+    receiver: Option<&Class>,
 ) -> Result<(), LinkageError> {
-    check_field_access(accessor, declaring, flags, store)?;
+    check_field_access(accessor, declaring, flags, store, receiver)?;
     check_module_access(accessor, declaring, registry)
 }
 
 /// Module-aware variant of [`check_method_access`].
+///
+/// `receiver` is the static type of the access receiver; see
+/// [`check_method_access`] for the JVMS В§5.4.4 cross-package protected rule.
 pub fn check_method_access_with_modules(
     accessor: &Class,
     declaring: &Class,
     flags: MethodAccessFlags,
     store: &ClassStore,
     registry: &ModuleRegistry,
+    receiver: Option<&Class>,
 ) -> Result<(), LinkageError> {
-    check_method_access(accessor, declaring, flags, store)?;
+    check_method_access(accessor, declaring, flags, store, receiver)?;
     check_module_access(accessor, declaring, registry)
 }
 
@@ -543,8 +630,13 @@ mod tests {
         let evil_c = store.get(evil).unwrap();
 
         // Package-private (no modifier) and protected non-subclass both denied.
-        assert!(check_field_access(evil_c, victim_c, FieldAccessFlags::empty(), &store).is_err());
-        assert!(check_method_access(evil_c, victim_c, MethodAccessFlags::empty(), &store).is_err());
+        assert!(
+            check_field_access(evil_c, victim_c, FieldAccessFlags::empty(), &store, None).is_err()
+        );
+        assert!(
+            check_method_access(evil_c, victim_c, MethodAccessFlags::empty(), &store, None)
+                .is_err()
+        );
         assert!(check_class_access(evil_c, victim_c).is_err());
     }
 
@@ -633,7 +725,9 @@ mod tests {
 
         let accessor = store.get(accessor_id).unwrap();
         let declaring = store.get(declaring_id).unwrap();
-        assert!(check_field_access(accessor, declaring, FieldAccessFlags::PUBLIC, &store).is_ok());
+        assert!(
+            check_field_access(accessor, declaring, FieldAccessFlags::PUBLIC, &store, None).is_ok()
+        );
     }
 
     #[test]
@@ -647,7 +741,7 @@ mod tests {
         );
 
         let class = store.get(class_id).unwrap();
-        assert!(check_field_access(class, class, FieldAccessFlags::PRIVATE, &store).is_ok());
+        assert!(check_field_access(class, class, FieldAccessFlags::PRIVATE, &store, None).is_ok());
     }
 
     #[test]
@@ -668,7 +762,7 @@ mod tests {
 
         let a = store.get(a_id).unwrap();
         let b = store.get(b_id).unwrap();
-        assert!(check_field_access(a, b, FieldAccessFlags::PRIVATE, &store).is_err());
+        assert!(check_field_access(a, b, FieldAccessFlags::PRIVATE, &store, None).is_err());
     }
 
     #[test]
@@ -689,7 +783,16 @@ mod tests {
 
         let child = store.get(child_id).unwrap();
         let parent = store.get(parent_id).unwrap();
-        assert!(check_field_access(child, parent, FieldAccessFlags::PROTECTED, &store).is_ok());
+        // Cross-package protected access through a receiver of the accessor's
+        // own type (`child`) is permitted (JVMS В§5.4.4 receiver-subtype clause
+        // satisfied). `None` (untracked receiver) is likewise permitted.
+        assert!(
+            check_field_access(child, parent, FieldAccessFlags::PROTECTED, &store, Some(child))
+                .is_ok()
+        );
+        assert!(
+            check_field_access(child, parent, FieldAccessFlags::PROTECTED, &store, None).is_ok()
+        );
     }
 
     #[test]
@@ -710,7 +813,7 @@ mod tests {
 
         let a = store.get(a_id).unwrap();
         let b = store.get(b_id).unwrap();
-        assert!(check_field_access(a, b, FieldAccessFlags::PROTECTED, &store).is_err());
+        assert!(check_field_access(a, b, FieldAccessFlags::PROTECTED, &store, None).is_err());
     }
 
     #[test]
@@ -731,7 +834,7 @@ mod tests {
 
         let a = store.get(a_id).unwrap();
         let b = store.get(b_id).unwrap();
-        assert!(check_field_access(a, b, FieldAccessFlags::empty(), &store).is_ok());
+        assert!(check_field_access(a, b, FieldAccessFlags::empty(), &store, None).is_ok());
     }
 
     #[test]
@@ -752,7 +855,7 @@ mod tests {
 
         let a = store.get(a_id).unwrap();
         let b = store.get(b_id).unwrap();
-        assert!(check_field_access(a, b, FieldAccessFlags::empty(), &store).is_err());
+        assert!(check_field_access(a, b, FieldAccessFlags::empty(), &store, None).is_err());
     }
 
     // --- check_method_access ---
@@ -775,7 +878,7 @@ mod tests {
 
         let a = store.get(a_id).unwrap();
         let b = store.get(b_id).unwrap();
-        assert!(check_method_access(a, b, MethodAccessFlags::PUBLIC, &store).is_ok());
+        assert!(check_method_access(a, b, MethodAccessFlags::PUBLIC, &store, None).is_ok());
     }
 
     #[test]
@@ -789,7 +892,7 @@ mod tests {
         );
 
         let class = store.get(class_id).unwrap();
-        assert!(check_method_access(class, class, MethodAccessFlags::PRIVATE, &store).is_ok());
+        assert!(check_method_access(class, class, MethodAccessFlags::PRIVATE, &store, None).is_ok());
     }
 
     #[test]
@@ -810,7 +913,7 @@ mod tests {
 
         let a = store.get(a_id).unwrap();
         let b = store.get(b_id).unwrap();
-        assert!(check_method_access(a, b, MethodAccessFlags::PRIVATE, &store).is_err());
+        assert!(check_method_access(a, b, MethodAccessFlags::PRIVATE, &store, None).is_err());
     }
 
     #[test]
@@ -831,7 +934,193 @@ mod tests {
 
         let child = store.get(child_id).unwrap();
         let parent = store.get(parent_id).unwrap();
-        assert!(check_method_access(child, parent, MethodAccessFlags::PROTECTED, &store).is_ok());
+        // Receiver of the accessor's own type satisfies the В§5.4.4 clause;
+        // `None` (untracked) is also permitted.
+        assert!(check_method_access(
+            child,
+            parent,
+            MethodAccessFlags::PROTECTED,
+            &store,
+            Some(child)
+        )
+        .is_ok());
+        assert!(
+            check_method_access(child, parent, MethodAccessFlags::PROTECTED, &store, None).is_ok()
+        );
+    }
+
+    // --- JVMS В§5.4.4 cross-package protected receiver-subtype clause ---
+
+    /// Builds the classic В§5.4.4 / JLS В§6.6.2 shape:
+    /// `p/Base` (declares the protected member) and two subclasses in a
+    /// *different* package `q`: `q/Sub` (the accessor C) and `q/Sibling`
+    /// (an unrelated subtype of Base that is NOT a subtype of Sub).
+    /// Returns `(store, base_id, sub_id, sibling_id, grandsub_id)` where
+    /// `q/GrandSub extends q/Sub`.
+    fn build_protected_hierarchy() -> (ClassStore, ClassId, ClassId, ClassId, ClassId) {
+        let mut store = ClassStore::new();
+        let base = make_class(
+            &mut store,
+            "p/Base",
+            None,
+            ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+        );
+        let sub = make_class(
+            &mut store,
+            "q/Sub",
+            Some(base),
+            ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+        );
+        let sibling = make_class(
+            &mut store,
+            "q/Sibling",
+            Some(base),
+            ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+        );
+        let grandsub = make_class(
+            &mut store,
+            "q/GrandSub",
+            Some(sub),
+            ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+        );
+        (store, base, sub, sibling, grandsub)
+    }
+
+    #[test]
+    fn protected_cross_pkg_receiver_self_type_ok() {
+        // Receiver static type == accessor C в†’ allowed.
+        let (store, base, sub, _sibling, _grand) = build_protected_hierarchy();
+        let base_c = store.get(base).unwrap();
+        let sub_c = store.get(sub).unwrap();
+        assert!(check_field_access(
+            sub_c,
+            base_c,
+            FieldAccessFlags::PROTECTED,
+            &store,
+            Some(sub_c)
+        )
+        .is_ok());
+        assert!(check_method_access(
+            sub_c,
+            base_c,
+            MethodAccessFlags::PROTECTED,
+            &store,
+            Some(sub_c)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn protected_cross_pkg_receiver_subtype_of_c_ok() {
+        // Receiver static type is a subclass of accessor C в†’ allowed.
+        let (store, base, sub, _sibling, grand) = build_protected_hierarchy();
+        let base_c = store.get(base).unwrap();
+        let sub_c = store.get(sub).unwrap();
+        let grand_c = store.get(grand).unwrap();
+        assert!(check_field_access(
+            sub_c,
+            base_c,
+            FieldAccessFlags::PROTECTED,
+            &store,
+            Some(grand_c)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn protected_cross_pkg_receiver_sibling_denied() {
+        // Receiver static type is a sibling (subtype of D=Base, but NOT of
+        // C=Sub) в†’ DENIED per В§5.4.4 receiver-subtype clause. This is the
+        // bug being fixed: previously the subclass check alone admitted it.
+        let (store, base, sub, sibling, _grand) = build_protected_hierarchy();
+        let base_c = store.get(base).unwrap();
+        let sub_c = store.get(sub).unwrap();
+        let sibling_c = store.get(sibling).unwrap();
+        assert!(check_field_access(
+            sub_c,
+            base_c,
+            FieldAccessFlags::PROTECTED,
+            &store,
+            Some(sibling_c)
+        )
+        .is_err());
+        assert!(check_method_access(
+            sub_c,
+            base_c,
+            MethodAccessFlags::PROTECTED,
+            &store,
+            Some(sibling_c)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn protected_cross_pkg_receiver_declaring_type_denied() {
+        // Receiver static type is D=Base itself (a supertype of C) в†’ DENIED:
+        // a subclass may not reach the protected member of its other-package
+        // superclass through a bare superclass-typed receiver.
+        let (store, base, sub, _sibling, _grand) = build_protected_hierarchy();
+        let base_c = store.get(base).unwrap();
+        let sub_c = store.get(sub).unwrap();
+        assert!(check_field_access(
+            sub_c,
+            base_c,
+            FieldAccessFlags::PROTECTED,
+            &store,
+            Some(base_c)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn protected_cross_pkg_untracked_receiver_allowed() {
+        // No receiver tracked (None) в†’ receiver clause N/A; the subclass
+        // check governs. Preserves behavior for callers that don't model the
+        // receiver type and for static members.
+        let (store, base, sub, _sibling, _grand) = build_protected_hierarchy();
+        let base_c = store.get(base).unwrap();
+        let sub_c = store.get(sub).unwrap();
+        assert!(
+            check_field_access(sub_c, base_c, FieldAccessFlags::PROTECTED, &store, None).is_ok()
+        );
+    }
+
+    #[test]
+    fn protected_same_pkg_ignores_receiver() {
+        // Same-package protected access is granted regardless of receiver
+        // type (the В§5.4.4 receiver clause only applies cross-package).
+        let mut store = ClassStore::new();
+        let base = make_class(
+            &mut store,
+            "p/Base",
+            None,
+            ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+        );
+        // Accessor in the SAME package as the declaring class, not a subclass.
+        let peer = make_class(
+            &mut store,
+            "p/Peer",
+            None,
+            ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+        );
+        let unrelated = make_class(
+            &mut store,
+            "p/Unrelated",
+            None,
+            ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+        );
+        let base_c = store.get(base).unwrap();
+        let peer_c = store.get(peer).unwrap();
+        let unrelated_c = store.get(unrelated).unwrap();
+        // Even with an unrelated receiver, same-package access is allowed.
+        assert!(check_field_access(
+            peer_c,
+            base_c,
+            FieldAccessFlags::PROTECTED,
+            &store,
+            Some(unrelated_c)
+        )
+        .is_ok());
     }
 
     // --- Nest-based access control (JEP 181) ---
@@ -895,9 +1184,9 @@ mod tests {
         let inner = store.get(inner_id).unwrap();
 
         // Inner can access Outer's private fields
-        assert!(check_field_access(inner, outer, FieldAccessFlags::PRIVATE, &store).is_ok());
+        assert!(check_field_access(inner, outer, FieldAccessFlags::PRIVATE, &store, None).is_ok());
         // Outer can access Inner's private methods
-        assert!(check_method_access(outer, inner, MethodAccessFlags::PRIVATE, &store).is_ok());
+        assert!(check_method_access(outer, inner, MethodAccessFlags::PRIVATE, &store, None).is_ok());
     }
 
     #[test]
@@ -919,8 +1208,8 @@ mod tests {
         let b = store.get(b_id).unwrap();
 
         // A and B are nestmates, can access each other's private members
-        assert!(check_field_access(a, b, FieldAccessFlags::PRIVATE, &store).is_ok());
-        assert!(check_field_access(b, a, FieldAccessFlags::PRIVATE, &store).is_ok());
+        assert!(check_field_access(a, b, FieldAccessFlags::PRIVATE, &store, None).is_ok());
+        assert!(check_field_access(b, a, FieldAccessFlags::PRIVATE, &store, None).is_ok());
     }
 
     #[test]
@@ -942,8 +1231,8 @@ mod tests {
         let a = store.get(a_id).unwrap();
         let b = store.get(b_id).unwrap();
 
-        assert!(check_field_access(a, b, FieldAccessFlags::PRIVATE, &store).is_err());
-        assert!(check_method_access(a, b, MethodAccessFlags::PRIVATE, &store).is_err());
+        assert!(check_field_access(a, b, FieldAccessFlags::PRIVATE, &store, None).is_err());
+        assert!(check_method_access(a, b, MethodAccessFlags::PRIVATE, &store, None).is_err());
     }
 
     #[test]
@@ -984,8 +1273,13 @@ mod tests {
 
         // Spoof must fail: attacker is not a confirmed nestmate of member.
         assert!(!are_nestmates(attacker, member, &store));
-        assert!(check_field_access(attacker, member, FieldAccessFlags::PRIVATE, &store).is_err());
-        assert!(check_method_access(attacker, member, MethodAccessFlags::PRIVATE, &store).is_err());
+        assert!(
+            check_field_access(attacker, member, FieldAccessFlags::PRIVATE, &store, None).is_err()
+        );
+        assert!(
+            check_method_access(attacker, member, MethodAccessFlags::PRIVATE, &store, None)
+                .is_err()
+        );
     }
 
     #[test]

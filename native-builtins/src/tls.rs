@@ -841,14 +841,58 @@ fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. javax.net.ssl.TrustManagerFactory  (3-field synthetic)
+// 5. javax.net.ssl.TrustManagerFactory  (binds a KeyStore's trust anchors;
+//    getTrustManagers returns a real validating X509TrustManager)
 // ---------------------------------------------------------------------------
 
+/// Recover the `keystore.rs`-registry id (the one `x509_manager::
+/// build_trust_manager_state` consults) from a `java/security/KeyStore` object
+/// passed to `TrustManagerFactory.init(KeyStore)`.
+///
+/// The real-JDK keystore path (`keystore.rs::engine_load`) registers a parsed
+/// `LoadedKeyStore` and stamps its id onto the *KeyStoreSpi* mirror via
+/// `set_store_id`, which writes the named field `cratonvm$keystore$storeId`
+/// (plus an identity side-table only reachable from inside `keystore.rs`). A
+/// public `java/security/KeyStore` delegates to that SPI through its
+/// `keyStoreSpi` field. So we probe, in order:
+///   1. the KeyStore object's own `cratonvm$keystore$storeId` named field;
+///   2. its `keyStoreSpi` delegate's `cratonvm$keystore$storeId` named field.
+///
+/// CROSS-FILE NOTE: the identity-side-table fallback in
+/// `keystore.rs::get_store_id` is private; if a future real-JDK JKS mirror
+/// carries the id *only* in that side-table (no usable named field), this probe
+/// returns 0 and the trust manager falls back to system roots. The robust fix
+/// is a `pub fn keystore::keystore_id_from_object(ctx, ks_obj) -> i32` exported
+/// from `keystore.rs` that reuses `get_store_id` over the `keyStoreSpi`
+/// delegate; this helper should prefer that once it exists. Flagged for
+/// keystore.rs.
+fn read_keystore_registry_id(ctx: &mut dyn NativeContext, ks_obj: ObjectRef) -> i32 {
+    // (1) directly on the KeyStore object.
+    if let Value::Int(i) = ctx.get_field_by_name(ks_obj, "cratonvm$keystore$storeId") {
+        if i != 0 {
+            return i;
+        }
+    }
+    // (2) on the SPI delegate referenced by `keyStoreSpi`.
+    if let Value::Object(Some(spi)) = ctx.get_field_by_name(ks_obj, "keyStoreSpi") {
+        if let Value::Int(i) = ctx.get_field_by_name(spi, "cratonvm$keystore$storeId") {
+            if i != 0 {
+                return i;
+            }
+        }
+    }
+    0
+}
+
 fn register_trust_manager_factory(r: &mut NativeMethodRegistry) {
-    // SyntheticStub: 3-field synthetic factory; getTrustManagers() returns a
-    // placeholder X509TrustManager that does no real trust-store loading.
+    // Bridge: init(KeyStore) records the loaded keystore's registry id on the
+    // factory; getTrustManagers() returns a real javax/net/ssl/X509TrustManager
+    // stamped with that id, so its checkServerTrusted/checkClientTrusted (in
+    // register_x509_trust_manager) validate against the keystore's trust anchors
+    // via x509_manager::build_trust_manager_state. No-validation placeholder
+    // removed.
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "javax/net/ssl/TrustManagerFactory";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -888,29 +932,60 @@ fn register_trust_manager_factory(r: &mut NativeMethodRegistry) {
     );
 
     // init(KeyStore) -> void
+    // FIX (nb-tls-tmf): wire the loaded KeyStore's trust anchors into this
+    // factory. Previously slot 2 recorded only a 0/1 presence flag and the
+    // store was discarded, so getTrustManagers() could not validate against it.
+    // We now recover the keystore's id in the `keystore.rs` registry (the one
+    // x509_manager::build_trust_manager_state reads) and store it on the factory
+    // (slot 2). A null KeyStore means "use the default trust store" — real-JDK
+    // loads the platform cacerts; we record id 0, which
+    // build_trust_manager_state(0) resolves to system roots only.
     r.register(
         cls,
         "init",
         "(Ljava/security/KeyStore;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let ks_present = match args.get(1) {
-                Some(Value::Object(Some(_))) => 1,
-                _ => 0,
+            let ks_id = match args.get(1) {
+                Some(Value::Object(Some(ks_obj))) => read_keystore_registry_id(ctx, *ks_obj),
+                _ => 0, // null KeyStore => default trust store (system roots)
             };
-            ctx.set_field(this, 2, Value::Int(ks_present));
+            // slot 2 = bound keystore registry id (0 = system roots only).
+            ctx.set_field(this, 2, Value::Int(ks_id));
+            // slot 1 = initialized flag.
             ctx.set_field(this, 1, Value::Int(1));
             Ok(None)
         },
     );
 
     // getTrustManagers() -> TrustManager[]
+    // FIX (nb-tls-tmf): return a REAL javax/net/ssl/X509TrustManager (whose
+    // checkServerTrusted/checkClientTrusted run full PKIX validation in
+    // register_x509_trust_manager) stamped with the keystore id bound by init().
+    // validate_cert_chain reads that id off the manager via
+    // read_trust_manager_id_from_obj (named field `cratonvm$x509tm$id`, slot 0
+    // fallback) and builds the anchor set from the keystore + system roots. This
+    // replaces the former no-validation placeholder that loaded no trust store.
     r.register(
         cls,
         "getTrustManagers",
         "()[Ljavax/net/ssl/TrustManager;",
-        |ctx, _args| {
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // The id init() bound to this factory (0 if init() was never called
+            // or a null KeyStore was passed => default/system trust anchors).
+            let ks_id = match ctx.get_field(this, 2) {
+                Value::Int(i) => i,
+                Value::Long(l) => l as i32,
+                _ => 0,
+            };
+            // Allocate a 1-field X509TrustManager and stamp the bound keystore id
+            // so its validation picks up those anchors. Both the named field
+            // (preferred by read_trust_manager_id_from_obj) and slot 0 (its
+            // fallback) carry the id.
             let tm = alloc_concurrent_synthetic(ctx, "javax/net/ssl/X509TrustManager", 1);
+            ctx.set_field_by_name(tm, "cratonvm$x509tm$id", Value::Int(ks_id));
+            ctx.set_field(tm, 0, Value::Int(ks_id));
             let arr = ctx.new_ref_array(ClassId::new(0), 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(tm)));
             Ok(Some(Value::Object(Some(arr))))
@@ -2278,6 +2353,56 @@ mod tls_tests {
         assert!(r.find(cls, "getDefaultAlgorithm", "()Ljava/lang/String;").is_some());
         assert!(r.find(cls, "init", "(Ljava/security/KeyStore;)V").is_some());
         assert!(r.find(cls, "getTrustManagers", "()[Ljavax/net/ssl/TrustManager;").is_some());
+    }
+
+    // FIX (nb-tls-tmf): getTrustManagers() must propagate the keystore registry
+    // id bound by init() (factory slot 2) onto the returned X509TrustManager's
+    // slot 0, so validate_cert_chain's read_trust_manager_id_from_obj resolves
+    // the bound trust anchors rather than returning a no-validation placeholder.
+    // The named-field stamp (`cratonvm$x509tm$id`) is not observable in the test
+    // mock (it only models known JDK field names), so we assert the slot-0
+    // fallback the mock fully supports — that is the channel validate_cert_chain
+    // also consults.
+    #[test]
+    fn nb_tls_tmf_get_trust_managers_propagates_keystore_id() {
+        use crate::test_utils::MockNativeContext;
+        let mut r = NativeMethodRegistry::new();
+        register_tls_natives(&mut r);
+        let cls = "javax/net/ssl/TrustManagerFactory";
+        let mut ctx = MockNativeContext::new();
+
+        // Obtain a factory instance via getInstance (PKIX), then simulate
+        // init(KeyStore) having bound a keystore registry id by writing slot 2.
+        let get_instance = r
+            .find(cls, "getInstance", "(Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;")
+            .unwrap();
+        let factory = match get_instance(&mut ctx, &[Value::Object(None)]) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => panic!("getInstance should return a factory, got {other:?}"),
+        };
+        const BOUND_ID: i32 = 7;
+        ctx.set_field(factory, 2, Value::Int(BOUND_ID));
+
+        // getTrustManagers() should return a 1-element array whose X509TrustManager
+        // carries the bound id in slot 0 (validate_cert_chain's fallback channel).
+        let get_tms = r
+            .find(cls, "getTrustManagers", "()[Ljavax/net/ssl/TrustManager;")
+            .unwrap();
+        let arr = match get_tms(&mut ctx, &[Value::Object(Some(factory))]) {
+            Ok(Some(Value::Object(Some(a)))) => a,
+            other => panic!("getTrustManagers should return an array, got {other:?}"),
+        };
+        assert_eq!(ctx.array_length(arr), 1, "expected exactly one trust manager");
+        let tm = match ctx.get_array_element(arr, 0) {
+            Value::Object(Some(t)) => t,
+            other => panic!("trust manager element should be an object, got {other:?}"),
+        };
+        assert_eq!(
+            ctx.get_field(tm, 0),
+            Value::Int(BOUND_ID),
+            "returned X509TrustManager must carry the keystore id init() bound, \
+             so checkServerTrusted validates against those anchors (not a no-op placeholder)"
+        );
     }
 
     #[test]
