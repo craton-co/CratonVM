@@ -35049,6 +35049,24 @@ pub fn register_reflect_proxy_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/lang/Class;",
         native_proxy_get_interfaces,
     );
+    // proxy-real-classfile increment 2 — the constructor the generated
+    // `$ProxyN.<init>` delegates to via `INVOKESPECIAL
+    // Proxy$Instance.<init>(InvocationHandler, Class[])V`. The synthetic
+    // super's matching method entry is declared in
+    // `cratonvm_classloading::class_manager::synthetic_stub_ctor_methods`
+    // (NATIVE-flagged, no Code); this native is its body. Today
+    // `native_proxy_new_instance` bypasses the ctor (allocate + `set_field`),
+    // so the canonical path never reaches here — but any path that *executes*
+    // the generated `<init>` (a JIT call site, or `new`+`invokespecial`)
+    // would otherwise hit `NoSuchMethodError`. The body mirrors the
+    // allocation-bypass field writes: slot 0 = handler, slot 1 = interfaces,
+    // slot 2 = identity-hash override (reserved, 0).
+    registry.register(
+        "java/lang/reflect/Proxy$Instance",
+        "<init>",
+        "(Ljava/lang/reflect/InvocationHandler;[Ljava/lang/Class;)V",
+        native_proxy_instance_init,
+    );
     // WP2.5 v3 — INVOKESTATIC target embedded in every generated `$ProxyN`
     // method body. Signature changed from the v2 3-string-arg shape to
     // `(Object, Method, Object[]) Object`: the Method object is now built
@@ -35730,6 +35748,48 @@ fn native_proxy_get_interfaces(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => Value::Object(None),
     };
     Ok(Some(arr))
+}
+
+/// proxy-real-classfile increment 2 — body for the synthetic
+/// `Proxy$Instance.<init>(InvocationHandler, Class[])V` super constructor
+/// that every generated `$ProxyN.<init>` delegates to via `INVOKESPECIAL`.
+///
+/// Args (instance ctor → receiver is arg 0):
+///   `[0]` the proxy `this`
+///   `[1]` `InvocationHandler`
+///   `[2]` `Class[]` interfaces
+///
+/// Populates the inherited 3-slot `Proxy$Instance` layout (handler /
+/// interfaces / identity-hash) exactly like the allocation-bypass path in
+/// `native_proxy_new_instance`, so a proxy constructed by *executing* the
+/// generated `<init>` (a JIT call site, or `new`+`invokespecial`) ends up
+/// with the same field state as one built by the fast path. Returns `None`
+/// (void).
+fn native_proxy_instance_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(p))) => *p,
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Proxy$Instance.<init>: null receiver".to_string()),
+            }
+            .into());
+        }
+    };
+    let handler = args.get(1).cloned().unwrap_or(Value::Object(None));
+    let interfaces = args.get(2).cloned().unwrap_or(Value::Object(None));
+
+    ctx.set_field(this, 0, handler);
+    ctx.set_field(this, 1, interfaces);
+    ctx.set_field(this, 2, Value::Int(0));
+
+    // Keep the global "last-proxy interfaces" cache populated for legacy
+    // readers (lang_class synthetic-mode `getInterfaces` fallback), mirroring
+    // `native_proxy_new_instance`.
+    if let Value::Object(Some(arr)) = interfaces {
+        lang_class::set_proxy_last_interfaces(arr);
+    }
+
+    Ok(None)
 }
 
 /// WP2.5 v3 — parse a JVMS method descriptor's parameter list into

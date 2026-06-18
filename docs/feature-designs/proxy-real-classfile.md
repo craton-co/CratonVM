@@ -213,15 +213,70 @@ synthetic `Proxy$Instance` shim), audited from source:
 
 ### Remaining (next increments)
 
-- **`Proxy$Instance.<init>(InvocationHandler, Class[])V` is absent** from the
-  synthetic super (`synthetic_stub_ctor_methods` does not special-case
-  `Proxy$Instance`). Allocation bypasses the ctor (`alloc_object` +
-  `set_field`), so it is currently dead, but any path that *executes* the
-  generated `<init>` (JIT call site, `new`+`invokespecial`) would hit
-  `NoSuchMethodError`. Fix belongs in `class_manager.rs`
-  (`synthetic_stub_ctor_methods`) — out of this item's edit boundary; flag for
-  the class-manager owner.
-- **Default-method + Object-method routing** parity (design §2 / §4).
 - **Raise the real JDK exception** (`IllegalArgumentException` /
   `UndeclaredThrowableException`) instead of degrading even when the gate is
   on and a define genuinely fails (design §3), then delete the shim.
+
+---
+
+## Increment 2 — synthetic proxy `<init>` + Object-method routing (landed)
+
+Closes the two correctness gaps increment 1 flagged as remaining.
+
+### 1. Synthetic proxy constructor (`NoSuchMethodError` gap)
+
+The generated `$ProxyN.<init>(InvocationHandler, Class[])V` delegates to its
+super via `INVOKESPECIAL Proxy$Instance.<init>(InvocationHandler, Class[])V`
+(`proxy_gen::emit_proxy_classfile`, ctor body). The synthetic `Proxy$Instance`
+super — minted by `ensure_synthetic_class` with a 3-field layout — previously
+had an **empty method table** (`synthetic_stub_ctor_methods` did not
+special-case it). Allocation in `native_proxy_new_instance` bypasses the ctor
+(`alloc_object` + `set_field`), so the gap was dead on the canonical path, but
+any path that *executes* the generated `<init>` (a JIT call site, or
+`new`+`invokespecial`) hit `NoSuchMethodError` resolving the super ctor.
+
+Fixed in two halves:
+
+- **Method entry** — `synthetic_stub_ctor_methods` (`classloading/src/class_manager.rs`)
+  now special-cases `java/lang/reflect/Proxy$Instance` and pushes a
+  NATIVE-flagged `<init>(Ljava/lang/reflect/InvocationHandler;[Ljava/lang/Class;)V`,
+  so the super ctor **resolves**.
+- **Native body** — `register_reflect_proxy_natives`
+  (`native-builtins/src/lib.rs`, proxy region) registers
+  `native_proxy_instance_init` for that signature; it populates the inherited
+  3-slot layout (slot 0 = handler, slot 1 = interfaces, slot 2 = identity-hash
+  reserved) exactly like the allocation-bypass path, so a proxy built by
+  executing `<init>` ends up with the same field state as the fast path.
+
+### 2. Object-method routing parity (design §2/§4)
+
+`hashCode()` / `equals(Object)` / `toString()` are routed through the
+`InvocationHandler`, matching the JDK generated proxy body. `build_proxy_spec_for`
+(native-builtins) already always appends these three as `ProxyMethod` entries
+(unless an interface redeclares them), and `emit_proxy_classfile` emits each as
+a concrete dispatch shim that boxes args and `INVOKESTATIC`s
+`Proxy$Dispatch.invokeProxy`, which forwards to `handler.invoke(proxy, method,
+args)` (`native_proxy_dispatch_invoke`). So on the real-classfile path these
+Object methods dispatch through the handler rather than inheriting Object's
+identity implementations — no new wiring was required beyond pinning it with a
+test. Default methods are likewise emitted with bodies that route through the
+same helper (the handler may call `invokeDefault`).
+
+### Tests
+
+- `classloading::class_manager::tests::synthetic_proxy_instance_declares_init_ctor`
+  — asserts (a) `synthetic_stub_ctor_methods("…/Proxy$Instance")` returns the
+  NATIVE-flagged ctor, and (b) the stub registered via `ensure_synthetic_class`
+  carries it in its method table (so super-ctor resolution succeeds — no
+  `NoSuchMethodError`).
+- `classloading::proxy_gen::tests::real_proxy_object_methods_route_through_handler_and_ctor_resolves`
+  — defines the real generated `$Proxy0` (verified) and asserts (a) the super
+  ctor resolves and (b) `hashCode`/`equals`/`toString` are emitted as concrete
+  dispatch shims whose constant pool references `Proxy$Dispatch.invokeProxy`
+  (the handler-forwarding helper) and that each carries a non-empty Code body.
+
+### Remaining (next increments)
+
+- **Raise the real JDK exception** instead of degrading on a genuine define
+  failure with the gate on (design §3), then delete the `Proxy$Instance` shim
+  and the three name-keyed intercepts.

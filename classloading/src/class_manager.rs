@@ -7412,6 +7412,24 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
             mk_ctor("(Ljava/lang/String;Ljava/lang/Throwable;)V"),
         ]);
     }
+    // proxy-real-classfile increment 2 — the synthetic `Proxy$Instance`
+    // super of every generated `$ProxyN` (see `native-builtins`
+    // `define_or_get_proxy_class` / `proxy_gen::emit_proxy_classfile`) must
+    // declare the constructor the generated `<init>` delegates to via
+    // `INVOKESPECIAL Proxy$Instance.<init>(InvocationHandler, Class[])V`.
+    // The 3-field stub created by `ensure_synthetic_class` previously had an
+    // empty method table, so any path that *executes* the generated `<init>`
+    // (a JIT call site, or `new`+`invokespecial` rather than the
+    // allocation-bypass in `native_proxy_new_instance`) hit a
+    // `NoSuchMethodError` resolving the super ctor. The matching NATIVE
+    // implementation (which populates slot 0 = handler, slot 1 = interfaces)
+    // is registered as `Proxy$Instance.<init>` in
+    // `native-builtins::register_reflect_proxy_natives`.
+    if name == "java/lang/reflect/Proxy$Instance" {
+        out.push(mk_ctor(
+            "(Ljava/lang/reflect/InvocationHandler;[Ljava/lang/Class;)V",
+        ));
+    }
     if name == "java/nio/file/attribute/PosixFilePermission" {
         out.push(ClassFileMethod {
             access_flags: MethodAccessFlags::STATIC | MethodAccessFlags::NATIVE,
@@ -8127,6 +8145,54 @@ mod tests {
                     && &*m.descriptor == "()Ljava/lang/ThreadGroup;"
             }),
             "synthetic Thread stub should declare getThreadGroup()"
+        );
+    }
+
+    /// proxy-real-classfile increment 2 — the synthetic `Proxy$Instance`
+    /// super must declare the constructor the generated `$ProxyN.<init>`
+    /// delegates to (`INVOKESPECIAL
+    /// Proxy$Instance.<init>(InvocationHandler, Class[])V`). Without this
+    /// entry the super ctor fails to *resolve* and any path that executes the
+    /// generated `<init>` (a JIT call site, or `new`+`invokespecial`) raises
+    /// `NoSuchMethodError`. The matching NATIVE body is registered in
+    /// `native-builtins::register_reflect_proxy_natives`.
+    #[test]
+    fn synthetic_proxy_instance_declares_init_ctor() {
+        const PROXY_CTOR_DESC: &str =
+            "(Ljava/lang/reflect/InvocationHandler;[Ljava/lang/Class;)V";
+
+        // (a) the generator returns the ctor entry, NATIVE-flagged.
+        let methods = synthetic_stub_ctor_methods("java/lang/reflect/Proxy$Instance");
+        let ctor = methods
+            .iter()
+            .find(|m| &*m.name == "<init>" && &*m.descriptor == PROXY_CTOR_DESC)
+            .expect(
+                "synthetic Proxy$Instance must declare \
+                 <init>(InvocationHandler, Class[])V so the generated \
+                 $ProxyN super ctor resolves",
+            );
+        assert!(
+            ctor.access_flags.contains(MethodAccessFlags::NATIVE),
+            "Proxy$Instance.<init> must be NATIVE-flagged (its body is the \
+             registered native), got 0x{:04X}",
+            ctor.access_flags.bits()
+        );
+
+        // (b) the stub registered through `ensure_synthetic_class` — the
+        // exact path `define_or_get_proxy_class` uses before defining the
+        // generated proxy — carries the ctor in its method table, so the
+        // super-ctor resolution that previously failed now succeeds.
+        let mut cm = ClassManager::new(&[], &[], &[]);
+        let super_id = cm.ensure_synthetic_class("java/lang/reflect/Proxy$Instance", 3);
+        let registered = cm
+            .get_class(super_id)
+            .expect("synthetic Proxy$Instance must be registered");
+        assert!(
+            registered.methods.iter().any(|m| {
+                &*m.name == "<init>" && &*m.descriptor == PROXY_CTOR_DESC
+            }),
+            "the registered Proxy$Instance stub must expose the proxy \
+             constructor for super-ctor resolution",
         );
     }
 
