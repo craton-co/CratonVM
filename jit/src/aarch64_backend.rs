@@ -277,6 +277,30 @@ pub enum Arm64Instruction {
         rn: Arm64Register,
         offset: i32,
     },
+    /// Pre-index STP with writeback: `STP rt1, rt2, [rn, #offset]!`.
+    ///
+    /// Bug-fix (ARM64 BUG #2): the AAPCS64-idiomatic prologue store. The base
+    /// register `rn` is updated to `rn + offset` as part of the instruction,
+    /// which both saves the pair AND allocates the (first 16 bytes of the)
+    /// stack frame atomically. `offset` uses the small fixed −16, always inside
+    /// the imm7 range, so it is robust for arbitrarily large frames (unlike a
+    /// signed-offset STP at `frame_size-16`).
+    StpPre {
+        rt1: Arm64Register,
+        rt2: Arm64Register,
+        rn: Arm64Register,
+        offset: i32,
+    },
+    /// Post-index LDP with writeback: `LDP rt1, rt2, [rn], #offset`.
+    ///
+    /// Bug-fix (ARM64 BUG #2): the matching epilogue restore. Loads the pair
+    /// from `[rn]` then updates `rn = rn + offset`, mirroring [`StpPre`].
+    LdpPost {
+        rt1: Arm64Register,
+        rt2: Arm64Register,
+        rn: Arm64Register,
+        offset: i32,
+    },
     LdrLiteral {
         rt: Arm64Register,
         label: u32,
@@ -957,46 +981,92 @@ impl Arm64Backend {
         };
         let frame_size = frame.frame_size;
 
-        // Save FP and LR.
-        self.buffer.emit(Arm64Instruction::Stp {
+        // Bug-fix (ARM64 BUG #2, broken prologue SP/frame geometry):
+        //
+        // The previous prologue emitted a *signed-offset* (non-writeback) STP
+        // `[SP,#-16]`, which does NOT decrement SP, then `MOV FP,SP`, then
+        // `SUB SP,SP,#(frame-16)` under the false assumption that "16 was
+        // already consumed by STP". Because the STP never moved SP, the frame
+        // ended up 16 bytes too small at the bottom and, for a minimal frame,
+        // SP could sit *above* the saved FP/LR slots — corrupting the frame.
+        //
+        // New scheme (AAPCS64-idiomatic, FP at top of frame, all callee-save /
+        // spill offsets remain NEGATIVE from FP exactly as `Arm64FrameLayout`
+        // computes them — no layout change required):
+        //
+        //   1. STP FP, LR, [SP, #-16]!   (writeback) — saves the caller's
+        //      FP/LR and moves SP to old_SP-16. Small fixed offset, always in
+        //      imm7 range, so it is robust for arbitrarily large frames.
+        //   2. SUB SP, SP, #(frame-16)   — allocate the rest of the frame;
+        //      SP now = old_SP - frame_size (the bottom).
+        //   3. ADD FP, SP, #frame        — FP = old_SP (the top). The saved
+        //      caller FP/LR therefore live at [FP-16], matching
+        //      `callee_save_offset = -16 - callee_save_bytes` and the spill
+        //      slots below it.
+        //
+        // The matching epilogue reverses this exactly (see `emit_epilogue`).
+        self.buffer.emit(Arm64Instruction::StpPre {
             rt1: Arm64Register::FP,
             rt2: Arm64Register::LR,
             rn: Arm64Register::SP,
             offset: -16,
         });
 
-        // Set up frame pointer.
-        self.buffer.emit(Arm64Instruction::Mov {
-            rd: Arm64Register::FP,
-            rm: Arm64Register::SP,
-        });
-
-        // Allocate stack space.
+        // Allocate the remainder of the frame (the writeback STP already
+        // consumed the first 16 bytes).
         if frame_size > 16 {
             self.buffer.emit(Arm64Instruction::SubImm {
                 rd: Arm64Register::SP,
                 rn: Arm64Register::SP,
-                imm: frame_size - 16, // 16 already consumed by STP above
+                imm: frame_size - 16,
             });
         }
 
+        // Point FP at the top of the frame (old_SP). After this, the saved
+        // FP/LR pair from step 1 sits at [FP-16].
+        self.buffer.emit(Arm64Instruction::AddImm {
+            rd: Arm64Register::FP,
+            rn: Arm64Register::SP,
+            imm: frame_size,
+        });
+
         // Save callee-saved registers used for locals (in pairs).
-        let saved = &frame.saved_regs.clone();
+        //
+        // PERF: the previous code cloned the entire `saved_regs` Vec
+        // (`&frame.saved_regs.clone()`) once per compiled method purely to
+        // satisfy the borrow checker — the loop body needs `&mut self` for
+        // `self.buffer.emit(...)`, which cannot coexist with a live borrow of
+        // `self.frame` held across the call. `Arm64Register` is `Copy`, so
+        // instead of cloning the whole Vec we hoist the two scalars we need
+        // (the callee-save base offset and the element count) out of the borrow,
+        // then copy out each register by briefly re-borrowing `self.frame` per
+        // access. No per-method heap allocation; the emission sequence is
+        // byte-for-byte identical to before.
+        let callee_save_offset = frame.callee_save_offset;
+        let saved_len = frame.saved_regs.len();
+        // `frame` is unused past this point — its borrow ends here, freeing the
+        // `self.buffer.emit` calls below to take `&mut self`.
+
         let mut i = 0;
-        while i + 1 < saved.len() {
-            let offset = frame.callee_save_offset + (i as i32) * 8;
+        while i + 1 < saved_len {
+            let offset = callee_save_offset + (i as i32) * 8;
+            // Re-borrow `self.frame` only to copy out the two `Copy` registers;
+            // the borrow ends before `self.buffer.emit` is invoked.
+            let frame = self.frame.as_ref().expect("frame present");
+            let (rt1, rt2) = (frame.saved_regs[i], frame.saved_regs[i + 1]);
             self.buffer.emit(Arm64Instruction::Stp {
-                rt1: saved[i],
-                rt2: saved[i + 1],
+                rt1,
+                rt2,
                 rn: Arm64Register::FP,
                 offset,
             });
             i += 2;
         }
-        if i < saved.len() {
-            let offset = frame.callee_save_offset + (i as i32) * 8;
+        if i < saved_len {
+            let offset = callee_save_offset + (i as i32) * 8;
+            let rt = self.frame.as_ref().expect("frame present").saved_regs[i];
             self.buffer.emit(Arm64Instruction::Str {
-                rt: saved[i],
+                rt,
                 rn: Arm64Register::FP,
                 offset,
             });
@@ -1039,16 +1109,24 @@ impl Arm64Backend {
             });
         }
 
-        // Restore SP from FP, then restore FP/LR.
-        self.buffer.emit(Arm64Instruction::Mov {
+        // Bug-fix (ARM64 BUG #2): reverse the writeback prologue exactly.
+        //
+        // The caller's FP/LR were saved at [FP-16] (see `emit_prologue`).
+        //   1. SUB SP, FP, #16          — SP = old_SP-16, the address the
+        //      post-index LDP loads from (mirror of the prologue's
+        //      `STP ...,[SP,#-16]!`).
+        //   2. LDP FP, LR, [SP], #16    — restore the caller's FP/LR, then
+        //      SP = old_SP (caller's stack pointer fully restored).
+        self.buffer.emit(Arm64Instruction::SubImm {
             rd: Arm64Register::SP,
-            rm: Arm64Register::FP,
+            rn: Arm64Register::FP,
+            imm: 16,
         });
-        self.buffer.emit(Arm64Instruction::Ldp {
+        self.buffer.emit(Arm64Instruction::LdpPost {
             rt1: Arm64Register::FP,
             rt2: Arm64Register::LR,
             rn: Arm64Register::SP,
-            offset: 0,
+            offset: 16,
         });
         self.buffer.emit(Arm64Instruction::Ret);
     }
@@ -1596,6 +1674,52 @@ impl Arm64Backend {
                 0x0e => self.emit_fconst(0.0),
                 // dconst_1
                 0x0f => self.emit_fconst(1.0),
+                // ldc (0x12) / ldc_w (0x13) / ldc2_w (0x14)
+                //
+                // Bug-fix (AArch64 STUB, ldc/ldc2_w): these opcodes load a
+                // constant identified by a constant-pool index, but this backend
+                // is never handed the method's constant pool — `Arm64Backend`
+                // carries only `method_info` (cp-index -> invoke arg count), not
+                // the resolved constant values — so there is no way to recover
+                // the int/long/float/double/String/Class constant here. We
+                // therefore BAIL to the interpreter rather than guess.
+                //
+                // CROSS-FILE FOLLOW-UP: to JIT these, plumb the resolved
+                // constant pool (or at least an index -> {i32,i64,f32,f64}
+                // numeric-constant table) into `compile_method_with_info`, then
+                // route numeric ldc/ldc2_w to `emit_iconst`/`emit_lconst`/
+                // `emit_fconst` (the bit-exact emit_fconst added in this pass
+                // handles arbitrary float/double values). String/Class/MethodType
+                // constants still require runtime resolution and must keep
+                // bailing. Until that plumbing exists, bailing is the only
+                // correct option.
+                0x12 | 0x13 => {
+                    // ldc consumes 1 operand byte, ldc_w consumes 2.
+                    let operand_len = if opcode == 0x12 { 1 } else { 2 };
+                    if pc + operand_len > bytecode.len() {
+                        success = false;
+                        break;
+                    }
+                    self.buffer.emit(Arm64Instruction::Comment(
+                        "ldc/ldc_w: constant pool not available — bailing to interpreter".into(),
+                    ));
+                    self.buffer.emit(Arm64Instruction::Brk { imm: 0 });
+                    success = false;
+                    break;
+                }
+                0x14 => {
+                    // ldc2_w consumes 2 operand bytes (long/double constant).
+                    if pc + 2 > bytecode.len() {
+                        success = false;
+                        break;
+                    }
+                    self.buffer.emit(Arm64Instruction::Comment(
+                        "ldc2_w: constant pool not available — bailing to interpreter".into(),
+                    ));
+                    self.buffer.emit(Arm64Instruction::Brk { imm: 0 });
+                    success = false;
+                    break;
+                }
                 // fload
                 0x17 => {
                     if pc >= bytecode.len() {
@@ -1653,7 +1777,28 @@ impl Arm64Backend {
                 // fdiv, ddiv
                 0x6e | 0x6f => self.emit_float_div(),
                 // frem, drem
-                0x72 | 0x73 => self.emit_float_rem(),
+                //
+                // Bug-fix (AArch64 STUB, frem/drem silent-wrong-result): the
+                // `emit_float_rem` truncating implementation (`a - trunc(a/b)*b`
+                // via an i64 round-trip with FCVTZS/SCVTF) is only correct while
+                // |a/b| < 2^63. FCVTZS SATURATES to i64::MIN/MAX outside that
+                // range, so the truncated quotient — and therefore the
+                // remainder — is silently WRONG for large operands. Java's
+                // frem/drem (JLS §15.17.3, fmod semantics) is exact across the
+                // whole double range. Rather than emit a path that is wrong for
+                // a real (if rare) input range, bail to the interpreter, which
+                // computes the correct IEEE remainder. AArch64 is the secondary
+                // backend; correctness over feature completeness. (Re-wiring
+                // emit_float_rem would require an exact reduction loop — e.g.
+                // repeated FRINT/scaled subtraction — not the saturating cast.)
+                0x72 | 0x73 => {
+                    self.buffer.emit(Arm64Instruction::Comment(
+                        "frem/drem: no exact lowering — bailing to interpreter".into(),
+                    ));
+                    self.buffer.emit(Arm64Instruction::Brk { imm: 0 });
+                    success = false;
+                    break;
+                }
                 // fneg, dneg
                 0x76 | 0x77 => self.emit_float_neg(),
                 // i2l
@@ -2539,42 +2684,66 @@ impl Arm64Backend {
             }
         }
 
-        // Emit an indirect call placeholder (real target patched later).
-        let call_label = self.buffer.new_label();
-        self.buffer.emit(Arm64Instruction::Bl { label: call_label });
+        // Bug-fix (ARM64 BUG #3, infinite self-call): the previous code created
+        // a fresh `call_label`, emitted `Bl { label: call_label }`, and never
+        // bound it. The branch-patch loop in `emit_machine_code` leaves an
+        // unbound label as a "branch to self" (`BL .`), which at runtime is an
+        // infinite self-call / stack overflow. There is no resolved target
+        // address available at emit time here, so the only safe action is to
+        // bail to the interpreter for this method (AArch64 is the secondary
+        // backend; correctness and a safe fallback take priority over feature
+        // completeness). We set `self.failed`, which forces
+        // `Arm64CompileResult.success = false`, and emit a `Brk` trap so that
+        // any code path which mistakenly ignores `failed` still traps loudly
+        // rather than executing a broken self-call.
+        //
+        // (If a concrete call target ever becomes available at emit time, the
+        // correct lowering is `mov_imm64 IP0, <target>; BLR IP0` — the
+        // range-unlimited indirect form — followed by capturing the X0 result.
+        // Until then we must NOT emit any call.)
+        self.failed = true;
+        self.buffer.emit(Arm64Instruction::Comment(format!(
+            "ARM64 BUG #3: unresolved invoke ({} args) — bailing to interpreter",
+            num_args
+        )));
+        self.buffer.emit(Arm64Instruction::Brk { imm: 0 });
 
-        // Result in X0; push onto operand stack.
+        // Keep the operand stack shape consistent for the remainder of the
+        // (now-doomed) compilation pass: a call leaves one result value on the
+        // stack. We push a scratch placeholder so later pops do not underflow
+        // and mask the real failure cause. The emitted code is discarded
+        // because `success` is false.
         let dst = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::Mov {
-            rd: dst,
-            rm: Arm64Register::X0,
-        });
         self.push_operand(dst);
     }
 
     // -- Float/Double helpers ------------------------------------------------
 
     /// Load a float/double constant onto the float operand stack.
-    /// Uses MOVIMM to load the bit pattern into a GP register, then FMOV to V reg.
+    ///
+    /// Bug-fix (AArch64 MEDIUM, emit_fconst miscompile): the previous body
+    /// materialized `value as i64` into a GP register and ran `ScvtfDouble`
+    /// (signed-integer → double CONVERSION). That is only correct for INTEGRAL
+    /// constants — e.g. `fconst_2` (2.0). For any non-integral value the
+    /// truncating `as i64` followed by integer→float conversion produced the
+    /// wrong number (2.5 → 2.0, 0.1 → 0.0, π → 3.0, etc.). This backend treats
+    /// every FP register as a 64-bit double (`Dn`), so the correct lowering is
+    /// a BIT-EXACT move: materialize the IEEE-754 double bit pattern into a GPR
+    /// with `mov_imm64`, then `FMOV Dd, Xn` (`FmovToFp`) which copies the raw
+    /// 64 bits with no numeric conversion. This reproduces every double exactly,
+    /// integral or not.
     pub fn emit_fconst(&mut self, value: f64) {
         let dst = self.alloc_float_scratch();
-        if value == 0.0 {
-            // FMOV from XZR: use MovImm 0 to GP, then ScvtfDouble
-            let tmp = self.alloc_scratch();
-            self.buffer
-                .emit(Arm64Instruction::MovImm { rd: tmp, imm: 0 });
-            self.buffer
-                .emit(Arm64Instruction::ScvtfDouble { vd: dst, rn: tmp });
-        } else {
-            // Load integer representation and convert
-            let tmp = self.alloc_scratch();
-            self.buffer.emit(Arm64Instruction::MovImm {
-                rd: tmp,
-                imm: value as i64,
-            });
-            self.buffer
-                .emit(Arm64Instruction::ScvtfDouble { vd: dst, rn: tmp });
-        }
+        let tmp = self.alloc_scratch();
+        // Reinterpret the f64 as its raw 64-bit pattern. `to_bits() as i64`
+        // round-trips losslessly through `MovImm`'s `imm as u64` lowering, so
+        // the GPR ends up holding the exact IEEE-754 encoding.
+        let bits = value.to_bits() as i64;
+        self.buffer
+            .emit(Arm64Instruction::MovImm { rd: tmp, imm: bits });
+        // FMOV Dd, Xn — bit-exact GPR → FP move (NOT a numeric conversion).
+        self.buffer
+            .emit(Arm64Instruction::FmovToFp { vd: dst, rn: tmp });
         self.push_float_operand(dst);
     }
 
@@ -2713,7 +2882,15 @@ impl Arm64Backend {
         self.push_float_operand(dst);
     }
 
-    /// Float/double remainder: a - (a/b)*b pattern using fdiv, fmul, fsub.
+    /// Float/double remainder: a - trunc(a/b)*b via FDIV + FCVTZS/SCVTF + FMUL + FSUB.
+    ///
+    /// UNWIRED / reference only. This is INEXACT: the FCVTZS round-trip used to
+    /// truncate the quotient saturates to i64::MIN/MAX once |a/b| >= 2^63, so
+    /// the remainder is wrong for large operands. The `frem`/`drem` dispatch
+    /// now bails to the interpreter instead of calling this (see the 0x72/0x73
+    /// arm). Kept as a starting point should an exact ARM64 reduction loop be
+    /// implemented later; `#[allow(dead_code)]` because nothing wires it now.
+    #[allow(dead_code)]
     pub fn emit_float_rem(&mut self) {
         let rhs = self.pop_float_operand();
         let lhs = self.pop_float_operand();
@@ -2905,6 +3082,15 @@ impl Arm64Backend {
 
     /// Emit a NEON-vectorized int-array sum loop.
     ///
+    /// TEST-ONLY / NOT WIRED: this helper is exercised by unit tests only and
+    /// is NOT reachable from the bytecode-compile dispatch in `compile_method`
+    /// (no opcode handler calls it; there is no NEON auto-vectorization pass).
+    /// It is retained as a worked reference for a future vectorizer. Before
+    /// wiring it into codegen, derive the array base/length operands from a real
+    /// induction-variable analysis (mirroring the x64 BCE path) rather than
+    /// passing pre-chosen registers, and re-validate the horizontal-reduce
+    /// stack spill (now red-zone-safe — see the SubImm/AddImm SP framing below).
+    ///
     /// Generates code equivalent to:
     /// ```ignore
     /// int sum = 0;
@@ -3022,14 +3208,24 @@ impl Arm64Backend {
         // Horizontal reduce: sum the 4 lanes of vacc into result_reg.
         // We use ADDV to sum all lanes, but since we don't have ADDV encoded,
         // extract each lane via GP and add them.
-        // For now, store vacc to stack, load the 4 ints, and add them.
-        let _tmp_frame_off = -64i32; // Use a stack scratch area below FP
-                                     // STR the vector to stack
+        // We store vacc to a stack scratch area, then load the 4 ints.
+        //
+        // Bug-fix (AArch64 NEON SP-store): AArch64 has NO red zone — storing
+        // below SP without first lowering SP can be clobbered by an interrupt
+        // or signal handler that reuses the stack. Reserve 16 bytes (one Q-reg)
+        // by lowering SP, spill the vector, read it back, then restore SP. SP
+        // must stay 16-byte aligned per AAPCS64; 16 is already aligned.
+        self.buffer.emit(Arm64Instruction::SubImm {
+            rd: Arm64Register::SP,
+            rn: Arm64Register::SP,
+            imm: 16,
+        });
+        // STR the vector to the reserved [SP] slot.
         self.buffer.emit(Arm64Instruction::NeonSt1_4s {
             vt: vacc,
             rn: Arm64Register::SP,
         });
-        // Load the 4 elements and add them
+        // Load the 4 elements (as two 64-bit halves) and add them.
         let t0 = self.alloc_scratch();
         let t1 = self.alloc_scratch();
         // Load first 2 as a pair, then next 2
@@ -3042,6 +3238,12 @@ impl Arm64Backend {
             rt: t1,
             rn: Arm64Register::SP,
             offset: 8,
+        });
+        // Release the reserved stack scratch now that the vector is back in GPRs.
+        self.buffer.emit(Arm64Instruction::AddImm {
+            rd: Arm64Register::SP,
+            rn: Arm64Register::SP,
+            imm: 16,
         });
         // Each 64-bit load holds 2x 32-bit ints. Split them:
         // Actually, for simplicity, use 32-bit loads. But our LDR is 64-bit.
@@ -3158,6 +3360,11 @@ impl Arm64Backend {
     /// Emit a NEON-vectorized dot product of two int arrays.
     ///
     /// Computes: sum(a[i] * b[i]) for i in 0..len
+    ///
+    /// TEST-ONLY / NOT WIRED: exercised by unit tests only; not reachable from
+    /// the bytecode-compile dispatch (see the note on `emit_neon_array_sum`).
+    /// Its horizontal-reduce stack spill is now red-zone-safe (SubImm/AddImm SP
+    /// framing). Re-validate operand provenance before wiring into codegen.
     pub fn emit_neon_dot_product(
         &mut self,
         arr_a_reg: Arm64Register,
@@ -3265,7 +3472,17 @@ impl Arm64Backend {
 
         self.buffer.bind_label(vec_done);
 
-        // Horizontal reduce vacc
+        // Horizontal reduce vacc.
+        //
+        // Bug-fix (AArch64 NEON SP-store): reserve 16 bytes by lowering SP
+        // before spilling the accumulator vector (AArch64 has no red zone — a
+        // store below SP can be clobbered by an interrupt/signal). Restore SP
+        // after reading the value back. 16 is 16-byte aligned per AAPCS64.
+        self.buffer.emit(Arm64Instruction::SubImm {
+            rd: Arm64Register::SP,
+            rn: Arm64Register::SP,
+            imm: 16,
+        });
         self.buffer.emit(Arm64Instruction::NeonSt1_4s {
             vt: vacc,
             rn: Arm64Register::SP,
@@ -3281,6 +3498,12 @@ impl Arm64Backend {
             rt: t1,
             rn: Arm64Register::SP,
             offset: 8,
+        });
+        // Release the reserved stack scratch.
+        self.buffer.emit(Arm64Instruction::AddImm {
+            rd: Arm64Register::SP,
+            rn: Arm64Register::SP,
+            imm: 16,
         });
         let mask32 = self.alloc_scratch();
         let shift32 = self.alloc_scratch();
@@ -3484,6 +3707,104 @@ fn to_cond(c: &Arm64Condition) -> crate::aarch64::Cond {
     }
 }
 
+/// Materialize the effective address `base + offset` into IP0 (X16).
+///
+/// Bug-fix (ARM64 BUG #1): used by the `Ldr`/`Str` lowering when `offset`
+/// falls outside the 9-bit signed range that LDUR/STUR can encode. We load the
+/// (possibly large, possibly negative) byte offset into IP0 with `mov_imm64`
+/// (sign-extended via the MOVN path for negatives) and add the base, so the
+/// subsequent zero-offset access never touches the base register's value. IP0
+/// (X16) is the AAPCS64 intra-procedure-call scratch register and is never a
+/// regalloc output, so clobbering it here is safe.
+fn emit_addr_into_ip0(
+    emitter: &mut crate::aarch64::Aarch64Emitter,
+    base: crate::aarch64::Reg,
+    offset: i32,
+) {
+    // IP0 = (i64)offset  (mov_imm64 picks MOVN for negative values, giving a
+    // correct two's-complement 64-bit value).
+    emitter.mov_imm64(crate::aarch64::Reg::X16, offset as i64 as u64);
+    // IP0 = base + IP0
+    emitter.add(
+        crate::aarch64::Reg::X16,
+        base,
+        crate::aarch64::Reg::X16,
+    );
+}
+
+/// Lower an ADD/SUB-immediate (`rd = rn ± imm`) safely.
+///
+/// Bug-fix (AArch64 LOW, immediate truncation): the ADD/SUB-immediate
+/// encoding (`addsub_imm`) only carries a 12-bit unsigned field and silently
+/// masks anything wider (`imm12 as u32 & 0xFFF`). The previous lowering passed
+/// `imm as u16` straight through, so any immediate > 0xFFF (e.g. a large
+/// `iinc` constant or a frame offset folded into an `AddImm`) was silently
+/// truncated to a WRONG value with no diagnostic.
+///
+/// This helper picks the correct, lossless encoding:
+///   * magnitude fits 12 bits (≤ 0xFFF)                  → ADD/SUB #imm12
+///   * magnitude fits the LSL-#12 shifted 12-bit form
+///     (low 12 bits zero, high 12 bits ≤ 0xFFF)          → ADD/SUB #imm12, LSL #12
+///   * otherwise                                         → materialize the
+///     immediate into IP0 (X16) with `mov_imm64` and use the register form
+///     ADD/SUB `rd, rn, X16`.
+///
+/// The sign is normalized first: a negative immediate flips ADD↔SUB so the
+/// magnitude handed to the encoding is always non-negative. IP0 (X16) is the
+/// AAPCS64 intra-procedure-call scratch and is never a regalloc output, so the
+/// register-form fallback never clobbers a live value.
+fn emit_addsub_imm_safe(
+    emitter: &mut crate::aarch64::Aarch64Emitter,
+    rd: crate::aarch64::Reg,
+    rn: crate::aarch64::Reg,
+    imm: i32,
+    is_sub: bool,
+) {
+    // Normalize: fold the sign into the operation so `mag` is non-negative.
+    // (i32::MIN's magnitude does not fit i32, so widen to i64 first.)
+    let signed = if is_sub { -(imm as i64) } else { imm as i64 };
+    let effective_sub = signed < 0;
+    let mag = signed.unsigned_abs();
+
+    if mag <= 0xFFF {
+        // Fits the plain 12-bit immediate form.
+        if effective_sub {
+            emitter.sub_imm(rd, rn, mag as u16, false);
+        } else {
+            emitter.add_imm(rd, rn, mag as u16, false);
+        }
+    } else if mag & 0xFFF == 0 && (mag >> 12) <= 0xFFF {
+        // Fits the LSL #12 shifted 12-bit immediate form.
+        let hi = (mag >> 12) as u16;
+        if effective_sub {
+            emitter.sub_imm(rd, rn, hi, true);
+        } else {
+            emitter.add_imm(rd, rn, hi, true);
+        }
+    } else if rd.enc() == 31 || rn.enc() == 31 {
+        // SP edge case. Encoding 31 means SP in the ADD/SUB *immediate* form but
+        // XZR in the shifted-*register* form, so we cannot fall back to the
+        // register path with SP as an operand without changing the semantics
+        // (and no extended-register `ADD/SUB (extended)` encoder exists here).
+        // This only arises for an SP adjustment whose magnitude exceeds 0xFFF
+        // and is not 4 KiB-aligned — i.e. a frame larger than 4095 bytes that
+        // isn't page-step-aligned, which this backend never generates. Trap
+        // loudly instead of emitting a silently-wrong SP update. If this ever
+        // fires, plumb an extended-register ADD/SUB into aarch64.rs.
+        emitter.brk(0);
+    } else {
+        // Out of immediate range: materialize into IP0 (X16) and use the
+        // register form. Never silently truncate. (rd/rn are guaranteed not to
+        // be SP here, so the shifted-register encoding is correct.)
+        emitter.mov_imm64(crate::aarch64::Reg::X16, mag);
+        if effective_sub {
+            emitter.sub(rd, rn, crate::aarch64::Reg::X16);
+        } else {
+            emitter.add(rd, rn, crate::aarch64::Reg::X16);
+        }
+    }
+}
+
 /// Emit machine code bytes from the ARM64 pseudo-instruction sequence.
 /// Uses `Aarch64Emitter` from `aarch64.rs` to encode each instruction.
 pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
@@ -3517,21 +3838,16 @@ pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
                 emitter.add(r(*rd), r(*rn), r(*rm));
             }
             Arm64Instruction::AddImm { rd, rn, imm } => {
-                if *imm >= 0 {
-                    emitter.add_imm(r(*rd), r(*rn), *imm as u16, false);
-                } else {
-                    emitter.sub_imm(r(*rd), r(*rn), (-*imm) as u16, false);
-                }
+                // Range-checked lowering: fits 12-bit / shifted-12-bit form, or
+                // materializes into IP0 and uses the register form. Never
+                // silently truncates a wide immediate (see emit_addsub_imm_safe).
+                emit_addsub_imm_safe(&mut emitter, r(*rd), r(*rn), *imm, false);
             }
             Arm64Instruction::Sub { rd, rn, rm } => {
                 emitter.sub(r(*rd), r(*rn), r(*rm));
             }
             Arm64Instruction::SubImm { rd, rn, imm } => {
-                if *imm >= 0 {
-                    emitter.sub_imm(r(*rd), r(*rn), *imm as u16, false);
-                } else {
-                    emitter.add_imm(r(*rd), r(*rn), (-*imm) as u16, false);
-                }
+                emit_addsub_imm_safe(&mut emitter, r(*rd), r(*rn), *imm, true);
             }
             Arm64Instruction::Mul { rd, rn, rm } => {
                 emitter.mul(r(*rd), r(*rn), r(*rm));
@@ -3575,7 +3891,25 @@ pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
                 emitter.cmp(r(*rn), r(*rm));
             }
             Arm64Instruction::CmpImm { rn, imm } => {
-                emitter.cmp_imm(r(*rn), *imm as u16);
+                // Range-checked lowering. CMP #imm12 (= SUBS XZR, rn, #imm12)
+                // only carries an unsigned 12-bit field. A wider or negative
+                // immediate cannot be encoded directly, so we materialize it
+                // into IP0 (X16) and use the register form `CMP rn, X16`
+                // (= SUBS XZR, rn, X16). Never silently truncate (the old
+                // `*imm as u16` masked anything > 0xFFFF and the encoder then
+                // masked again to 12 bits). The shifted LSL #12 form is left to
+                // the register-materialization path to avoid threading a new
+                // shifted-immediate encoder through aarch64.rs; CMP immediates
+                // in this backend are small (almost always 0) so this costs at
+                // most one extra MOV in a cold path.
+                let imm = *imm;
+                if imm >= 0 && imm <= 0xFFF {
+                    emitter.cmp_imm(r(*rn), imm as u16);
+                } else {
+                    // Negative or out-of-range: materialize and compare by reg.
+                    emitter.mov_imm64(crate::aarch64::Reg::X16, imm as i64 as u64);
+                    emitter.cmp(r(*rn), crate::aarch64::Reg::X16);
+                }
             }
             Arm64Instruction::Tst { rn, rm } => {
                 emitter.tst(r(*rn), r(*rm));
@@ -3593,18 +3927,39 @@ pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
             }
 
             // -- Load / Store --
+            //
+            // Bug-fix (ARM64 BUG #1, frame-slot corruption): plain
+            // `[base + #offset]` access must NEVER use the pre-index
+            // writeback form (`ldr_pre`/`str_pre`), which mutates the base
+            // register `base = base + offset` as a side effect. Every frame
+            // slot is addressed at a NEGATIVE offset from FP, so the old code
+            // corrupted FP on every spill/reload. Routing:
+            //   * offset >= 0 and 8-aligned and in scaled range → scaled
+            //     unsigned-offset LDR/STR (`ldr_imm`/`str_imm`);
+            //   * offset in the signed imm9 range (−256..=255) → unscaled
+            //     non-writeback LDUR/STUR (`ldur`/`stur`);
+            //   * otherwise → materialize the effective address into a scratch
+            //     (IP0/X16) and use a zero-offset access.
             Arm64Instruction::Ldr { rt, rn, offset } => {
-                if *offset >= 0 && *offset % 8 == 0 {
+                if *offset >= 0 && *offset % 8 == 0 && *offset <= 32760 {
                     emitter.ldr_imm(r(*rt), r(*rn), *offset as u16);
+                } else if (-256..=255).contains(offset) {
+                    emitter.ldur(r(*rt), r(*rn), *offset as i16);
                 } else {
-                    emitter.ldr_pre(r(*rt), r(*rn), *offset as i16);
+                    // Out of imm9 range: IP0 = base + offset, then LDR [IP0, #0].
+                    emit_addr_into_ip0(&mut emitter, r(*rn), *offset);
+                    emitter.ldur(r(*rt), crate::aarch64::Reg::X16, 0);
                 }
             }
             Arm64Instruction::Str { rt, rn, offset } => {
-                if *offset >= 0 && *offset % 8 == 0 {
+                if *offset >= 0 && *offset % 8 == 0 && *offset <= 32760 {
                     emitter.str_imm(r(*rt), r(*rn), *offset as u16);
+                } else if (-256..=255).contains(offset) {
+                    emitter.stur(r(*rt), r(*rn), *offset as i16);
                 } else {
-                    emitter.str_pre(r(*rt), r(*rn), *offset as i16);
+                    // Out of imm9 range: IP0 = base + offset, then STR [IP0, #0].
+                    emit_addr_into_ip0(&mut emitter, r(*rn), *offset);
+                    emitter.stur(r(*rt), crate::aarch64::Reg::X16, 0);
                 }
             }
             Arm64Instruction::Ldp {
@@ -3622,6 +3977,23 @@ pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
                 offset,
             } => {
                 emitter.stp(r(*rt1), r(*rt2), r(*rn), *offset as i16);
+            }
+            // Bug-fix (ARM64 BUG #2): writeback prologue/epilogue pair ops.
+            Arm64Instruction::StpPre {
+                rt1,
+                rt2,
+                rn,
+                offset,
+            } => {
+                emitter.stp_pre(r(*rt1), r(*rt2), r(*rn), *offset as i16);
+            }
+            Arm64Instruction::LdpPost {
+                rt1,
+                rt2,
+                rn,
+                offset,
+            } => {
+                emitter.ldp_post(r(*rt1), r(*rt2), r(*rn), *offset as i16);
             }
             Arm64Instruction::LdrLiteral { rt, label } => {
                 // Emit a real LDR (literal) instruction. The offset to the
@@ -4231,23 +4603,32 @@ mod tests {
     #[test]
     fn backend_prologue_emits_stp_fp_lr() {
         let result = make_backend_with_method(0, 0, &[0xb1]); // return void
+        // Bug-fix (ARM64 BUG #2): the prologue now uses the writeback
+        // `STP FP, LR, [SP, #-16]!` form (StpPre) so SP is decremented as part
+        // of the save, instead of the old non-writeback `Stp` with an unsound
+        // "16 already consumed" SUB fudge.
         let has_stp_fp_lr = result.instructions.iter().any(|inst| {
             matches!(
                 inst,
-                Arm64Instruction::Stp { rt1, rt2, .. }
+                Arm64Instruction::StpPre { rt1, rt2, offset: -16, .. }
                     if *rt1 == Arm64Register::FP && *rt2 == Arm64Register::LR
             )
         });
-        assert!(has_stp_fp_lr, "prologue must save FP/LR with STP");
+        assert!(
+            has_stp_fp_lr,
+            "prologue must save FP/LR with writeback STP (StpPre, #-16)"
+        );
     }
 
     #[test]
     fn backend_epilogue_emits_ldp_fp_lr_and_ret() {
         let result = make_backend_with_method(0, 0, &[0xb1]);
+        // Bug-fix (ARM64 BUG #2): the epilogue now restores FP/LR with the
+        // matching post-index `LDP FP, LR, [SP], #16` (LdpPost).
         let has_ldp = result.instructions.iter().any(|inst| {
             matches!(
                 inst,
-                Arm64Instruction::Ldp { rt1, rt2, .. }
+                Arm64Instruction::LdpPost { rt1, rt2, offset: 16, .. }
                     if *rt1 == Arm64Register::FP && *rt2 == Arm64Register::LR
             )
         });
@@ -4255,7 +4636,7 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| matches!(inst, Arm64Instruction::Ret));
-        assert!(has_ldp, "epilogue must restore FP/LR with LDP");
+        assert!(has_ldp, "epilogue must restore FP/LR with post-index LDP (LdpPost, #16)");
         assert!(has_ret, "epilogue must emit RET");
     }
 
@@ -4729,18 +5110,112 @@ mod tests {
     }
 
     #[test]
-    fn backend_float_rem_emits_instructions() {
-        // fconst_1, fconst_1, frem (0x72), return void
+    fn backend_float_rem_bails_to_interpreter() {
+        // fconst_1, fconst_1, frem (0x72), return void.
+        //
+        // frem/drem have no EXACT ARM64 lowering in this backend (the
+        // truncating FCVTZS round-trip saturates for large operands), so the
+        // dispatch bails to the interpreter rather than emit a silently-wrong
+        // result. The compile must report failure and emit_machine_code must
+        // return None.
         let result = make_backend_with_method(0, 0, &[0x0c, 0x0c, 0x72, 0xb1]);
-        assert!(result.success, "float rem should succeed");
-        // frem uses fdiv + fcvtzs + scvtf + fmul + fsub
-        let has_fdiv = result
-            .instructions
-            .iter()
-            .any(|inst| matches!(inst, Arm64Instruction::FdivDouble { .. }));
         assert!(
-            has_fdiv,
-            "frem should emit FdivDouble as part of remainder pattern"
+            !result.success,
+            "frem should bail (success=false), not emit an inexact remainder"
+        );
+        assert!(
+            emit_machine_code(&result).is_none(),
+            "a failed compile must not produce machine code"
+        );
+    }
+
+    #[test]
+    fn backend_fconst_bit_exact_for_non_integral() {
+        // emit_fconst must move the IEEE-754 bit pattern (FMOV Dd, Xn), NOT
+        // perform an integer→float conversion (ScvtfDouble), which would round
+        // 2.5 down to 2.0. Drive emit_fconst directly with a non-integral value.
+        let mut backend = Arm64Backend::new();
+        backend.emit_fconst(2.5);
+        let expected_bits = 2.5f64.to_bits() as i64;
+        let has_movimm_bits = backend
+            .buffer
+            .instructions()
+            .iter()
+            .any(|inst| matches!(inst, Arm64Instruction::MovImm { imm, .. } if *imm == expected_bits));
+        assert!(
+            has_movimm_bits,
+            "emit_fconst should materialize the exact f64 bit pattern {:#018x}",
+            expected_bits as u64
+        );
+        let has_fmov = backend
+            .buffer
+            .instructions()
+            .iter()
+            .any(|inst| matches!(inst, Arm64Instruction::FmovToFp { .. }));
+        assert!(
+            has_fmov,
+            "emit_fconst should bit-move the pattern into FP via FmovToFp"
+        );
+        let has_scvtf = backend
+            .buffer
+            .instructions()
+            .iter()
+            .any(|inst| matches!(inst, Arm64Instruction::ScvtfDouble { .. }));
+        assert!(
+            !has_scvtf,
+            "emit_fconst must NOT use ScvtfDouble (integer→float conversion)"
+        );
+    }
+
+    #[test]
+    fn backend_ldc_bails_to_interpreter() {
+        // ldc (0x12) #1, return void. The backend has no constant pool, so it
+        // must bail (success=false) rather than guess at the constant.
+        let result = make_backend_with_method(0, 0, &[0x12, 0x01, 0xb1]);
+        assert!(
+            !result.success,
+            "ldc should bail to the interpreter (no constant pool available)"
+        );
+        // ldc2_w (0x14) #1, return void — same reasoning (long/double constant).
+        let result2 = make_backend_with_method(0, 0, &[0x14, 0x00, 0x01, 0xb1]);
+        assert!(!result2.success, "ldc2_w should bail to the interpreter");
+    }
+
+    #[test]
+    fn addsub_imm_safe_no_truncation_for_wide_immediate() {
+        use crate::aarch64::{Aarch64Emitter, Reg};
+
+        // Small immediate (fits 12 bits): one ADD-immediate instruction.
+        let mut e_small = Aarch64Emitter::new();
+        emit_addsub_imm_safe(&mut e_small, Reg::X9, Reg::X9, 5, false);
+        assert_eq!(
+            e_small.code().len(),
+            4,
+            "a 12-bit immediate should lower to a single ADD-imm"
+        );
+
+        // Wide immediate (> 0xFFF, not 4 KiB-aligned): must NOT be truncated to
+        // a single ADD-imm. It is materialized into X16 (one or more MOV-wide)
+        // then added by register, so the sequence is longer than one
+        // instruction and never encodes the (wrong) masked immediate.
+        let wide = 5000i32; // 0x1388 — low 12 bits 0x388 != 0, > 0xFFF
+        let mut e_wide = Aarch64Emitter::new();
+        emit_addsub_imm_safe(&mut e_wide, Reg::X9, Reg::X9, wide, false);
+        assert!(
+            e_wide.code().len() > 4,
+            "a >12-bit immediate must not collapse into one (truncated) ADD-imm"
+        );
+
+        // Compare against what a (buggy) single truncated ADD-imm would encode,
+        // and assert the safe lowering's first 4 bytes are NOT that instruction.
+        let mut e_trunc = Aarch64Emitter::new();
+        // The old buggy path: add_imm with the value masked to 12 bits.
+        e_trunc.add_imm(Reg::X9, Reg::X9, (wide as u16) & 0xFFF, false);
+        let trunc_first = &e_trunc.code()[0..4];
+        assert_ne!(
+            &e_wide.code()[0..4],
+            trunc_first,
+            "safe lowering must not begin with the truncated ADD-imm encoding"
         );
     }
 

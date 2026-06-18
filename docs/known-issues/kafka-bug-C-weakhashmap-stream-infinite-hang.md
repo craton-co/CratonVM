@@ -6,8 +6,61 @@
 | **Kind** | Hang / infinite loop (TIMEOUT @ 600s) |
 | **Surfaced by** | The whole `org.apache.kafka.clients.consumer.internals.*` TIMEOUT cluster (13+ classes), starting with the trivial `ConsumerRecordsTest` |
 | **CratonVM** | TIMEOUT · **HotSpot** OK |
-| **Status** | OPEN — root-caused with 3-line repro |
-| **Recommendation** | **Fix** — small, well-scoped (WeakHashMap stream/spliterator path); unblocks a large hang cluster |
+| **Status** | ✅ **HANG FIXED** (2026-06-18, dev `1cd0ab26`) via targeted JIT ban — verified. Underlying `dup_x1` codegen defect remains OPEN (general fix). |
+| **Recommendation** | Done (workaround shipped). Follow-up: fix the `dup_x1` field-post-increment codegen so the ban can be lifted. |
+
+## ✅ Resolution (2026-06-18) — it was a JIT miscompile, not a stream/native-masking bug
+
+The original "fix direction" below (native-mask `values()` like the other maps, or
+fix the stream/Sink engine) was **wrong**. Reproduced and bisected on a built VM:
+
+- **JIT-specific:** `--nojit` passes; JIT-on hangs. Not GC-triggered (`-Xmx4g` still
+  hangs) and not invocation-tier-up (`CRATONVM_JIT_THRESHOLD=1000000` still hangs).
+- **The watchdog shows the main thread stuck in *native Rust* code** with the dispatch
+  ring on `ReferenceQueue.poll`/`WeakReference.<init>` — a red herring; the real spin
+  is the JIT'd traversal loop.
+- **Bisected to one method** with `CRATONVM_JIT_BISECT_ONLY=java/util/WeakHashMap` then
+  `CRATONVM_JIT_BISECT_SKIP=...$ValueSpliterator.tryAdvance` → skipping *only* that
+  method makes the repro return (`getFence`/`size`/`expungeStaleEntries` skips do not).
+- **Root cause:** JIT miscompiles `ValueSpliterator.tryAdvance`'s `current = tab[index++]`
+  field-post-increment. Bytecode 60-77 is `aload_0; aload tab; aload_0; dup; getfield
+  index; dup_x1; iconst_1; iadd; putfield index; aaload; putfield current`. The
+  `putfield index` (the `++` store) is effectively dropped under JIT, so the inner
+  `while (index < hi || current != null)` loop never advances `index` past a null table
+  slot and spins forever. It's a **`dup_x1` field-post-increment codegen defect**, the
+  same class as the dup_x family in memory.
+
+**Workaround shipped (`1cd0ab26`):** extend the existing Tomcat-Bug-B WeakHashMap
+*iterator* ban (`skip_list.rs::is_known_miscompile`) to the *spliterator/stream*
+siblings — `Value/Key/EntrySpliterator` × `tryAdvance`/`forEachRemaining` (all share the
+identical `tab[index++]` loop). **Verified:** `WeakHashMap.values()/keySet()/entrySet()
+.stream()` × `sum/count/forEach/collect` all match HotSpot, JIT-on, `rc=0`.
+
+**Still OPEN (follow-up) — refined 2026-06-18.** A direct attempt to fix the codegen
+established that this is **NOT a standalone `dup_x1` lowering bug**. Three increasingly
+faithful standalone reproducers of the `this.cur = localTab[this.idx++]` shape — (1) `int[]`,
+(2) `Object[]` + GC write-barrier + two-condition `while (idx<hi || cur!=null)` loop, (3) the
+full external-driver pattern (linked `Entry`, null table slot, `fence`, one-emit-per-call
+driven by an external `while(tryStep())` loop) — **all JIT-compile correctly** and match
+HotSpot. So the `dup_x1`/`tab[index++]` sequence is lowered correctly in isolation; the defect
+only manifests inside the real `tryAdvance` compilation.
+
+That places it in the **context-sensitive register-allocation clobber family** the skip_list
+already manages with ~30 sibling bans (W2-CHM / RBC.1 / SPB.1-3 / EXEC.1 / NETTY.1 / Tomcat
+Bug B/D), whose comments pin the shared cause to *"the regalloc clobber in
+`patch_self_calls`/`emit_invoke_virtual` leaves a stale pointer in a callee-saved register"* —
+here, one of `tryAdvance`'s JIT'd calls (`getFence`/`Consumer.accept`) clobbers a callee-saved
+register holding a live value (`index`/`this`/`tab`) across the call, so the loop never
+advances. Skipping `getFence`/`size`/`expungeStaleEntries` does **not** fix it (the clobber is
+inside `tryAdvance`'s own body), only skipping `tryAdvance` does. Disassembly captured
+(`CRATONVM_JIT_ALLOW_PACKAGES=java/util/ CRATONVM_DBG_JIT_DISASM=1`, `len=2570`).
+
+**Why no codegen fix was shipped:** without a standalone reproducer a codegen change cannot be
+verified (only hang/no-hang against the real method) and cannot get a regression test, and a
+speculative regalloc change risks miscompiling the VM's hot paths. The correct home for the
+general fix is the **precise-JIT-maps / regalloc project** (Stage B/C, deferred), which is also
+what closes the whole sibling-ban family. Until then the targeted ban is the right disposition;
+once the regalloc clobber is fixed, lift the six entries and re-run the repro to confirm.
 
 ## Symptom
 

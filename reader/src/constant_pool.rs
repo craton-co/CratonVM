@@ -311,7 +311,61 @@ impl ConstantPool {
                         ));
                     }
                 }
-                _ => {} // Tombstone, Utf8, Integer, Float, Long, Double, MethodHandle, Dynamic, InvokeDynamic, Module, Package
+                // Audit fix (LOW): the `_ => {}` arm previously skipped
+                // MethodHandle / Dynamic / InvokeDynamic, leaving their
+                // cross-references unvalidated. Extend the walk to cover
+                // them. (`bootstrap_method_attr_index` on Dynamic /
+                // InvokeDynamic indexes the BootstrapMethods *attribute*,
+                // not the constant pool, so it is intentionally not checked
+                // here — only the constant-pool-relative
+                // `name_and_type_index` is.)
+                ConstantPoolEntry::MethodHandle { reference_index, .. } => {
+                    // JVMS §4.4.8: reference_index must point to a Fieldref,
+                    // Methodref, or InterfaceMethodref. The exact kind is
+                    // determined by reference_kind (and is version-dependent
+                    // for kinds 6/7), so — matching the conservative,
+                    // entry-type-only style of the checks above — we verify
+                    // only that the target is one of those three reference
+                    // kinds, not the precise kind→reference mapping.
+                    if *reference_index == 0 || *reference_index >= len {
+                        errors.push(format!(
+                            "cp#{i}: MethodHandle reference_index {} out of bounds",
+                            reference_index
+                        ));
+                    } else if !matches!(
+                        self.entries.get(*reference_index as usize),
+                        Some(
+                            ConstantPoolEntry::FieldReference { .. }
+                                | ConstantPoolEntry::MethodReference { .. }
+                                | ConstantPoolEntry::InterfaceMethodReference { .. }
+                        )
+                    ) {
+                        errors.push(format!(
+                            "cp#{i}: MethodHandle reference_index {} does not point to a Field/Method/InterfaceMethod reference",
+                            reference_index
+                        ));
+                    }
+                }
+                ConstantPoolEntry::Dynamic { name_and_type_index, .. }
+                | ConstantPoolEntry::InvokeDynamic { name_and_type_index, .. } => {
+                    // JVMS §4.4.10 / §4.4.11: name_and_type_index must point
+                    // to a NameAndType entry.
+                    if *name_and_type_index == 0 || *name_and_type_index >= len {
+                        errors.push(format!(
+                            "cp#{i}: name_and_type_index {} out of bounds",
+                            name_and_type_index
+                        ));
+                    } else if !matches!(
+                        self.entries.get(*name_and_type_index as usize),
+                        Some(ConstantPoolEntry::NameAndType { .. })
+                    ) {
+                        errors.push(format!(
+                            "cp#{i}: name_and_type_index {} does not point to NameAndType",
+                            name_and_type_index
+                        ));
+                    }
+                }
+                _ => {} // Tombstone, Utf8, Integer, Float, Long, Double, Module, Package
             }
         }
         errors
@@ -484,5 +538,127 @@ mod tests {
         ]);
         assert_eq!(pool2.len(), 2);
         assert!(!pool2.is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // Audit fix (LOW): validate() now covers MethodHandle / Dynamic /
+    // InvokeDynamic, which the old `_ => {}` arm silently skipped.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn validate_method_handle_well_formed() {
+        // reference_kind 6 (invokeStatic) -> Methodref is valid.
+        let entries = vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Utf8("C".into()),
+            ConstantPoolEntry::Utf8("m".into()),
+            ConstantPoolEntry::Utf8("()V".into()),
+            ConstantPoolEntry::ClassReference { name_index: 1 },
+            ConstantPoolEntry::NameAndType {
+                name_index: 2,
+                descriptor_index: 3,
+            },
+            ConstantPoolEntry::MethodReference {
+                class_index: 4,
+                name_and_type_index: 5,
+            },
+            ConstantPoolEntry::MethodHandle {
+                reference_kind: 6,
+                reference_index: 6, // -> MethodReference
+            },
+        ];
+        let pool = ConstantPool::new(entries);
+        let errors = pool.validate();
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn validate_method_handle_reference_wrong_type() {
+        let entries = vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Integer(7),
+            ConstantPoolEntry::MethodHandle {
+                reference_kind: 1,
+                reference_index: 1, // -> Integer, not a Field/Method/InterfaceMethod ref
+            },
+        ];
+        let pool = ConstantPool::new(entries);
+        let errors = pool.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("does not point to a Field/Method/InterfaceMethod reference"),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_method_handle_reference_out_of_bounds() {
+        let entries = vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::MethodHandle {
+                reference_kind: 1,
+                reference_index: 99,
+            },
+        ];
+        let pool = ConstantPool::new(entries);
+        let errors = pool.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("out of bounds"), "got: {errors:?}");
+    }
+
+    #[test]
+    fn validate_dynamic_name_and_type_wrong_type() {
+        // bootstrap_method_attr_index is NOT a constant-pool index, so it is
+        // not checked; only name_and_type_index is. Point it at a Utf8.
+        let entries = vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Utf8("notNaT".into()),
+            ConstantPoolEntry::Dynamic {
+                bootstrap_method_attr_index: 0,
+                name_and_type_index: 1, // -> Utf8, not NameAndType
+            },
+        ];
+        let pool = ConstantPool::new(entries);
+        let errors = pool.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("does not point to NameAndType"),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_invoke_dynamic_well_formed() {
+        let entries = vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Utf8("m".into()),
+            ConstantPoolEntry::Utf8("()V".into()),
+            ConstantPoolEntry::NameAndType {
+                name_index: 1,
+                descriptor_index: 2,
+            },
+            ConstantPoolEntry::InvokeDynamic {
+                bootstrap_method_attr_index: 0,
+                name_and_type_index: 3, // -> NameAndType
+            },
+        ];
+        let pool = ConstantPool::new(entries);
+        let errors = pool.validate();
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn validate_invoke_dynamic_out_of_bounds() {
+        let entries = vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::InvokeDynamic {
+                bootstrap_method_attr_index: 0,
+                name_and_type_index: 0, // index 0 is Tombstone -> rejected
+            },
+        ];
+        let pool = ConstantPool::new(entries);
+        let errors = pool.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("out of bounds"), "got: {errors:?}");
     }
 }

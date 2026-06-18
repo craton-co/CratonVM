@@ -6,6 +6,42 @@
 //! Implements colored pointers, load barriers, ZPages, concurrent GC phases,
 //! and a stub for Generational ZGC (JEP 439 / JDK 21+).
 //!
+//! # ⚠ SIMULATION / EXPERIMENTAL BACKEND — NOT production ZGC
+//!
+//! The colored-pointer / load-barrier / phase machinery in this module
+//! ([`ColoredPointer`], [`LoadBarrier`], [`ZPage`], [`ZgcHeap`],
+//! [`ZgcCollector`], [`GenerationalZgc`]) is an **explicit, documented
+//! simulation** of OpenJDK ZGC's *model*, not a working low-latency
+//! collector. It exists to exercise the ZGC phase lifecycle and to give the
+//! rest of the VM a faithful API shape; it does **not** deliver any of ZGC's
+//! production guarantees. Concretely, it does **NOT** provide:
+//!
+//! - **Real backing storage.** `ZPage::virtual_start` / `physical_start` are
+//!   synthetic `u64` offsets handed out by an internal counter
+//!   ([`ZgcHeap::add_page`]); there is no `*mut u8` and no Java object bytes
+//!   behind them. See the long note on [`ZgcCollector::concurrent_relocate`].
+//! - **Real concurrent relocation.** [`ZgcCollector::concurrent_relocate`]
+//!   records a forwarding-table entry but copies **no object bytes** (there
+//!   is nothing to copy from). "Concurrent" marking/relocation run
+//!   synchronously inside [`ZgcCollector::trigger_gc`]; there is no actual
+//!   overlap with mutator threads and therefore **no pause-time benefit**.
+//! - **A real colored-pointer load barrier.** [`LoadBarrier::slow_path`]
+//!   takes `&mut self` and mutates a plain `ColoredPointer` value — it is
+//!   **not** the atomic, lock-free, self-healing compare-and-set on an
+//!   in-memory oop that ZGC's barrier performs. It cannot be driven
+//!   concurrently from mutator threads against live heap pointers.
+//!
+//! Selecting this collector at runtime emits a one-time `tracing::warn!` (see
+//! [`ZgcCollector::new`] / [`GenerationalZgc::new`]) so it can never silently
+//! masquerade as production ZGC.
+//!
+//! **Follow-up (real implementation):** a production ZGC — multi-mapped
+//! colored-pointer address space, an atomic CAS load barrier driven from
+//! mutator threads, genuinely concurrent mark/relocate with real byte-copy
+//! compaction, and remembered-set-backed generational collection — is a
+//! major feature tracked separately and intentionally out of scope here. The
+//! machinery above is retained as the scaffolding for that future work.
+//!
 //! # Real vs. simulated
 //!
 //! The original module ([`ZgcCollector`] / [`ZgcHeap`] / [`GenerationalZgc`])
@@ -46,6 +82,35 @@ use crate::heap::{
     ObjectKind, GC_FLAG_MARKED, HEADER_SIZE, SLOT_SIZE,
 };
 use cratonvm_types::{ClassId, ObjectRef, Value};
+
+// ---------------------------------------------------------------------------
+// Simulation-selected warning
+// ---------------------------------------------------------------------------
+
+/// Fires the one-time "this is a ZGC *simulation*, not production ZGC"
+/// warning. Guarded by a process-wide [`std::sync::Once`] so constructing
+/// many [`ZgcCollector`] / [`GenerationalZgc`] instances logs at most once.
+///
+/// The simulation backend cannot deliver ZGC's real guarantees (no real
+/// concurrent relocation, no atomic colored-pointer load barrier — see the
+/// module-level docs), so we make selecting it loud rather than letting it
+/// silently masquerade as production ZGC.
+fn warn_zgc_simulation_selected() {
+    use std::sync::Once;
+    static WARN_ONCE: Once = Once::new();
+    WARN_ONCE.call_once(|| {
+        tracing::warn!(
+            target: "zgc",
+            "ZGC (simulation) selected: the ColoredPointer / LoadBarrier / \
+             ZPage / ZgcCollector / GenerationalZgc backend is an EXPERIMENTAL \
+             SIMULATION of OpenJDK ZGC — it has NO real backing storage, does \
+             NO byte-copy relocation, and its load barrier is a non-atomic \
+             `&mut self` value (so relocation is NOT actually concurrent and \
+             provides NO pause-time benefit). For a real, memory-backed \
+             collector use ZgcRealHeap. See gc::zgc module docs."
+        );
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Colored pointer constants
@@ -176,6 +241,16 @@ impl LoadBarrier {
     }
 
     /// Slow path: fix up the pointer according to the current GC phase.
+    ///
+    /// ## Simulation note
+    ///
+    /// This is **not** a production ZGC load barrier. It takes `&mut self`
+    /// and returns a recolored *value*; a real barrier performs an atomic,
+    /// lock-free compare-and-set that *self-heals* the in-memory oop and runs
+    /// concurrently from every mutator thread. Because this version is
+    /// neither atomic nor applied in place, it provides no concurrency and no
+    /// pause-time benefit — it only models the color-flip bookkeeping. See
+    /// the module-level docs.
     pub fn slow_path(&mut self, ptr: ColoredPointer, phase: ZgcPhase) -> ColoredPointer {
         self.barrier_misses += 1;
         let fixed = match phase {
@@ -581,6 +656,8 @@ pub struct ZgcCollector {
 
 impl ZgcCollector {
     pub fn new(config: ZgcConfig) -> Self {
+        // One-time loud warning: this is the SIMULATION backend, not real ZGC.
+        warn_zgc_simulation_selected();
         Self {
             heap: ZgcHeap::new(config),
             load_barrier: LoadBarrier::new(),
@@ -946,6 +1023,8 @@ pub struct GenerationalZgc {
 
 impl GenerationalZgc {
     pub fn new(young_size: usize, old_size: usize) -> Self {
+        // One-time loud warning: this is the SIMULATION backend, not real ZGC.
+        warn_zgc_simulation_selected();
         let mut young_cfg = ZgcConfig::default();
         young_cfg.heap_size = young_size;
         young_cfg.generational = true;

@@ -922,20 +922,25 @@ fn native_file_get_absolute_path(ctx: &mut dyn NativeContext, args: &[Value]) ->
         _ => return Ok(Some(Value::Object(None))),
     };
     let path = read_file_path(ctx, this).unwrap_or_default();
-    let abs = fs::canonicalize(&path)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| {
-            // Fallback: join with cwd
-            if Path::new(&path).is_absolute() {
-                path.clone()
-            } else {
-                let cwd = std::env::current_dir()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let sep = std::path::MAIN_SEPARATOR;
-                format!("{cwd}{sep}{path}")
-            }
-        });
+    // VULN-fix (getAbsolutePath/getCanonicalPath divergence): the JDK's
+    // `File.getAbsolutePath()` only resolves the path against the current
+    // working directory — it does NOT follow symlinks, collapse `..`, or
+    // emit a Windows `\\?\` long-path prefix. `fs::canonicalize` does all
+    // three, which is `getCanonicalPath()`'s job (kept distinct below).
+    // Using canonicalize here leaked resolved symlink targets and the
+    // `\\?\` prefix to callers expecting a plain absolute path, and (on
+    // canonicalize failure for a non-existent file) silently diverged.
+    // FIX: if already absolute, return verbatim; otherwise join onto the
+    // cwd without any canonicalization.
+    let abs = if Path::new(&path).is_absolute() {
+        path.clone()
+    } else {
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let sep = std::path::MAIN_SEPARATOR;
+        format!("{cwd}{sep}{path}")
+    };
     let s = ctx.create_string(&abs);
     Ok(Some(Value::Object(Some(s))))
 }
@@ -1764,7 +1769,14 @@ fn native_isr_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 // boundary in the middle of a multi-byte sequence, we stash the
 // leftover bytes so the next read() can prepend them. Keyed by the
 // ISR ObjectRef identity (stable for the reader's lifetime).
-static ISR_PENDING: OnceLock<Mutex<HashMap<ObjectRef, IsrState>>> = OnceLock::new();
+// GC-stable-key-fix: like `br_buf_table`, the per-InputStreamReader UTF-8
+// decode carry-over (`pending` bytes / `pending_low_surrogate` / `eof`) is
+// cross-call state that must survive a young-gen GC. Keying directly on
+// `ObjectRef` (a raw heap pointer) goes stale when the moving collector
+// relocates the reader between `read(char[],...)` calls → the next read
+// misses its own pending tail and emits replacement chars / drops a deferred
+// low surrogate. Key on the header-stable identity-hash instead.
+static ISR_PENDING: OnceLock<Mutex<HashMap<i32, IsrState>>> = OnceLock::new();
 
 #[derive(Default)]
 struct IsrState {
@@ -1777,7 +1789,7 @@ struct IsrState {
     eof: bool,
 }
 
-fn isr_pending() -> &'static Mutex<HashMap<ObjectRef, IsrState>> {
+fn isr_pending() -> &'static Mutex<HashMap<i32, IsrState>> {
     ISR_PENDING.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -1896,6 +1908,10 @@ fn native_isr_read_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(-1))),
     };
+    // GC-stable-key-fix: compute the identity-hash carry-over key once.
+    // The pending-decode side-table is keyed on this (header-stable) value
+    // rather than the raw `ObjectRef`, which a moving GC would relocate.
+    let isr_key = ctx.identity_hash_code(this);
     let out_arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(Some(Value::Int(-1))),
@@ -1922,7 +1938,7 @@ fn native_isr_read_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let mut written = 0usize;
     {
         let mut map = isr_pending().lock();
-        let entry = map.entry(this).or_default();
+        let entry = map.entry(isr_key).or_default();
         if let Some(lo) = entry.pending_low_surrogate.take() {
             ctx.set_array_element(out_arr, off, Value::Int(lo as i32));
             written = 1;
@@ -1935,7 +1951,7 @@ fn native_isr_read_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // Pull the reader's leftover pending tail.
     let (mut buf, mut eof_seen) = {
         let mut map = isr_pending().lock();
-        let entry = map.entry(this).or_default();
+        let entry = map.entry(isr_key).or_default();
         (std::mem::take(&mut entry.pending), entry.eof)
     };
 
@@ -1971,7 +1987,7 @@ fn native_isr_read_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
     if buf.is_empty() {
         // No raw bytes AND no earlier chars → EOF for the caller.
-        isr_pending().lock().entry(this).or_default().eof = eof_seen;
+        isr_pending().lock().entry(isr_key).or_default().eof = eof_seen;
         if written == 0 {
             return Ok(Some(Value::Int(-1)));
         }
@@ -1989,7 +2005,7 @@ fn native_isr_read_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // Stash unconsumed tail and any deferred low surrogate.
     {
         let mut map = isr_pending().lock();
-        let entry = map.entry(this).or_default();
+        let entry = map.entry(isr_key).or_default();
         entry.pending = tail;
         entry.pending_low_surrogate = deferred_low;
         entry.eof = eof_seen;
@@ -2012,7 +2028,10 @@ fn native_isr_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(None),
     };
     // Drop any pending UTF-8 decode state for this reader.
-    isr_pending().lock().remove(&this);
+    // GC-stable-key-fix: remove by identity-hash, matching the key under
+    // which `native_isr_read_chars` stored the carry-over state.
+    let isr_key = ctx.identity_hash_code(this);
+    isr_pending().lock().remove(&isr_key);
     // Close underlying InputStream via virtual dispatch if we have one;
     // otherwise attempt the legacy fd-slot path.
     if let Value::Object(Some(stream)) = ctx.get_field(this, 1) {
@@ -2058,7 +2077,9 @@ fn native_br_read_line(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // skip data. Construct the line from the leftover buffer up to the
     // first '\n'/'\r'; if no terminator is found in the buffer fall
     // through to `read_line` for the remainder.
-    let key = this.as_ptr() as usize;
+    // GC-stable-key-fix: identity-hash key (header-stable), not the raw
+    // heap address, which a moving young-gen GC invalidates between calls.
+    let key = ctx.identity_hash_code(this);
     let mut prefix: Vec<u8> = Vec::new();
     let mut found_terminator = false;
     {
@@ -2135,8 +2156,16 @@ struct BrBuf {
     eof: bool,
 }
 
-fn br_buf_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<usize, BrBuf>> {
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<usize, BrBuf>>> =
+// GC-stable-key-fix: the per-BufferedReader fill buffer is cross-call state
+// that MUST outlive a young-gen GC. The map was keyed on
+// `this.as_ptr() as usize` (the raw heap address), but under the moving
+// young-gen collector a BufferedReader relocates between `read()` calls, so
+// the raw-address key goes stale → the next `read()` misses its own buffer
+// and silently re-reads / drops stream bytes. We key instead on the object's
+// identity-hash (stored in the header, stable across relocation) — the same
+// GC-stable identity used by the channel/selector side-tables in this crate.
+fn br_buf_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, BrBuf>> {
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, BrBuf>>> =
         OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
@@ -2154,7 +2183,9 @@ fn native_br_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
 
     // Fast path: drain from the side-table buffer.
-    let key = this.as_ptr() as usize;
+    // GC-stable-key-fix: identity-hash key (header-stable), not the raw
+    // heap address, which a moving young-gen GC invalidates between calls.
+    let key = ctx.identity_hash_code(this);
     {
         let mut table = br_buf_table().lock();
         if let Some(state) = table.get_mut(&key) {
@@ -2211,7 +2242,9 @@ fn native_br_ready(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => return Ok(Some(Value::Int(0))),
     };
     // If the side-table buffer still has bytes, we're definitely ready.
-    let key = this.as_ptr() as usize;
+    // GC-stable-key-fix: identity-hash key (header-stable), not the raw
+    // heap address, which a moving young-gen GC invalidates between calls.
+    let key = ctx.identity_hash_code(this);
     if let Some(state) = br_buf_table().lock().get(&key) {
         if state.pos < state.end {
             return Ok(Some(Value::Int(1)));
@@ -2230,7 +2263,9 @@ fn native_br_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // buffer's pending bytes become inaccessible to the legitimate
     // `BufferedReader.read()` callers after close (which is a no-op per
     // JDK contract, but holding a stale buffer is wasted memory).
-    let key = this.as_ptr() as usize;
+    // GC-stable-key-fix: identity-hash key (header-stable), not the raw
+    // heap address, which a moving young-gen GC invalidates between calls.
+    let key = ctx.identity_hash_code(this);
     br_buf_table().lock().remove(&key);
     let fd = match ctx.get_field(this, 0) {
         Value::Int(fd) => fd as FdId,
@@ -6048,9 +6083,14 @@ fn native_fc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         return Ok(Some(Value::Int(0)));
     }
 
-    // Read bytes from fd into temp buffer
+    // Read bytes from fd into temp buffer.
+    // I/O-error-fix: previously a failed `read_bytes` was `unwrap_or(0)`-ed
+    // into a 0-byte result, which we then reported as EOF (-1) — silently
+    // masking a genuine I/O failure as a clean end-of-stream. Propagate the
+    // error as an IOException (matching `native_br_read`) so callers see the
+    // real failure instead of phantom EOF.
     let mut buf = vec![0u8; remaining];
-    let n = ctx.fd_table().read_bytes(fd_id, &mut buf).unwrap_or(0);
+    let n = ctx.fd_table().read_bytes(fd_id, &mut buf).map_err(io_err)?;
     if n == 0 {
         return Ok(Some(Value::Int(-1)));
     }
@@ -6094,7 +6134,13 @@ fn native_fc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             _ => 0,
         };
     }
-    ctx.fd_table().write_bytes(fd_id, &buf).unwrap_or(());
+    // I/O-error-fix: previously the write result was `unwrap_or(())`-ed and
+    // we unconditionally claimed `n == buf.len()` bytes written, advancing
+    // the buffer position and file position even when the underlying write
+    // failed — silently losing data and corrupting the reported position.
+    // Propagate the failure as an IOException; only on success do we advance
+    // the buffer/file position by the bytes actually written.
+    ctx.fd_table().write_bytes(fd_id, &buf).map_err(io_err)?;
     let n = buf.len();
     buf_set_position(ctx, bb, pos + n as i32);
     let fc_pos = match ctx.get_field(this, FC_FIELD_POS) {
@@ -12442,9 +12488,16 @@ struct WatchServiceState {
     registered: Vec<PathBuf>,
 }
 
-static WATCH_SERVICES: OnceLock<Mutex<HashMap<usize, WatchServiceState>>> = OnceLock::new();
+// GC-stable-key-fix (sibling of br_buf_table / isr_pending): the live
+// platform watcher + event queues are cross-call state keyed by the
+// WatchService object. The raw `as_ptr() as usize` address is NOT stable —
+// a moving young-gen GC relocates the WatchService between `register()` /
+// `poll()` / `take()` / `close()` calls, after which the key no longer
+// finds the watcher (events vanish, close() leaks the watcher thread). Key
+// on the header-stable identity-hash instead.
+static WATCH_SERVICES: OnceLock<Mutex<HashMap<i32, WatchServiceState>>> = OnceLock::new();
 
-fn watch_services() -> &'static Mutex<HashMap<usize, WatchServiceState>> {
+fn watch_services() -> &'static Mutex<HashMap<i32, WatchServiceState>> {
     WATCH_SERVICES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -12635,7 +12688,8 @@ fn native_ws_new(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResu
         })?;
 
     watch_services().lock().insert(
-        ws.as_ptr() as usize,
+        // GC-stable-key-fix: identity-hash, not the raw heap address.
+        ctx.identity_hash_code(ws),
         WatchServiceState {
             watcher,
             rx,
@@ -12697,7 +12751,9 @@ fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let canonical = normalize_watch_path(&path_str);
     {
         let mut services = watch_services().lock();
-        let state = services.get_mut(&(watcher.as_ptr() as usize)).ok_or_else(|| {
+        // GC-stable-key-fix: identity-hash, not the raw heap address.
+        let watcher_key = ctx.identity_hash_code(watcher);
+        let state = services.get_mut(&watcher_key).ok_or_else(|| {
             RuntimeError::IOException {
                 message: "WatchService.register: service is closed or unknown".into(),
             }
@@ -12755,8 +12811,10 @@ fn detect_events(ctx: &mut dyn NativeContext, service: ObjectRef, wk: ObjectRef)
     };
     let canonical = normalize_watch_path(&path_str);
 
+    // GC-stable-key-fix: identity-hash, not the raw heap address.
+    let service_key = ctx.identity_hash_code(service);
     let mut services = watch_services().lock();
-    let state = match services.get_mut(&(service.as_ptr() as usize)) {
+    let state = match services.get_mut(&service_key) {
         Some(s) => s,
         None => return Vec::new(),
     };
@@ -12829,8 +12887,10 @@ fn native_ws_take(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         }
         // Drain whatever the OS has delivered so far, then try to return a key.
         {
+            // GC-stable-key-fix: identity-hash, not the raw heap address.
+            let this_key = ctx.identity_hash_code(this);
             let mut services = watch_services().lock();
-            if let Some(state) = services.get_mut(&(this.as_ptr() as usize)) {
+            if let Some(state) = services.get_mut(&this_key) {
                 drain_into_queues(state);
             }
         }
@@ -12851,7 +12911,9 @@ fn native_ws_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // Dropping the WatchServiceState releases the platform watcher and its
     // background thread, which in turn hangs up the mpsc sender so any
     // concurrent `take()` observes the OPEN=0 flag and returns.
-    watch_services().lock().remove(&(this.as_ptr() as usize));
+    // GC-stable-key-fix: identity-hash, not the raw heap address.
+    let this_key = ctx.identity_hash_code(this);
+    watch_services().lock().remove(&this_key);
     Ok(None)
 }
 
@@ -15813,5 +15875,51 @@ mod files_bulk_transfer_tests {
             &[Value::Object(Some(p)), Value::Object(Some(arr))],
         );
         assert!(res.is_err(), "null-byte path must be rejected");
+    }
+}
+
+// ===========================================================================
+// Regression: File.getAbsolutePath must NOT canonicalize (no symlink
+// resolution, no Windows `\\?\` verbatim prefix). That behaviour belongs to
+// getCanonicalPath. An already-absolute path is returned verbatim.
+// ===========================================================================
+#[cfg(test)]
+mod abs_path_tests {
+    use super::*;
+    use crate::test_support::MockNativeContext;
+
+    /// Build a synthetic `java.io.File` whose slot-0 path string is `path`.
+    fn make_file(ctx: &mut MockNativeContext, path: &str) -> ObjectRef {
+        let f = ctx.alloc_object(1);
+        let s = ctx.attach_string(path);
+        ctx.set_field(f, 0, Value::Object(Some(s)));
+        f
+    }
+
+    #[test]
+    fn get_absolute_path_returns_absolute_input_verbatim() {
+        // Use a platform-appropriate absolute path that does not exist on
+        // disk. The pre-fix code ran `fs::canonicalize` first; for a path
+        // that resolves it would have injected a `\\?\` prefix / followed
+        // symlinks. The fix returns an already-absolute path unchanged.
+        let input = if cfg!(windows) {
+            r"C:\craton\does\not\exist\abs_path_probe.txt"
+        } else {
+            "/craton/does/not/exist/abs_path_probe.txt"
+        };
+        let mut ctx = MockNativeContext::new();
+        let f = make_file(&mut ctx, input);
+        let r = native_file_get_absolute_path(&mut ctx, &[Value::Object(Some(f))])
+            .expect("native ok")
+            .expect("returns a string");
+        let out = match r {
+            Value::Object(Some(o)) => ctx.read_string(o).expect("string value"),
+            other => panic!("expected String, got {other:?}"),
+        };
+        assert_eq!(out, input, "already-absolute path must be returned verbatim");
+        assert!(
+            !out.starts_with(r"\\?\"),
+            "getAbsolutePath must not add the canonicalize-only \\\\?\\ prefix"
+        );
     }
 }

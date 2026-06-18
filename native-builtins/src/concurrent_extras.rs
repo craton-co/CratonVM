@@ -322,8 +322,23 @@ fn register_forkjoin_extras(r: &mut NativeMethodRegistry) {
 // pairs rendezvous correctly.
 
 struct SqSlot {
-    /// The current item — `0` means empty. We store the raw pointer of
-    /// the `ObjectRef` / primitive value to keep the slot Send+Sync.
+    /// Primitive payload for `tag == 2` (Int) / `tag == 3` (Long). For
+    /// `tag == 1` (Object) this is UNUSED — see the GC-safety note below.
+    ///
+    /// GC-SAFETY (bug nb-concurrent-extras): we MUST NOT stash a bare
+    /// Object pointer here. This `SqSlot` lives in a process-global
+    /// `HashMap` that is neither scanned as a GC root nor pointer-remapped
+    /// on a moving collection. A parked Object reference left in this map
+    /// would dangle the instant the depositing native returns (the VM
+    /// truncates its per-thread `native_pin_roots` on every native return,
+    /// so GC pins do NOT survive the parked window) and the object could be
+    /// relocated or reclaimed → use-after-move / UAF when the taker
+    /// reconstructs the `ObjectRef`. Instead the Object item is held only
+    /// in field 0 of the owning `SynchronousQueue` `this` object, which IS
+    /// a live GC root and is remapped in place by a moving GC. The taker
+    /// reads it back from that field via `ctx.get_field(this, 0)`. The slot
+    /// retains only `has_item`/`tag` for rendezvous signalling plus the
+    /// primitive payload — none of which is a heap pointer.
     item_bits: i64,
     has_item: bool,
     tag: u8, // 0=None, 1=Object, 2=Int, 3=Long
@@ -349,6 +364,10 @@ impl SyncSlot {
     }
 }
 
+/// Encode a value into the slot's `(bits, tag)` representation. Only the
+/// `tag` is meaningful for Object items (the pointer in `bits` is NEVER
+/// stored across a native return — see [`SqSlot`] and [`deposit_item`]);
+/// for primitives the `bits` carry the full payload.
 fn value_to_bits(v: Value) -> (i64, u8) {
     match v {
         Value::Object(Some(o)) => (o.as_ptr() as i64, 1),
@@ -359,23 +378,24 @@ fn value_to_bits(v: Value) -> (i64, u8) {
     }
 }
 
+/// Decode a PRIMITIVE / null slot payload back into a `Value`. Tag 1
+/// (Object) only ever round-trips here for the `bits == 0` null case in
+/// the unit tests — live Object items are stored in/read from field 0 of
+/// the owning queue object, never reconstructed from a raw `bits` pointer
+/// (bug nb-concurrent-extras). The alignment guard keeps a stray pointer
+/// degrading to null instead of UB if `bits` is ever non-zero.
 fn bits_to_value(bits: i64, tag: u8) -> Value {
     match tag {
         1 => {
             if bits == 0 {
                 Value::Object(None)
             } else {
-                // Reconstruct ObjectRef from raw pointer.
-                // SAFETY: the pointer came from a live ObjectRef that the
-                // producer deposited; the GC will not move it because the
-                // producer holds the reference on its stack until its
-                // `put` returns. We rely on the single-slot rendezvous
-                // ensuring liveness — the taker receives the item before
-                // the putter's frame unwinds.
                 let ptr = bits as usize as *mut u8;
                 if ptr.is_null() || (ptr as usize) % 8 != 0 {
                     Value::Object(None)
                 } else {
+                    // SAFETY: defensive only; the production deposit path
+                    // never stores a non-zero Object pointer here.
                     unsafe { Value::Object(Some(ObjectRef::from_raw(ptr))) }
                 }
             }
@@ -384,6 +404,69 @@ fn bits_to_value(bits: i64, tag: u8) -> Value {
         3 => Value::Long(bits),
         _ => Value::Object(None),
     }
+}
+
+/// Deposit `item` into the rendezvous slot owned by `this`.
+///
+/// GC-safety (bug nb-concurrent-extras): an Object `item` is stored ONLY
+/// in field 0 of `this` (a live, moving-GC-remapped root), never as a raw
+/// pointer in the process-global slot map. The slot keeps just the
+/// rendezvous signalling (`has_item`/`tag`) and, for primitives, the
+/// payload bits. `ctx` writes the mirror field; `state` is the locked
+/// slot guard. Callers must hold the slot lock before calling.
+fn deposit_item(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    state: &mut SqSlot,
+    item: Value,
+) {
+    let (bits, tag) = value_to_bits(item);
+    state.tag = tag;
+    state.has_item = true;
+    // Primitives carry their payload in the slot; Object items live in the
+    // GC-tracked mirror field 0 only (never a bare pointer in the map).
+    state.item_bits = if tag == 1 { 0 } else { bits };
+    // Mirror the (Object or boxed) item into field 0 so the taker — which
+    // may run on a different thread after a GC moved the object — reads the
+    // forwarded reference straight from the heap root. The caller also sets
+    // field 1 = 1 (has-item flag) for p58 stub compatibility.
+    if ctx.object_num_fields(this) > 0 {
+        ctx.set_field(this, 0, item);
+    }
+}
+
+/// Consume the parked item from the slot owned by `this`, returning it as
+/// a `Value` and clearing both the slot and the mirror field.
+///
+/// For an Object item the live (post-GC, remapped) reference is read back
+/// from field 0 of `this`; the raw `item_bits` is never dereferenced
+/// (bug nb-concurrent-extras). Caller must hold the slot lock.
+fn consume_item(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    state: &mut SqSlot,
+) -> Value {
+    let result = if state.tag == 1 {
+        // Object item: read the forwarded reference from the GC-tracked
+        // mirror field rather than the (never-stored) slot pointer.
+        if ctx.object_num_fields(this) > 0 {
+            ctx.get_field(this, 0)
+        } else {
+            Value::Object(None)
+        }
+    } else {
+        // Primitive or empty: decode the slot payload directly.
+        bits_to_value(state.item_bits, state.tag)
+    };
+    state.item_bits = 0;
+    state.has_item = false;
+    state.tag = 0;
+    // Clear the mirror so a stale reference is not pinned as a root past
+    // its handoff.
+    if ctx.object_num_fields(this) > 0 {
+        ctx.set_field(this, 0, Value::Object(None));
+    }
+    result
 }
 
 /// Global map from ObjectRef pointer → SyncSlot, created lazily on first
@@ -404,6 +487,9 @@ fn get_or_create_slot(this: ObjectRef) -> Arc<SyncSlot> {
 fn reset_slot(this: ObjectRef) {
     let key = this.as_ptr() as usize;
     let mut map = sync_slots().lock();
+    // No GC pin to release: parked Object items live only in field 0 of the
+    // queue object (cleared by the `<init>` caller right after), never as a
+    // raw pointer in this map (bug nb-concurrent-extras).
     map.insert(key, Arc::new(SyncSlot::new()));
 }
 
@@ -459,17 +545,15 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let item = args.get(1).copied().unwrap_or(Value::Object(None));
         let slot = get_or_create_slot(this);
-        let (bits, tag) = value_to_bits(item);
         let mut state = slot.state.lock();
-        // If a taker is already parked, fill the slot and notify.
-        state.item_bits = bits;
-        state.has_item = true;
-        state.tag = tag;
+        // If a taker is already parked, fill the slot and notify. The Object
+        // item is stored only in the GC-tracked mirror field 0 by
+        // `deposit_item` (bug nb-concurrent-extras) — no bare pointer ever
+        // enters the process-global slot map.
+        deposit_item(ctx, this, &mut state, item);
         slot.take_cv.notify_one();
-        // Mirror into object field for same-thread test compatibility.
-        if ctx.object_num_fields(this) > 0 {
-            ctx.set_field(this, 0, item);
-        }
+        // Set the p58 has-item flag in field 1 (field 0 was written by
+        // `deposit_item`). field 1 is a primitive flag, GC-irrelevant.
         if ctx.object_num_fields(this) > 1 {
             ctx.set_field(this, 1, Value::Int(1));
         }
@@ -493,18 +577,16 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let item = args.get(1).copied().unwrap_or(Value::Object(None));
         let slot = get_or_create_slot(this);
-        let (bits, tag) = value_to_bits(item);
         let mut state = slot.state.lock();
         // offer always "succeeds" by placing the item; paired take/poll
         // drains it. Matches existing p58 stub semantics so
-        // `synchronous_queue_offer_poll_p58` continues to pass.
-        state.item_bits = bits;
-        state.has_item = true;
-        state.tag = tag;
+        // `synchronous_queue_offer_poll_p58` continues to pass. The Object
+        // item is stored only in the GC-tracked mirror field 0 by
+        // `deposit_item` (bug nb-concurrent-extras), so the deposited
+        // reference survives a moving GC after this non-blocking offer
+        // returns and the producer frame unwinds.
+        deposit_item(ctx, this, &mut state, item);
         slot.take_cv.notify_one();
-        if ctx.object_num_fields(this) > 0 {
-            ctx.set_field(this, 0, item);
-        }
         if ctx.object_num_fields(this) > 1 {
             ctx.set_field(this, 1, Value::Int(1));
         }
@@ -539,15 +621,11 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
             }
         }
         if state.has_item {
-            let item = bits_to_value(state.item_bits, state.tag);
-            state.item_bits = 0;
-            state.has_item = false;
-            state.tag = 0;
+            // GC-safe drain: read the forwarded Object reference back from
+            // the GC-tracked mirror field 0 (bug nb-concurrent-extras);
+            // `consume_item` also clears field 0.
+            let item = consume_item(ctx, this, &mut state);
             slot.put_cv.notify_one();
-            // Clear mirror field too.
-            if ctx.object_num_fields(this) > 0 {
-                ctx.set_field(this, 0, Value::Object(None));
-            }
             if ctx.object_num_fields(this) > 1 {
                 ctx.set_field(this, 1, Value::Int(0));
             }
@@ -563,14 +641,10 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
         let slot = get_or_create_slot(this);
         let mut state = slot.state.lock();
         if state.has_item {
-            let item = bits_to_value(state.item_bits, state.tag);
-            state.item_bits = 0;
-            state.has_item = false;
-            state.tag = 0;
+            // GC-safe drain: forward the Object from mirror field 0 (bug
+            // nb-concurrent-extras); `consume_item` clears field 0.
+            let item = consume_item(ctx, this, &mut state);
             slot.put_cv.notify_one();
-            if ctx.object_num_fields(this) > 0 {
-                ctx.set_field(this, 0, Value::Object(None));
-            }
             if ctx.object_num_fields(this) > 1 {
                 ctx.set_field(this, 1, Value::Int(0));
             }
@@ -638,14 +712,10 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
                 }
             }
             if state.has_item {
-                let item = bits_to_value(state.item_bits, state.tag);
-                state.item_bits = 0;
-                state.has_item = false;
-                state.tag = 0;
+                // GC-safe drain: forward the Object from mirror field 0 (bug
+                // nb-concurrent-extras); `consume_item` clears field 0.
+                let item = consume_item(ctx, this, &mut state);
                 slot.put_cv.notify_one();
-                if ctx.object_num_fields(this) > 0 {
-                    ctx.set_field(this, 0, Value::Object(None));
-                }
                 if ctx.object_num_fields(this) > 1 {
                     ctx.set_field(this, 1, Value::Int(0));
                 }
@@ -742,5 +812,104 @@ mod tests {
         let p2 = common_pool() as *const _;
         assert_eq!(p1, p2, "common_pool must return the same instance");
         assert!(common_pool().parallelism() >= 1);
+    }
+
+    // --- bug nb-concurrent-extras: GC-safe deposit/consume ------------------
+
+    /// Allocate a stand-in `SynchronousQueue` instance with the 2 fields the
+    /// hardened natives rely on (slot mirror + has-item flag).
+    fn alloc_queue(ctx: &mut crate::test_utils::MockNativeContext) -> ObjectRef {
+        let cid = ctx
+            .ensure_class_initialized("java/util/concurrent/SynchronousQueue")
+            .unwrap();
+        ctx.alloc_object(cid, 2)
+    }
+
+    fn fresh_slot() -> SqSlot {
+        SqSlot {
+            item_bits: 0,
+            has_item: false,
+            tag: 0,
+        }
+    }
+
+    /// Depositing an Object stores it in the GC-tracked mirror field 0 (NOT a
+    /// bare pointer in the slot), and consuming it hands the same reference
+    /// back and clears both the slot and the mirror (bug nb-concurrent-extras).
+    #[test]
+    fn sq_deposit_consume_object_via_field0() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_queue(&mut ctx);
+        let item_cid = ctx.ensure_class_initialized("java/lang/Object").unwrap();
+        let item = ctx.alloc_object(item_cid, 0);
+
+        let mut slot = fresh_slot();
+        deposit_item(&mut ctx, this, &mut slot, Value::Object(Some(item)));
+        assert!(slot.has_item, "deposit must mark the slot occupied");
+        assert_eq!(slot.tag, 1, "Object item must carry tag 1");
+        assert_eq!(
+            slot.item_bits, 0,
+            "Object pointer must NOT be stashed in the global slot",
+        );
+        // The Object lives in the GC-tracked mirror field 0.
+        assert_eq!(ctx.get_field(this, 0), Value::Object(Some(item)));
+
+        let out = consume_item(&mut ctx, this, &mut slot);
+        assert_eq!(
+            out,
+            Value::Object(Some(item)),
+            "consume must hand back the reference read from mirror field 0",
+        );
+        // Slot fully drained and mirror cleared (no stale root past handoff).
+        assert!(!slot.has_item);
+        assert_eq!(slot.tag, 0);
+        assert_eq!(ctx.get_field(this, 0), Value::Object(None));
+    }
+
+    /// A second deposit before the first is consumed overwrites the mirror
+    /// and surfaces the newest item.
+    #[test]
+    fn sq_deposit_over_deposit_surfaces_latest() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_queue(&mut ctx);
+        let item_cid = ctx.ensure_class_initialized("java/lang/Object").unwrap();
+        let first = ctx.alloc_object(item_cid, 0);
+        let second = ctx.alloc_object(item_cid, 0);
+
+        let mut slot = fresh_slot();
+        deposit_item(&mut ctx, this, &mut slot, Value::Object(Some(first)));
+        deposit_item(&mut ctx, this, &mut slot, Value::Object(Some(second)));
+
+        let out = consume_item(&mut ctx, this, &mut slot);
+        assert_eq!(
+            out,
+            Value::Object(Some(second)),
+            "second deposit must overwrite the first",
+        );
+        assert_eq!(ctx.get_field(this, 0), Value::Object(None));
+    }
+
+    /// Primitive and null-Object items roundtrip correctly: primitives use
+    /// the in-slot payload, null Objects clear field 0.
+    #[test]
+    fn sq_deposit_consume_primitive_and_null() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_queue(&mut ctx);
+        let mut slot = fresh_slot();
+
+        deposit_item(&mut ctx, this, &mut slot, Value::Int(7));
+        assert_eq!(slot.tag, 2);
+        assert_eq!(slot.item_bits, 7, "primitive payload kept in the slot");
+        assert_eq!(consume_item(&mut ctx, this, &mut slot), Value::Int(7));
+        assert!(!slot.has_item);
+
+        deposit_item(&mut ctx, this, &mut slot, Value::Object(None));
+        assert_eq!(slot.tag, 1);
+        assert_eq!(slot.item_bits, 0, "null Object stores no pointer bits");
+        assert_eq!(
+            consume_item(&mut ctx, this, &mut slot),
+            Value::Object(None),
+        );
+        assert!(!slot.has_item);
     }
 }

@@ -691,6 +691,33 @@ fn native_unsafe_set_memory_consolidated(
                 }
                 .into());
             }
+            // Object-field (non-array) target. `bytes` is treated as a slot
+            // count in this slot-based model, so it MUST be bounded by the
+            // object's real field count — otherwise an attacker-controlled
+            // (offset, bytes) walks `set_field` past the last slot and scribbles
+            // over neighbouring heap objects (OOB field write). Validate the
+            // whole [off, off+bytes) window up-front and reject if it does not
+            // fit, rather than partially filling then aborting.
+            let num_fields = ctx.object_num_fields(obj_ref);
+            let end = match off.checked_add(bytes) {
+                Some(e) => e,
+                None => {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: format!(
+                            "Unsafe.setMemory: offset {off} + size {bytes} overflows"
+                        ),
+                    }
+                    .into());
+                }
+            };
+            if end > num_fields {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe.setMemory: range [{off}, {end}) exceeds object field count {num_fields}"
+                    ),
+                }
+                .into());
+            }
             let fill_value = Value::Int(value as i32);
             for i in 0..bytes {
                 ctx.set_field(obj_ref, off + i, fill_value);

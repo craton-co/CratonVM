@@ -65,12 +65,20 @@ pub const THREAD_BUFFER_FLUSH_THRESHOLD: usize = 64;
 /// collector can drain it at a stop-the-world safepoint even if the owning
 /// thread parked without flushing.
 ///
-/// SECURITY FIX (V6) — table-id scoping: each element is a
-/// `(table_id, offset)` pair. `table_id` identifies which [`CardTable`] the
-/// `offset` was dirtied against, so a collector draining one table never
-/// consumes another table's buffered offsets. The single global buffer per
-/// thread therefore multiplexes the dirty edges of *all* tables that thread
-/// has touched.
+/// SECURITY FIX (V6) — table-id scoping: offsets are kept partitioned BY
+/// `table_id`, so a collector draining one table never consumes another
+/// table's buffered offsets. The single global buffer per thread therefore
+/// multiplexes the dirty edges of *all* tables that thread has touched.
+///
+/// PERF (gc-cardtable-perf): the partition is materialised as a small
+/// `table_id -> Vec<offset>` vec-map ([`DirtyPartitions`]) rather than a flat
+/// `Vec<(table_id, offset)>`. Previously every flush had to `Vec::retain`-scan
+/// the *entire* shared buffer (all tables' entries) to extract one table's
+/// offsets; with N live `CardTable`s that made each flush O(total buffered)
+/// instead of O(this table's buffered). Partitioning lets a flush locate its
+/// own bucket and `std::mem::take` it in one move, never touching foreign
+/// tables' entries. The set of cards ultimately marked dirty is unchanged —
+/// only the per-flush work and the layout differ.
 ///
 /// The inner `Mutex` is contended only in the (impossible-by-construction at
 /// STW) case where a mutator runs concurrently with the collector's drain. By
@@ -79,7 +87,56 @@ pub const THREAD_BUFFER_FLUSH_THRESHOLD: usize = 64;
 /// fast path; it exists purely to make the cross-thread read at STW sound
 /// (a bare `RefCell` is `!Sync` and could not legally be read by the
 /// collector thread).
-type ThreadBuffer = Arc<Mutex<Vec<(u64, usize)>>>;
+type ThreadBuffer = Arc<Mutex<DirtyPartitions>>;
+
+/// PERF (gc-cardtable-perf): per-thread dirty-offset storage partitioned by
+/// `CardTable::id`. Most threads touch only one or two tables, so a linear
+/// vec-map keyed on `table_id` is both the smallest and the fastest structure
+/// here — it avoids per-push hashing/allocation churn while letting a flush
+/// find and take exactly its own table's offsets without scanning foreign
+/// entries (the regression the previous flat `Vec<(table_id, offset)>` had,
+/// where every flush `retain`-walked all tables' buffered offsets).
+#[derive(Default)]
+struct DirtyPartitions {
+    /// One bucket per distinct `table_id` seen on this thread. `buckets` is
+    /// expected to hold a single-digit number of entries (one per live
+    /// `CardTable` the thread has dirtied), so a linear lookup is optimal.
+    buckets: Vec<(u64, Vec<usize>)>,
+}
+
+impl DirtyPartitions {
+    /// Append `offset` to `table_id`'s bucket, creating it on first use, and
+    /// return that bucket's new length so the caller can evaluate the
+    /// per-table auto-flush threshold without a second lookup.
+    #[inline]
+    fn push(&mut self, table_id: u64, offset: usize) -> usize {
+        for (id, offsets) in self.buckets.iter_mut() {
+            if *id == table_id {
+                offsets.push(offset);
+                return offsets.len();
+            }
+        }
+        self.buckets.push((table_id, vec![offset]));
+        1
+    }
+
+    /// Take (remove and return) all buffered offsets for `table_id`, leaving
+    /// other tables' buckets untouched. Returns an empty `Vec` when this
+    /// thread has nothing buffered for `table_id`.
+    #[inline]
+    fn take(&mut self, table_id: u64) -> Vec<usize> {
+        for i in 0..self.buckets.len() {
+            if self.buckets[i].0 == table_id {
+                // Remove the whole bucket: its offsets are about to be folded
+                // into the table's shared `pending_offsets`, so the per-thread
+                // entry is fully consumed. `swap_remove` is O(1) and bucket
+                // ordering is irrelevant.
+                return self.buckets.swap_remove(i).1;
+            }
+        }
+        Vec::new()
+    }
+}
 
 /// SECURITY FIX (V6): global intrusive registry of every thread's dirty
 /// buffer. The collector walks this list at STW (via [`CardTable::flush_all`])
@@ -135,13 +192,14 @@ thread_local! {
     /// [`CardTable::flush_dirty_buffer`] drains it into the
     /// shared-side `pending_offsets` vector under the mutex.
     ///
-    /// SECURITY FIX (V6): the buffer is an `Arc<Mutex<Vec<(u64, usize)>>>`
+    /// SECURITY FIX (V6): the buffer is an `Arc<Mutex<DirtyPartitions>>`
     /// (not a bare `RefCell`) registered in [`BUFFER_REGISTRY`] on first use
-    /// so the collector can drain it cross-thread at STW. Each element is a
-    /// `(table_id, offset)` pair so a per-table drain consumes only its own
-    /// entries. [`DirtyBufferGuard`] deregisters it on thread exit.
+    /// so the collector can drain it cross-thread at STW. Offsets are
+    /// partitioned by `table_id` so a per-table drain consumes only its own
+    /// entries without scanning foreign tables' offsets (PERF
+    /// gc-cardtable-perf). [`DirtyBufferGuard`] deregisters it on thread exit.
     static THREAD_DIRTY_BUFFER: DirtyBufferGuard = {
-        let buffer: ThreadBuffer = Arc::new(Mutex::new(Vec::new()));
+        let buffer: ThreadBuffer = Arc::new(Mutex::new(DirtyPartitions::default()));
         BUFFER_REGISTRY.lock().push(Arc::clone(&buffer));
         DirtyBufferGuard { buffer }
     };
@@ -395,24 +453,31 @@ impl CardTable {
     ///
     /// # SECURITY FIX (V6) — table-id scoping
     ///
-    /// The entry pushed is `(self.id, offset)`. The single per-thread buffer
-    /// is shared by *all* tables this thread touches, so the auto-flush
-    /// threshold is evaluated against the buffer's TOTAL length across tables
-    /// (the simplest correct policy: it strictly upper-bounds per-table
-    /// backlog and keeps the fast path a single length check). When it trips,
-    /// [`Self::flush_dirty_buffer`] flushes only this table's entries; any
-    /// other table's entries stay buffered until their own auto-flush or
-    /// `flush_all` handles them.
+    /// The offset is appended to *this table's* bucket in the per-thread
+    /// [`DirtyPartitions`]. The single per-thread buffer is shared by *all*
+    /// tables this thread touches, but each table's offsets live in their own
+    /// bucket so a flush of one table never touches another's entries.
+    ///
+    /// # PERF (gc-cardtable-perf)
+    ///
+    /// The auto-flush threshold is now evaluated against THIS table's bucket
+    /// length (returned by [`DirtyPartitions::push`]) rather than the buffer's
+    /// total length across all tables. This is a pure batching/timing detail —
+    /// flushing only decides *when* buffered offsets move to `pending_offsets`,
+    /// never *which* cards ultimately become dirty — so the observable card
+    /// set is identical. The previous total-length policy could trip a flush
+    /// on table A merely because table B had buffered a lot; per-bucket sizing
+    /// is both more accurate (each table flushes on its own backlog) and keeps
+    /// the fast path a single length check.
     pub fn thread_local_dirty(&self, offset: usize) {
-        // SECURITY FIX (V6): push into the registered per-thread buffer
-        // (Arc<Mutex<..>>), tagging the entry with this table's id so a drain
-        // by another table cannot consume it. The lock is uncontended on the
-        // mutator fast path (only this thread touches it outside STW); it is
-        // acquirable by the collector only at STW, when this thread is parked.
+        // SECURITY FIX (V6): push into this table's bucket of the registered
+        // per-thread buffer (Arc<Mutex<DirtyPartitions>>) so a drain by another
+        // table cannot consume it. The lock is uncontended on the mutator fast
+        // path (only this thread touches it outside STW); it is acquirable by
+        // the collector only at STW, when this thread is parked.
         let should_flush = THREAD_DIRTY_BUFFER.with(|guard| {
             let mut b = guard.buffer.lock();
-            b.push((self.id, offset));
-            b.len() >= THREAD_BUFFER_FLUSH_THRESHOLD
+            b.push(self.id, offset) >= THREAD_BUFFER_FLUSH_THRESHOLD
         });
         if should_flush {
             self.flush_dirty_buffer();
@@ -429,29 +494,27 @@ impl CardTable {
     ///
     /// # SECURITY FIX (V6) — table-id scoping
     ///
-    /// Only entries tagged with `self.id` are moved into this table's
-    /// `pending_offsets`; entries belonging to other tables sharing this
-    /// thread's buffer are retained untouched. We therefore use `Vec::retain`
-    /// rather than a blanket `Vec::append`, fixing the regression where one
-    /// table's flush emptied another table's buffered old→young edges.
+    /// Only this table's offsets are moved into its `pending_offsets`; entries
+    /// belonging to other tables sharing this thread's buffer are left
+    /// untouched, fixing the regression where one table's flush emptied
+    /// another table's buffered old→young edges.
+    ///
+    /// # PERF (gc-cardtable-perf)
+    ///
+    /// Offsets are partitioned by `table_id` in the per-thread buffer, so this
+    /// flush locates its own bucket and `std::mem::take`s it in one move
+    /// instead of `Vec::retain`-scanning the entire shared buffer (all tables'
+    /// entries). With multiple live tables this turns each flush from
+    /// O(total buffered) into O(this table's buffered).
     pub fn flush_dirty_buffer(&self) {
-        THREAD_DIRTY_BUFFER.with(|guard| {
-            let mut local = guard.buffer.lock();
-            if local.is_empty() {
-                return;
-            }
-            let mut shared = self.pending_offsets.lock();
-            // Move out only this table's offsets, leaving foreign entries in
-            // place. `retain` keeps the non-matching tail in a single pass.
-            local.retain(|&(table_id, offset)| {
-                if table_id == self.id {
-                    shared.push(offset);
-                    false
-                } else {
-                    true
-                }
-            });
-        });
+        // Take only this table's bucket while holding the per-thread buffer
+        // lock, then release it before touching `pending_offsets`. Foreign
+        // tables' buckets are never inspected.
+        let offsets = THREAD_DIRTY_BUFFER.with(|guard| guard.buffer.lock().take(self.id));
+        if offsets.is_empty() {
+            return;
+        }
+        self.pending_offsets.lock().extend(offsets);
     }
 
     /// T5.5.2 / SECURITY FIX (V6) — Drain EVERY thread's dirty buffer into
@@ -506,21 +569,17 @@ impl CardTable {
             // Lock order matches the mutator fast path (buffer-lock before
             // pending-lock) so the two can never deadlock even if, contrary
             // to the STW invariant, they were ever to run concurrently.
-            let mut local = buf.lock();
-            if local.is_empty() {
+            //
+            // PERF (gc-cardtable-perf): take only this table's bucket from
+            // each thread buffer, leaving every foreign-table bucket in place
+            // for that table's own collector. The take is a single bucket
+            // lookup + O(1) `swap_remove`, not a `retain`-scan over all of the
+            // thread's buffered offsets across tables.
+            let offsets = buf.lock().take(self.id);
+            if offsets.is_empty() {
                 continue;
             }
-            let mut shared = self.pending_offsets.lock();
-            // SECURITY FIX (V6): take only this table's offsets; retain every
-            // foreign-table entry so another table's collector still finds it.
-            local.retain(|&(table_id, offset)| {
-                if table_id == self.id {
-                    shared.push(offset);
-                    false
-                } else {
-                    true
-                }
-            });
+            self.pending_offsets.lock().extend(offsets);
         }
     }
 

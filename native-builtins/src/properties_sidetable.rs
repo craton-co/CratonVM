@@ -433,6 +433,26 @@ fn split_key_value(line: &str) -> (String, String) {
 /// Decode Java `.properties` escapes (`\n`, `\t`, `\r`, `\\`, `\"`,
 /// `\'`, `\<space>`, `\:`, `\=`, `\uXXXX`).  Unknown escapes degrade
 /// to literal characters.
+///
+/// Surrogate handling matches `java.util.Properties.load` as closely as a
+/// `String`-returning helper can:
+///   * A high `\uD800..\uDBFF` immediately followed by a low `\uDC00..\uDFFF`
+///     is combined into the supplementary code point it encodes (the prior
+///     implementation dropped both halves, losing every emoji / CJK-ext char).
+///   * A malformed `\u` (zero or fewer-than-four hex digits) is handled
+///     loudly (warn + best-effort decode of the digits present), not silently
+///     tolerated, mirroring the JDK's "Malformed \\uxxxx encoding" error.
+///
+/// LIMITATION / CROSS-FILE FOLLOW-UP: a *lone* surrogate `\uXXXX` (a high or
+/// low half with no matching pair) is a valid single UTF-16 code unit that a
+/// Rust `String` cannot represent. Exact preservation requires storing the
+/// value as `[u16]` units and materialising the Java string via
+/// `vm::vm_object::create_java_string_from_units` (the "wide-unit path", cf.
+/// the SB-13 GroovyLexer fix). That path is not reachable from this
+/// `String`-typed pipeline (`put_kv`/`get_kv` store `String`, and
+/// `NativeContext::create_string` re-`encode_utf16`s its `&str`), so we
+/// substitute U+FFFD and warn rather than silently dropping the unit. Wiring a
+/// units-aware value channel through the side-table is a separate change.
 fn unescape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -452,23 +472,80 @@ fn unescape(s: &str) -> String {
             Some(':') => out.push(':'),
             Some('=') => out.push('='),
             Some('u') => {
-                // Read up to 4 hex digits.
-                let mut code = 0u32;
-                let mut seen = 0;
-                while seen < 4 {
-                    match chars.peek() {
-                        Some(&h) if h.is_ascii_hexdigit() => {
-                            code = (code << 4) | h.to_digit(16).unwrap();
-                            chars.next();
-                            seen += 1;
-                        }
-                        _ => break,
-                    }
+                // `\uXXXX` — a single UTF-16 code unit. Read the hex digits.
+                let (code, seen) = read_u_escape(&mut chars);
+                if seen == 0 {
+                    // `\u` with no following hex digit at all. The JDK's
+                    // `Properties.load` (`loadConvert`) throws
+                    // IllegalArgumentException("Malformed \\uxxxx encoding.")
+                    // here. `unescape` has no error channel on this
+                    // best-effort, app-enabling path, so we don't abort the
+                    // whole load — but we must NOT silently swallow the `u`.
+                    // Preserve it literally and warn loudly.
+                    tracing::warn!(
+                        target: "cratonvm_vm::props_sidetable",
+                        "Malformed \\u escape in .properties value (no hex digits); \
+                         preserving 'u' literally"
+                    );
+                    out.push('u');
+                    continue;
                 }
-                if seen > 0 {
-                    if let Some(ch) = char::from_u32(code) {
-                        out.push(ch);
+                if seen < 4 {
+                    // Fewer than 4 hex digits before a non-hex char/EOF. The
+                    // JDK treats this as malformed and throws; we decode the
+                    // digits actually present (so the parsed value is NOT
+                    // silently dropped) and warn.
+                    tracing::warn!(
+                        target: "cratonvm_vm::props_sidetable",
+                        digits = ?seen,
+                        "Malformed (short) \\u escape in .properties value; \
+                         decoding the hex digits present"
+                    );
+                }
+                if (0xD800..=0xDBFF).contains(&code) {
+                    // High surrogate. A valid supplementary code point is
+                    // written in .properties as TWO escapes: a high surrogate
+                    // immediately followed by `\uDC00..\uDFFF`. Combine them
+                    // into one Rust `char` (the previous code dropped BOTH
+                    // halves because each lone half failed `char::from_u32`).
+                    if let Some(low) = peek_low_surrogate(&mut chars) {
+                        let cp = 0x10000
+                            + (((code - 0xD800) << 10) | (low - 0xDC00));
+                        if let Some(ch) = char::from_u32(cp) {
+                            out.push(ch);
+                            continue;
+                        }
                     }
+                    // Lone high surrogate (no matching low half). A Rust
+                    // `String` cannot hold an unpaired UTF-16 surrogate, so
+                    // we cannot preserve it here without the wide-unit path
+                    // (`create_java_string_from_units`, in vm/vm_object.rs)
+                    // which this `String`-returning function can't reach.
+                    // Substitute U+FFFD rather than silently dropping the
+                    // unit. See CROSS-FILE note in the header doc.
+                    tracing::warn!(
+                        target: "cratonvm_vm::props_sidetable",
+                        unit = ?code,
+                        "Lone high surrogate (\\uXXXX) in .properties value; \
+                         cannot be stored as a Rust String — substituting \
+                         U+FFFD (wide-unit storage needed for exact \
+                         preservation)"
+                    );
+                    out.push('\u{FFFD}');
+                } else if (0xDC00..=0xDFFF).contains(&code) {
+                    // Lone low surrogate (no preceding high half). Same
+                    // limitation as the lone-high case above.
+                    tracing::warn!(
+                        target: "cratonvm_vm::props_sidetable",
+                        unit = ?code,
+                        "Lone low surrogate (\\uXXXX) in .properties value; \
+                         cannot be stored as a Rust String — substituting \
+                         U+FFFD (wide-unit storage needed for exact \
+                         preservation)"
+                    );
+                    out.push('\u{FFFD}');
+                } else if let Some(ch) = char::from_u32(code) {
+                    out.push(ch);
                 }
             }
             Some(other) => out.push(other),
@@ -476,6 +553,64 @@ fn unescape(s: &str) -> String {
         }
     }
     out
+}
+
+/// Consume the hex digits of a `\uXXXX` escape (the `\u` prefix has already
+/// been consumed). Reads up to 4 ASCII hex digits and returns the decoded
+/// code unit together with how many digits were actually read (`0..=4`).
+///
+/// Fewer than 4 digits means the escape was malformed per the JDK; callers
+/// decide how loudly to react. We deliberately read *only* what's present
+/// rather than over-consuming, so a non-hex follow-on character (and any
+/// subsequent escapes) is still processed by the caller.
+fn read_u_escape<I: Iterator<Item = char>>(
+    chars: &mut std::iter::Peekable<I>,
+) -> (u32, u32) {
+    let mut code = 0u32;
+    let mut seen = 0u32;
+    while seen < 4 {
+        match chars.peek() {
+            Some(&h) if h.is_ascii_hexdigit() => {
+                code = (code << 4) | h.to_digit(16).unwrap();
+                chars.next();
+                seen += 1;
+            }
+            _ => break,
+        }
+    }
+    (code, seen)
+}
+
+/// If the next two characters are a `\uXXXX` escape whose value is a low
+/// surrogate (`0xDC00..=0xDFFF`), consume them and return that code unit;
+/// otherwise leave the iterator untouched and return `None`.
+///
+/// Used to greedily pair a high surrogate with its trailing low surrogate so
+/// supplementary code points (emoji, CJK-ext, …) round-trip through the
+/// `String`-typed pipeline. We require the full 4-hex-digit form: a short
+/// `\uDC` after a high surrogate is itself malformed and is left for the main
+/// loop to report.
+fn peek_low_surrogate<I>(chars: &mut std::iter::Peekable<I>) -> Option<u32>
+where
+    I: Iterator<Item = char> + Clone,
+{
+    // Speculatively clone the cursor so a non-matching lookahead costs us
+    // nothing — we only advance the real iterator on a confirmed low
+    // surrogate. `Peekable<Chars>` is `Clone` (chars over a &str slice).
+    let mut probe = chars.clone();
+    if probe.next() != Some('\\') || probe.next() != Some('u') {
+        return None;
+    }
+    let (code, seen) = read_u_escape(&mut probe);
+    if seen == 4 && (0xDC00..=0xDFFF).contains(&code) {
+        // Commit: fast-forward the real iterator past `\uXXXX` (6 chars).
+        for _ in 0..6 {
+            chars.next();
+        }
+        Some(code)
+    } else {
+        None
+    }
 }
 
 /// Insert (or overwrite) a key/value pair in the side-table for a
@@ -2179,6 +2314,41 @@ mod tests {
     fn unescape_unicode() {
         assert_eq!(unescape("\\u0041"), "A");
         assert_eq!(unescape("\\u00e9"), "\u{00e9}");
+    }
+
+    #[test]
+    fn unescape_surrogate_pair_combines_to_supplementary() {
+        // U+1F600 GRINNING FACE is written as the surrogate pair
+        // 😀 in a .properties file. The two halves must combine
+        // into the single supplementary code point (previously BOTH halves
+        // were dropped, yielding an empty string).
+        assert_eq!(unescape("\\uD83D\\uDE00"), "\u{1F600}");
+        // Surrounded by ordinary text, and with lowercase hex.
+        assert_eq!(unescape("a\\ud83d\\ude00b"), "a\u{1F600}b");
+    }
+
+    #[test]
+    fn unescape_lone_surrogate_becomes_replacement_not_dropped() {
+        // A lone surrogate can't live in a Rust String; we substitute U+FFFD
+        // rather than silently dropping the unit (exact preservation needs
+        // the cross-file wide-unit path). The key assertion is that *some*
+        // character survives — the value is not silently lost.
+        assert_eq!(unescape("\\uD800"), "\u{FFFD}"); // lone high
+        assert_eq!(unescape("\\uDC00"), "\u{FFFD}"); // lone low
+        // High surrogate followed by a NON-low escape: the high is replaced,
+        // and the trailing 'A' (A) is preserved.
+        assert_eq!(unescape("\\uD800\\u0041"), "\u{FFFD}A");
+    }
+
+    #[test]
+    fn unescape_short_u_decodes_digits_present_not_dropped() {
+        // Fewer than 4 hex digits is malformed per the JDK. We decode the
+        // digits actually present rather than silently swallowing them.
+        assert_eq!(unescape("\\u41"), "A"); // 0x41 from 2 digits
+        assert_eq!(unescape("\\u41Z"), "AZ"); // stops at non-hex 'Z'
+        // `\u` with no hex digit at all: preserve the 'u' literally.
+        assert_eq!(unescape("\\u"), "u");
+        assert_eq!(unescape("\\uZ"), "uZ");
     }
 
     #[test]

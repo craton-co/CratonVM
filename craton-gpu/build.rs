@@ -3,10 +3,20 @@
 
 //! Build script for craton-gpu.
 //!
-//! Compiles the Java annotation source files under `src/main/java/`
-//! using `javac` (if available) and packages them into a jar via
-//! `jar` (if available). The resulting paths are surfaced to the
-//! Rust crate via two `cargo:rustc-env=` variables:
+//! Compiles the Java annotation source files using `javac` (if
+//! available) and packages them into a jar via `jar` (if available).
+//!
+//! The `.java` sources are NOT shipped inside this crate — they live in
+//! an external standalone Maven project (the craton-gpu-java repo). The
+//! source tree is located at build time via, in priority order: the
+//! `$CRATON_GPU_JAVA_SRC` env override, a `../craton-gpu-java/...`
+//! sibling checkout, or (on Windows only) a `C:/craton/...` default
+//! install. See `resolve_java_root` for the exact resolution. When no
+//! source tree is found the build degrades gracefully to an empty jar
+//! plus a `cargo:warning=` — it never fails.
+//!
+//! The resulting paths are surfaced to the Rust crate via two
+//! `cargo:rustc-env=` variables:
 //!
 //! * `CRATON_GPU_ANNOTATIONS_JAR` — absolute path to the produced
 //!   jar, or empty string when the jar could not be produced.
@@ -38,15 +48,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    // Java sources moved to a standalone Maven project at
-    // C:/craton/craton-gpu-java/ — see that repo's README.md.
-    // Locate them via, in priority order:
+    // Java sources moved to a standalone Maven project (the
+    // craton-gpu-java repo) — see that repo's README.md. They are NOT
+    // shipped inside this crate. Locate them via, in priority order:
     //   1. $CRATON_GPU_JAVA_SRC env var (full absolute path to a
-    //      directory containing `craton/gpu/*.java`),
-    //   2. ../craton-gpu-java/src/main/java (works from main repo),
-    //   3. C:/craton/craton-gpu-java/src/main/java (default install).
+    //      directory containing `craton/gpu/*.java`); a set-but-invalid
+    //      value is diagnosed via cargo:warning and then ignored,
+    //   2. ../craton-gpu-java/src/main/java (portable sibling checkout;
+    //      tried on every platform),
+    //   3. C:/craton/craton-gpu-java/src/main/java (Windows-only default
+    //      install; never consulted on Linux/macOS).
     // If none exists, the build script emits empty paths and a warning
-    // — same fallback behaviour as before the move.
+    // — same fallback behaviour as before the move. The build NEVER fails.
     println!("cargo:rerun-if-env-changed=CRATON_GPU_JAVA_SRC");
     println!("cargo:rerun-if-changed=build.rs");
 
@@ -174,38 +187,66 @@ fn main() {
 
 /// Resolve the Java source root, in priority order:
 /// 1. `$CRATON_GPU_JAVA_SRC` (treated as an absolute path to a
-///    directory containing `craton/gpu/*.java`).
-/// 2. `../craton-gpu-java/src/main/java` (sibling of CratonVM repo).
-/// 3. `C:/craton/craton-gpu-java/src/main/java` (default install).
+///    directory containing `craton/gpu/*.java`). A set-but-invalid
+///    value is diagnosed via `cargo:warning=` and then ignored.
+/// 2. `../craton-gpu-java/src/main/java` (sibling of CratonVM repo) —
+///    portable, tried on every platform.
+/// 3. `C:/craton/craton-gpu-java/src/main/java` (default install) —
+///    **Windows only**; never consulted on Linux/macOS.
 ///
-/// Returns the first path that exists; if none exists, returns the
-/// final default — the caller (`main`) will discover the absence and
-/// emit a `cargo:warning=` instead of failing the build.
+/// Returns the first path that exists; if none exists, returns a
+/// platform-appropriate fallback (the Windows install path on Windows,
+/// the OS-agnostic sibling path elsewhere) — the caller (`main`) will
+/// discover the absence and emit a `cargo:warning=` instead of failing
+/// the build.
 fn resolve_java_root() -> PathBuf {
     if let Some(v) = std::env::var_os("CRATON_GPU_JAVA_SRC") {
         let p = PathBuf::from(v);
         if p.is_dir() {
             return p;
         }
+        // Fix (1): a set-but-invalid override used to be silently ignored,
+        // so a typo'd path would mysteriously fall back to the built-in
+        // candidates with no clue why the override "did nothing". Diagnose
+        // it via cargo:warning. We still fall through to the candidate list
+        // (and ultimately to an empty-jar warning) per the no-fail contract.
+        println!(
+            "cargo:warning=craton-gpu: $CRATON_GPU_JAVA_SRC is set to {} but that is not a directory; ignoring the override and falling back to the default source-resolution candidates",
+            p.display()
+        );
     }
-    // The first candidate is relative: cargo guarantees the build
-    // script's CWD is the crate root (craton-gpu/), so `..` resolves to
-    // the CratonVM workspace parent and finds a sibling craton-gpu-java
-    // checkout. The second is the default Windows install location.
-    let candidates: [PathBuf; 2] = [
-        PathBuf::from("../craton-gpu-java/src/main/java"),
-        PathBuf::from("C:/craton/craton-gpu-java/src/main/java"),
-    ];
-    for c in &candidates {
-        if c.is_dir() {
-            return c.clone();
+    // The first candidate is relative and OS-agnostic: cargo guarantees
+    // the build script's CWD is the crate root (craton-gpu/), so `..`
+    // resolves to the CratonVM workspace parent and finds a sibling
+    // craton-gpu-java checkout. This is the portable fallback used on
+    // every platform.
+    let sibling = PathBuf::from("../craton-gpu-java/src/main/java");
+    if sibling.is_dir() {
+        return sibling;
+    }
+    // Fix (3): the `C:/craton/...` absolute default is Windows-only — on
+    // Linux/macOS it can never exist and, worse, returning it as the final
+    // fallback used to surface a bogus Windows path in the build warning,
+    // making a clean non-Windows checkout look broken. Only consult (and
+    // only return) the Windows install path when actually building on
+    // Windows. On other hosts the OS-agnostic sibling path is the final
+    // fallback; `main` discovers its absence and emits a `cargo:warning=`,
+    // degrading gracefully to an empty jar per the resilient-build contract.
+    #[cfg(windows)]
+    {
+        let win_default = PathBuf::from("C:/craton/craton-gpu-java/src/main/java");
+        if win_default.is_dir() {
+            return win_default;
         }
+        return win_default;
     }
-    // No candidate exists: fall back to the default Windows install path.
-    // `main` will see it does not exist and emit a `cargo:warning=`
-    // rather than failing the build. (This default is Windows-targeted;
-    // non-Windows hosts are expected to set `$CRATON_GPU_JAVA_SRC`.)
-    candidates[1].clone()
+    // Non-Windows: return the portable sibling path (which does not exist
+    // here, by the check above) so the warning names a sensible relative
+    // location and instructs the user to set $CRATON_GPU_JAVA_SRC.
+    #[cfg(not(windows))]
+    {
+        sibling
+    }
 }
 
 /// Probe for `javac` on PATH by running `javac -version`. Both

@@ -1271,7 +1271,52 @@ pub(crate) fn register_phase53_record(r: &mut NativeMethodRegistry) {
             }
             let nf = ctx.object_num_fields(this);
             for i in 0..nf {
-                if ctx.get_field(this, i) != ctx.get_field(*other, i) {
+                let a = ctx.get_field(this, i);
+                let b = ctx.get_field(*other, i);
+                // MED fix: per the JLS record-equality contract (and the
+                // `java.lang.runtime.ObjectMethods` bootstrap HotSpot uses),
+                // reference-typed components are compared with `Objects.equals`
+                // (null-safe `a.equals(b)` via virtual dispatch), NOT by pointer
+                // identity. Two records with equal-but-distinct String/boxed
+                // components must be `equals`. Primitive components compare by
+                // value; `float`/`double` use bitwise (`Float`/`Double.compare`)
+                // semantics to match the generated canonical `equals`.
+                let component_equal = match (&a, &b) {
+                    // Reference components: null-safe virtual `equals`.
+                    (Value::Object(_), _) | (_, Value::Object(_)) => {
+                        match (a, b) {
+                            (Value::Object(None), Value::Object(None)) => true,
+                            (Value::Object(None), _) | (_, Value::Object(None)) => false,
+                            (Value::Object(Some(ra)), Value::Object(Some(rb))) => {
+                                // Identity fast-path, then dispatch `ra.equals(rb)`.
+                                if std::ptr::eq(ra.as_ptr(), rb.as_ptr()) {
+                                    true
+                                } else {
+                                    match ctx.invoke_virtual(
+                                        ra,
+                                        "equals",
+                                        "(Ljava/lang/Object;)Z",
+                                        &[Value::Object(Some(rb))],
+                                    )? {
+                                        Some(Value::Int(v)) => v != 0,
+                                        _ => false,
+                                    }
+                                }
+                            }
+                            // Mismatched kinds (a reference vs. a primitive slot)
+                            // cannot occur for a well-formed record, but treat as
+                            // not-equal rather than mis-comparing.
+                            _ => false,
+                        }
+                    }
+                    // Primitive components: compare by value. `float`/`double`
+                    // use bitwise compare so `NaN==NaN` and `-0.0!=0.0`, matching
+                    // the canonical generated `equals` (Float/Double.compare).
+                    (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+                    (Value::Double(x), Value::Double(y)) => x.to_bits() == y.to_bits(),
+                    _ => a == b,
+                };
+                if !component_equal {
                     return Ok(Some(Value::Int(0)));
                 }
             }
@@ -1286,6 +1331,10 @@ pub(crate) fn register_phase53_record(r: &mut NativeMethodRegistry) {
         let mut hash: i32 = 0;
         for i in 0..nf {
             let v = ctx.get_field(this, i);
+            // MED fix: derive a reference component's contribution from its
+            // virtual `hashCode()` (null -> 0), NOT its pointer address, so the
+            // result is stable across equal-but-distinct components and honours
+            // the record equals/hashCode contract. Primitives hash by value.
             let h = match v {
                 Value::Int(n) => n,
                 Value::Long(n) => (n ^ (n >> 32)) as i32,
@@ -1294,7 +1343,11 @@ pub(crate) fn register_phase53_record(r: &mut NativeMethodRegistry) {
                     let bits = d.to_bits();
                     (bits ^ (bits >> 32)) as i32
                 }
-                Value::Object(Some(r)) => r.as_ptr() as i32,
+                Value::Object(None) => 0,
+                Value::Object(Some(r)) => match ctx.invoke_virtual(r, "hashCode", "()I", &[])? {
+                    Some(Value::Int(hc)) => hc,
+                    _ => ctx.identity_hash_code(r),
+                },
                 _ => 0,
             };
             hash = hash.wrapping_mul(31).wrapping_add(h);

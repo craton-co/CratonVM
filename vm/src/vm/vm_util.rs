@@ -56,6 +56,76 @@ fn lenient_clinit() -> bool {
     })
 }
 
+/// Whether a swallowed `<clinit>` failure for `class_name` has a *documented,
+/// genuinely-needed* recovery path that leaves the class usable.
+///
+/// Historically the lenient `<clinit>` swallow used a broad prefix allowlist
+/// (`java/`, `jdk/`, `sun/`, `javax/`, `org/jboss/`, `io/quarkus/`,
+/// `org/wildfly/`, `io/smallrye/`, `org/springframework/boot/loader/`,
+/// `org/slf4j/impl/`, `ch/qos/logback/`, `com/sun/`) crossed with a long
+/// list of "non-critical" exception types. That swallowed — and silently
+/// marked `Initialized` — *any* framework class whose `<clinit>` failed,
+/// even when nothing repairs the half-initialized statics. The result was a
+/// class that linked but whose load-bearing statics were left null, surfacing
+/// later as a bare NPE far from the real cause and masking genuine init bugs.
+///
+/// This narrows the swallow to **exactly** the cases that are recovered:
+///
+///   1. Every class with a [`post_clinit_fixup`] match arm — the fixup
+///      backfills the statics that downstream framework code reads, so the
+///      class is genuinely usable after the swallow. Each entry below is
+///      kept in lock-step with a `post_clinit_fixup` arm; if you add a
+///      fixup arm, add it here too (and vice-versa).
+///   2. The SLF4J/logback binder packages (`org/slf4j/impl/`,
+///      `ch/qos/logback/`) — these have **no** `post_clinit_fixup` arm, but
+///      `register_slf4j_binder_stubs_pub` (vm_init.rs) provides native
+///      singletons for `getSingleton()`/`getLoggerFactory()`/MDC/Marker
+///      binders, so SLF4J's `LoggerFactory.bind()` never reads the
+///      half-initialized `SINGLETON` static. Documented framework-compat
+///      case; retained explicitly.
+///
+/// Any other framework/JDK class is **no longer** swallowed even under
+/// `CRATONVM_LENIENT_CLINIT=1`: the failure propagates as
+/// `ExceptionInInitializerError` (JVMS §5.5) so real init bugs surface at
+/// their true origin instead of being hidden behind a stamped-`Initialized`
+/// class with null statics.
+fn clinit_swallow_has_recovery(class_name: &str) -> bool {
+    // (1) Classes with an explicit `post_clinit_fixup` recovery arm.
+    let has_fixup_arm = matches!(class_name,
+        "java/util/logging/LogManager"
+        | "jdk/internal/icu/text/NormalizerBase$NFCModeImpl"
+        | "jdk/internal/icu/text/NormalizerBase$NFDModeImpl"
+        | "jdk/internal/icu/text/NormalizerBase$NFKCModeImpl"
+        | "jdk/internal/icu/text/NormalizerBase$NFKDModeImpl"
+        | "jdk/internal/icu/text/NormalizerBase$NFKC32ModeImpl"
+        | "java/lang/invoke/VarHandleInts$Array"
+        | "java/lang/invoke/VarHandleLongs$Array"
+        | "java/lang/invoke/VarHandleShorts$Array"
+        | "java/lang/invoke/VarHandleBytes$Array"
+        | "java/lang/invoke/VarHandleBooleans$Array"
+        | "java/lang/invoke/VarHandleChars$Array"
+        | "java/lang/invoke/VarHandleFloats$Array"
+        | "java/lang/invoke/VarHandleDoubles$Array"
+        | "java/lang/invoke/VarHandleReferences$Array"
+        | "io/quarkus/bootstrap/logging/InitialConfigurator"
+        | "org/jboss/modules/DefaultBootModuleLoaderHolder"
+        | "java/math/BigInteger"
+        | "java/nio/file/attribute/PosixFilePermission"
+        | "java/math/BigDecimal"
+        | "org/springframework/core/metrics/ApplicationStartup"
+        | "org/jboss/msc/service/ServiceContainerImpl"
+        | "org/wildfly/security/auth/server/_private/ElytronMessages"
+        | "org/jboss/msc/service/ServiceLogger"
+    );
+    if has_fixup_arm {
+        return true;
+    }
+    // (2) SLF4J/logback binder packages — recovered by native binder stubs,
+    // not by `post_clinit_fixup`. See doc comment above.
+    class_name.starts_with("org/slf4j/impl/")
+        || class_name.starts_with("ch/qos/logback/")
+}
+
 /// Lazily allocate and cache the canonical `System.in` `FileInputStream` (stdin fd 0).
 ///
 /// Surefire's `LegacyMasterProcessChannelProcessorFactory` calls
@@ -904,10 +974,21 @@ fn initialize_class_shared(
                         || feature.contains("stack overflow")
                         || feature.contains("invokedynamic")
                 );
-                if is_stack_underflow && lenient_clinit() {
+                // NARROWED (2026-06-17): only swallow the stack-error /
+                // invokedynamic failure for classes with a documented recovery
+                // path (`clinit_swallow_has_recovery`). Previously this
+                // swallowed for ANY class — hiding broken invokedynamic /
+                // LambdaMetafactory bugs in arbitrary code behind a
+                // stamped-`Initialized` class with null statics. For everything
+                // else the failure now falls through to the JVMS-correct
+                // propagation below.
+                if is_stack_underflow
+                    && lenient_clinit()
+                    && clinit_swallow_has_recovery(&class_name_for_jfr)
+                {
                     tracing::warn!(
                         class = %class_name_for_jfr,
-                        "CRATONVM_LENIENT_CLINIT: swallowing <clinit> stack-error/invokedynamic failure and marking Initialized (JVMS-divergent)"
+                        "CRATONVM_LENIENT_CLINIT: swallowing <clinit> stack-error/invokedynamic failure and marking Initialized (JVMS-divergent; class has documented recovery path)"
                     );
                     crate::runtime::diagnostics::record_swallow(
                         shared,
@@ -917,6 +998,20 @@ fn initialize_class_shared(
                     );
                     finalize_init(shared, class_id, ClassState::Initialized);
                     return Ok(());
+                }
+                // Debug-gated visibility: a stack-error/invokedynamic <clinit>
+                // failure we are NOT swallowing (no recovery path). Name the
+                // class+exception so the real LambdaMetafactory/invokedynamic
+                // gap is visible at its true origin instead of silently
+                // propagating as ExceptionInInitializerError.
+                if is_stack_underflow
+                    && lenient_clinit()
+                    && crate::runtime::env_cache::strict_swallows()
+                {
+                    eprintln!(
+                        "CRATONVM_LENIENT_CLINIT: NOT swallowing <clinit> stack-error/invokedynamic failure (no recovery path) — class={} err={:?} — propagating per JVMS §5.5",
+                        class_name_for_jfr, &e
+                    );
                 }
                 // For non-critical exception types during <clinit> (ClassCastException,
                 // NullPointerException, etc.) that arise from incomplete native
@@ -957,44 +1052,33 @@ fn initialize_class_shared(
                         // for the same framework allowlist below.
                         | "java/lang/Error"
                     );
-                    // Only swallow for JDK/framework classes, not for arbitrary app classes.
-                    // This prevents masking real errors in user code.
-                    let is_framework_class = class_name_for_jfr.starts_with("java/")
-                        || class_name_for_jfr.starts_with("jdk/")
-                        || class_name_for_jfr.starts_with("sun/")
-                        || class_name_for_jfr.starts_with("javax/")
-                        || class_name_for_jfr.starts_with("org/jboss/")
-                        || class_name_for_jfr.starts_with("io/quarkus/")
-                        || class_name_for_jfr.starts_with("org/wildfly/")
-                        || class_name_for_jfr.starts_with("io/smallrye/")
-                        // Spring Boot launcher classes (loader package). Do not
-                        // swallow `JarFileArchive*` <clinit> failures: partial init
-                        // (e.g. bad `PosixFilePermissions.asFileAttribute`) surfaces
-                        // later as `ClassCastException` in `Launcher.createClassLoader`.
-                        || (class_name_for_jfr.starts_with("org/springframework/boot/loader/")
-                            && !class_name_for_jfr.contains("JarFileArchive"))
-                        // SLF4J/logback impl classes whose <clinit> wires up an
-                        // entire logging backend (logback Joran XML config,
-                        // ContextSelectorStaticBinder, status printer, etc.)
-                        // that touches many partial-real-JDK paths. The
-                        // CratonVM `register_slf4j_binder_stubs_pub` natives
-                        // (vm_init.rs) already provide synthetic singletons
-                        // for `getSingleton()` / `getLoggerFactory()` / the
-                        // MDC and Marker binders, so a failed real <clinit>
-                        // is harmless: SLF4J's `LoggerFactory.bind()` only
-                        // calls `StaticLoggerBinder.getSingleton()`, which
-                        // routes through our native and never reads the
-                        // half-initialized `SINGLETON` static. Without this,
-                        // Spring Boot fat-jars bundling logback fail with a
-                        // NoClassDefFoundError at the linkage of the
-                        // getSingleton invokestatic, even though the class
-                        // is correctly extracted from BOOT-INF/lib.
-                        || class_name_for_jfr.starts_with("org/slf4j/impl/")
-                        || class_name_for_jfr.starts_with("ch/qos/logback/")
-                        || class_name_for_jfr.starts_with("com/sun/");
-                    is_swallowable_type && is_framework_class
+                    // NARROWED (2026-06-17): the swallow is now gated on
+                    // `clinit_swallow_has_recovery` — the explicit list of
+                    // classes/packages that have a documented recovery path
+                    // (a `post_clinit_fixup` arm, or the SLF4J/logback native
+                    // binder stubs). The previous broad prefix allowlist
+                    // (`java/`, `jdk/`, `sun/`, `javax/`, `org/jboss/`,
+                    // `io/quarkus/`, `org/wildfly/`, `io/smallrye/`,
+                    // `org/springframework/boot/loader/`, `com/sun/`, …)
+                    // swallowed for EVERY framework class on a "non-critical"
+                    // exception even when nothing repaired the
+                    // half-initialized statics, hiding real init bugs behind a
+                    // stamped-`Initialized` class with null statics that
+                    // surfaced later as a bare NPE far from the cause. See
+                    // `clinit_swallow_has_recovery` for the retained cases and
+                    // the rationale for each.
+                    let has_recovery = clinit_swallow_has_recovery(&class_name_for_jfr);
+                    is_swallowable_type && has_recovery
                 } else {
-                    matches!(&e,
+                    // NARROWED (2026-06-17): the internal-error swallow path
+                    // (ClassCast/IllegalState/NPE/NotImplemented raised as a
+                    // VM-internal `RuntimeError`, not a thrown Java exception)
+                    // previously swallowed for ANY class — including arbitrary
+                    // app classes — leaving them stamped `Initialized` with
+                    // null statics. Gate it on the same `clinit_swallow_has_recovery`
+                    // allowlist as the thrown-exception branch so only classes
+                    // with a documented recovery path are tolerated.
+                    let is_swallowable_internal = matches!(&e,
                         MethodCallFailed::InternalError(VmError::Runtime(
                             RuntimeError::ClassCastException { .. }
                         )) | MethodCallFailed::InternalError(VmError::Runtime(
@@ -1004,7 +1088,8 @@ fn initialize_class_shared(
                         )) | MethodCallFailed::InternalError(VmError::Runtime(
                             RuntimeError::NotImplemented { .. }
                         ))
-                    )
+                    );
+                    is_swallowable_internal && clinit_swallow_has_recovery(&class_name_for_jfr)
                 };
                 // JVMS §5.5 default: a failing `<clinit>` is *not* swallowed —
                 // the class becomes Erroneous and the failure propagates (see
@@ -1131,6 +1216,32 @@ fn initialize_class_shared(
                     post_clinit_fixup(shared, class_id, &class_name_for_jfr);
 
                     return Ok(());
+                }
+                // Debug-gated visibility (2026-06-17): lenient mode is ON but
+                // the swallow was DECLINED — either the class has no documented
+                // recovery path (`clinit_swallow_has_recovery` == false) or the
+                // exception type is genuinely critical (StackOverflowError,
+                // OutOfMemoryError, …, not on the recoverable list). Name the
+                // class + exception type so a previously-hidden init bug is now
+                // visible at its true origin instead of vanishing behind a
+                // stamped-`Initialized` class. The failure then propagates per
+                // JVMS §5.5 below. Gated on `CRATONVM_STRICT_SWALLOWS=1` to keep
+                // the default lenient run quiet.
+                if lenient_clinit() && crate::runtime::env_cache::strict_swallows() {
+                    let exc_ty = match &e {
+                        MethodCallFailed::ExceptionThrown(exc_ref) => {
+                            let eid = shared.heap.class_id_of(*exc_ref);
+                            shared.class_manager.read()
+                                .get_class(eid)
+                                .map(|c| c.name.to_string())
+                                .unwrap_or_else(|| format!("class_id={}", eid.as_u32()))
+                        }
+                        other => format!("{:?}", other),
+                    };
+                    eprintln!(
+                        "CRATONVM_LENIENT_CLINIT: NOT swallowing <clinit> failure (no recovery path / critical exception) — class={} exc={} — propagating per JVMS §5.5",
+                        class_name_for_jfr, exc_ty
+                    );
                 }
                 finalize_init(shared, class_id, ClassState::InitializationError);
                 // JVM spec В§5.5: If the exception is an Error (or subclass),
@@ -3004,6 +3115,71 @@ mod tests {
             assert!(
                 !lenient_clinit(),
                 "lenient <clinit> swallow must be OFF unless CRATONVM_LENIENT_CLINIT=1"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Narrowed lenient-swallow allowlist (`clinit_swallow_has_recovery`).
+    //
+    // The swallow must be tolerated ONLY for classes with a documented
+    // recovery path (a `post_clinit_fixup` arm or the SLF4J/logback native
+    // binder stubs) — not for the old broad framework prefix allowlist that
+    // hid real init bugs behind a stamped-`Initialized` class.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn clinit_swallow_recovery_admits_documented_cases() {
+        // Each of these has an explicit `post_clinit_fixup` match arm.
+        for cls in [
+            "java/util/logging/LogManager",
+            "jdk/internal/icu/text/NormalizerBase$NFCModeImpl",
+            "java/lang/invoke/VarHandleInts$Array",
+            "java/lang/invoke/VarHandleReferences$Array",
+            "io/quarkus/bootstrap/logging/InitialConfigurator",
+            "org/jboss/modules/DefaultBootModuleLoaderHolder",
+            "java/math/BigInteger",
+            "java/math/BigDecimal",
+            "java/nio/file/attribute/PosixFilePermission",
+            "org/springframework/core/metrics/ApplicationStartup",
+            "org/jboss/msc/service/ServiceContainerImpl",
+            "org/jboss/msc/service/ServiceLogger",
+            "org/wildfly/security/auth/server/_private/ElytronMessages",
+        ] {
+            assert!(
+                clinit_swallow_has_recovery(cls),
+                "{cls} has a post_clinit_fixup recovery arm and must stay swallowable",
+            );
+        }
+        // SLF4J/logback binder packages — recovered by native binder stubs.
+        assert!(clinit_swallow_has_recovery("org/slf4j/impl/StaticLoggerBinder"));
+        assert!(clinit_swallow_has_recovery("ch/qos/logback/classic/util/ContextSelectorStaticBinder"));
+    }
+
+    #[test]
+    fn clinit_swallow_recovery_rejects_unrecovered_classes() {
+        // These matched the OLD broad prefix allowlist (java/ jdk/ sun/ javax/
+        // org/jboss/ io/quarkus/ org/wildfly/ com/sun/ org/springframework/boot/loader/)
+        // but have NO recovery path. They must now propagate per JVMS §5.5
+        // instead of being silently stamped Initialized with null statics.
+        for cls in [
+            "java/util/HashMap",
+            "jdk/internal/misc/Unsafe",
+            "sun/security/provider/Sun",
+            "javax/crypto/Cipher",
+            "org/jboss/modules/Module",
+            "io/quarkus/runtime/Application",
+            "org/wildfly/common/Assert",
+            "com/sun/crypto/provider/SunJCE",
+            "org/springframework/boot/loader/jar/JarFileArchive",
+            // Arbitrary app classes were never in the old allowlist and must
+            // stay rejected.
+            "com/example/MyService",
+            "org/apache/catalina/startup/Catalina",
+        ] {
+            assert!(
+                !clinit_swallow_has_recovery(cls),
+                "{cls} has no recovery path and must NOT be swallowed",
             );
         }
     }

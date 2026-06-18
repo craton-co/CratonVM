@@ -427,6 +427,42 @@ fn verify_method(
                     ),
                 });
             }
+
+            // SECURITY FIX (cl-verifier): forward-edge type-state merge at the
+            // BRANCH SITE. The linear-walk's fall-through check (above, where a
+            // declared-frame PC is reached) only validates assignability when
+            // control fell through into that PC (`verified == true`). A PC that
+            // is reachable ONLY via a branch — i.e. the instruction preceding it
+            // does not fall through, so `verified` is `false` there — would have
+            // its declared frame ADOPTED BLINDLY without ever confirming that the
+            // type-state arriving along the branch edge is assignable to that
+            // declared frame. That is a type-confusion hole (a permissive
+            // verifier is a security hole): an attacker could branch into a PC
+            // with an incompatible operand-stack / local layout and have the
+            // verifier silently accept the declared frame.
+            //
+            // JVMS §4.10.1 requires every forward edge into a target to be
+            // checked against the target's declared frame (standard data-flow
+            // merge). So here, at each branch source, if the target carries a
+            // declared StackMapTable frame, verify the CURRENT frame (the
+            // type-state leaving this instruction) is assignable to the target's
+            // declared frame — independent of the fall-through `verified` flag.
+            // `is_assignable_to` already tolerates the declared frame being
+            // compact (fewer locals than max_locals); it only compares up to the
+            // target's declared length, exactly as the fall-through site does.
+            if let Some(target_frame) = declared_frames.get(&target) {
+                if !current_frame.is_assignable_to(target_frame, hierarchy) {
+                    return Err(LinkageError::VerifyError {
+                        class_name: class_name.to_string(),
+                        method_name: method.name.to_string(),
+                        message: format!(
+                            "frame mismatch on branch to offset {target}: \
+                             current frame is not assignable to the declared \
+                             StackMapTable frame at the branch target"
+                        ),
+                    });
+                }
+            }
         }
 
         verified = result.falls_through;
@@ -2094,6 +2130,61 @@ mod tests {
             m1_stackmap_frame_at_5(),
         );
         assert!(verify_bytecode_strict(&class, &MockHierarchy).is_err());
+    }
+
+    // =======================================================================
+    // cl-verifier — forward-edge type-state merge at the BRANCH SITE.
+    //
+    // Regression for the branch-only-target type-confusion hole: when a PC is
+    // reachable ONLY via a branch (the preceding instruction does not fall
+    // through, so the linear walk's `verified` flag is `false` at that PC), the
+    // declared StackMapTable frame at that PC was previously ADOPTED BLINDLY —
+    // the fall-through assignability check (`if verified && !is_assignable_to`)
+    // was skipped. The fix checks `current_frame.is_assignable_to(target_frame)`
+    // at every branch source, independent of `verified`. Here the branch target
+    // (offset 6) DOES declare a frame, so the old "missing frame" rejection does
+    // NOT apply; only the new forward-edge merge catches the inconsistency.
+    // =======================================================================
+
+    /// Branch-only target whose declared frame is INCOMPATIBLE with the
+    /// type-state arriving along the branch edge. The `goto` at offset 0 leaves
+    /// an empty operand stack, but the declared full_frame at offset 6 says the
+    /// stack holds one int. A spec-compliant verifier rejects this forward edge
+    /// (stack-depth / type mismatch); the pre-fix linear walk adopted the
+    /// declared frame blindly because the target is reached only by branch.
+    #[test]
+    fn cl_verifier_branch_site_incompatible_declared_frame_rejected() {
+        //   0: goto +6   (0xa7 0x00 0x06)  → branch target = offset 6 (branch-only)
+        //   3: nop        (0x00)
+        //   4: nop        (0x00)
+        //   5: nop        (0x00)
+        //   6: pop        (0x57)           ← target, declared frame says stack=[int]
+        //   7: return     (0xb1)
+        let code = vec![0xa7, 0x00, 0x06, 0x00, 0x00, 0x00, 0x57, 0xb1];
+        // StackMapTable: number_of_entries=1, then full_frame (tag 255) at
+        // offset_delta=6 with 0 locals and 1 stack item = ITEM_INTEGER (1).
+        let stack_map_bytes = vec![
+            0x00, 0x01, // number_of_entries = 1
+            0xFF, // full_frame
+            0x00, 0x06, // offset_delta = 6 → absolute offset 6
+            0x00, 0x00, // number_of_locals = 0
+            0x00, 0x01, // number_of_stack_items = 1
+            0x01, // ITEM_INTEGER
+        ];
+        let class = make_class_with_stackmap(
+            ClassFileVersion::JAVA_8,
+            "()V",
+            1,
+            1,
+            code,
+            stack_map_bytes,
+        );
+        let res = verify_bytecode(&class, &MockHierarchy);
+        assert!(
+            res.is_err(),
+            "branch to a target whose declared frame is not assignable from the \
+             branch-site type-state must be rejected, got {res:?}"
+        );
     }
 
     // =======================================================================

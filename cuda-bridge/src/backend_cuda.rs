@@ -376,45 +376,71 @@ impl DeviceModuleInner {
         args: KernelArgs,
         needs_d2h_sync: bool,
     ) -> Result<()> {
-        // AUDIT 2026-05-24 (C32 stream-port fix): before the launch,
-        // make the compute stream wait on `e_h2d`. If a recent
-        // `from_host_async` (or `from_host`) recorded the event, this
-        // orders the kernel correctly behind the upload without
-        // host-blocking. If no upload was ever issued, the wait is a
-        // cheap no-op (cuStreamWaitEvent on a never-recorded event
-        // returns immediately).
+        // BUGFIX 2026-06-17 (cuda-backend H10b input-side analogue):
+        // snapshot the device-ptr args' `last_write` slots BEFORE the
+        // launch consumes `args`. We need these for TWO purposes:
+        //   (a) the per-buffer INPUT wait below (gate the compute stream
+        //       behind each input's upload/producing-kernel event), and
+        //   (b) stamping THIS launch's kernel-completion event back into
+        //       each slot afterward (the H10b output-side fix).
+        // The snapshot is now UNCONDITIONAL: even a fire-and-forget
+        // launch (`needs_d2h_sync == false`) must still order behind its
+        // inputs' uploads, so the input wait cannot be gated on the
+        // output-sync flag. Only the post-launch write-back (b) remains
+        // gated on `needs_d2h_sync`.
+        let last_write_slots: Vec<crate::LastWriteSlot> = args
+            .raw
+            .iter()
+            .filter_map(|a| match a {
+                KernelArg::DevicePtr { last_write, .. } => Some(last_write.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // BUGFIX 2026-06-17 (cuda-backend): wait on each input buffer's
+        // PER-BUFFER `last_write` event instead of the context-wide
+        // singleton `e_h2d` barrier.
         //
-        // The fact that `e_h2d` records the *most recent* upload is
-        // important: a `from_host_async` that ran on a different user
-        // stream's behalf still routes through `copy_h2d`, so the
-        // compute stream picks up the dependency uniformly.
-        unsafe {
-            cudarc::driver::result::stream::wait_event(
-                ctx.compute.stream,
-                ctx.barriers.e_h2d,
-                cudarc::driver::sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
-            )
-            .map_err(map_err("cuStreamWaitEvent compute←e_h2d"))?;
+        // The old code (AUDIT 2026-05-24, C32) made the compute stream
+        // wait on `ctx.barriers.e_h2d`, a single context-shared event
+        // that `from_host`/`from_host_async` re-record on EVERY upload
+        // (see `upload_via_copy_h2d_stream`, ~line 692). Under concurrent
+        // use that singleton races: thread A uploads buffer X and records
+        // `e_h2d`, thread B then uploads buffer Y and clobbers `e_h2d`
+        // before A's launch issues its `wait_event` — so A's launch waits
+        // on Y's upload, not X's, and may run before X's upload completes
+        // (reading stale/partial device memory). This is the input-side
+        // twin of the already-fixed H10b output-side bug.
+        //
+        // FIX: mirror `launch_on_stream` (launch.rs §2) — gate the
+        // compute stream behind EACH device-ptr arg's own `last_write`
+        // event, which was recorded on the stream that actually produced
+        // that buffer's contents (its upload, or an earlier kernel). A
+        // never-written buffer has `None` and is skipped. Snapshotting the
+        // event under the mutex avoids holding the lock across the FFI
+        // `wait_event` call.
+        for slot in &last_write_slots {
+            let maybe_ev = slot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+                .cloned();
+            if let Some(ev) = maybe_ev {
+                // SAFETY: `ev` is an `Arc<Event>` cloned out of the slot
+                // and kept alive for this iteration; `cu_event_raw()` only
+                // borrows its handle for the FFI call, and `compute.stream`
+                // is owned by `ctx`. `cuStreamWaitEvent` records a wait op
+                // on the compute stream and returns immediately.
+                unsafe {
+                    cudarc::driver::result::stream::wait_event(
+                        ctx.compute.stream,
+                        ev.cu_event_raw(),
+                        cudarc::driver::sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+                    )
+                    .map_err(map_err("cuStreamWaitEvent compute←last_write"))?;
+                }
+            }
         }
-        // AUDIT 2026-05-29 (H10b fix — per-buffer events): snapshot the
-        // device-ptr args' `last_write` slots BEFORE the launch consumes
-        // `args`, so we can stamp this launch's per-buffer
-        // kernel-completion event into each one afterward. A subsequent
-        // sync `to_host` on any of these buffers then waits on THIS
-        // launch's event (recorded on `compute`) rather than the shared
-        // `e_k`, which a concurrent launch on another buffer could
-        // clobber.
-        let last_write_slots: Vec<crate::LastWriteSlot> = if needs_d2h_sync {
-            args.raw
-                .iter()
-                .filter_map(|a| match a {
-                    KernelArg::DevicePtr { last_write, .. } => Some(last_write.clone()),
-                    _ => None,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
         self.launch_raw_on_stream_inner(&ctx.compute, kernel, cfg, args)?;
         // AUDIT 2026-05-17 (PERF Fix 1): after the launch is submitted,
         // record the post-kernel event so a subsequent D→H copy can wait
@@ -459,10 +485,21 @@ impl DeviceModuleInner {
         // an Arc bump, not a new driver context.
         let ctx_pub = crate::DeviceContext::from_inner(ctx.clone());
         let event = crate::Event::new(&ctx_pub)?;
+        // BUGFIX 2026-06-17 (cuda-backend SOUND): explicitly bind the
+        // primary context to THIS thread before `cuEventRecord`. The
+        // `unsafe impl Send + Sync` across the bridge is sound only when
+        // the driving thread has bound the device first; `Event::new`
+        // happens to bind during creation, but relying on that side
+        // effect is fragile — make the invariant local and self-evident
+        // at the record site. `bind_to_thread` is a cheap per-thread TLS
+        // check (no-op when already bound).
+        ctx.bind_to_thread()?;
         // SAFETY: the event is owned by `event` for the rest of this
         // call (and beyond, via the returned value); `compute.stream` is
         // owned by `ctx`. `cuEventRecord` borrows both only for the FFI
-        // call.
+        // call. The `bind_to_thread` above ensures this thread drives the
+        // correct primary context, satisfying the bridge's Send/Sync
+        // contract.
         unsafe {
             cudarc::driver::result::event::record(event.cu_event_raw(), ctx.compute.stream)
                 .map_err(map_err("cuEventRecord kernel_done (compute)"))?;

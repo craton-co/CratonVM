@@ -774,17 +774,38 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+thread_local! {
+    /// PERF: cache the derived OS thread id per thread. The id is stable for
+    /// the lifetime of the thread, so we compute the SipHash digest of
+    /// `ThreadId` once (lazily on first access) and reuse it thereafter.
+    /// This removes a fresh `DefaultHasher` (SipHash) computation from every
+    /// hot-path call in `run_io_loop`/`dispatch`. `Cell<u64>` with a 0
+    /// sentinel keeps the fast path branch-light; `ThreadId`'s hash never
+    /// collides with a real-thread value of exactly 0 in practice, and even
+    /// if it did the only cost is recomputing the same (stable) value.
+    static OS_TID_CACHE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Process-wide OS thread id, stable for the lifetime of the thread.
 /// We derive it from `thread::current().id()` because `std::thread::ThreadId`
 /// is Windows/Linux portable, whereas `libc::pthread_self` is not.
 fn os_tid() -> u64 {
-    // `ThreadId` is an opaque wrapper around a u64; transmute-via-hash
-    // turns it into a stable u64. Hasher + Hash is defined for ThreadId.
-    use std::hash::{Hash, Hasher};
-    let tid = thread::current().id();
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    tid.hash(&mut h);
-    h.finish()
+    // PERF: read the per-thread cached id; only hash on first access.
+    OS_TID_CACHE.with(|cache| {
+        let cached = cache.get();
+        if cached != 0 {
+            return cached;
+        }
+        // `ThreadId` is an opaque wrapper around a u64; transmute-via-hash
+        // turns it into a stable u64. Hasher + Hash is defined for ThreadId.
+        use std::hash::{Hash, Hasher};
+        let tid = thread::current().id();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        tid.hash(&mut h);
+        let id = h.finish();
+        cache.set(id);
+        id
+    })
 }
 
 // ---------------------------------------------------------------------------

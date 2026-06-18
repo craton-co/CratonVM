@@ -635,6 +635,28 @@ fn native_string_get_bytes_charset(
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
+    // FIX (charset-nb, MEDIUM): refuse to silently produce wrong bytes for a
+    // charset the transcoding engine cannot actually encode. Previously this
+    // dropped straight into `encode_with_charset` → `encode_chars_lossy`, which
+    // for an unsupported canonical name (e.g. "Shift_JIS", "EUC-JP") falls back
+    // to a Latin-1 / byte-identity substitution — emitting plausible-looking but
+    // SEMANTICALLY WRONG bytes with no error. `String.getBytes(Charset)` takes a
+    // already-constructed `Charset` object and is NOT declared to throw a checked
+    // exception, so we surface the VM's limitation as an unchecked
+    // `UnsupportedOperationException` rather than misencoding. Charsets the engine
+    // genuinely supports (UTF-*, ISO-8859-*, US-ASCII, windows-125x, KOI8-R)
+    // continue to encode correctly through the normal path below.
+    let canon = charset_name_of(ctx, Value::Object(Some(charset_ref)));
+    if !engine_supports(&canon) {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: format!(
+                "charset \"{}\" is not supported by this VM's transcoding engine \
+                 (String.getBytes(Charset) would otherwise emit incorrect bytes)",
+                canon
+            ),
+        }
+        .into());
+    }
     let chars: Vec<u16> = val.encode_utf16().collect();
     let bytes = encode_with_charset(ctx, charset_ref, &chars);
     let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
@@ -883,5 +905,54 @@ mod tests {
         assert_eq!(normalize_charset_name("Shift_JIS"), "Shift_JIS");
         assert!(!engine_supports("Shift_JIS"));
         assert!(!engine_supports("EUC-JP"));
+    }
+
+    #[test]
+    fn get_bytes_charset_supported_encodes_correctly() {
+        // The supported-charset path must still produce real bytes. "A©" in
+        // ISO-8859-1 = [0x41, 0xE9-ish]; use a code point representable in
+        // Latin-1 to confirm the requested charset (not UTF-8) is honoured.
+        let mut ctx = mock_ctx();
+        let cs = make_charset(&mut ctx, "ISO-8859-1");
+        let this = ctx.create_string("A\u{00A9}");
+        let r = native_string_get_bytes_charset(
+            &mut ctx,
+            &[Value::Object(Some(this)), Value::Object(Some(cs))],
+        )
+        .expect("supported charset must not error");
+        let arr = match r {
+            Some(Value::Object(Some(a))) => a,
+            other => panic!("expected byte[] result, got {:?}", other),
+        };
+        // 'A' = 0x41, '©' (U+00A9) = 0xA9 in Latin-1 (single byte, not the
+        // 2-byte 0xC2 0xA9 a UTF-8 fallback would emit).
+        assert_eq!(ctx.array_length(arr), 2);
+        assert_eq!(ctx.get_array_element(arr, 0).as_int(), Some(0x41));
+        assert_eq!(ctx.get_array_element(arr, 1).as_int(), Some(0xA9u8 as i8 as i32));
+    }
+
+    #[test]
+    fn get_bytes_charset_unsupported_throws_instead_of_latin1() {
+        // FIX (charset-nb): `String.getBytes(Charset)` for an unsupported
+        // charset must FAIL LOUD rather than silently substitute Latin-1 bytes.
+        let mut ctx = mock_ctx();
+        let cs = make_charset(&mut ctx, "Shift_JIS");
+        let this = ctx.create_string("hello");
+        let err = native_string_get_bytes_charset(
+            &mut ctx,
+            &[Value::Object(Some(this)), Value::Object(Some(cs))],
+        )
+        .expect_err("unsupported charset must surface an error, not Latin-1 bytes");
+        // It must be the UnsupportedOperationException we raise, mentioning the
+        // offending charset name — not a silently-wrong byte array.
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("UnsupportedOperationException"),
+            "expected UnsupportedOperationException, got: {msg}"
+        );
+        assert!(
+            msg.contains("Shift_JIS"),
+            "error should name the unsupported charset, got: {msg}"
+        );
     }
 }
