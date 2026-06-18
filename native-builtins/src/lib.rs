@@ -1921,8 +1921,10 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(r))) => r,
                 _ => return Ok(None),
             };
-            ctx.invoke_virtual(runnable, "run", "()V", &[])?;
-            Ok(None)
+            // Bug D: run on a real daemon thread, not inline, so blocking tasks
+            // (start-gate latches, CompletableFuture.get) don't deadlock the
+            // submitter. See `spawn_runnable_on_real_thread`.
+            spawn_runnable_on_real_thread(ctx, runnable)
         },
     );
     registry.register(
@@ -27547,6 +27549,109 @@ fn native_es_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         let _ = ctx.invoke_virtual(*runnable, "run", "()V", &[]);
     }
     Ok(None)
+}
+
+/// Process-wide singleton async worker pool (Bug D). Stored as a raw `ObjectRef`
+/// and kept alive across calls + GC via `register_var_handle_root` — the same
+/// long-lived-native-singleton pattern used for `SYSTEM_CL` / `SECURITY_MANAGER`
+/// (a `pin_native_root` handle is NOT usable here: that is a transient per-thread
+/// pin stack cleared after each native call, not a persistent root).
+static ASYNC_POOL: std::sync::Mutex<Option<ObjectRef>> = std::sync::Mutex::new(None);
+
+/// Bug D (kafka-suite-0617) — submit a `Runnable` to a real, **bounded** pool of
+/// Java worker threads instead of running it inline on the calling thread.
+///
+/// The historical eager-inline policy (`runnable.run()` on the caller) was a
+/// stopgap because CratonVM's *Rust* ForkJoinPool workers cannot run Java
+/// bytecode. But it **deadlocks** whenever the submitted task blocks waiting for
+/// a signal the *submitting* thread sends later — the canonical case is a
+/// start-gate `CountDownLatch.await()` (the submitter `countDown()`s only after
+/// submitting), and any `CompletableFuture.*Async` stage whose completer is the
+/// submitter. The whole Kafka consumer/producer `internals` TIMEOUT cluster is
+/// this pattern.
+///
+/// A naive "spawn one real thread per task" fix trades deadlock for **thread
+/// explosion** (RecordHeadersTest spawned ~477 OS threads → starvation). The
+/// robust fix mirrors HotSpot's common pool: a single bounded
+/// `ThreadPoolExecutor` (cached-style — grows on demand to a cap, reuses idle
+/// workers, retires them after a keep-alive so the VM still exits cleanly past
+/// `main()` without daemon threads). `submit()` on a *real* TPE runs real JDK
+/// bytecode on a real worker thread (only the synthetic-executor stubs and the
+/// force-gated `ForkJoinPool.execute` are intercepted), so blocking tasks park a
+/// worker while the submitter stays free.
+///
+/// This covers the executor-`execute(Runnable)` path only; the recursive
+/// `ForkJoinTask.fork/invoke/submit(ForkJoinTask)` compute path stays
+/// eager-inline (CPU-bound, must not spawn threads). If the pool can't be
+/// created we fall back to inline so the completion contract still holds.
+pub(crate) fn spawn_runnable_on_real_thread(
+    ctx: &mut dyn NativeContext,
+    runnable: ObjectRef,
+) -> MethodCallResult {
+    if let Some(pool) = async_worker_pool(ctx) {
+        // submit() on a real ThreadPoolExecutor runs real bytecode → real worker.
+        ctx.invoke_virtual(
+            pool,
+            "submit",
+            "(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;",
+            &[Value::Object(Some(runnable))],
+        )?;
+        return Ok(None);
+    }
+    // Fallback: pool creation failed — preserve the completion contract inline.
+    ctx.invoke_virtual(runnable, "run", "()V", &[])?;
+    Ok(None)
+}
+
+/// Get-or-create the singleton bounded async worker pool. Returns `None` if the
+/// pool could not be constructed (caller then falls back to inline execution).
+fn async_worker_pool(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    if let Some(p) = *ASYNC_POOL.lock().unwrap_or_else(|e| e.into_inner()) {
+        return Some(p);
+    }
+    // Construct OUTSIDE the lock (the re-entrant <init> calls must not hold it):
+    //   new ThreadPoolExecutor(0, 256, 10, SECONDS, new SynchronousQueue())
+    // Cached-style: grows on demand to 256, reuses idle workers, retires them
+    // after 10s idle so no lingering thread keeps the VM alive past main().
+    let tu_cid = ctx
+        .ensure_class_initialized("java/util/concurrent/TimeUnit")
+        .ok()?;
+    let seconds_idx = ctx.static_field_index_by_name(tu_cid, "SECONDS")?;
+    let seconds = ctx.get_static_field(tu_cid, seconds_idx);
+    let queue = match ctx
+        .new_object_initialized("java/util/concurrent/SynchronousQueue", "()V", &[])
+        .ok()?
+    {
+        Some(Value::Object(Some(q))) => q,
+        _ => return None,
+    };
+    let pool = match ctx
+        .new_object_initialized(
+            "java/util/concurrent/ThreadPoolExecutor",
+            "(IIJLjava/util/concurrent/TimeUnit;Ljava/util/concurrent/BlockingQueue;)V",
+            &[
+                Value::Int(0),
+                Value::Int(256),
+                Value::Long(10),
+                seconds,
+                Value::Object(Some(queue)),
+            ],
+        )
+        .ok()?
+    {
+        Some(Value::Object(Some(p))) => p,
+        _ => return None,
+    };
+    // Keep alive + remap across GC moves (same as SYSTEM_CL / VarHandle roots).
+    ctx.register_var_handle_root(pool);
+    let mut guard = ASYNC_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = *guard {
+        // A racing creator already installed one; use it (ours is orphaned but
+        // harmless — core=0 means it has no live worker threads yet).
+        return Some(existing);
+    }
+    *guard = Some(pool);
+    Some(pool)
 }
 
 /// Interrupt every worker thread of a (possibly delegate-wrapped) REAL
