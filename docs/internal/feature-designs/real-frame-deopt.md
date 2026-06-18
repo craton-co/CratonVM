@@ -75,6 +75,11 @@ machine-state → frame plumbing and the actual mid-method resume.
 So today: data types exist, codegen emits none of them, resume is "re-run from
 bci 0".
 
+> **Next:** the production backport is scoped in
+> [`real-frame-deopt-x64-backport.md`](real-frame-deopt-x64-backport.md) — bring
+> this mechanism to the single-pass `x64.rs` backend (which has regalloc, real VM
+> dispatch, and the precise-oop-map safepoint infra) so it deopts real workloads.
+
 ## Progress — Phase A foundation landed on the IR path (2026-06-18)
 
 Branch `feat/real-frame-deopt-phaseA`. Steps 1–3 of the plan below are
