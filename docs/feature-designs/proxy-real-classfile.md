@@ -277,6 +277,27 @@ same helper (the handler may call `invokeDefault`).
 
 ### Remaining (next increments)
 
-- **Raise the real JDK exception** instead of degrading on a genuine define
-  failure with the gate on (design §3), then delete the `Proxy$Instance` shim
-  and the three name-keyed intercepts.
+- Flip `CRATONVM_REAL_PROXY_STRICT` to the default once the reflection suites
+  soak clean, then **delete** the `Proxy$Instance` shim and the three name-keyed
+  intercepts (the soak-gated remainder of §3).
+
+## Increment 3 — stop the silent degrade, STRICT mode (landed)
+
+Design §3, first half. A genuine proxy-class generation failure no longer
+*always* masquerades as a working synthetic shim.
+
+- `define_or_get_proxy_class` now returns a `ProxyClassOutcome` enum that
+  distinguishes the intended gate-off `Degrade` (use the shim) from a concrete
+  `Failed(stage)` (spec / emit / define) — previously both collapsed to `None`.
+- New gate `real_proxy_strict()` (`CRATONVM_REAL_PROXY_STRICT`, **default OFF**).
+  When ON, `native_proxy_new_instance` surfaces a `Failed` outcome as the real
+  JDK `IllegalArgumentException` (built via `throw_proxy_failure` →
+  `ensure_class_initialized` + `<init>(String)` + `Err(ExceptionThrown)`),
+  matching `Proxy.newProxyInstance`. When OFF (default), the synthetic shim
+  safety net is unchanged, so no default-path regression.
+- Gated default-off (not flipped) because the degrade is currently a safety net
+  on the canonical gate-on path; flipping it changes default behaviour and waits
+  on the reflection-suite soak. Deleting the shim outright is the follow-up.
+- Test: `proxy_strict_gate_tests::real_proxy_strict_defaults_off` (the throw path
+  itself needs a live VM; exercised by the suites under
+  `CRATONVM_REAL_PROXY_STRICT=1`).
