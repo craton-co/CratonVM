@@ -1,7 +1,17 @@
 # Intermittent reactor worker-thread leak at client shutdown (RUNNABLE, empty stack)
 
-**Status:** OPEN (intermittent, ~1 in 6–8 runs). Lower-priority follow-up to the
+**Status:** OPEN (intermittent, ~1 in 16 runs — reduced surface, one window closed). Follow-up to the
 `Thread.getState()` fix (commit `16d23e7b`).
+
+## Progress (commit `4064580d`)
+
+One lost-wakeup window was closed: `selector_wakeup()` documented that "the woken flag still gets
+observed at top of select()", but the blocking select paths (`WSAPoll`/`epoll_wait`/`poll`) only
+checked `woken` in the empty-key sleep branch — the normal path went straight into the kernel wait.
+A pre-wait `woken` check (drain + return 0) was added to all three `kernel_select_*` paths, so a
+`wakeup()` that lands *before* `select()` enters the wait is no longer lost. Verified no regression
+(multi-host stays 4/4; NIO connect+selector test green). **The intermittent leak persists at ~1/16**,
+so the dominant cause is a *different* window (below).
 
 ## Context
 
@@ -43,17 +53,27 @@ and the worker blocks in `select()` forever → leaked, uninterruptible, empty-s
 This is in the same selector/reactor machinery touched by the ES-HANG-02 connect fix, but is a
 **shutdown-path wakeup race**, not the connect path.
 
-## Next steps
+## Next steps (remaining ~1/16 leak)
 
-1. Reproduce with a thread dump of the stuck worker (e.g. `--stack-dump-on-timeout`, or a SIGQUIT-
-   style dump) to confirm it is blocked in `Selector.select()` / the kernel wait.
-2. Audit the selector `wakeup()` ↔ `select()` ordering in `native-io/src/nio_selector.rs`: ensure a
-   `wakeup()` that arrives between two `select()` calls is not lost (the wakeup signal must be
-   sticky — a `select()` entered after a pending `wakeup()` must return immediately). Check the
-   Windows UDP-loopback wakeup pair and the Linux self-pipe/eventfd drain logic for a
-   lost-wakeup window.
-3. Verify the reactor's shutdown actually reaches `wakeup()` for every worker (vs. only the first).
-4. Acceptance: `RestClientSingleHostIntegTests` ≥10 consecutive clean runs (no `ThreadLeakError`),
+The before-entry window is closed (`4064580d`); the residual is most likely the **worker already
+inside the kernel wait when `wakeup()` fires** (the UDP-loopback nudge raced/was dropped, so `WSAPoll`
+didn't return) — or the worker is blocked in a *non-select* native (a blocking socket read/accept)
+that no `wakeup()` can interrupt.
+
+1. **Pinpoint the block.** Blocked here by a CratonVM gap: cross-thread `Thread.getStackTrace()`
+   returns an EMPTY stack (randomizedtesting prints `at (empty stack)`), so the leak report doesn't
+   say where the worker is parked. Either (a) add cross-thread stack-walk support, or (b) add gated
+   selector tracing (`CRATONVM_DBG_SELECTOR`): log `tid` on WSAPoll enter/exit and on `wakeup(id)`,
+   run until a leak, and check whether a thread entered `WSAPoll` and never exited despite a
+   `wakeup()` for its selector.
+2. If confirmed in-`WSAPoll`: make the in-flight wakeup reliable — e.g. verify the UDP `wakeup_peer`
+   address/non-blocking receiver, retry the nudge, or switch the Windows wakeup to a mechanism
+   `WSAPoll` can't miss. The `woken` flag is now also re-checked after the poll (Phase 3), so the
+   gap is purely *interrupting an in-progress* `WSAPoll`.
+3. If blocked in a non-select native: that worker loop needs an interruptible wait or a
+   close-driven unblock.
+4. Verify the reactor's shutdown reaches `wakeup()` for *every* worker (vs. only the first).
+5. Acceptance: `RestClientSingleHostIntegTests` ≥16 consecutive clean runs (no `ThreadLeakError`),
    no regression to `RestClientMultipleHostsIntegTests` (stays 4/4).
 
 ## Related
