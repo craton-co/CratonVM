@@ -7902,6 +7902,16 @@ fn execute_instruction(
                 ),
             )?;
             let field = resolve_field_ref(shared, current_class_id, *index)?;
+            // Perf: ALL of the per-getfield diagnostic blocks below are gated
+            // behind a SINGLE cached "any field diagnostic enabled" branch, so
+            // the common no-diagnostics case (the overwhelmingly hot path) does
+            // exactly one branch instead of stepping through each individual
+            // gate. Inside, every block still re-checks its own cached gate, so
+            // behaviour is byte-for-byte identical to the original sequence —
+            // including the `CRATONVM_DBG_BADRECV` wild-pointer guard, which is
+            // only ever reachable when its var is set (and `any_field_diag()` is
+            // then `true`). See `env_cache::any_field_diag`.
+            if crate::runtime::env_cache::any_field_diag() {
             if crate::runtime::env_cache::field_addr_dbg() {
                 let field_name = resolve_field_name(shared, current_class_id, *index);
                 if let Some(fname) = field_name.as_deref() {
@@ -7990,6 +8000,7 @@ fn execute_instruction(
                               *index, field_name, field.field_index, field.is_reference, obj_ref.as_ptr(), v);
                 }
             }
+            } // end `if any_field_diag()` — consolidated getfield diagnostics
             // K2 (T10.9.E) — category-2 primitive tag hint.  `ResolvedField`
             // records only is_reference/is_volatile, so we re-read the first
             // byte of the descriptor from the constant pool to choose the
@@ -8195,7 +8206,15 @@ fn execute_instruction(
             // "Cannot write field X because the object is null" family (a JIT'd
             // or misdispatched caller losing the freshly allocated receiver,
             // cf. gap-jit-fastmath-transform-miscompile.md Bug 4).
-            if obj_ref.is_err() && std::env::var_os("CRATONVM_DBG_NULLTHIS").is_some() {
+            // Perf: short-circuit on the consolidated field-diagnostics gate
+            // first (a single cached bool) so the common no-diagnostics path
+            // never even tests `obj_ref.is_err()` for this block. `any_field_diag`
+            // is `true` whenever `CRATONVM_DBG_NULLTHIS` is set, so the inner
+            // var check still selects exactly this block — semantics unchanged.
+            if crate::runtime::env_cache::any_field_diag()
+                && obj_ref.is_err()
+                && std::env::var_os("CRATONVM_DBG_NULLTHIS").is_some()
+            {
                 let field_name = resolve_field_name(shared, current_class_id, *index);
                 let fr0 = &thread.frames[frame_idx];
                 eprintln!(
@@ -8222,6 +8241,15 @@ fn execute_instruction(
                 }
             }
             let obj_ref = obj_ref?;
+            // Perf: ALL of the per-putfield diagnostic blocks below are gated
+            // behind a SINGLE cached "any field diagnostic enabled" branch, so
+            // the common no-diagnostics case (the overwhelmingly hot path) does
+            // exactly one branch instead of stepping through each individual
+            // gate (FIELDADDR, STRAYSTACK, HashtableOfInt, BAOS). Inside, every
+            // block still re-checks its own cached gate, so behaviour is
+            // byte-for-byte identical to the original sequence. See
+            // `env_cache::any_field_diag`.
+            if crate::runtime::env_cache::any_field_diag() {
             // Gated diagnostic (CRATONVM_DBG_FIELDADDR): trace put for specific
             // fields — object address + resolved slot — to localize a write
             // that doesn't reach the read site.
@@ -8311,6 +8339,7 @@ fn execute_instruction(
                     );
                 }
             }
+            } // end `if any_field_diag()` — consolidated putfield diagnostics
             // T17.Δ.4 — JVMTI FieldModification watchpoint.
             {
                 let method_id = synth_method_id(&thread.frames[frame_idx]);

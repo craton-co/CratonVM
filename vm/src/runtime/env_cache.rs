@@ -307,6 +307,37 @@ cached_is_ok!(hashtableofint_trace, "CRATON_HASHTABLEOFINT_TRACE");
 /// Cached.
 cached_is_set!(baos_dbg, "CRATON_BAOS_DBG");
 
+/// Perf: SINGLE consolidated fast-path gate for ALL of the per-field-access
+/// diagnostic blocks in the `Getfield`/`Putfield` opcode handlers (the two
+/// hottest opcodes in object-oriented bytecode). Each individual gate below is
+/// already a cached `OnceLock` bool, but the hot handlers previously branched
+/// through ~4–5 of them in sequence on every single field access. This OR of
+/// every field-diagnostic flag is itself cached once, so the common
+/// no-diagnostics case takes exactly ONE branch (`if any_field_diag()`) instead
+/// of one per gate, and the per-gate checks inside that block are reached only
+/// when at least one diagnostic var is actually set.
+///
+/// Behaviour is identical to checking each gate individually: with no
+/// diagnostic var set this returns `false` and every inner block was a no-op
+/// anyway (including the `CRATONVM_DBG_BADRECV` wild-pointer guard, which only
+/// acts when its own var is set); with any var set this returns `true` and the
+/// inner per-gate checks select exactly the same blocks as before. The two
+/// interpreter-local gates (`CRATONVM_DBG_STRAYSTACK`, `CRATONVM_DBG_NULLTHIS`)
+/// are folded in here too so the single gate covers every field-diagnostic path.
+#[inline]
+pub fn any_field_diag() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        field_addr_dbg()
+            || badrecv_dbg()
+            || hashtableofint_trace()
+            || bd_debug()
+            || baos_dbg()
+            || std::env::var_os("CRATONVM_DBG_STRAYSTACK").is_some()
+            || std::env::var_os("CRATONVM_DBG_NULLTHIS").is_some()
+    })
+}
+
 /// `CRATONVM_DBG_CHARSET=1` — targeted diagnostic for the bare
 /// `NullPointerException: charset` blocker (keycloak26 Picocli /
 /// Hazelcast JAXP-XPath). When set, the `Athrow` opcode handler and

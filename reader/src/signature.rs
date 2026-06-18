@@ -126,6 +126,29 @@ struct SigParser<'a> {
     depth_exceeded: bool,
 }
 
+/// Materialize a parsed identifier byte-slice into an owned `String`.
+///
+/// Perf: the previous body was `String::from_utf8_lossy(bytes).into_owned()`,
+/// which unconditionally walks the slice through `Utf8Chunks` looking for
+/// invalid sequences (so it can substitute U+FFFD) and builds a `Cow` before
+/// the `into_owned` copy. In this parser the input *always* originates from a
+/// `&str` (`SigParser::new` takes `&'a str` and stores `s.as_bytes()`), and
+/// the identifier scanners only ever advance over ASCII bytes, so every slice
+/// handed here is already valid UTF-8 in the overwhelmingly common case.
+/// `str::from_utf8` is a single cheap validation pass with no chunk/Cow
+/// machinery; on success we do exactly one allocation+copy (`to_owned`), the
+/// same as before but without the replacement-scan overhead. We fall back to
+/// the lossy path only on the (here unreachable) malformed-input case so
+/// behavior is byte-for-byte identical to the original on every input,
+/// valid or not.
+#[inline]
+fn slice_to_string(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_owned(),
+        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
 impl<'a> SigParser<'a> {
     fn new(s: &'a str) -> Self {
         SigParser {
@@ -171,7 +194,7 @@ impl<'a> SigParser<'a> {
                 _ => break,
             }
         }
-        String::from_utf8_lossy(&self.input[start..self.pos]).into_owned()
+        slice_to_string(&self.input[start..self.pos])
     }
 
     fn read_class_name(&mut self) -> String {
@@ -184,7 +207,7 @@ impl<'a> SigParser<'a> {
                 }
             }
         }
-        String::from_utf8_lossy(&self.input[start..self.pos]).into_owned()
+        slice_to_string(&self.input[start..self.pos])
     }
 
     /// Parse `<TypeParam+>`.
@@ -487,6 +510,46 @@ impl SignatureCacheInner {
     }
 
     fn insert(&mut self, key: Arc<str>, value: ParsedSignature) {
+        // Perf/correctness: dedup the recency queue on re-insert.
+        //
+        // Previously `order` was unconditionally `push_back`'d on every
+        // insert, even when the key was already present. Re-parsing a hot
+        // signature (e.g. after a `Some(_)` shape-mismatch fall-through, or
+        // a benign concurrent double-parse where two threads miss the probe
+        // and both insert) therefore appended a *duplicate* entry. Two bad
+        // effects followed:
+        //   1. `order.len()` grew without bound past `map.len()`, so the
+        //      `map.len() >= CAP` eviction trigger and the queue drifted out
+        //      of lockstep — the queue could hold thousands of stale handles
+        //      for keys still live in the map (memory the FIFO never reclaims
+        //      until the key is finally evicted), and
+        //   2. eviction popped the *oldest* occurrence of a key that may have
+        //      been re-inserted (and is therefore still hot), evicting a live
+        //      entry while a duplicate of it lingered deeper in the queue.
+        //
+        // Fix: if the key already lives in the map, this is a value refresh —
+        // move its single recency slot to the back instead of appending a new
+        // one. The map keeps exactly one entry per key and `order` keeps
+        // exactly one slot per key, so `order.len() == map.len()` always and
+        // eviction can never drop a key that was just touched.
+        if self.map.contains_key(&key) {
+            // Refresh: relocate the existing recency slot to the back. The
+            // queue holds one slot per live key, so there is at most one match
+            // to remove. Compare by string *content*, not pointer: the map is
+            // keyed by content, so a re-insert may arrive via a different
+            // `Arc<str>` allocation carrying the same signature bytes (e.g. a
+            // distinct constant-pool entry). Matching on content guarantees we
+            // always find — and remove — the stale slot, never leaving a
+            // duplicate behind. Linear scan, but the cache is small and
+            // re-inserts of an already-present key are the cold path (a true
+            // hit short-circuits before `insert` is ever called).
+            if let Some(idx) = self.order.iter().position(|k| **k == *key) {
+                self.order.remove(idx);
+            }
+            self.order.push_back(Arc::clone(&key));
+            self.map.insert(key, value);
+            return;
+        }
         if self.map.len() >= SIGNATURE_CACHE_CAP {
             if let Some(victim) = self.order.pop_front() {
                 self.map.remove(&victim);
@@ -719,6 +782,38 @@ mod tests {
         assert!(
             parse_field_signature_cached(&key).is_none(),
             "cached path must remember the Invalid verdict"
+        );
+    }
+
+    #[test]
+    fn reinsert_keeps_order_and_map_in_lockstep() {
+        // Regression for the LRU dedup fix: re-inserting an already-present
+        // key must REFRESH its single recency slot, never append a duplicate.
+        // Otherwise `order.len()` drifts past `map.len()` and eviction can
+        // drop a still-hot key.
+        let mut cache = SignatureCacheInner::new();
+        let k: Arc<str> = Arc::from("Ldedup/Marker;");
+
+        cache.insert(Arc::clone(&k), ParsedSignature::Invalid);
+        assert_eq!(cache.map.len(), 1);
+        assert_eq!(cache.order.len(), 1);
+
+        // Re-insert the SAME content many times (including via a distinct
+        // Arc allocation carrying the same bytes — the map keys by content,
+        // so the dedup must match on content, not pointer identity).
+        for _ in 0..100 {
+            cache.insert(Arc::clone(&k), ParsedSignature::Invalid);
+            let fresh_alloc: Arc<str> = Arc::from("Ldedup/Marker;");
+            cache.insert(fresh_alloc, ParsedSignature::Invalid);
+        }
+
+        // The map still holds exactly one entry and the recency queue is in
+        // lockstep — no duplicate slots accumulated.
+        assert_eq!(cache.map.len(), 1, "map must hold one entry per key");
+        assert_eq!(
+            cache.order.len(),
+            cache.map.len(),
+            "order must stay in lockstep with map (one slot per key)"
         );
     }
 }

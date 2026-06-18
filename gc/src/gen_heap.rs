@@ -3581,6 +3581,21 @@ impl GenerationalHeap {
         if selective_on {
             let is_y = |a: usize| -> bool { a >= from_base && a < from_end && (a & 0x7) == 0 };
 
+            // PERF: compute the sorted young free-block view (and `used`) ONCE
+            // per sweep and reuse it across every selective-promotion pass.
+            // `free_blocks_sorted()` collect-and-sorts the WHOLE free list, and
+            // it was previously rebuilt at least three times per non-moving
+            // sweep (evacuate pass (2), fixup pass (3a), and SP_VERIFY). The
+            // `young_from` lock is held for the entire function and NOTHING in
+            // this block mutates its free list or `used()` — all free-list
+            // mutations (`add_free_block` / `clear_free_list` / `reset`) and any
+            // `young_from` allocation happen strictly AFTER the `selective_on`
+            // block, and evacuation only allocates into `old_gen`. So this
+            // single snapshot is valid for every pass below; behavior is
+            // identical, we just skip the redundant collect+sort each pass.
+            let sweep_free_blocks = young_from.free_blocks_sorted();
+            let sweep_used = young_from.used();
+
             // (1) Pin set: every root / finalizer value that lands in young.
             // (1) Pin set: every root / finalizer value that lands in young.
             // Stage B (precise oop maps, B-K relocation track): EXCLUDE addresses
@@ -3605,9 +3620,9 @@ impl GenerationalHeap {
             // fills (leave the remainder in young — correctness over completeness).
             let mut evacuated: Vec<*mut u8> = Vec::new();
             {
-                let free_blocks = young_from.free_blocks_sorted();
-                let mut free_iter = free_blocks.iter().peekable();
-                let used = young_from.used();
+                // PERF: reuse the once-computed sorted free-block snapshot.
+                let mut free_iter = sweep_free_blocks.iter().peekable();
+                let used = sweep_used;
                 let mut cursor = 0usize;
                 let mut old_full = false;
                 while cursor < used && !old_full {
@@ -3764,9 +3779,9 @@ impl GenerationalHeap {
                 // (3a) References inside surviving (pinned / non-evacuated) young
                 // objects → rewrite to the evacuated copies in old gen.
                 {
-                    let free_blocks = young_from.free_blocks_sorted();
-                    let mut free_iter = free_blocks.iter().peekable();
-                    let used = young_from.used();
+                    // PERF: reuse the once-computed sorted free-block snapshot.
+                    let mut free_iter = sweep_free_blocks.iter().peekable();
+                    let used = sweep_used;
                     let mut cursor = 0usize;
                     while cursor < used {
                         if let Some(&&(off, sz)) = free_iter.peek() {
@@ -3865,9 +3880,9 @@ impl GenerationalHeap {
                         for_each_ref(oaddr, h, &mut bump);
                     }
                     let mut missed_young = 0usize;
-                    let fb = young_from.free_blocks_sorted();
-                    let mut fi = fb.iter().peekable();
-                    let used = young_from.used();
+                    // PERF: reuse the once-computed sorted free-block snapshot.
+                    let mut fi = sweep_free_blocks.iter().peekable();
+                    let used = sweep_used;
                     let mut c = 0usize;
                     while c < used {
                         if let Some(&&(off, sz)) = fi.peek() {

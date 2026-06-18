@@ -20,7 +20,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tracing::debug;
 use zip::ZipArchive;
 
@@ -306,7 +306,14 @@ enum ClassPathEntry {
         /// multi-release lookup so subsequent lookups skip
         /// `by_name` probes for absent versions. `None` means the
         /// cache hasn't been built yet.
-        versions_cache: Mutex<Option<BTreeSet<u32>>>,
+        ///
+        /// PERF: wrapped in `Arc` so `ensure_versions_cache` can hand
+        /// callers a cheap reference-count bump instead of deep-cloning
+        /// the whole `BTreeSet` on every multi-release class lookup (the
+        /// previous `cache.clone()` heap-allocated a fresh tree per
+        /// lookup). The set is immutable once built, so sharing it is
+        /// behavior-preserving.
+        versions_cache: Mutex<Option<Arc<BTreeSet<u32>>>>,
         /// Report P1 (perf): memoized verified signer cert chain (leaf+chain
         /// DER) for this archive. `extract_jar_signer_blocks` is a pure
         /// function of the archive — the `CodeSource` certificates are
@@ -980,14 +987,17 @@ impl ClassPath {
     /// absent version.
     fn ensure_versions_cache(
         archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>,
-        versions_cache: &Mutex<Option<BTreeSet<u32>>>,
-    ) -> BTreeSet<u32> {
-        // Fast-path under the lock; clone-out is cheap for a set of
-        // <= ~20 small integers.
+        versions_cache: &Mutex<Option<Arc<BTreeSet<u32>>>>,
+    ) -> Arc<BTreeSet<u32>> {
+        // PERF: hand back a shared `Arc` so the fast path (every
+        // multi-release class lookup after the first) is an atomic
+        // reference-count bump, not a heap-allocating deep `BTreeSet`
+        // clone. The cached set is immutable after construction, so all
+        // callers can safely share it; they only iterate over it.
         {
             let guard = versions_cache.lock();
             if let Some(cache) = guard.as_ref() {
-                return cache.clone();
+                return Arc::clone(cache);
             }
         }
         // Build by scanning the central directory once.
@@ -1009,9 +1019,20 @@ impl ClassPath {
                 }
             }
         }
+        // PERF: store the set behind an `Arc` once; the build path no
+        // longer pays an extra `set.clone()` — the `Arc` and its return
+        // value share the single heap allocation.
+        let shared = Arc::new(set);
         let mut guard = versions_cache.lock();
-        *guard = Some(set.clone());
-        set
+        // Tolerate the benign race where another thread built the cache
+        // first; either set is identical (pure function of the archive),
+        // so adopt whichever is already published to keep all callers on
+        // one shared allocation.
+        if let Some(existing) = guard.as_ref() {
+            return Arc::clone(existing);
+        }
+        *guard = Some(Arc::clone(&shared));
+        shared
     }
 
     /// Look up an entry in a multi-release JAR archive.
@@ -1029,7 +1050,7 @@ impl ClassPath {
     /// per-class 17 `by_name` round-trips.
     fn find_in_multi_release_archive(
         archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>,
-        versions_cache: &Mutex<Option<BTreeSet<u32>>>,
+        versions_cache: &Mutex<Option<Arc<BTreeSet<u32>>>>,
         name: &str,
     ) -> Option<Vec<u8>> {
         let present = Self::ensure_versions_cache(archive, versions_cache);
@@ -2239,7 +2260,7 @@ impl ClassPath {
         info: &JarSignerInfo,
         archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>,
         relative_path: &str,
-        mr_versions: Option<&Mutex<Option<BTreeSet<u32>>>>,
+        mr_versions: Option<&Mutex<Option<Arc<BTreeSet<u32>>>>>,
     ) -> Vec<Vec<u8>> {
         // Unsigned JAR / failed verification: nothing to attach.
         if info.chain.is_empty() {

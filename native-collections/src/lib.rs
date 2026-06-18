@@ -98,10 +98,38 @@ struct ObjKeyEntry {
     class_id: u32,
 }
 
-fn obj_key_registry() -> &'static Mutex<StdHashMap<u32, Vec<ObjKeyEntry>>> {
-    static REG: std::sync::OnceLock<Mutex<StdHashMap<u32, Vec<ObjKeyEntry>>>> =
-        std::sync::OnceLock::new();
-    REG.get_or_init(|| Mutex::new(StdHashMap::new()))
+// PERF (registry-shard): the identity-hash registry was a SINGLE global
+// `Mutex<HashMap>` taken on EVERY `widened_obj_key` call (every TreeMap /
+// TreeSet / LinkedHashMap / LinkedList side-table op, on every thread). Under
+// multi-threaded collection churn that one lock serialized all those ops and
+// became the dominant contention point. Shard it into `OBJ_KEY_SHARDS`
+// independent stripes, each its own `Mutex<HashMap>`, selected by the identity
+// hash. Because the shard is chosen deterministically from `hash` and every
+// per-hash bucket lives entirely inside one shard, the per-hash `Vec` and the
+// generation-disambiguation logic are bit-for-bit identical to the single-map
+// version — only the lock granularity changes. Contention drops ~N-fold since
+// threads touching different hashes now take different locks. The GC walks
+// (relocate / prune) iterate every shard, which is equivalent to iterating the
+// former single map. 64 is a power of two so the shard index is a cheap mask.
+const OBJ_KEY_SHARDS: usize = 64;
+
+type ObjKeyShard = Mutex<StdHashMap<u32, Vec<ObjKeyEntry>>>;
+
+fn obj_key_shards() -> &'static [ObjKeyShard; OBJ_KEY_SHARDS] {
+    static REG: std::sync::OnceLock<[ObjKeyShard; OBJ_KEY_SHARDS]> = std::sync::OnceLock::new();
+    REG.get_or_init(|| std::array::from_fn(|_| Mutex::new(StdHashMap::new())))
+}
+
+/// Select the registry shard for an identity hash. Mixes with the 64-bit
+/// Fibonacci/golden-ratio constant first because identity hashes can be
+/// low-entropy / sequentially assigned, which would otherwise cluster nearby
+/// objects onto a handful of shards; the masked high bits of the product are
+/// well distributed. Deterministic in `hash`, so a given object's bucket is
+/// always in the same shard (preserves the per-hash generation contract).
+#[inline]
+fn obj_key_shard_for(hash: u32) -> &'static ObjKeyShard {
+    let mixed = (hash as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    &obj_key_shards()[((mixed >> 58) as usize) & (OBJ_KEY_SHARDS - 1)]
 }
 
 /// GC-stable, collision-resistant side-table key. Replaces the former
@@ -113,7 +141,9 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     let ptr = this.as_ptr() as usize;
     let class_id = ctx.class_id_of_object(this).as_u32();
 
-    let mut reg = obj_key_registry().lock().unwrap();
+    // PERF (registry-shard): lock only this hash's shard, not a process-global
+    // mutex, so concurrent side-table ops on different hashes don't serialize.
+    let mut reg = obj_key_shard_for(hash).lock().unwrap();
     let slots = reg.entry(hash).or_default();
 
     // 1. Exact pointer match: same object at the same address.
@@ -18876,6 +18906,15 @@ fn ts_array_table() -> &'static Mutex<StdHashMap<usize, TsArrayState>> {
 ///     LHMs that relocated must still be repointed; dead entries are not in the
 ///     `pointer_map` so their stale refs are left untouched (never read again).
 fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
+    // PERF (overlay-empty-skip): this runs on EVERY GC. Pruning keeps each
+    // overlay table bounded to live collections, but an app that uses none of a
+    // given collection type leaves that table empty — yet we still locked it and
+    // built an iterator every GC. Each block now early-skips when its table is
+    // empty (a single lock + `is_empty()` check, no iterator setup). For the
+    // LinkedHashMap block this additionally avoids acquiring the second
+    // `lhm_heap_backed` lock when there is nothing to walk. Behaviour is
+    // identical: iterating an empty map invokes `f` zero times.
+    //
     // Inner name -> Value overlays (LinkedList head/tail/size, LinkedHashMap
     // table/head/tail/…).
     if let Ok(mut ll) = ll_overlay().lock() {
@@ -18888,6 +18927,9 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
         }
     }
     if let Ok(mut lhm) = lhm_overlay().lock() {
+        if lhm.is_empty() {
+            // Nothing to root/remap — skip without taking `lhm_heap_backed`.
+        } else {
         // Hold the heap-backed set across the loop (lock order: heap_backed is
         // never taken while lhm_overlay is held elsewhere — `lhm_set` locks them
         // sequentially, not nested — so this order can't deadlock).
@@ -18908,6 +18950,7 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
                 }
             }
         }
+        } // end else (non-empty lhm)
     }
     // TreeMap array mode: backing `data` array + comparator.
     if let Ok(mut tm) = tm_array_table().lock() {
@@ -18981,11 +19024,16 @@ pub fn gc_update_collection_overlay_refs(pointer_map: &StdHashMap<usize, usize>)
     // address. A relocated collection object's identity-hash key (the overlay
     // bucket key) is invariant across the move, so only the stored pointer
     // changes — the overlay/cache entries stay correctly keyed.
-    if let Ok(mut reg) = obj_key_registry().lock() {
-        for slots in reg.values_mut() {
-            for slot in slots.iter_mut() {
-                if let Some(&new_addr) = pointer_map.get(&slot.last_ptr) {
-                    slot.last_ptr = new_addr;
+    // PERF (registry-shard): iterate every shard — equivalent to walking the
+    // former single map. Runs during GC (single-threaded), so per-shard locking
+    // adds no contention.
+    for shard in obj_key_shards().iter() {
+        if let Ok(mut reg) = shard.lock() {
+            for slots in reg.values_mut() {
+                for slot in slots.iter_mut() {
+                    if let Some(&new_addr) = pointer_map.get(&slot.last_ptr) {
+                        slot.last_ptr = new_addr;
+                    }
                 }
             }
         }
@@ -19020,27 +19068,32 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
     //    and rebuild the registry without their slots. Done as an explicit
     //    two-pass walk (collect dead keys, then drop slots) to keep the
     //    `dead_keys` mutation cleanly outside the `retain` predicate's borrow.
+    // PERF (registry-shard): walk every shard, collecting dead keys and dropping
+    // their slots per-shard. Equivalent to the former single-map walk (the union
+    // of all shards is the whole registry); runs under GC so per-shard locking is
+    // uncontended. Preserves the original early-return: if NO shard yielded a
+    // dead key, skip the overlay-cleanup pass entirely.
     let mut dead_keys: Vec<usize> = Vec::new();
-    if let Ok(mut reg) = obj_key_registry().lock() {
-        for (&hash, slots) in reg.iter() {
-            for slot in slots.iter() {
-                // A zero `last_ptr` is the unset/never-resolved sentinel; treat
-                // it as live (defensive — never prune what we can't classify).
-                let live = slot.last_ptr == 0 || is_live(slot.last_ptr);
-                if !live {
-                    dead_keys.push(pack_obj_key(hash, slot.generation));
+    for shard in obj_key_shards().iter() {
+        if let Ok(mut reg) = shard.lock() {
+            for (&hash, slots) in reg.iter() {
+                for slot in slots.iter() {
+                    // A zero `last_ptr` is the unset/never-resolved sentinel; treat
+                    // it as live (defensive — never prune what we can't classify).
+                    let live = slot.last_ptr == 0 || is_live(slot.last_ptr);
+                    if !live {
+                        dead_keys.push(pack_obj_key(hash, slot.generation));
+                    }
                 }
             }
+            // Drop the dead slots; remove buckets that become empty.
+            reg.retain(|_hash, slots| {
+                slots.retain(|slot| slot.last_ptr == 0 || is_live(slot.last_ptr));
+                !slots.is_empty()
+            });
         }
-        if dead_keys.is_empty() {
-            return;
-        }
-        // Drop the dead slots; remove buckets that become empty.
-        reg.retain(|_hash, slots| {
-            slots.retain(|slot| slot.last_ptr == 0 || is_live(slot.last_ptr));
-            !slots.is_empty()
-        });
-    } else {
+    }
+    if dead_keys.is_empty() {
         return;
     }
 
@@ -22155,7 +22208,7 @@ fn chm_seg_get(
     let seg_id = ctx.identity_hash_code(seg);
     // `parking_lot::RwLock::read` is infallible — no PoisonError to
     // recover from.
-    let _read_guard = chm_seg_lock_for(seg_id).read();
+    let read_guard = chm_seg_lock_for(seg_id).read();
     // Acquire-load the buckets array reference. If the writer has
     // begun publishing a new array, we see either the old one (with a
     // fully-linked chain) or the new one (also fully-linked) — never a
@@ -22184,18 +22237,24 @@ fn chm_seg_get(
         return Ok(None);
     }
     let idx = map_bucket_index(hash, cap);
+    // PERF (chm-narrow-lock): SNAPSHOT the bucket chain (each node's key+value)
+    // while holding the read-lock, then RELEASE the lock before running the
+    // key-equality comparisons. The lock exists only to serialize this chain
+    // walk against `map_resize_concurrent`'s in-place NEXT mutation; capturing a
+    // consistent, fully-linked view under the lock satisfies that contract
+    // exactly (same linearization point a lock-free JDK `get` uses). Holding the
+    // `parking_lot` read-lock across `map_keys_equal` was both a needlessly long
+    // critical section AND a latent self-deadlock: `map_keys_equal` can invoke a
+    // user-defined `equals(Object)` (arbitrary Java) which could re-enter a CHM
+    // resize and take the WRITE lock on the same stripe — parking_lot read→write
+    // on one thread is not reentrant. Resize only re-links NEXT pointers; it
+    // never rewrites a node's key/value, so a snapshot taken under the lock stays
+    // valid for comparison after the lock drops. Behaviour is identical: the same
+    // (key,value) pairs are examined in the same order.
+    let mut chain: Vec<(Value, Value)> = Vec::new();
     let mut node_val = ctx.get_array_element(buckets, idx);
     while let Value::Object(Some(node)) = node_val {
-        let node_key_field = get_node_key(ctx, node);
-        if is_null_key {
-            if matches!(node_key_field, Value::Object(None)) {
-                return Ok(Some(get_node_value(ctx, node)));
-            }
-        } else if let Value::Object(Some(node_key)) = node_key_field {
-            if map_keys_equal(ctx, node_key, key_ref.unwrap())? {
-                return Ok(Some(get_node_value(ctx, node)));
-            }
-        }
+        chain.push((get_node_key(ctx, node), get_node_value(ctx, node)));
         // Acquire-load the NEXT pointer. Pairs with the writer's
         // `set_field` of NEXT during chain construction — the writer
         // publishes the buckets array with `set_field_volatile` AFTER
@@ -22203,6 +22262,19 @@ fn chm_seg_get(
         // buckets array necessarily observes the corresponding NEXT
         // writes (happens-before via Release/Acquire).
         node_val = ctx.get_field_volatile(node, NODE_FIELD_NEXT);
+    }
+    drop(read_guard); // critical section ends — comparisons run lock-free
+
+    for (node_key_field, node_value) in chain {
+        if is_null_key {
+            if matches!(node_key_field, Value::Object(None)) {
+                return Ok(Some(node_value));
+            }
+        } else if let Value::Object(Some(node_key)) = node_key_field {
+            if map_keys_equal(ctx, node_key, key_ref.unwrap())? {
+                return Ok(Some(node_value));
+            }
+        }
     }
     Ok(None)
 }

@@ -202,6 +202,16 @@ pub struct ReferenceProcessor {
     /// allow O(log n) range queries instead of O(n) linear scans.
     soft_ref_lru_index: BTreeMap<(u64, usize), usize>,
 
+    /// PERF: address -> position-in-`soft_refs` index, so `touch_soft_reference`
+    /// (called on every `SoftReference.get()` that advances the LRU timer) is
+    /// O(1) instead of a linear scan over all soft refs. For large soft-ref
+    /// populations (memory-sensitive caches) the old per-`get()` linear scan
+    /// made `get()` O(n). This map is kept in lock-step with `soft_refs`
+    /// positions at every mutation site (discover/relocate/remove_collected);
+    /// the `(reference_obj -> idx)` invariant mirrors the `soft_ref_lru_index`
+    /// `(timestamp, idx) -> idx` invariant the LRU-leak fix already maintains.
+    soft_ref_addr_index: FxHashMap<usize, usize>,
+
     stats: ReferenceProcessingStats,
 }
 
@@ -221,6 +231,7 @@ impl ReferenceProcessor {
             pending_queues: FxHashMap::default(),
             finalization_queue: std::collections::VecDeque::new(),
             soft_ref_lru_index: BTreeMap::new(),
+            soft_ref_addr_index: FxHashMap::default(),
             stats: ReferenceProcessingStats::default(),
         }
     }
@@ -251,6 +262,14 @@ impl ReferenceProcessor {
                 let idx = self.soft_refs.len();
                 self.soft_ref_lru_index
                     .insert((entry.last_access_time_ms, idx), idx);
+                // PERF: maintain the address->idx index for O(1) touch.
+                // First-occurrence wins (matches the old linear scan, which
+                // returned at the lowest-index match) — `or_insert` so a
+                // duplicate-address discovery does not steal the target from
+                // the earlier entry.
+                self.soft_ref_addr_index
+                    .entry(entry.reference_obj)
+                    .or_insert(idx);
                 self.soft_refs.push(entry);
             }
             ReferenceType::Weak => self.weak_refs.push(entry),
@@ -270,30 +289,30 @@ impl ReferenceProcessor {
     /// SoftReference looks infinitely stale and gets cleared on the next
     /// major GC — defeating the whole point of memory-sensitive caches.
     ///
-    /// Cost is O(log n) for the BTreeMap re-key plus O(1) for the entry
-    /// update; no global lock beyond the caller's existing
+    /// Cost is O(1) for the address-index lookup plus O(log n) for the
+    /// BTreeMap re-key; no global lock beyond the caller's existing
     /// `Mutex<ReferenceProcessor>` is taken.
     pub fn touch_soft_reference(&mut self, reference_obj: usize, now_ms: u64) {
-        // Linear search is acceptable here: this is called only on the
-        // SoftReference.get() path (rare compared to ordinary loads) and
-        // soft-ref populations are typically in the hundreds for caches.
-        // If profiling reveals this as a bottleneck the index can be
-        // augmented with a `FxHashMap<usize, usize>` from reference_obj
-        // to soft_refs index.
-        for (idx, entry) in self.soft_refs.iter_mut().enumerate() {
-            if entry.reference_obj == reference_obj {
-                let old_key = (entry.last_access_time_ms, idx);
-                // Only re-insert when the timestamp actually advances;
-                // many caches `get()` faster than the timer resolution.
-                if now_ms == entry.last_access_time_ms {
-                    return;
-                }
-                self.soft_ref_lru_index.remove(&old_key);
-                entry.last_access_time_ms = now_ms;
-                self.soft_ref_lru_index.insert((now_ms, idx), idx);
-                return;
-            }
+        // PERF: O(1) address-index lookup replaces the former O(n) linear
+        // scan over all soft refs. `SoftReference.get()` calls this on the
+        // timer-advance path; for large cache populations the linear scan made
+        // `get()` O(n). `soft_ref_addr_index` is kept in lock-step with
+        // `soft_refs` positions, so the resolved `idx` indexes the same entry
+        // the old scan would have found (first-occurrence wins for duplicates).
+        let idx = match self.soft_ref_addr_index.get(&reference_obj) {
+            Some(&idx) => idx,
+            None => return,
+        };
+        let entry = &mut self.soft_refs[idx];
+        let old_key = (entry.last_access_time_ms, idx);
+        // Only re-insert when the timestamp actually advances;
+        // many caches `get()` faster than the timer resolution.
+        if now_ms == entry.last_access_time_ms {
+            return;
         }
+        self.soft_ref_lru_index.remove(&old_key);
+        entry.last_access_time_ms = now_ms;
+        self.soft_ref_lru_index.insert((now_ms, idx), idx);
     }
 
     // -- Main entry point ---------------------------------------------------
@@ -674,6 +693,19 @@ impl ReferenceProcessor {
         relocate_list(&mut self.cleaner_refs, pointer_map);
         relocate_list(&mut self.finalizer_refs, pointer_map);
 
+        // PERF: relocation rewrote `reference_obj` on the soft refs, so the
+        // address->idx index is stale. Positions in `soft_refs` did not
+        // change (relocate is in-place), so rebuild the keys from the new
+        // addresses. First-occurrence wins to match `discover_reference` /
+        // the old linear scan. (Cheap: only runs after a compacting GC, which
+        // is far rarer than `get()`.)
+        self.soft_ref_addr_index.clear();
+        for (idx, entry) in self.soft_refs.iter().enumerate() {
+            self.soft_ref_addr_index
+                .entry(entry.reference_obj)
+                .or_insert(idx);
+        }
+
         // Relocate finalization queue entries
         for addr in &mut self.finalization_queue {
             if let Some(&new_addr) = pointer_map.get(addr) {
@@ -708,10 +740,18 @@ impl ReferenceProcessor {
         // Without this, surviving (timestamp, old_idx) keys would point
         // past the new soft_refs.len(), causing a panic when
         // process_soft_refs indexes the BTreeMap-returned `idx`.
+        //
+        // PERF: rebuild the address->idx index in the same walk for the same
+        // reason — `retain` shifted positions, so old `idx` values are stale.
+        // First-occurrence wins (matches discovery / the old linear scan).
         self.soft_ref_lru_index.clear();
+        self.soft_ref_addr_index.clear();
         for (new_idx, entry) in self.soft_refs.iter().enumerate() {
             self.soft_ref_lru_index
                 .insert((entry.last_access_time_ms, new_idx), new_idx);
+            self.soft_ref_addr_index
+                .entry(entry.reference_obj)
+                .or_insert(new_idx);
         }
     }
 
@@ -1764,5 +1804,97 @@ mod tests {
         let r2 = proc.process_references(&always_dead, 2, 5000);
         assert_eq!(r2.stats.soft_refs_cleared, 0);
         assert_eq!(proc.soft_ref_lru_index.len(), 0);
+    }
+
+    // ======================================================================
+    // PERF: O(1) touch_soft_reference via address index
+    // ======================================================================
+
+    // 57. touch_soft_reference re-keys the matching entry in the LRU index
+    //     using the O(1) address index (same effect the old linear scan had).
+    #[test]
+    fn touch_soft_reference_rekeys_lru_index() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        proc.discover_reference(ReferenceType::Soft, 0xAA, 0x10, Some(0x100));
+        proc.discover_reference(ReferenceType::Soft, 0xBB, 0x20, Some(0x200));
+        // Initial keys are both at timestamp 0.
+        assert!(proc.soft_ref_lru_index.contains_key(&(0, 0)));
+        assert!(proc.soft_ref_lru_index.contains_key(&(0, 1)));
+
+        // Touch the second soft ref (idx 1) to time 5000.
+        proc.touch_soft_reference(0xBB, 5000);
+        assert_eq!(proc.soft_refs[1].last_access_time_ms, 5000);
+        // Old key removed, new key inserted; first entry untouched.
+        assert!(!proc.soft_ref_lru_index.contains_key(&(0, 1)));
+        assert!(proc.soft_ref_lru_index.contains_key(&(5000, 1)));
+        assert!(proc.soft_ref_lru_index.contains_key(&(0, 0)));
+        // Index size unchanged (re-key, not add).
+        assert_eq!(proc.soft_ref_lru_index.len(), 2);
+    }
+
+    // 58. touch on an unknown address is a no-op (O(1) miss, no scan needed).
+    #[test]
+    fn touch_soft_reference_unknown_addr_noop() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        proc.discover_reference(ReferenceType::Soft, 0xAA, 0x10, None);
+        proc.touch_soft_reference(0xDEAD, 5000);
+        assert_eq!(proc.soft_refs[0].last_access_time_ms, 0);
+        assert_eq!(proc.soft_ref_lru_index.len(), 1);
+    }
+
+    // 59. touch with an unadvanced timestamp is a no-op (preserves the
+    //     "only re-insert when the timer actually advances" fast path).
+    #[test]
+    fn touch_soft_reference_same_timestamp_noop() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        proc.discover_reference(ReferenceType::Soft, 0xAA, 0x10, None);
+        proc.touch_soft_reference(0xAA, 7000);
+        // Touching again with the same time must not churn the index.
+        proc.touch_soft_reference(0xAA, 7000);
+        assert_eq!(proc.soft_refs[0].last_access_time_ms, 7000);
+        assert!(proc.soft_ref_lru_index.contains_key(&(7000, 0)));
+        assert_eq!(proc.soft_ref_lru_index.len(), 1);
+    }
+
+    // 60. After remove_collected compacts soft_refs, the address index is
+    //     rebuilt so touch still resolves the (now-shifted) survivor.
+    #[test]
+    fn touch_soft_reference_after_remove_collected() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        // idx 0 (0xAA) will be collected; idx 1 (0xBB) survives -> shifts to 0.
+        proc.discover_reference(ReferenceType::Soft, 0xAA, 0x10, None);
+        proc.discover_reference(ReferenceType::Soft, 0xBB, 0x20, None);
+        let live = [0xBBusize];
+        proc.remove_collected(&live_set(&live));
+        assert_eq!(proc.soft_refs.len(), 1);
+        assert_eq!(proc.soft_refs[0].reference_obj, 0xBB);
+
+        // Touch the survivor at its NEW position; LRU key must use idx 0.
+        proc.touch_soft_reference(0xBB, 9000);
+        assert_eq!(proc.soft_refs[0].last_access_time_ms, 9000);
+        assert!(proc.soft_ref_lru_index.contains_key(&(9000, 0)));
+        assert_eq!(proc.soft_ref_lru_index.len(), 1);
+        // The collected entry's address no longer resolves.
+        proc.touch_soft_reference(0xAA, 9999);
+        assert_eq!(proc.soft_ref_lru_index.len(), 1);
+    }
+
+    // 61. After update_after_gc relocates reference_obj, the address index is
+    //     rebuilt so touch resolves the NEW address (not the stale one).
+    #[test]
+    fn touch_soft_reference_after_update_after_gc() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        proc.discover_reference(ReferenceType::Soft, 0xAA, 0x10, None);
+        let mut map = HashMap::new();
+        map.insert(0xAAusize, 0xCCusize); // reference_obj 0xAA -> 0xCC
+        proc.update_after_gc(&map);
+        assert_eq!(proc.soft_refs[0].reference_obj, 0xCC);
+
+        // Old address must no longer resolve; new address must.
+        proc.touch_soft_reference(0xAA, 1234);
+        assert_eq!(proc.soft_refs[0].last_access_time_ms, 0);
+        proc.touch_soft_reference(0xCC, 1234);
+        assert_eq!(proc.soft_refs[0].last_access_time_ms, 1234);
+        assert!(proc.soft_ref_lru_index.contains_key(&(1234, 0)));
     }
 }

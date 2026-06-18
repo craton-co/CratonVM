@@ -27,6 +27,7 @@
 //! The sorted-by-offset view needed for coalescing and compaction is
 //! rebuilt on demand from the per-bucket vectors.
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use crate::heap::{
@@ -127,6 +128,30 @@ pub struct OldGen {
     buckets: Vec<Vec<FreeBlock>>,
     /// Total bytes currently allocated (excluding free space).
     used_bytes: usize,
+    /// PERF (gc-oldgen-perf): cache of the offset-sorted free-block view.
+    ///
+    /// `walk_objects` / `walk_objects_in_card_ranges` / `compact` all need
+    /// the free blocks in ascending-offset order to locate object boundaries
+    /// (the gaps between free blocks are the allocated regions). The previous
+    /// code re-`collect()`ed every block out of all 28 buckets and ran a fresh
+    /// `sort_by_key` on *every* call. Several GC phases call `walk_objects`
+    /// repeatedly with no intervening `alloc`/`free` (e.g. the
+    /// `concurrent_mark` rescan loop and the multiple sequential sweep/verify
+    /// passes in `gen_heap`), so that view is recomputed identically many
+    /// times per cycle.
+    ///
+    /// We cache the sorted view and rebuild it lazily only when the buckets
+    /// have actually changed. `dirty` is set by every bucket mutation
+    /// (`alloc`, `free`, and `compact`'s free-list rebuild); while it stays
+    /// clear the cached `Vec` is byte-for-byte the same sort that would have
+    /// been recomputed, so behaviour is identical — only redundant work is
+    /// removed. `RefCell`/`Cell` give interior mutability so the `&self`
+    /// walkers can refresh the cache; `OldGen` lives inside a `Mutex`, which
+    /// only requires `Send` (satisfied), not `Sync`.
+    sorted_free_cache: RefCell<Vec<FreeBlock>>,
+    /// `true` when `buckets` has been mutated since `sorted_free_cache` was
+    /// last rebuilt, so the cache must be regenerated before use.
+    sorted_free_dirty: Cell<bool>,
 }
 
 impl OldGen {
@@ -167,7 +192,47 @@ impl OldGen {
             data,
             buckets,
             used_bytes: 0,
+            // Start dirty: the cache is empty and the first walk rebuilds it.
+            sorted_free_cache: RefCell::new(Vec::new()),
+            sorted_free_dirty: Cell::new(true),
         }
+    }
+
+    /// Mark the cached offset-sorted free-block view stale.
+    ///
+    /// PERF (gc-oldgen-perf): called from every site that mutates `buckets`
+    /// (`alloc`, `free`, and `compact`'s free-list rebuild). Cheap — just
+    /// flips a `Cell<bool>`; the actual recompute is deferred to the next
+    /// walker that needs the sorted view.
+    #[inline]
+    fn invalidate_sorted_free(&self) {
+        self.sorted_free_dirty.set(true);
+    }
+
+    /// Run `f` with the offset-sorted free-block view, rebuilding the cached
+    /// view first only if the buckets changed since it was last built.
+    ///
+    /// PERF (gc-oldgen-perf): replaces the per-call `buckets.iter().flatten()
+    /// .collect()` + `sort_by_key` that `walk_objects` /
+    /// `walk_objects_in_card_ranges` / `compact` each used to do unconditionally.
+    /// The produced slice is the *exact same* ascending-offset ordering as
+    /// before (same elements, same comparator), so every walk is unchanged;
+    /// when nothing mutated the buckets between two walks the second one reuses
+    /// the cache and skips the collect+sort entirely.
+    ///
+    /// The closure receives a borrowed `&[FreeBlock]`; the `RefCell` borrow is
+    /// held only for the duration of `f`. Callers must not mutate the buckets
+    /// (which would require `&mut self`) from inside `f`, and none do.
+    fn with_sorted_free_blocks<R>(&self, f: impl FnOnce(&[FreeBlock]) -> R) -> R {
+        if self.sorted_free_dirty.get() {
+            let mut cache = self.sorted_free_cache.borrow_mut();
+            cache.clear();
+            cache.extend(self.buckets.iter().flatten().copied());
+            cache.sort_by_key(|b| b.offset);
+            self.sorted_free_dirty.set(false);
+        }
+        let cache = self.sorted_free_cache.borrow();
+        f(&cache)
     }
 
     /// Allocate `size` bytes with the given alignment from the segregated
@@ -225,6 +290,9 @@ impl OldGen {
             let Some(i) = best else { continue };
             // swap_remove keeps the bucket O(1).
             let block = self.buckets[bucket_idx].swap_remove(i);
+            // PERF (gc-oldgen-perf): buckets change here (and via the pushes
+            // below) — invalidate the cached sorted free-block view once.
+            self.invalidate_sorted_free();
             let block_addr = base + block.offset;
             let aligned_addr = (block_addr + align - 1) & !(align - 1);
             let padding = aligned_addr - block_addr;
@@ -298,6 +366,8 @@ impl OldGen {
         // Push into the appropriate size bucket — O(1).
         // Coalescing happens during the next `compact()` call.
         self.buckets[bucket_for(size)].push(FreeBlock { offset, size });
+        // PERF (gc-oldgen-perf): a new free block changes the sorted view.
+        self.invalidate_sorted_free();
     }
 
     /// Returns true if the given pointer falls within this old generation's storage.
@@ -342,21 +412,27 @@ impl OldGen {
         // buckets on demand. Free is now O(1) and walk-objects pays the
         // sort cost up front; the trade is favourable because alloc/free
         // run on the hot path and walk_objects only at GC time.
-        let mut sorted_free: Vec<FreeBlock> = self.buckets.iter().flatten().copied().collect();
-        sorted_free.sort_by_key(|b| b.offset);
-
-        let mut cursor: usize = 0;
-        for block in &sorted_free {
-            // Allocated region from cursor to block.offset
-            if block.offset > cursor {
-                self.scan_region(base, cursor, block.offset, &mut objects);
+        //
+        // PERF (gc-oldgen-perf): the collect+sort is now memoised via
+        // `with_sorted_free_blocks` — when the buckets are unchanged since the
+        // previous walk (common across GC phases that call `walk_objects`
+        // repeatedly without allocating) the cached ordering is reused instead
+        // of being rebuilt from scratch. The slice contents are identical to
+        // the old inline `collect()`+`sort_by_key`, so the walk is unchanged.
+        self.with_sorted_free_blocks(|sorted_free| {
+            let mut cursor: usize = 0;
+            for block in sorted_free {
+                // Allocated region from cursor to block.offset
+                if block.offset > cursor {
+                    self.scan_region(base, cursor, block.offset, &mut objects);
+                }
+                cursor = block.offset + block.size;
             }
-            cursor = block.offset + block.size;
-        }
-        // Region after last free block
-        if cursor < self.data.len() {
-            self.scan_region(base, cursor, self.data.len(), &mut objects);
-        }
+            // Region after last free block
+            if cursor < self.data.len() {
+                self.scan_region(base, cursor, self.data.len(), &mut objects);
+            }
+        });
 
         objects
     }
@@ -394,25 +470,41 @@ impl OldGen {
         // Same offset-sorted free-list view as `walk_objects`; needed to
         // locate true object boundaries (old-gen layout is header-following
         // with no external object index).
-        let mut sorted_free: Vec<FreeBlock> = self.buckets.iter().flatten().copied().collect();
-        sorted_free.sort_by_key(|b| b.offset);
-
+        //
+        // PERF (gc-oldgen-perf): shares the memoised sorted view with
+        // `walk_objects` via `with_sorted_free_blocks` rather than re-collecting
+        // and re-sorting the buckets here. Same ordering, same early-exit once
+        // the cursor passes the last dirty card.
         let last_dirty_end = dirty_ranges[dirty_ranges.len() - 1].1;
-        let mut cursor: usize = 0;
-        for block in &sorted_free {
-            if block.offset > cursor {
-                self.scan_region_filtered(base, cursor, block.offset, dirty_ranges, &mut objects);
+        self.with_sorted_free_blocks(|sorted_free| {
+            let mut cursor: usize = 0;
+            for block in sorted_free {
+                if block.offset > cursor {
+                    self.scan_region_filtered(
+                        base,
+                        cursor,
+                        block.offset,
+                        dirty_ranges,
+                        &mut objects,
+                    );
+                }
+                cursor = block.offset + block.size;
+                // Allocated regions are address-ordered; once the cursor passes
+                // the last dirty card there is nothing left to collect.
+                if cursor >= last_dirty_end {
+                    return;
+                }
             }
-            cursor = block.offset + block.size;
-            // Allocated regions are address-ordered; once the cursor passes
-            // the last dirty card there is nothing left to collect.
-            if cursor >= last_dirty_end {
-                return objects;
+            if cursor < self.data.len() {
+                self.scan_region_filtered(
+                    base,
+                    cursor,
+                    self.data.len(),
+                    dirty_ranges,
+                    &mut objects,
+                );
             }
-        }
-        if cursor < self.data.len() {
-            self.scan_region_filtered(base, cursor, self.data.len(), dirty_ranges, &mut objects);
-        }
+        });
 
         objects
     }
@@ -598,6 +690,9 @@ impl OldGen {
         // Phase 4: Rebuild free list — one contiguous block at the end.
         // Round-5 #14: clears every bucket so deferred free()s coalesce
         // into the single trailing block formed by compaction.
+        // PERF (gc-oldgen-perf): the buckets are about to be fully rewritten,
+        // so the cached sorted free-block view is stale — invalidate it once.
+        self.invalidate_sorted_free();
         let compacted_end = (write_cursor + 7) & !7;
         for bucket in &mut self.buckets {
             bucket.clear();
