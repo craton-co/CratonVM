@@ -1,13 +1,56 @@
 # ES-HANG-02 residuals — handoff (`testAsyncRequests` multi-host + `testManyAsyncRequests` throughput)
 
-**Status:** OPEN (2 tests). The ES-HANG-02 **hang is fixed** on `dev` (see
+**Status:** Residual 1 **FIXED**; residual 2 **substantially improved** (was 0% → now ~90%, borderline at the
+10 s latch). The ES-HANG-02 **hang is fixed** on `dev` (see
 [ES-HANG-02-restclient-integ-http-server.md](ES-HANG-02-restclient-integ-http-server.md)); both classes now
-run. This handoff is the two remaining non-passing tests.
+run.
 
-- `RestClientSingleHostIntegTests` — **12/13** (only `testManyAsyncRequests` fails).
-- `RestClientMultipleHostsIntegTests` — **3/4** (only `testAsyncRequests` fails).
+- `RestClientMultipleHostsIntegTests.testAsyncRequests` — **✅ FIXED** (branch
+  `fix/es-hang-02-real-nonblocking-connect`): **4/4 green, 6/6 consecutive full-suite runs, 0
+  CancelledKeyException / IllegalStateException, ~2.9 s** (== HotSpot). See "Residual 1 — RESOLVED" below.
+- `RestClientSingleHostIntegTests.testManyAsyncRequests` — **improved but still flaky.** The real
+  non-blocking connect (residual-1 fix) cut per-request cost enough that the single-host suite now passes
+  ~85–90 % of full runs (isolated `testManyAsyncRequests` = 8/8; full suite occasionally times out the 10 s
+  latch at high N≈1000). The remaining lever is **HTTP keep-alive in the synthetic server** — see
+  "Residual 2 — still open" below.
 
 Baseline: HotSpot JDK 25.0.1 = `OK (13)` / `OK (4)` in ~2–3 s.
+
+## Residual 1 — RESOLVED (real non-blocking connect with a pollable fd)
+
+Root cause was exactly as diagnosed below: a non-blocking `SocketChannel.connect()` parked in a **fd-less**
+`Connecting` registry entry (synchronous fast-path + background connect-pool), so the JDK selector never
+reported `OP_CONNECT` and the Apache reactor's connect-deadline race threw `CancelledKeyException`, losing the
+request.
+
+**Fix** (branch `fix/es-hang-02-real-nonblocking-connect`):
+1. **New `native-io/src/nb_connect.rs`** — a genuine non-blocking OS connect via raw FFI (Windows `Ws2_32`
+   `socket`+`ioctlsocket(FIONBIO)`+`connect`→`WSAEWOULDBLOCK`; Unix `libc` `socket`+`O_NONBLOCK`+`connect`→
+   `EINPROGRESS`), wrapped as a std `TcpStream`. `poll()` reads write/error-readiness + `SO_ERROR`.
+2. **`socket_channel.rs`** — `TcpHandle::Connecting` now holds the **live connecting `TcpStream`** (removed the
+   `ConnectInProgress` background-pool model entirely). `tcp_clone_for_selector` clones it as a `Stream` so the
+   selector polls it for `OP_CONNECT` *naturally* — **no manual `OP_CONNECT` injection** (that was the
+   reverted approach that double-fired the reactor → `IllegalStateException`). `finishConnect()` calls
+   `nb_connect::poll`. Vetted addresses are ordered **IPv4-first** (matches HotSpot's default resolution and
+   the IPv4 `127.0.0.1` that CratonVM's `getLoopbackAddress()` binds — re-resolving `"localhost"` yields both
+   `::1` and `127.0.0.1`, and a non-blocking connect can't cheaply probe which family is live).
+3. **`nio_selector.rs` `kernel_select_windows`** — a *failed* non-blocking connect signals via
+   `WSAPOLLERR`/`WSAPOLLHUP` (not `WSAPOLLWRNORM`); surface `OP_CONNECT` in that case too so `finishConnect()`
+   runs and reports the failure (`onFailure`) instead of waiting for a writable readiness the OS never sends.
+
+**Verified:** `testAsyncRequests` 4/4 × 6 consecutive full-suite runs, 0 bad exceptions, ~2.9 s. A focused raw
+JDK-selector test (`scratch/eshang/NioConnectTest.java`) passes identically on HotSpot and CratonVM (live echo
+via `OP_CONNECT`/`finishConnect`/`OP_READ`; refused connect reported, no hang). native-io unit tests 8/8.
+
+## Residual 2 — still open (throughput; HTTP keep-alive lever)
+
+The residual-1 connect fix improved this from a hard fail to ~90 % passing, but `testManyAsyncRequests` is
+still borderline against the 10 s latch at N≈1000 (full single-host suite ~9.6–11 s; occasional 17 s timeout).
+The robust fix remains **lever #1 below: HTTP keep-alive in the synthetic `com.sun.net.httpserver` server** so
+the Apache pool reuses ~10 connections instead of one connect/accept/close per request. That is an intricate
+rework of the accept→parse-thread→VM-dispatcher split (per-connection loop + a oneshot channel to hand the
+response back to the connection thread) and must be regression-checked against every consumer of the synthetic
+`HttpServer`. NOT attempted in this pass to avoid regressing the now-green ES tests. Detail unchanged below.
 
 ## How to run (per class)
 
