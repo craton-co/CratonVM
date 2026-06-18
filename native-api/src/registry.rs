@@ -1959,6 +1959,21 @@ pub trait NativeContext {
         Err("redefine_class not implemented".to_string())
     }
 
+    /// Like [`Self::redefine_class`] but for
+    /// `Instrumentation.retransformClasses`: preserves the class's original
+    /// cached bytes so each retransformation re-runs the transformer chain
+    /// from the ORIGINAL bytes (not the previously-woven ones). Without this,
+    /// a second retransform of the same class — e.g. `mockStatic(X)` then
+    /// `mock(X)` — double-instruments it. The default delegates to
+    /// `redefine_class` (correct for impls that don't cache original bytes).
+    fn retransform_class(
+        &mut self,
+        class_id: ClassId,
+        new_bytes: &[u8],
+    ) -> Result<(), String> {
+        self.redefine_class(class_id, new_bytes)
+    }
+
     /// WP2.4 — list all loaded classes.
     fn list_loaded_class_ids(&self) -> Vec<ClassId> {
         Vec::new()

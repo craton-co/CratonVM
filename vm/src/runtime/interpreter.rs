@@ -2373,7 +2373,17 @@ pub fn execute(
                     args,
                 );
             }
-            if method_name != "<init>" && method_name != "<clinit>" {
+            // JVMTI redefine guard: when this class has been redefined in
+            // place by an agent, its woven bytecode is authoritative — skip the
+            // per-class native shadow so the interpreter runs the (instrumented)
+            // body and the advice fires. Fast-pathed on `any_class_redefined`.
+            let class_redefined = crate::classloading::any_class_redefined()
+                && shared
+                    .class_manager
+                    .read()
+                    .class_redefine_generation(class_id)
+                    > 0;
+            if method_name != "<init>" && method_name != "<clinit>" && !class_redefined {
                 if let Some(cb) = shared.native_methods.find(
                     &class_name_owned,
                     method_name,
@@ -12682,6 +12692,29 @@ fn force_native_over_real_jdk_bytecode(
         ))
 }
 
+/// True when `class_name` has been redefined in place by a JVMTI agent
+/// (e.g. Mockito's inline mock maker), so its woven bytecode is authoritative
+/// and the VM's per-class native/intrinsic shadows must be suppressed — the
+/// woven advice has to run for the mock to intercept (matching HotSpot, which
+/// always executes the retransformed bytecode).
+///
+/// Fast-pathed on the global [`any_class_redefined`] flag: until some agent
+/// redefines a class (the overwhelming common case) this is a single relaxed
+/// atomic load and never touches the class-manager lock. Once armed, it costs
+/// one `class_manager` read + a generation lookup, but only at the handful of
+/// dispatch sites that were about to serve a native/intrinsic shadow.
+#[inline]
+fn native_shadow_suppressed_by_redefine(shared: &SharedVm, class_name: &str) -> bool {
+    if !crate::classloading::any_class_redefined() {
+        return false;
+    }
+    let cm = shared.class_manager.read();
+    match cm.get_loaded_class_id(class_name) {
+        Some(cid) => cm.class_redefine_generation(cid) > 0,
+        None => false,
+    }
+}
+
 /// Dispatch a force-native override via `safe_native_call`, pushing any return
 /// value onto the caller operand stack.
 #[inline]
@@ -12705,6 +12738,12 @@ fn intercept_force_registered_native(
         );
     }
     if !force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor) {
+        return None;
+    }
+    // A JVMTI agent that redefined this class (e.g. a Mockito inline mock)
+    // makes its woven bytecode authoritative — cede to it instead of forcing
+    // the native, so the instrumentation advice runs.
+    if native_shadow_suppressed_by_redefine(shared, class_name) {
         return None;
     }
     let cb = shared
@@ -12942,6 +12981,15 @@ fn try_stackless_invoke(
                 cid = parent_id;
             }
         });
+    // JVMTI redefine guard: when an agent (e.g. a Mockito inline mock) has
+    // redefined this class, its woven bytecode is authoritative. Drop any
+    // native override so dispatch falls through to the (instrumented)
+    // bytecode and the advice runs. Fast-pathed on `any_class_redefined`.
+    let native_cb = if native_shadow_suppressed_by_redefine(shared, class_name) {
+        None
+    } else {
+        native_cb
+    };
     if crate::runtime::env_cache::bd_debug() && (method_name == "intValue" || (class_name.contains("BigDecimal") && (method_name == "<init>" || method_name == "intValue"))) {
         eprintln!("[try_stackless_invoke] class_name={} method={} desc={} native_cb={} walk_native={}",
                   class_name, method_name, descriptor, native_cb.is_some(), walk_native_hierarchy);
@@ -13082,7 +13130,11 @@ fn try_stackless_invoke(
     // in `force_native_over_real_jdk_bytecode`, which fires before this path.
     // Static interface methods keep the native check (mirrors invokestatic
     // promotion in `populate_invoke_cache`, which keys on the CP class).
-    if !(declaring_is_interface && !is_static) {
+    // JVMTI redefine guard: a class redefined in place by an agent runs its
+    // woven bytecode (so the mock advice fires) rather than the native shadow.
+    if !(declaring_is_interface && !is_static)
+        && !native_shadow_suppressed_by_redefine(shared, &class_name_arc)
+    {
         if let Some(callback) = shared.native_methods.find(&class_name_arc, method_name, descriptor) {
             let result = safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result {
@@ -17207,6 +17259,14 @@ fn execute_invokevirtual_vtable_fast(
             store,
         )
         .and_then(|(_m, declaring_id)| {
+            // A class redefined in place by a JVMTI agent (e.g. a Mockito
+            // inline mock) has authoritative woven bytecode — do not shadow
+            // it with the Rust intrinsic, or the advice never runs.
+            if crate::classloading::any_class_redefined()
+                && cm.class_redefine_generation(declaring_id) > 0
+            {
+                return Some(false);
+            }
             store.get(declaring_id).map(|c| {
                 cratonvm_native_builtins::intrinsics::lookup(
                     &c.name,
@@ -17249,6 +17309,12 @@ fn execute_invokevirtual_vtable_fast(
             .get_class(receiver_class_id)
             .map(|c| c.name.clone());
         if let Some(rcv_name) = rcv_name_owned.as_ref() {
+            // JVMTI redefine guard: a class redefined in place by an agent has
+            // authoritative woven bytecode, so the per-class native shadows
+            // below must be suppressed (the mock's advice has to run). Cheap
+            // fast-path on `any_class_redefined`.
+            let receiver_redefined = crate::classloading::any_class_redefined()
+                && cm.class_redefine_generation(receiver_class_id) > 0;
             // WP2.7 — annotation proxies have no real bytecode for
             // equals/hashCode/toString. Force fall-through to the slow path
             // so `execute_invoke`'s annotation_proxy interception layer
@@ -17268,10 +17334,11 @@ fn execute_invokevirtual_vtable_fast(
                 drop(cm);
                 return Ok(CachedCallResult::CacheMiss);
             }
-            if shared
-                .native_methods
-                .find(rcv_name, &method_name, &method_descriptor)
-                .is_some()
+            if !receiver_redefined
+                && shared
+                    .native_methods
+                    .find(rcv_name, &method_name, &method_descriptor)
+                    .is_some()
             {
                 if &**rcv_name == "java/lang/invoke/ConstantCallSite"
                     && std::env::var_os("CRATONVM_DBG_CCSPROBE").is_some()
@@ -17311,10 +17378,15 @@ fn execute_invokevirtual_vtable_fast(
                     // native wins. See `populate_virtual_invoke_cache` for
                     // the LinkedHashMap-overlay rationale.
                     let has_bytecode = parent.find_method(&method_name, &method_descriptor).is_some();
-                    let has_native = shared
-                        .native_methods
-                        .find(&parent.name, &method_name, &method_descriptor)
-                        .is_some();
+                    // Suppress an inherited native shadow when the declaring
+                    // parent has been redefined by an agent (woven bytecode wins).
+                    let parent_redefined = crate::classloading::any_class_redefined()
+                        && cm.class_redefine_generation(parent_id) > 0;
+                    let has_native = !parent_redefined
+                        && shared
+                            .native_methods
+                            .find(&parent.name, &method_name, &method_descriptor)
+                            .is_some();
                     if has_native {
                         drop(cm);
                         return Ok(CachedCallResult::CacheMiss);

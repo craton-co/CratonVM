@@ -472,6 +472,24 @@ pub type JitInvalidateHook = fn(u32);
 static JIT_INVALIDATE_HOOK: OnceLock<JitInvalidateHook> = OnceLock::new();
 static JIT_INVALIDATE_HOOK_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// Set the first time ANY class is redefined in place (JVMTI
+/// RedefineClasses / RetransformClasses). The interpreter's native/intrinsic
+/// shadowing guards read this as a one-instruction fast-path: in the common
+/// case (no agent ever redefines a class) it stays `false` and the per-class
+/// generation check is skipped entirely. Once an agent (e.g. Mockito's inline
+/// mock maker) redefines a JDK class, the woven bytecode must run so the
+/// instrumentation advice fires — the shadowing guards then consult the
+/// per-class `redefine_generations` counter. Never reset (a redefined class
+/// stays observably redefined for the VM's lifetime).
+static ANY_CLASS_REDEFINED: AtomicBool = AtomicBool::new(false);
+
+/// True once any class has been redefined in place. Single relaxed load —
+/// the guard fast-path for native/intrinsic shadow suppression.
+#[inline]
+pub fn any_class_redefined() -> bool {
+    ANY_CLASS_REDEFINED.load(Ordering::Relaxed)
+}
+
 /// Install the JIT-invalidate hook. Called once by the VM during
 /// `SharedVm::new`. Idempotent.
 pub fn install_jit_invalidate_hook(hook: JitInvalidateHook) {
@@ -821,6 +839,16 @@ pub struct RedefineOptions {
     /// emits a `tracing::debug` line listing the methods whose bodies
     /// changed (and any structural-check rejections). Default: `false`.
     pub log_diff: bool,
+    /// When `true`, do NOT overwrite the cached "original" class bytes
+    /// with the redefined bytes. Set by `Instrumentation.retransformClasses`:
+    /// per JVMTI, each retransformation re-runs the full transformer chain
+    /// against the class's ORIGINAL bytes, so the base must be preserved.
+    /// Overwriting it (the `redefineClasses` behaviour) makes the next
+    /// retransform of the same class weave on top of the already-woven bytes
+    /// — e.g. `mockStatic(X)` then `mock(X)` double-instruments X and the
+    /// instance mock fails. Default: `false` (explicit redefine updates the
+    /// base, matching HotSpot's `cached_class_file` semantics).
+    pub preserve_original_bytes: bool,
 }
 
 /// Manages class loading for the VM.
@@ -4090,7 +4118,20 @@ impl ClassManager {
         // bytes as their "old bytes".  Route through the FIFO helper:
         // a redefine bumps the entry to the most-recently-used end of
         // the deque so it stays in cache.
-        self.insert_class_bytes(existing_name.clone(), effective_new_bytes);
+        //
+        // SKIPPED for `retransformClasses` (`preserve_original_bytes`): the
+        // cached bytes are the retransform BASE — each retransform must re-run
+        // the transformer chain from the ORIGINAL bytes, not the previously
+        // woven ones, or a second retransform (e.g. mockStatic+mock of the
+        // same class) double-instruments it. Matches HotSpot, which keeps the
+        // original `cached_class_file` across retransformations.
+        if options.preserve_original_bytes {
+            // Touch `effective_new_bytes` so the move-out below is balanced and
+            // no unused-variable lint fires when the cache update is skipped.
+            let _ = &effective_new_bytes;
+        } else {
+            self.insert_class_bytes(existing_name.clone(), effective_new_bytes);
+        }
 
         // ---- Step 6: rebuild + re-install vtable descriptor snapshots ----
         //
@@ -4123,6 +4164,9 @@ impl ClassManager {
         // the explicit Release pairs cleanly with cross-thread
         // Acquire reads of the counter).
         let new_gen = counter.fetch_add(1, Ordering::Release) + 1;
+        // Arm the global fast-path flag so the interpreter's native/intrinsic
+        // shadowing guards start consulting per-class redefine generations.
+        ANY_CLASS_REDEFINED.store(true, Ordering::Release);
 
         // ---- Step 8: invalidate JIT caches keyed on class_id ----
         fire_jit_invalidate_hook(class_id_u32);

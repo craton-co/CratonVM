@@ -1376,6 +1376,45 @@ impl<'a> NativeContextImpl<'a> {
     }
 }
 
+impl<'a> NativeContextImpl<'a> {
+    /// Shared body for the `redefine_class` / `retransform_class` trait
+    /// methods. `preserve_original` controls whether the class's cached
+    /// "original" bytes are kept (retransform) or replaced (redefine) — see
+    /// [`cratonvm_classloading::RedefineOptions::preserve_original_bytes`].
+    fn redefine_class_with(
+        &mut self,
+        class_id: ClassId,
+        new_bytes: &[u8],
+        preserve_original: bool,
+    ) -> Result<(), String> {
+        use cratonvm_classloading::RedefineOptions;
+        let name = {
+            let cm = self.shared.class_manager.read();
+            let cls = cm
+                .class_store
+                .get(class_id)
+                .ok_or_else(|| "class not loaded".to_string())?;
+            cls.name.to_string()
+        };
+        {
+            let mut cm = self.shared.class_manager.write();
+            let options = RedefineOptions {
+                preserve_original_bytes: preserve_original,
+                ..RedefineOptions::default()
+            };
+            cm.redefine_class(class_id, new_bytes.to_vec(), options)
+                .map_err(|e| format!("{e:?}"))?;
+        }
+        // Best-effort JIT cache eviction by name (the
+        // `fire_jit_invalidate_hook` call inside `redefine_class` already
+        // notifies the registered hook keyed by `class_id`; this catches
+        // any name-keyed sibling caches).
+        let _ = self.shared.jit_cache.write().invalidate_for_class(&name);
+        let _ = self.shared.invalidate_jit_for_class(&name);
+        Ok(())
+    }
+}
+
 impl<'a> NativeContext for NativeContextImpl<'a> {
     fn load_class(&mut self, name: &str) -> MethodCallResult {
         let class_id = self.shared.load_class_concurrent(name)?;
@@ -5372,27 +5411,20 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // (keyed on the original ClassId) never observed a generation
         // bump.  The route below makes the in-place swap semantics
         // observable end-to-end.
-        use cratonvm_classloading::RedefineOptions;
-        let name = {
-            let cm = self.shared.class_manager.read();
-            let cls = cm
-                .class_store
-                .get(class_id)
-                .ok_or_else(|| "class not loaded".to_string())?;
-            cls.name.to_string()
-        };
-        {
-            let mut cm = self.shared.class_manager.write();
-            cm.redefine_class(class_id, new_bytes.to_vec(), RedefineOptions::default())
-                .map_err(|e| format!("{e:?}"))?;
-        }
-        // Best-effort JIT cache eviction by name (the
-        // `fire_jit_invalidate_hook` call inside `redefine_class` already
-        // notifies the registered hook keyed by `class_id`; this catches
-        // any name-keyed sibling caches).
-        let _ = self.shared.jit_cache.write().invalidate_for_class(&name);
-        let _ = self.shared.invalidate_jit_for_class(&name);
-        Ok(())
+        self.redefine_class_with(class_id, new_bytes, false)
+    }
+
+    /// `Instrumentation.retransformClasses` path. Same in-place swap as
+    /// `redefine_class`, but preserves the class's ORIGINAL cached bytes so the
+    /// NEXT retransform re-runs the transformer chain from the original rather
+    /// than the already-woven bytes (otherwise `mockStatic(X)` followed by
+    /// `mock(X)` double-instruments X and the instance mock fails).
+    fn retransform_class(
+        &mut self,
+        class_id: ClassId,
+        new_bytes: &[u8],
+    ) -> Result<(), String> {
+        self.redefine_class_with(class_id, new_bytes, true)
     }
 
     fn list_loaded_class_ids(&self) -> Vec<ClassId> {

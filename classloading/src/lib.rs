@@ -39,6 +39,7 @@ pub use class::{
     ClassState, ClassStore, CodeSource, RecordComponentInfo,
 };
 pub use class_manager::{
+    any_class_redefined,
     install_class_file_load_hook, install_class_load_hook, install_class_prepare_hook,
     install_jit_invalidate_hook, install_resolution_invalidate_hook,
     install_vtable_install_hook, install_vtable_override_hook,

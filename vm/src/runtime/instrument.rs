@@ -422,7 +422,10 @@ fn native_retransform_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         if final_bytes.is_empty() {
             continue;
         }
-        if let Err(msg) = ctx.redefine_class(class_id, &final_bytes) {
+        // retransform (not redefine): preserve the class's original cached
+        // bytes so a subsequent retransform re-runs the chain from the
+        // original, avoiding double-instrumentation (mockStatic+mock).
+        if let Err(msg) = ctx.retransform_class(class_id, &final_bytes) {
             tracing::warn!("retransformClasses0: {msg}");
         }
     }

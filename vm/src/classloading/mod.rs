@@ -18,9 +18,9 @@ pub use cratonvm_classloading::verify_insn;
 pub use cratonvm_classloading::vtype;
 
 pub use cratonvm_classloading::{
-    find_field_recursive, find_method_recursive, jdk_superclass_lookup, Class, ClassId,
-    ClassLoaderId, ClassManager, ClassPath, ClassState, ClassStore, ManifestInfo, ModuleDescriptor,
-    ModuleRegistry, RecordComponentInfo,
+    any_class_redefined, find_field_recursive, find_method_recursive, jdk_superclass_lookup, Class,
+    ClassId, ClassLoaderId, ClassManager, ClassPath, ClassState, ClassStore, ManifestInfo,
+    ModuleDescriptor, ModuleRegistry, RecordComponentInfo,
 };
 pub use cratonvm_classloading::{
     descriptor_from_module_attribute, package_of, JAVA_BASE, UNNAMED_MODULE,
