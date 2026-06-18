@@ -435,6 +435,12 @@ pub(crate) fn native_init_stack_trace_elements(
             .unwrap_or_default();
 
     let cap = ctx.array_length(elements);
+    if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
+        eprintln!("[STTRACE init] cap={cap} trace_data.len={}", trace_data.len());
+        for (i, (c, m, _, _)) in trace_data.iter().rev().take(cap).enumerate() {
+            eprintln!("[STTRACE init]   [{i}] {c}.{m}");
+        }
+    }
     // `Throwable.getStackTrace()` requires index 0 = the most-recent (innermost)
     // frame — the throw site. The stored trace is **outermost-first** (`main`
     // first): that is the order `capture_stack_trace` documents and the order
@@ -461,17 +467,23 @@ pub(crate) fn native_init_stack_trace_elements(
         ctx.set_array_element(elements, i, Value::Object(Some(ste)));
         filled = i + 1;
     }
-    // ES-FAIL-06 (cont.): `StackTraceElement.of` pre-fills the array with empty
-    // `new StackTraceElement()` objects (null `declaringClass`). When the array
-    // length (from getStackTraceDepth) exceeds the captured frame count, the
-    // trailing slots stay empty — and consumers like RandomizedRunner's
-    // `seedFromThrowable` do `element.getClassName().startsWith(...)`, NPEing on
-    // the null class name. Backfill any remaining slots with a populated
-    // placeholder so no element ever has a null `declaringClass`/`methodName`.
+    // ES-FAIL-06 (root): `StackTraceElement.of(x, depth)` pre-fills the array
+    // with empty `new StackTraceElement()` objects (null `declaringClass`).
+    // `depth` comes from `getStackTraceDepth()` (keyed on the throwable), but
+    // this native looks the trace up by the `backtrace` object's identity hash
+    // (arg #1). For most throwables CratonVM stores `backtrace == throwable`
+    // (self-reference) so the keys agree, but for some (observed: the
+    // suite-level failure thrown through RandomizedRunner) they don't — the
+    // lookup misses (len 0) while `cap` is large, leaving every slot empty.
+    // Consumers such as RandomizedRunner.seedFromThrowable do
+    // `element.getClassName().startsWith(...)` and NPE on the null name.
+    // Backfill any slot we didn't populate with a non-null placeholder so no
+    // StackTraceElement ever has a null class/method name. (A proper fix would
+    // unify the depth/elements lookup key; tracked separately.)
     if filled < cap {
         for i in filled..cap {
             let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
-            fill_stack_trace_element(ctx, ste, "java/lang/Thread", "java.lang.Thread", "<unknown>", None, -1);
+            fill_stack_trace_element(ctx, ste, "(unknown)", "(unknown)", "(unknown)", None, -1);
             ctx.set_array_element(elements, i, Value::Object(Some(ste)));
         }
     }
@@ -972,6 +984,31 @@ pub(crate) fn native_throwable_get_stack_trace_array(
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
+    // ES-FAIL-06 (proper fix): honor an explicitly-set `stackTrace` array.
+    // `RandomizedRunner.augmentStackTrace()` prepends a synthetic
+    // `__randomizedtesting.SeedInfo.seed(...)` frame via `setStackTrace()`, and
+    // the JDK stores the (cloned) array in the `stackTrace` field. Previously
+    // this native ALWAYS re-materialised from the captured backtrace, dropping
+    // that augmentation and yielding length/content mismatches (the masked
+    // ES-suite failures). The JDK sentinel `UNASSIGNED_STACK` is a zero-length
+    // array, so a non-empty `stackTrace` field means it was set (or cached) and
+    // must be returned verbatim instead of re-deriving from the backtrace.
+    if let Value::Object(Some(set_arr)) = ctx.get_field_by_name(this, "stackTrace") {
+        if ctx.array_length(set_arr) > 0 {
+            if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
+                let n = ctx.array_length(set_arr);
+                for i in 0..n {
+                    if let Value::Object(Some(e)) = ctx.get_array_element(set_arr, i) {
+                        let cn = ctx.get_field_by_name(e, "declaringClass");
+                        eprintln!("[STTRACE set-array] [{i}] declaringClass={cn:?}");
+                    } else {
+                        eprintln!("[STTRACE set-array] [{i}] = NULL ELEMENT");
+                    }
+                }
+            }
+            return Ok(Some(Value::Object(Some(set_arr))));
+        }
+    }
     let hash = ctx.identity_hash_code(this);
     if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
         eprintln!("STTRACE_DBG_GET_ARRAY this={:?} hash={hash}", this.as_ptr());
@@ -1019,6 +1056,17 @@ pub(crate) fn native_throwable_get_stack_trace_array(
             *line,
         );
         ctx.set_array_element(arr, i, Value::Object(Some(ste)));
+    }
+    if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
+        let n = ctx.array_length(arr);
+        for i in 0..n {
+            if let Value::Object(Some(e)) = ctx.get_array_element(arr, i) {
+                let cn = ctx.get_field_by_name(e, "declaringClass");
+                eprintln!("[STTRACE materialized] [{i}] declaringClass={cn:?}");
+            } else {
+                eprintln!("[STTRACE materialized] [{i}] = NULL ELEMENT");
+            }
+        }
     }
     Ok(Some(Value::Object(Some(arr))))
 }
