@@ -5448,6 +5448,46 @@ fn request_queue() -> &'static Mutex<HashMap<i32, Vec<PendingRequest>>> {
     INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// VULN-FIX [nb-net-phase-e]: configurable upper bound on the size of an inbound
+/// HTTP request body for the embedded com.sun.net.httpserver. Previously
+/// `parse_http_request` read up to the client-supplied `Content-Length` with NO
+/// upper bound, allowing a remote peer to exhaust process memory (DoS) by
+/// advertising (and streaming) an enormous body. We now cap the accepted body
+/// and reject anything larger with a 413 response.
+///
+/// The cap is read once from `CRATONVM_HTTP_MAX_BODY` (bytes); it defaults to
+/// 8 MiB, which is comfortably larger than any normal request the test suite
+/// issues while still bounding worst-case allocation. A value of 0 or an
+/// unparseable value falls back to the default.
+fn http_max_request_body() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        const DEFAULT: usize = 8 * 1024 * 1024; // 8 MiB
+        std::env::var("CRATONVM_HTTP_MAX_BODY")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT)
+    })
+}
+
+/// VULN-FIX [nb-net-phase-e]: best-effort write of a fixed minimal HTTP response
+/// to a peer we are about to reject (e.g. 413 for an oversized body, 400 for a
+/// malformed/duplicate Content-Length). Used so that the parse path can refuse a
+/// request cheaply without allocating its body and still tell the client why.
+fn http_reject_and_close(stream: &mut TcpStream, status: i32) {
+    let body = http_reason(status);
+    let mut resp = Vec::with_capacity(96 + body.len());
+    let _ = write!(
+        &mut resp,
+        "HTTP/1.1 {status} {body}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(&resp);
+    let _ = stream.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
 fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let mut buf = Vec::with_capacity(4096);
@@ -5476,22 +5516,85 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
     let uri = rl.next()?.to_string();
     let _ = rl.next()?;
     let mut headers = Vec::new();
-    let mut content_length: usize = 0;
+    // VULN-FIX [nb-net-phase-e]: track Content-Length as an Option and DETECT
+    // duplicate/conflicting declarations instead of silently letting the last
+    // one win. Two differing Content-Length values (or a malformed one) are a
+    // classic request-smuggling vector, so we reject the request with 400.
+    let mut content_length: Option<usize> = None;
     for line in lines {
         if let Some(colon) = line.find(':') {
             let k = line[..colon].trim().to_string();
             let v = line[colon + 1..].trim().to_string();
             if k.eq_ignore_ascii_case("content-length") {
-                content_length = v.parse().unwrap_or(0);
+                // A header value may itself be a comma-separated list of equal
+                // values (RFC 9110 §8.6); any unparseable or conflicting value
+                // is treated as malformed.
+                let parsed = v
+                    .split(',')
+                    .map(|p| p.trim())
+                    .try_fold(None::<usize>, |acc, p| {
+                        let n: usize = p.parse().ok()?;
+                        match acc {
+                            Some(prev) if prev != n => None, // conflicting list members
+                            _ => Some(Some(n)),
+                        }
+                    })
+                    .flatten();
+                match parsed {
+                    Some(n) => match content_length {
+                        Some(prev) if prev != n => {
+                            // Conflicting duplicate Content-Length headers.
+                            http_reject_and_close(&mut stream, 400);
+                            return None;
+                        }
+                        _ => content_length = Some(n),
+                    },
+                    None => {
+                        // Unparseable / list with differing values.
+                        http_reject_and_close(&mut stream, 400);
+                        return None;
+                    }
+                }
             }
             headers.push((k, v));
         }
     }
-    let mut body = buf[sep + 4..].to_vec();
+    let content_length = content_length.unwrap_or(0);
+    // VULN-FIX [nb-net-phase-e]: bound the advertised body length BEFORE we read
+    // or allocate anything. Without this a remote peer could send a huge
+    // Content-Length and stream gigabytes, exhausting process memory.
+    let max_body = http_max_request_body();
+    if content_length > max_body {
+        http_reject_and_close(&mut stream, 413);
+        return None;
+    }
+    // Any bytes already pulled in while reading the header also count toward the
+    // bounded body. Clamp the initial slice so a peer can't smuggle past the cap
+    // via a body that arrived in the same read as the header terminator.
+    let leftover = &buf[sep + 4..];
+    if leftover.len() > max_body {
+        http_reject_and_close(&mut stream, 413);
+        return None;
+    }
+    // Allocate with bounded capacity (never the unbounded client value): we will
+    // read at most `content_length` bytes, itself already <= max_body.
+    let mut body = Vec::with_capacity(content_length.min(max_body));
+    body.extend_from_slice(leftover);
     while body.len() < content_length {
-        match stream.read(&mut tmp) {
+        // Read no more than what is still wanted; stop hard at the cap.
+        let want = content_length - body.len();
+        let chunk = want.min(tmp.len());
+        match stream.read(&mut tmp[..chunk]) {
             Ok(0) => break,
-            Ok(n) => body.extend_from_slice(&tmp[..n]),
+            Ok(n) => {
+                body.extend_from_slice(&tmp[..n]);
+                if body.len() > max_body {
+                    // Defensive: should be unreachable given the checks above,
+                    // but never let the buffer grow past the cap.
+                    http_reject_and_close(&mut stream, 413);
+                    return None;
+                }
+            }
             Err(_) => break,
         }
     }
@@ -5629,6 +5732,9 @@ fn http_reason(code: i32) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        // VULN-FIX [nb-net-phase-e]: 413 used to reject oversized request bodies
+        // (Content-Length exceeding the configurable max — see http_max_request_body()).
+        413 => "Payload Too Large",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
@@ -6012,5 +6118,79 @@ mod tests {
         assert_eq!(req.method, "GET");
         assert_eq!(req.uri, "/hi");
         assert!(req.headers.iter().any(|(k, v)| k == "Host" && v == "x"));
+    }
+
+    // VULN-FIX [nb-net-phase-e] regression: an oversized advertised body must be
+    // rejected with 413 and NOT allocated. We set a tiny per-process unlikely
+    // value by exploiting the default cap (8 MiB) being far above 10 bytes while
+    // we claim a body larger than the cap via Content-Length.
+    #[test]
+    fn re10_oversized_content_length_rejected_with_413() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Advertise a body well beyond the 8 MiB default cap; do NOT actually
+        // send it (the server must refuse before reading the body).
+        let huge = http_max_request_body() + 1;
+        let handle = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c.write_all(
+                format!("POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: {huge}\r\n\r\n").as_bytes(),
+            )
+            .unwrap();
+            // Read back whatever the server responds with.
+            let mut resp = Vec::new();
+            let _ = c.read_to_end(&mut resp);
+            resp
+        });
+        let (stream, _) = listener.accept().unwrap();
+        // parse must reject (None) without reading the huge body.
+        assert!(parse_http_request(stream).is_none());
+        let resp = handle.join().unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with("HTTP/1.1 413"),
+            "expected 413 response, got: {text}"
+        );
+    }
+
+    // VULN-FIX [nb-net-phase-e] regression: conflicting duplicate Content-Length
+    // headers (request-smuggling vector) must be rejected with 400 rather than
+    // last-wins.
+    #[test]
+    fn re10_conflicting_content_length_rejected_with_400() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c.write_all(b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nContent-Length: 5\r\n\r\nabc")
+                .unwrap();
+            let mut resp = Vec::new();
+            let _ = c.read_to_end(&mut resp);
+            resp
+        });
+        let (stream, _) = listener.accept().unwrap();
+        assert!(parse_http_request(stream).is_none());
+        let resp = handle.join().unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with("HTTP/1.1 400"),
+            "expected 400 response, got: {text}"
+        );
+    }
+
+    // VULN-FIX [nb-net-phase-e] regression: a small, well-formed body within the
+    // cap is still accepted unchanged.
+    #[test]
+    fn re10_small_body_within_cap_accepted() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c.write_all(b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello")
+                .unwrap();
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let req = parse_http_request(stream).unwrap();
+        assert_eq!(req.body, b"hello");
     }
 }

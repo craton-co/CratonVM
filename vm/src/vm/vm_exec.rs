@@ -144,19 +144,26 @@ pub fn coerce_value_for_return(value: Value, ret_type: u8) -> Value {
         },
         b'L' | b'[' => match value {
             Value::Int(0) | Value::Long(0) => Value::Object(None),
-            // JNI and a few internal bridges surface jobject handles as raw
-            // i64 / jlong in `Value::Long`.  If we keep that shape through
-            // `push_invoke_return_value`, the slot is stored as VTAG_LONG,
-            // GC never traces it, and the next `astore`/`aload` sequence can
-            // use a collected `java.lang.Class` — Letsgo AV after
-            // `ConfigurationClassEnhancer.enhance` returns.
-            Value::Long(v) => {
-                if let Some(p) = jlong_bits_as_aligned_object_ptr(v as u64) {
-                    Value::Object(Some(unsafe { ObjectRef::from_raw(p as *mut u8) }))
-                } else {
-                    Value::Object(None)
-                }
-            }
+            // vm-vmexec-coerce: a `Value::Long` reaching an `L`/`[` return slot
+            // used to be reinterpreted as a heap pointer whenever
+            // `jlong_bits_as_aligned_object_ptr` returned `Some` — but that
+            // helper only checks `p != 0 && p % 8 == 0`, with NO heap-membership
+            // test. A `long` carrying an 8-aligned hash / size / length thus
+            // became a *fabricated* `ObjectRef`; once stored as `VTAG_OBJECT`,
+            // the next GC marks/moves that bogus pointer → Win32 AV / 0xC0000005.
+            //
+            // We MUST NOT fabricate an `ObjectRef` here without proving the bits
+            // point into the heap, and this context-free coercer has no
+            // `SharedVm`/heap to consult. So for the aligned-Long case we yield
+            // `Value::Object(None)` and force callers that legitimately surface
+            // jobject-as-jlong handles (JNI / internal bridges) onto the
+            // heap-validating sibling `coerce_value_for_return_validated`, which
+            // round-trips the bits through `shared.heap.is_object_address`.
+            //
+            // Genuine object returns arrive as `Value::Object(Some(_))` and flow
+            // unchanged through the `other` arm below — their behavior is
+            // untouched.
+            Value::Long(_) => Value::Object(None),
             other => other,
         },
         _ => value,
@@ -10833,6 +10840,32 @@ mod tests {
     #[test]
     fn coerce_int_to_long_widens() {
         assert_eq!(coerce_value_for_return(Value::Int(-1), b'J'), Value::Long(-1));
+    }
+
+    #[test]
+    fn coerce_aligned_long_to_ref_does_not_fabricate_objectref() {
+        // vm-vmexec-coerce: a non-zero, 8-aligned `Value::Long` (e.g. a hash /
+        // size / length that happens to satisfy `p != 0 && p % 8 == 0`) reaching
+        // an `L`/`[` return slot must NOT be reinterpreted as a heap `ObjectRef`
+        // by this heap-unaware coercer — that fabricated pointer would later be
+        // marked/moved by GC and crash. It now coerces to `null`; a real
+        // jobject-as-jlong handle must go through
+        // `coerce_value_for_return_validated`, which checks heap membership.
+        let aligned = 0x4000_0000u64; // != 0 and 8-aligned
+        assert!(jlong_bits_as_aligned_object_ptr(aligned).is_some());
+        assert_eq!(
+            coerce_value_for_return(Value::Long(aligned as i64), b'L'),
+            Value::Object(None)
+        );
+        assert_eq!(
+            coerce_value_for_return(Value::Long(aligned as i64), b'['),
+            Value::Object(None)
+        );
+        // A genuine object return is forwarded unchanged.
+        assert_eq!(
+            coerce_value_for_return(Value::Object(None), b'L'),
+            Value::Object(None)
+        );
     }
 
     // -----------------------------------------------------------------------

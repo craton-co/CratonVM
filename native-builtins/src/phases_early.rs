@@ -1860,7 +1860,33 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
                 }
             }
         }
-        // Add new pair
+        // Add new pair.
+        //
+        // BUGFIX [nb-phases-early (1)]: the <init> above allocates a FIXED
+        // 32-element interleaved key/value backing array (= 16 pairs). The
+        // previous code wrote data[size*2]/[size*2+1] with NO capacity check,
+        // so the 17th distinct key produced an out-of-bounds array store whose
+        // error was silently discarded by vm_exec.rs — the pair simply vanished
+        // and `size` was still bumped, corrupting the table. Grow the backing
+        // array (double capacity, copy, reset field 0) BEFORE the store once it
+        // would not fit, mirroring ucl_add_url's growth in classloader.rs.
+        let data = {
+            let arr_len = ctx.array_length(data);
+            if size * 2 + 1 >= arr_len {
+                // Double capacity (guard the degenerate len==0 case) and copy
+                // every existing slot into the fresh, larger array.
+                let new_cap = (arr_len * 2).max((size + 1) * 2);
+                let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+                for i in 0..arr_len {
+                    let elem = ctx.get_array_element(data, i);
+                    ctx.set_array_element(new_arr, i, elem);
+                }
+                ctx.set_field(this, 0, Value::Object(Some(new_arr)));
+                new_arr
+            } else {
+                data
+            }
+        };
         ctx.set_array_element(data, size * 2, key);
         ctx.set_array_element(data, size * 2 + 1, val);
         ctx.set_field(this, 1, Value::Int((size + 1) as i32));
@@ -9108,11 +9134,30 @@ fn pkcs7_unpad(data: &[u8]) -> Result<Vec<u8>, &'static str> {
     if pad_len == 0 || pad_len > 16 || pad_len > data.len() {
         return Err("invalid padding");
     }
-    // Verify all padding bytes
-    for &b in &data[data.len() - pad_len..] {
-        if b != pad_byte {
-            return Err("invalid padding bytes");
-        }
+    // BUGFIX [nb-phases-early (2)] — CBC padding-oracle hardening.
+    // The previous loop early-returned on the FIRST mismatching padding byte,
+    // so the time-to-error leaked HOW MANY trailing bytes matched — a classic
+    // Vaudenay CBC padding oracle. Verify in constant time instead: iterate a
+    // FIXED 16-byte window over the tail (loop trip count independent of the
+    // claimed pad_len), accumulate any mismatch into `bad` with no data-
+    // dependent branches, and decide exactly once at the end. This mirrors the
+    // constant-time discipline of the RustCrypto AES core used above.
+    let mut bad: u8 = 0;
+    let n = data.len();
+    for i in 0..16usize {
+        // `in_pad` is all-ones when this position falls within the claimed
+        // padding region (the last `pad_len` bytes), all-zeros otherwise —
+        // computed branchlessly so the mask itself leaks nothing.
+        let in_pad = ((((i as i32) - (pad_len as i32)) >> 31) as u8) & 1;
+        let mask = in_pad.wrapping_neg(); // 0xFF when in_pad==1, else 0x00
+        // Index from the end; `i < pad_len <= n` whenever the mask is active,
+        // so the read stays in bounds. Out-of-window iterations read a valid
+        // tail byte but contribute nothing (mask == 0).
+        let b = data[n - 1 - i];
+        bad |= mask & (b ^ pad_byte);
+    }
+    if bad != 0 {
+        return Err("invalid padding bytes");
     }
     Ok(data[..data.len() - pad_len].to_vec())
 }
@@ -16195,5 +16240,64 @@ mod t2_tests {
         assert_eq!(p52_group_digits("123"), "123");
         assert_eq!(p52_group_digits("1234"), "1,234");
         assert_eq!(p52_group_digits("1234567"), "1,234,567");
+    }
+
+    // -----------------------------------------------------------------------
+    // BUGFIX [nb-phases-early (2)]: PKCS7 constant-time unpad regression tests.
+    // These exercise the rewritten constant-time validator (fixed 16-byte
+    // window, branch-once-at-end) for correctness across every valid pad_len
+    // and a representative set of malformed inputs. They are pure (no
+    // NativeContext) since pkcs7_unpad operates on &[u8].
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pkcs7_unpad_roundtrip_all_pad_lengths() {
+        // For every payload that yields pad_len 1..=16, pad then unpad must
+        // recover the original bytes exactly.
+        for plaintext_len in 0..16usize {
+            let plaintext: Vec<u8> = (0..plaintext_len).map(|i| (i as u8).wrapping_mul(7)).collect();
+            let padded = pkcs7_pad(&plaintext);
+            assert_eq!(padded.len() % 16, 0);
+            let unpadded = pkcs7_unpad(&padded).expect("valid padding must unpad");
+            assert_eq!(unpadded, plaintext, "len {plaintext_len}");
+        }
+    }
+
+    #[test]
+    fn pkcs7_unpad_full_block_padding() {
+        // A 16-byte plaintext pads to a second all-0x10 block; unpad recovers it.
+        let plaintext = vec![0xAAu8; 16];
+        let padded = pkcs7_pad(&plaintext);
+        assert_eq!(padded.len(), 32);
+        assert_eq!(&padded[16..], &[0x10u8; 16]);
+        assert_eq!(pkcs7_unpad(&padded).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn pkcs7_unpad_rejects_corrupt_padding_byte() {
+        // pad_len = 5; corrupt a NON-last padding byte. The old early-return
+        // loop and the new constant-time loop must both reject, but the new
+        // one does so without leaking how deep the mismatch was.
+        let mut padded = pkcs7_pad(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]); // 11 -> pad 5
+        assert_eq!(*padded.last().unwrap(), 5);
+        let n = padded.len();
+        padded[n - 3] ^= 0xFF; // flip a padding byte that is not the trailing one
+        assert!(pkcs7_unpad(&padded).is_err());
+    }
+
+    #[test]
+    fn pkcs7_unpad_rejects_zero_and_oversize_pad_byte() {
+        let mut block = vec![0u8; 16];
+        // pad_byte 0 is invalid.
+        assert!(pkcs7_unpad(&block).is_err());
+        // pad_byte > 16 is invalid.
+        block[15] = 17;
+        assert!(pkcs7_unpad(&block).is_err());
+    }
+
+    #[test]
+    fn pkcs7_unpad_rejects_bad_length() {
+        assert!(pkcs7_unpad(&[]).is_err());
+        assert!(pkcs7_unpad(&[1, 2, 3]).is_err()); // not a multiple of 16
     }
 }

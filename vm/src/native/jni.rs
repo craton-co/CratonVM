@@ -102,6 +102,25 @@ thread_local! {
     /// can reconstruct the correct `Vec` layout and deallocate safely.
     static JNI_STRING_BUFFERS: std::cell::RefCell<HashMap<usize, usize>> =
         std::cell::RefCell::new(HashMap::new());
+    /// Tracks (pointer -> element count) for the copy buffers handed out by
+    /// `Get<Type>ArrayElements` so that `Release<Type>ArrayElements` can copy
+    /// the elements back and reconstruct the exact `Vec` layout for
+    /// deallocation.
+    ///
+    /// BUG FIX (vm-jni-roots #2): `Release` previously RE-DERIVED the length
+    /// from the array handle (`array_length`). If the length observed at
+    /// Release differed from the length at Get — the array moved/was realloc'd
+    /// under a moving GC, the handle was aliased/stale, or `array_length` read
+    /// 0 — then `Vec::from_raw_parts(elems, len, len)` was built with the wrong
+    /// length/capacity, corrupting the allocator. We now key the allocation by
+    /// its returned pointer at Get time and use the STORED count for both the
+    /// copy-back loop and `from_raw_parts`, never re-deriving from the handle.
+    /// Value is `(initialised_len, capacity)`: `initialised_len` is the number
+    /// of elements actually written (bounds the copy-back loop so we never read
+    /// uninitialised memory) and `capacity` is the original `Vec` allocation
+    /// size that MUST be passed to `Vec::from_raw_parts` for a sound free.
+    static JNI_ARRAY_ELEM_BUFFERS: std::cell::RefCell<HashMap<usize, (usize, usize)>> =
+        std::cell::RefCell::new(HashMap::new());
     /// Tracks temporary contiguous buffers handed out by
     /// `GetPrimitiveArrayCritical` when the underlying array is a G1
     /// **humongous** array (whose payload is split across non-contiguous
@@ -655,6 +674,63 @@ pub fn delete_local_ref(jobj: JObject) {
         let mut stack = f.borrow_mut();
         if let Some(top) = stack.last_mut() {
             top.retain(|&r| r != jobj);
+        }
+    });
+}
+
+/// Collect every active JNI **local** reference held by THIS thread into `out`
+/// for GC root scanning.
+///
+/// BUG FIX (vm-jni-roots #1): the per-thread `JNI_LOCAL_FRAMES` stack holds
+/// local-ref `JObject` handles, which for local refs are raw heap pointers
+/// (bit 0 = 0). Previously only `JniGlobalRefs::collect_roots` was folded into
+/// the root set (see `roots.rs`), so a heap object reachable ONLY through a JNI
+/// local ref could be reclaimed mid-native-call (or, under a moving GC, left as
+/// a stale from-space pointer). This mirrors `JniGlobalRefs::collect_roots`,
+/// but for the thread-local local-frame stack. Must be called on each thread
+/// that may hold local refs (the per-thread `roots::collect_roots`).
+///
+/// Global refs (bit 0 = 1) never appear in `JNI_LOCAL_FRAMES`, but we defend
+/// against a tagged value sneaking in by skipping any handle with bit 0 set
+/// (those are rooted separately via `JniGlobalRefs`).
+pub fn collect_local_ref_roots(out: &mut Vec<ObjectRef>) {
+    JNI_LOCAL_FRAMES.with(|f| {
+        for frame in f.borrow().iter() {
+            for &handle in frame.iter() {
+                if handle == 0 || handle & 1 == 1 {
+                    continue;
+                }
+                // Safety: a local ref is a raw, non-null heap pointer; it was a
+                // live ObjectRef when pushed and is kept live precisely by being
+                // reported here.
+                out.push(unsafe { ObjectRef::from_raw(handle as *mut u8) });
+            }
+        }
+    });
+}
+
+/// Apply a GC pointer map to every active JNI local reference on THIS thread,
+/// rewriting moved-object handles in place.
+///
+/// BUG FIX (vm-jni-roots #1): after a moving GC relocates objects, the raw
+/// pointers stored in `JNI_LOCAL_FRAMES` would dangle (point at from-space).
+/// This mirrors `JniGlobalRefs::update_after_gc` for the local-frame stack:
+/// for each stored local-ref handle whose address appears in `pointer_map`, we
+/// overwrite it with the relocated address so the native code's local jobject
+/// continues to resolve to the live object. Must be called on each thread that
+/// may hold local refs, after the heap has been compacted.
+pub fn update_local_refs_after_gc(pointer_map: &std::collections::HashMap<usize, usize>) {
+    JNI_LOCAL_FRAMES.with(|f| {
+        for frame in f.borrow_mut().iter_mut() {
+            for handle in frame.iter_mut() {
+                if *handle == 0 || *handle & 1 == 1 {
+                    continue;
+                }
+                let old_addr = *handle as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    *handle = new_addr as JObject;
+                }
+            }
         }
     });
 }
@@ -2238,6 +2314,19 @@ macro_rules! get_array_elements {
                     buf.push(elem);
                 }
                 let ptr = buf.as_mut_ptr();
+                // BUG FIX (vm-jni-roots #2): record (ptr -> (len, cap)) so
+                // Release uses the EXACT layout we allocated. `buf` was created
+                // with `Vec::with_capacity(len)` then filled via `push`, so its
+                // capacity is `len` and its initialised count is `buf.len()`
+                // (== len unless an element fetch broke early). We store BOTH:
+                // `buf.len()` bounds the copy-back (never read uninitialised
+                // tail) and `buf.capacity()` is the size `Vec::from_raw_parts`
+                // requires for a sound free.
+                let buf_len = buf.len();
+                let buf_cap = buf.capacity();
+                JNI_ARRAY_ELEM_BUFFERS.with(|c| {
+                    c.borrow_mut().insert(ptr as usize, (buf_len, buf_cap));
+                });
                 std::mem::forget(buf); // OWNERSHIP: buffer transferred to native caller, freed by Release<Type>ArrayElements via Vec::from_raw_parts
                 Some(ptr)
             })
@@ -2279,14 +2368,39 @@ macro_rules! release_array_elements {
             if elems.is_null() {
                 return;
             }
+            // BUG FIX (vm-jni-roots #2): look up the (initialised_len, capacity)
+            // recorded for THIS buffer at Get time. Never re-derive the length
+            // from the array handle — the array may have moved/realloc'd under a
+            // moving GC, the handle may be aliased/stale, or `array_length` may
+            // read 0, any of which made the old code build the copy-back loop
+            // and `Vec::from_raw_parts` with a wrong length → heap corruption.
+            //
+            // For mode != 1 (i.e. modes that free) we `remove` the entry so the
+            // pointer can never be double-freed; for JNI_COMMIT (1, no free) we
+            // only `get` so a later release can still find it.
+            let entry = if mode != 1 {
+                JNI_ARRAY_ELEM_BUFFERS.with(|c| c.borrow_mut().remove(&(elems as usize)))
+            } else {
+                JNI_ARRAY_ELEM_BUFFERS.with(|c| c.borrow().get(&(elems as usize)).copied())
+            };
+            let (stored_len, stored_cap) = match entry {
+                Some(v) => v,
+                // Unknown pointer — not one we handed out (or already released).
+                // Do nothing rather than risk a wrong-length free.
+                None => return,
+            };
             // mode 0 = copy back and free, JNI_COMMIT = copy back don't free,
             // JNI_ABORT = free without copy back
             if mode != 2 && array != 0 {
-                // Copy back to array (mode 0 or JNI_COMMIT=1)
+                // Copy back to array (mode 0 or JNI_COMMIT=1). Bound the loop by
+                // BOTH our initialised length and the live array length so we
+                // neither read past the end of our buffer nor write out of the
+                // array's bounds if it has since shrunk.
                 with_shared_vm(|shared| {
                     let oref = jobject_to_obj(array)?;
-                    let len = shared.heap.array_length(oref);
-                    for i in 0..len {
+                    let arr_len = shared.heap.array_length(oref);
+                    let copy_len = stored_len.min(arr_len);
+                    for i in 0..copy_len {
                         let val = unsafe { *elems.add(i) };
                         let value = $value_constructor(val);
                         let _ = shared.heap.set_array_element(oref, i, value);
@@ -2295,21 +2409,10 @@ macro_rules! release_array_elements {
                 });
             }
             if mode != 1 {
-                // Free buffer (mode 0 or JNI_ABORT=2)
-                // Reconstruct Vec to free — we need the length.
-                // Since we don't track length, use array length.
-                if array != 0 {
-                    let len = with_shared_vm(|shared| {
-                        jobject_to_obj(array)
-                            .map(|oref| shared.heap.array_length(oref))
-                    })
-                    .flatten()
-                    .unwrap_or(0);
-                    if len > 0 {
-                        unsafe {
-                            drop(Vec::from_raw_parts(elems, len, len));
-                        }
-                    }
+                // Free buffer (mode 0 or JNI_ABORT=2) using the EXACT length and
+                // capacity we recorded at allocation time.
+                unsafe {
+                    drop(Vec::from_raw_parts(elems, stored_len, stored_cap));
                 }
             }
         }
@@ -5265,6 +5368,120 @@ mod tests {
     fn global_refs_remove_returns_false_for_untagged() {
         let mut refs = JniGlobalRefs::new();
         assert!(!refs.remove(0x1000)); // bit 0 clear
+    }
+
+    // -----------------------------------------------------------------------
+    // vm-jni-roots #1: JNI LOCAL refs are GC roots and are remapped on move.
+    //
+    // These exercise the pure thread-local-frame bookkeeping without a heap:
+    // `collect_local_ref_roots` / `update_local_refs_after_gc` only read/write
+    // raw handle integers (and wrap them with `ObjectRef::from_raw`, which does
+    // not dereference), so fabricated aligned, non-null, bit-0-clear handles
+    // are sufficient. Each test pops its frame at the end so it leaves no
+    // residue for sibling tests sharing the thread-local stack.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn local_refs_collected_as_roots() {
+        push_local_frame(8);
+        // Two valid local-ref handles (8-byte aligned, non-null, bit 0 == 0).
+        let h1: JObject = 0x1_0000;
+        let h2: JObject = 0x2_0000;
+        track_local_ref(h1);
+        track_local_ref(h2);
+        // A global ref (bit 0 == 1) and null must NOT be picked up here.
+        track_local_ref(0x3_0001);
+        track_local_ref(0);
+
+        let mut roots = Vec::new();
+        collect_local_ref_roots(&mut roots);
+        let addrs: Vec<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
+        assert!(addrs.contains(&(h1 as usize)));
+        assert!(addrs.contains(&(h2 as usize)));
+        assert!(!addrs.contains(&0x3_0001));
+        assert_eq!(addrs.len(), 2, "only the 2 untagged local refs are roots");
+
+        pop_local_frame(0);
+    }
+
+    #[test]
+    fn local_refs_remapped_after_gc() {
+        push_local_frame(8);
+        let old_addr: JObject = 0x4_0000;
+        track_local_ref(old_addr);
+        let new_addr = (old_addr as usize).wrapping_add(0x1000);
+        let mut pointer_map = std::collections::HashMap::new();
+        pointer_map.insert(old_addr as usize, new_addr);
+
+        update_local_refs_after_gc(&pointer_map);
+
+        let mut roots = Vec::new();
+        collect_local_ref_roots(&mut roots);
+        let addrs: Vec<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
+        assert!(
+            addrs.contains(&new_addr),
+            "moved local ref must report its relocated address"
+        );
+        assert!(
+            !addrs.contains(&(old_addr as usize)),
+            "stale from-space address must be gone after remap"
+        );
+
+        pop_local_frame(0);
+    }
+
+    #[test]
+    fn local_refs_dropped_when_frame_popped() {
+        push_local_frame(4);
+        track_local_ref(0x5_0000);
+        pop_local_frame(0);
+        // After popping the only frame there are no local-ref roots.
+        let mut roots = Vec::new();
+        collect_local_ref_roots(&mut roots);
+        assert!(roots.iter().all(|r| r.as_ptr() as usize != 0x5_0000));
+    }
+
+    // -----------------------------------------------------------------------
+    // vm-jni-roots #2: Get/Release<Type>ArrayElements free with the STORED
+    // length/capacity, never a length re-derived from the array handle.
+    //
+    // We mirror the exact pattern the macros use — `Vec::with_capacity` +
+    // `forget`, record `(len, cap)` in `JNI_ARRAY_ELEM_BUFFERS`, then look it
+    // up and `Vec::from_raw_parts(ptr, len, cap)` — and prove the round-trip is
+    // sound even when a (simulated) handle-derived length would DIFFER. With
+    // the old re-derivation, a divergent length here produced a from_raw_parts
+    // mismatch (heap corruption); with the stored layout it is always exact.
+    // (Miri/ASAN would flag any mismatch; a normal build at least proves the
+    // map plumbing compiles and the lengths are preserved.)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn array_elem_buffer_freed_with_stored_layout() {
+        let mut buf: Vec<i32> = Vec::with_capacity(5);
+        for i in 0..5 {
+            buf.push(i);
+        }
+        let ptr = buf.as_mut_ptr();
+        let stored = (buf.len(), buf.capacity());
+        std::mem::forget(buf);
+        JNI_ARRAY_ELEM_BUFFERS.with(|c| {
+            c.borrow_mut().insert(ptr as usize, stored);
+        });
+
+        // Simulate a Release that does NOT trust the handle: pull the stored
+        // layout and reconstruct exactly. A spurious "handle length" of 0 or 99
+        // must be irrelevant.
+        let entry = JNI_ARRAY_ELEM_BUFFERS.with(|c| c.borrow_mut().remove(&(ptr as usize)));
+        let (len, cap) = entry.expect("buffer must be tracked");
+        assert_eq!(len, 5);
+        assert_eq!(cap, 5);
+        // Sound free using the stored layout (NOT a re-derived length).
+        unsafe {
+            drop(Vec::from_raw_parts(ptr, len, cap));
+        }
+        // Entry is consumed; a second release would find nothing and no-op.
+        assert!(
+            JNI_ARRAY_ELEM_BUFFERS.with(|c| c.borrow().get(&(ptr as usize)).is_none())
+        );
     }
 
     // -----------------------------------------------------------------------

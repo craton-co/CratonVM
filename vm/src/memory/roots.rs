@@ -184,6 +184,19 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         shared.jni_global_refs.lock().collect_roots(&mut roots);
     }
 
+    // 9b. JNI LOCAL references (vm-jni-roots #1).
+    //
+    //     Previously only global refs (section 9) were rooted. The per-thread
+    //     `JNI_LOCAL_FRAMES` stack — pushed by PushLocalFrame and every JNI
+    //     accessor that hands a fresh local jobject back to native code — held
+    //     raw heap pointers that were NEVER scanned. A heap object reachable
+    //     only through a JNI local ref could therefore be collected mid-native-
+    //     call, or left dangling at a from-space address under the moving GC.
+    //     Fold this thread's active local refs into the root set here; the
+    //     matching remap after a moving collection is
+    //     `crate::native::jni::update_local_refs_after_gc` (gc.rs).
+    crate::native::jni::collect_local_ref_roots(&mut roots);
+
     // 10. Thread-local ObjectRefs — java_thread_obj, pending_async_exception
     if let Some(ref obj_ref) = thread.java_thread_obj {
         roots.push(*obj_ref);

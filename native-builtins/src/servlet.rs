@@ -2273,12 +2273,34 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(bb, "get", "([BII)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let dst = obj_arg(args, 1)?;
-        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+        // BUG [nb-servlet]: `off`/`len` were taken as raw i32 with NO negativity
+        // check, and `off` was cast to usize BEFORE validation. A negative `len`
+        // passed the `pos + len > limit` test (it makes the sum smaller), then
+        // `for i in 0..len as usize` reinterpreted the negative as ~1.8e19 → hang/DoS.
+        // A negative `off` cast straight to a huge usize. Fix: reject off<0/len<0
+        // with (Array)IndexOutOfBoundsException first, do the bounds math in widened
+        // i64 to avoid overflow, and verify off+len fits the destination array.
+        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+        let dst_cap = ctx.array_length(dst) as i64;
+        if off < 0
+            || len < 0
+            || (off as i64) + (len as i64) > dst_cap
+        {
+            // ArrayIndexOutOfBoundsException is a subclass of
+            // IndexOutOfBoundsException (what the JDK throws here), so it
+            // satisfies `catch (IndexOutOfBoundsException)` callers.
+            return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                index: if off < 0 { off } else { off.saturating_add(len) },
+            }
+            .into());
+        }
         let pos = s2_bb_pos(ctx, this);
-        if pos + len > s2_bb_limit(ctx, this) {
+        // Widened arithmetic: pos+len cannot wrap into a "passing" value.
+        if (pos as i64) + (len as i64) > s2_bb_limit(ctx, this) as i64 {
             return Err(RuntimeError::BufferUnderflowException.into());
         }
+        let off = off as usize;
         let arr = s2_bb_arr(ctx, this).unwrap_or(dst);
         for i in 0..len as usize {
             let b = ctx.get_array_element(arr, pos as usize + i);
@@ -2326,12 +2348,32 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(bb, "put", "([BII)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let src = obj_arg(args, 1)?;
-        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+        // BUG [nb-servlet]: symmetric to get([BII). `off`/`len` were raw i32 with
+        // no negativity check and `off` cast to usize before validation. A negative
+        // `len` slipped past `pos + len > limit` then `for i in 0..len as usize`
+        // looped ~1.8e19 times (hang/DoS); a negative `off` indexed src wildly. Fix:
+        // reject off<0/len<0 with (Array)IndexOutOfBoundsException, widen the buffer
+        // bounds math to i64, and verify off+len fits the source array.
+        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+        let src_cap = ctx.array_length(src) as i64;
+        if off < 0
+            || len < 0
+            || (off as i64) + (len as i64) > src_cap
+        {
+            // ArrayIndexOutOfBoundsException ⊂ IndexOutOfBoundsException (JDK's
+            // throw), so `catch (IndexOutOfBoundsException)` callers still match.
+            return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                index: if off < 0 { off } else { off.saturating_add(len) },
+            }
+            .into());
+        }
         let pos = s2_bb_pos(ctx, this);
-        if pos + len > s2_bb_limit(ctx, this) {
+        // Widened arithmetic: pos+len cannot wrap into a "passing" value.
+        if (pos as i64) + (len as i64) > s2_bb_limit(ctx, this) as i64 {
             return Err(RuntimeError::BufferOverflowException.into());
         }
+        let off = off as usize;
         let arr = s2_bb_arr(ctx, this).unwrap_or(src);
         for i in 0..len as usize {
             let b = ctx.get_array_element(src, off + i);
@@ -3755,6 +3797,56 @@ mod tests {
         assert_eq!(s2_bb_int_byte_off(0, i32::MAX / 3), -1);
         // `base + bytes` overflow also saturates.
         assert_eq!(s2_bb_int_byte_off(i32::MAX, 1), -1);
+    }
+
+    // =======================================================================
+    // [nb-servlet] — ByteBuffer.get/put([BII) off/len validation.
+    //
+    // The bulk get([BII)/put([BII) handlers used to accept `off`/`len` as raw
+    // i32 with no negativity check and cast `off` to usize before validating.
+    // A negative `len` slipped past `pos + len > limit` (the sum shrinks), then
+    // `for i in 0..len as usize` reinterpreted the negative as ~1.8e19 → an
+    // effectively infinite loop (hang/DoS). This pins the exact validation
+    // predicate the fix introduced (mirrored here as a pure function so it is
+    // testable without a full VM `ctx`).
+    // =======================================================================
+
+    /// Returns the rejected index (as the JDK-style IOOBE would report) if the
+    /// (off, len) pair is invalid for an array of `cap` elements, else `None`.
+    /// This is a faithful copy of the guard now in the get/put([BII) handlers.
+    fn bb_bii_reject(off: i32, len: i32, cap: i64) -> Option<i32> {
+        if off < 0 || len < 0 || (off as i64) + (len as i64) > cap {
+            Some(if off < 0 { off } else { off.saturating_add(len) })
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn nb_servlet_bb_bii_rejects_negative_and_oob() {
+        // Valid in-range copies pass.
+        assert_eq!(bb_bii_reject(0, 8, 8), None);
+        assert_eq!(bb_bii_reject(3, 5, 8), None);
+        assert_eq!(bb_bii_reject(8, 0, 8), None);
+
+        // Negative len — the original hang/DoS vector — is rejected.
+        assert!(bb_bii_reject(0, -1, 8).is_some());
+        assert!(bb_bii_reject(0, i32::MIN, 8).is_some());
+
+        // Negative off (would become a huge usize) is rejected.
+        assert!(bb_bii_reject(-1, 4, 8).is_some());
+
+        // off+len overrunning the array is rejected, even when each is in-range.
+        assert!(bb_bii_reject(4, 5, 8).is_some());
+        // Overflow of off+len cannot wrap into a "passing" value (i64 widening).
+        assert!(bb_bii_reject(i32::MAX, i32::MAX, 8).is_some());
+
+        // Sanity: a negative len would, if cast to usize, drive an astronomically
+        // long loop — confirm we never reach that cast for the bad case.
+        let bad_len = -1i32;
+        assert!(bb_bii_reject(0, bad_len, 16).is_some());
+        // (If the guard were absent, `bad_len as usize` would be ~1.8e19.)
+        assert!(bad_len as usize > 1_000_000_000_000_000_000usize);
     }
 
     // =======================================================================

@@ -1492,8 +1492,24 @@ fn register_ssl_socket_factory(r: &mut NativeMethodRegistry) {
 /// 2. Check validity dates for every certificate
 /// 3. Verify each certificate's signature against its issuer
 /// 4. Validate chain continuity (issuer[i] == subject[i+1])
+/// 5. Enforce BasicConstraints.cA on intermediates and require the chain to
+///    terminate at a configured trust anchor.
+///
+/// VULN [nb-tls] FIX: previously, in the DEFAULT build (legacy-synthetic-crypto
+/// is NOT a default feature) this routine bailed out with `Ok(None)` after the
+/// null/empty guard, so a custom `javax/net/ssl/X509TrustManager` performed NO
+/// PKIX validation — every cert chain was trusted at the JVM TrustManager
+/// layer. We now route to the production RFC 5280 validator
+/// (`crate::x509_manager::validate_chain`) in ALL builds. That validator parses
+/// the DER, enforces validity dates, verifies signatures up to a trust anchor,
+/// checks chain continuity and BasicConstraints — the same code path used by
+/// the real `sun.security.ssl` trust manager registrations. `this_obj` is the
+/// trust-manager receiver, used to pick up an app-configured trust-anchor set
+/// (falling back to the system trust store when the TM was never bound to a
+/// KeyStore).
 fn validate_cert_chain(
     ctx: &mut dyn NativeContext,
+    this_obj: Option<&Value>,
     chain_arg: Option<&Value>,
 ) -> MethodCallResult {
     let chain_arr = match chain_arg {
@@ -1513,24 +1529,148 @@ fn validate_cert_chain(
         }.into());
     }
 
-    // Without legacy-synthetic-crypto we can only enforce non-empty chains; the
-    // signature/date/continuity checks below all rely on the parsed
-    // `crate::crypto::crypto_impl::X509Cert` representation. Chain cert DER
-    // bytes produced by NEW-13's native-tls path are still captured and
-    // returned via SSLSession.getPeerCertificates — the underlying native-tls
-    // handshake already performed full PKIX validation (including hostname
-    // verification) before the chain reached the JVM side.
-    #[cfg(not(feature = "legacy-synthetic-crypto"))]
-    {
-        let _ = ctx;
-        return Ok(None);
+    // VULN [nb-tls] FIX: perform REAL PKIX validation in every build by routing
+    // to the production validator rather than returning Ok(None). Extract the
+    // DER for each cert in the chain (leaf first) and hand it to
+    // `x509_manager::validate_chain` together with the trust-anchor set this
+    // trust manager was configured with.
+    let mut chain_der: Vec<Vec<u8>> = Vec::with_capacity(chain_len);
+    for i in 0..chain_len {
+        if let Value::Object(Some(cert_ref)) = ctx.get_array_element(chain_arr, i) {
+            if let Some(der) = read_x509_der(ctx, cert_ref) {
+                chain_der.push(der);
+            } else {
+                // A cert object whose DER we cannot recover is a hard failure:
+                // we must never silently skip a certificate and then validate a
+                // shorter (possibly anchor-less) chain.
+                return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+                    message: format!(
+                        "Certificate at index {} has no recoverable DER encoding — TLS connection rejected",
+                        i
+                    ),
+                }.into());
+            }
+        } else {
+            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+                message: format!(
+                    "Certificate at index {} is null — TLS connection rejected",
+                    i
+                ),
+            }.into());
+        }
     }
 
-    #[cfg(feature = "legacy-synthetic-crypto")]
-    return validate_cert_chain_crypto(ctx, chain_arr, chain_len);
+    // Build the trust-anchor set. Prefer the anchors the application bound to
+    // this trust manager (via its KeyStore); fall back to the system trust
+    // store (keystore id 0 has no user entries) so the implicit default trust
+    // manager still validates — exactly what real-JDK does when init() is
+    // bypassed.
+    let tm_id = match this_obj {
+        Some(Value::Object(Some(this_ref))) => read_trust_manager_id_from_obj(ctx, *this_ref),
+        _ => 0,
+    };
+    let trust = crate::x509_manager::build_trust_manager_state(tm_id);
+
+    match crate::x509_manager::validate_chain(&chain_der, &trust) {
+        Ok(()) => Ok(None),
+        Err(e) => Err(cratonvm_types::error::RuntimeError::IOException {
+            // Mirrors the production trust-manager path: a failed PKIX check
+            // surfaces as a CertificateException (mapped to IOException at the
+            // native boundary) so apps see a real validation failure rather
+            // than a silently-trusted connection.
+            message: format!("CertificateException: {}", e),
+        }.into()),
+    }
 }
 
+/// Recover the DER encoding of a Java `X509Certificate` mirror object.
+///
+/// Two object layouts are in play across the native crypto surface:
+///   * the keystore mirror `(subject, issuer, cert_id, der_bytes)` — slot 3 is
+///     the `byte[]` DER (see `x509_manager::make_x509_mirror`);
+///   * the synthetic crypto cert whose slot 2 is a `cert_id` indexing the
+///     `crypto_impl` cert side-table, whose `X509Cert.encoded` holds the DER.
+/// We also probe a by-name `encoded` field as a last resort. Returns `None`
+/// only when no layout yields bytes, which `validate_cert_chain` treats as a
+/// hard rejection.
+fn read_x509_der(ctx: &mut dyn NativeContext, cert: ObjectRef) -> Option<Vec<u8>> {
+    let n = ctx.object_num_fields(cert);
+    // (a) keystore-mirror layout: slot 3 = byte[] DER.
+    if n > 3 {
+        if let Value::Object(Some(arr)) = ctx.get_field(cert, 3) {
+            if let Some(bytes) = read_byte_array(ctx, arr) {
+                return Some(bytes);
+            }
+        }
+    }
+    // (b) synthetic crypto cert: slot 2 = cert_id into the crypto_impl table.
+    if n > 2 {
+        let cert_id = match ctx.get_field(cert, 2) {
+            Value::Long(id) => Some(id as u64),
+            Value::Int(id) if id != 0 => Some(id as u64),
+            _ => None,
+        };
+        if let Some(id) = cert_id {
+            if let Some(cert) = crate::crypto_impl::cert_get(id) {
+                if !cert.encoded.is_empty() {
+                    return Some(cert.encoded);
+                }
+            }
+        }
+    }
+    // (c) by-name fallback for non-standard mirror layouts.
+    if let Value::Object(Some(arr)) = ctx.get_field_by_name(cert, "encoded") {
+        if let Some(bytes) = read_byte_array(ctx, arr) {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+/// Read a Java `byte[]` into a `Vec<u8>` (elements arrive as sign-extended Int).
+fn read_byte_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Option<Vec<u8>> {
+    let len = ctx.array_length(arr);
+    if len == 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        match ctx.get_array_element(arr, i) {
+            Value::Int(b) => out.push(b as u8),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Read the configured trust-manager id off the receiver object. Mirrors the
+/// `x509_manager::get_tm_id` convention: a named field
+/// `cratonvm$x509tm$id`, falling back to slot 0. Returns 0 when unset, which
+/// `build_trust_manager_state(0)` resolves to "system roots only".
+fn read_trust_manager_id_from_obj(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
+    if let Value::Int(i) = ctx.get_field_by_name(this, "cratonvm$x509tm$id") {
+        if i != 0 {
+            return i;
+        }
+    }
+    if ctx.object_num_fields(this) > 0 {
+        if let Value::Int(i) = ctx.get_field(this, 0) {
+            if i != 0 {
+                return i;
+            }
+        }
+    }
+    0
+}
+
+// VULN [nb-tls] FIX: `validate_cert_chain` now routes to the production
+// `x509_manager::validate_chain` in ALL builds (including the default build
+// where `legacy-synthetic-crypto` is off), so this legacy synthetic-crypto
+// validator is no longer wired into the trust-manager path. It is retained
+// (allow dead_code) for reference and to keep the legacy crypto feature
+// compiling; the unified validator supersedes it.
 #[cfg(feature = "legacy-synthetic-crypto")]
+#[allow(dead_code)]
 fn validate_cert_chain_crypto(
     ctx: &mut dyn NativeContext,
     chain_arr: ObjectRef,
@@ -1630,24 +1770,28 @@ fn register_x509_trust_manager(r: &mut NativeMethodRegistry) {
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
     // checkClientTrusted(X509Certificate[] chain, String authType) -> void
-    // Validates certificate chain: checks dates and chain length.
+    // VULN [nb-tls] FIX: now performs full PKIX validation in every build (was
+    // a no-op Ok(None) in the default build). args[0]=this, args[1]=chain,
+    // args[2]=authType.
     r.register(
         cls,
         "checkClientTrusted",
         "([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",
         |ctx, args| {
-            validate_cert_chain(ctx, args.get(1))
+            validate_cert_chain(ctx, args.first(), args.get(1))
         },
     );
 
     // checkServerTrusted(X509Certificate[] chain, String authType) -> void
-    // Validates server certificate chain: checks dates and basic chain integrity.
+    // VULN [nb-tls] FIX: now performs full PKIX validation in every build (was
+    // a no-op Ok(None) in the default build). args[0]=this, args[1]=chain,
+    // args[2]=authType.
     r.register(
         cls,
         "checkServerTrusted",
         "([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",
         |ctx, args| {
-            validate_cert_chain(ctx, args.get(1))
+            validate_cert_chain(ctx, args.first(), args.get(1))
         },
     );
 
@@ -2195,6 +2339,38 @@ mod tls_tests {
         // T19.9: getAcceptedIssuers moved to t27_tls.rs (rustls-backed). The
         // tls.rs baseline no longer registers it — t27 is the canonical home.
         assert!(r.find(cls, "getAcceptedIssuers", "()[Ljava/security/cert/X509Certificate;").is_none());
+    }
+
+    // VULN [nb-tls] regression: the X509TrustManager check{Server,Client}Trusted
+    // path must perform REAL PKIX validation in every build, NOT return Ok(None).
+    // `validate_cert_chain` routes to `crate::x509_manager::validate_chain`, so
+    // we guard the security property of that production validator directly: an
+    // empty chain and an unparseable/untrusted chain MUST be rejected (no
+    // trust anchors configured). Before the fix the default build accepted any
+    // chain unconditionally.
+    #[test]
+    fn test_validate_chain_rejects_untrusted_in_all_builds() {
+        use crate::x509_manager::{validate_chain, TrustManagerState};
+
+        // No trust anchors → nothing can validate.
+        let trust = TrustManagerState::default();
+
+        // (1) Empty chain is rejected.
+        let empty: Vec<Vec<u8>> = Vec::new();
+        assert!(
+            validate_chain(&empty, &trust).is_err(),
+            "empty cert chain must be rejected"
+        );
+
+        // (2) A structurally invalid / untrusted single-cert chain is rejected
+        // (garbage DER fails to parse; even a well-formed self-signed cert with
+        // no matching anchor would fail at the trust-anchor step). The key
+        // property is simply: validation actually runs and says NO.
+        let garbage: Vec<Vec<u8>> = vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]];
+        assert!(
+            validate_chain(&garbage, &trust).is_err(),
+            "untrusted/unparseable cert chain must be rejected"
+        );
     }
 
     #[test]

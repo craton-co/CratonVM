@@ -973,131 +973,21 @@ fn native_secure_random_generate_seed(ctx: &mut dyn NativeContext, args: &[Value
     Ok(Some(Value::Object(Some(arr))))
 }
 
-/// MessageDigest.digest(byte[]) → byte[] — real SHA-256 digest
-fn native_message_digest_digest(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // args: [this, byte[]]
-    // Read the algorithm from this object's field 0 (algorithm name string)
-    // For simplicity, default to SHA-256
-    let input_arr = match args.get(1) {
-        Some(Value::Object(Some(a))) => *a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let len = ctx.array_length(input_arr);
-    let mut input = vec![0u8; len];
-    for i in 0..len {
-        if let Value::Int(b) = ctx.get_array_element(input_arr, i) {
-            input[i] = b as u8;
-        }
-    }
-
-    // Compute SHA-256 digest using our real implementation
-    let mut hasher = Sha256::new();
-    hasher.update(&input);
-    let digest = hasher.finalize();
-
-    // Return as byte array
-    let result = ctx.new_array(cratonvm_types::ArrayElementType::Byte, digest.len());
-    for (i, &b) in digest.iter().enumerate() {
-        ctx.set_array_element(result, i, Value::Int(b as i8 as i32));
-    }
-    Ok(Some(Value::Object(Some(result))))
-}
-
-/// MessageDigest.update(byte[]) — accumulate data (simplified: just hash on digest call)
-fn native_message_digest_update(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // In a full implementation, this would accumulate data in the hasher state.
-    // For now, the simplified approach hashes all data in digest() call.
-    Ok(None)
-}
-
-/// Cipher.doFinal(byte[]) → byte[] — real AES encryption/decryption
-pub fn native_cipher_do_final(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // args: [this, byte[]]
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let input_arr = match args.get(1) {
-        Some(Value::Object(Some(a))) => *a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let len = ctx.array_length(input_arr);
-    let mut input = vec![0u8; len];
-    for i in 0..len {
-        if let Value::Int(b) = ctx.get_array_element(input_arr, i) {
-            input[i] = b as u8;
-        }
-    }
-
-    // Read mode from this object (field 0 = mode: 1=ENCRYPT, 2=DECRYPT)
-    let mode = match ctx.get_field(this, 0) {
-        Value::Int(m) => m,
-        _ => 1, // default encrypt
-    };
-
-    // Read the key from the Cipher object's key field (field 2 = Key object from init()).
-    // The Key object stores raw key bytes in its field 0 as a byte[] array.
-    let key_bytes: Vec<u8> = match ctx.get_field(this, 2) {
-        Value::Object(Some(key_obj)) => {
-            // Key object field 0 = byte[] of encoded key material
-            match ctx.get_field(key_obj, 0) {
-                Value::Object(Some(key_arr)) => {
-                    let klen = ctx.array_length(key_arr);
-                    let mut kb = vec![0u8; klen];
-                    for i in 0..klen {
-                        if let Value::Int(b) = ctx.get_array_element(key_arr, i) {
-                            kb[i] = b as u8;
-                        }
-                    }
-                    kb
-                }
-                _ => vec![0u8; 16], // fallback: no key material available
-            }
-        }
-        _ => vec![0u8; 16], // fallback: Cipher.init() was not called with a key
-    };
-    let aes_key = match Aes::key_expansion(&key_bytes) {
-        Ok(k) => k,
-        Err(_) => return Ok(Some(Value::Object(None))),
-    };
-
-    let result_bytes = if mode == 1 {
-        AesEcb::encrypt(&aes_key, &input)
-    } else {
-        AesEcb::decrypt(&aes_key, &input).unwrap_or_default()
-    };
-
-    let result = ctx.new_array(cratonvm_types::ArrayElementType::Byte, result_bytes.len());
-    for (i, &b) in result_bytes.iter().enumerate() {
-        ctx.set_array_element(result, i, Value::Int(b as i8 as i32));
-    }
-    Ok(Some(Value::Object(Some(result))))
-}
-
-fn native_cipher_update(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Cipher.update — accumulate for streaming (simplified: no-op, all in doFinal)
-    Ok(Some(Value::Object(None)))
-}
-
-/// Mac.doFinal() → byte[] — real HMAC computation
-fn native_mac_do_final(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Return a 32-byte HMAC-SHA256 with a zero key and empty message.
-    // A full implementation would track the key from Mac.init() and accumulated
-    // data from Mac.update() calls. For now, produce deterministic output.
-    let hmac = Hmac::new(&[0u8; 32], HashFunction::Sha256);
-    let mac_bytes = hmac.finalize();
-
-    let result = ctx.new_array(cratonvm_types::ArrayElementType::Byte, mac_bytes.len());
-    for (i, &b) in mac_bytes.iter().enumerate() {
-        ctx.set_array_element(result, i, Value::Int(b as i8 as i32));
-    }
-    Ok(Some(Value::Object(Some(result))))
-}
-
-fn native_mac_update(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Mac.update — accumulate (simplified: no-op, computed in doFinal)
-    Ok(None)
-}
+// nb-crypto-impl VULN(3): The single-shot MessageDigest/Cipher/Mac stubs that
+// formerly lived here have been DELETED outright. They were dead code (registered
+// nowhere — only stored in an `_unused_single_shot_stubs` tuple to silence
+// dead-code warnings) and were actively dangerous:
+//   * `native_cipher_do_final` ALWAYS performed raw AES-ECB regardless of the
+//     requested transformation, silently downgrading GCM/CBC to ECB (no auth tag,
+//     no IV), and FELL BACK TO AN ALL-ZERO 16-byte KEY whenever Cipher.init()
+//     had not stored key material — an attacker-predictable null encryption.
+//   * `native_mac_do_final` returned a fixed HMAC-SHA256 over a zero key and an
+//     empty message, i.e. a constant MAC independent of the data.
+//   * the digest stub hashed only the single doFinal argument, ignoring any
+//     accumulated update() state and the requested algorithm (always SHA-256).
+// The real accumulate-and-finalize implementations live in phases_early.rs /
+// phases_late.rs / lib.rs and are the ones actually registered, so removing
+// these leaves no functional gap — only the landmine.
 
 pub(crate) fn register_crypto_impl_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -1106,22 +996,6 @@ pub(crate) fn register_crypto_impl_natives(r: &mut NativeMethodRegistry) {
     // (BCryptGenRandom / getrandom) rather than a stub PRNG.
     r.register("java/security/SecureRandom", "nextBytes", "([B)V", native_secure_random_next_bytes);
     r.register("java/security/SecureRandom", "generateSeed", "(I)[B", native_secure_random_generate_seed);
-
-    // T2.6 — MessageDigest/Cipher/Mac are now served by the full
-    // accumulate-and-finalize implementations in phases_early.rs /
-    // phases_late.rs / lib.rs. The single-shot stubs formerly defined
-    // here clobbered those real registrations and silently downgraded
-    // the Cipher to AES-ECB only, so they are intentionally not
-    // registered anymore. The underlying helper functions are kept for
-    // the legacy-synthetic path only.
-    let _unused_single_shot_stubs = (
-        native_message_digest_digest,
-        native_message_digest_update,
-        native_cipher_do_final,
-        native_cipher_update,
-        native_mac_do_final,
-        native_mac_update,
-    );
     r.set_category(__prev_cat);
 }
 
@@ -1500,8 +1374,20 @@ impl BigUint {
         self.div_rem(m).1
     }
 
-    /// Modular exponentiation: self^exp mod m
-    /// Uses Montgomery ladder for constant-time operation (prevents timing side-channels).
+    /// Modular exponentiation: `self^exp mod m`.
+    ///
+    /// nb-crypto-impl VULN(2): this is plain left-to-right square-and-multiply
+    /// over a *variable-time* `BigUint` (the `mul`/`modulo`/`div_rem` limb
+    /// routines are not constant-time, and the per-bit code path is selected by
+    /// `exp.bit(i)`). The previous doc comment claimed a "constant-time
+    /// Montgomery ladder", which it never was. This routine is therefore NOT
+    /// side-channel resistant: when `exp` is a secret (RSA `d`, an ECDSA nonce
+    /// inverse, etc.) the running time and branch pattern leak information about
+    /// the exponent. It is retained only because routing every RSA/EC private-key
+    /// operation through the vendored RustCrypto primitives is a larger, cross-
+    /// crate change (new dependency + call-site rewrites) outside this module's
+    /// scope. Do NOT rely on this for secrets exposed to a timing adversary;
+    /// prefer the audited `rsa` / `p256` crates for such paths.
     pub fn modpow(&self, exp: &BigUint, m: &BigUint) -> BigUint {
         if m.is_one() { return Self::zero(); }
         let mut r0 = BigUint::one();
@@ -1921,17 +1807,97 @@ fn rsa_pkcs1_type2_pad(msg: &[u8], k: usize) -> Result<Vec<u8>, String> {
     Ok(em)
 }
 
+/// Single, value-independent error string for every RSA decryption-padding
+/// failure (PKCS#1 v1.5 and OAEP).
+///
+/// nb-crypto-impl VULN(1): both decoders previously returned DISTINGUISHABLE
+/// error strings ("decryption error" vs "decryption error (lHash mismatch)" vs
+/// "(no 0x01 marker)") and short-circuited on the first failing check with
+/// data-dependent control flow. That is a classic Bleichenbacher (PKCS#1) /
+/// Manger (OAEP) decryption oracle: a caller that surfaces the distinct error /
+/// timing learns *which* structural check failed and can recover plaintext one
+/// query at a time. All padding failures now collapse to this one message and
+/// are decided by a single branch over a bitwise-accumulated failure mask.
+const RSA_PADDING_ERROR: &str = "RSA: decryption error";
+
+/// Constant-time non-zero test: returns `0xFF` if `x != 0`, else `0x00`,
+/// without a data-dependent branch.
+#[inline(always)]
+fn ct_is_nonzero_u8(x: u8) -> u8 {
+    // Widen to u16, OR with its two's-complement negation: for any x != 0 the
+    // result has its high bit (bit 15) set; for x == 0 it is 0. Shift that bit
+    // down to a full 0xFF / 0x00 mask. Uses wrapping ops only — no overflow,
+    // no data-dependent branch.
+    let v = x as u16;
+    let nz = v | v.wrapping_neg(); // high bit set iff v != 0
+    ((nz >> 15) as u8).wrapping_neg() // 1 -> 0xFF, 0 -> 0x00
+}
+
+/// Constant-time byte equality: returns `0xFF` if `a == b`, else `0x00`.
+#[inline(always)]
+fn ct_eq_u8(a: u8, b: u8) -> u8 {
+    !ct_is_nonzero_u8(a ^ b)
+}
+
+/// Constant-time slice equality over equal-length slices: `0xFF` if all bytes
+/// match, else `0x00`. Always touches every byte (no early exit).
+#[inline(always)]
+fn ct_eq_bytes(a: &[u8], b: &[u8]) -> u8 {
+    if a.len() != b.len() {
+        return 0x00;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    !ct_is_nonzero_u8(diff)
+}
+
 /// EME-PKCS1-v1_5 decode: strip `00 02 || PS || 00` and return `M`.
+///
+/// nb-crypto-impl VULN(1): rewritten to be constant-time in the padding
+/// structure and to leak no information about *which* check failed. We scan the
+/// whole buffer once, accumulating (a) a single `bad` failure mask and (b) the
+/// 0x00-separator index, all without branching on secret bytes, then take a
+/// single decision at the end and always return `RSA_PADDING_ERROR`.
 fn rsa_pkcs1_type2_unpad(em: &[u8]) -> Result<Vec<u8>, String> {
-    if em.len() < 11 || em[0] != 0x00 || em[1] != 0x02 {
-        return Err("RSA PKCS1: decryption error".into());
+    // Length is public (it equals the modulus byte length); a too-short buffer
+    // cannot hold `00 02 || PS(>=8) || 00 || M` so it is a structural reject.
+    if em.len() < 11 {
+        return Err(RSA_PADDING_ERROR.into());
     }
-    // PS must be at least 8 bytes, then a single 0x00 separator.
-    let sep = em[2..].iter().position(|&b| b == 0x00).map(|i| i + 2);
-    match sep {
-        Some(s) if s >= 10 => Ok(em[s + 1..].to_vec()),
-        _ => Err("RSA PKCS1: decryption error".into()),
+    let mut bad: u8 = 0;
+    // First two bytes must be 00 02.
+    bad |= ct_is_nonzero_u8(em[0]);
+    bad |= !ct_eq_u8(em[1], 0x02);
+
+    // Walk the padding string looking for the first 0x00 separator at index
+    // >= 2. `found` latches once we see it; `sep` records its index. We never
+    // break out early — every byte is visited regardless of content.
+    let mut found: u8 = 0; // 0xFF once the separator has been seen
+    let mut sep: usize = 0;
+    for (i, &b) in em.iter().enumerate().skip(2) {
+        let is_zero = ct_eq_u8(b, 0x00);
+        // first-zero = is_zero & !found
+        let first = is_zero & !found;
+        // conditionally record the index for the first zero only
+        sep |= (i as u64 & (first as u64).wrapping_neg()) as usize;
+        found |= is_zero;
     }
+    // A valid separator must exist (found) and leave PS >= 8 bytes, i.e. the
+    // separator index must be >= 10 (bytes 2..sep are the >=8 non-zero PS).
+    bad |= !found;
+    // sep < 10  =>  invalid PS length. Compare without branching: build a mask
+    // that is 0xFF when sep < 10. Since sep is small, a direct comparison here
+    // does not leak plaintext (it only reflects the padding length, which the
+    // attacker already influences), but we still fold it into `bad`.
+    let ps_too_short = if found != 0 && sep < 10 { 0xFFu8 } else { 0x00u8 };
+    bad |= ps_too_short;
+
+    if bad != 0 {
+        return Err(RSA_PADDING_ERROR.into());
+    }
+    Ok(em[sep + 1..].to_vec())
 }
 
 /// EME-OAEP encode (RFC 8017 §7.1.1) with an empty label.
@@ -1966,10 +1932,21 @@ fn rsa_oaep_pad(pad: RsaCipherPadding, msg: &[u8], k: usize) -> Result<Vec<u8>, 
 }
 
 /// EME-OAEP decode (RFC 8017 §7.1.2) with an empty label.
+///
+/// nb-crypto-impl VULN(1): rewritten to Manger-resistant constant time. The
+/// previous version checked `em[0] != 0x00` first (early reject), then the
+/// lHash, then the 0x01 marker, each returning a *different* error string —
+/// exactly the structure Manger's attack exploits to recover plaintext from a
+/// single chosen-ciphertext byte at a time. We now decode unconditionally, fold
+/// the leading-byte check, the lHash comparison, and the marker search into one
+/// bitwise `bad` accumulator (visiting every DB byte without early exit), branch
+/// exactly once, and always return the single `RSA_PADDING_ERROR` string.
 fn rsa_oaep_unpad(pad: RsaCipherPadding, em: &[u8]) -> Result<Vec<u8>, String> {
     let hlen = pad.hlen();
-    if em.len() < 2 * hlen + 2 || em[0] != 0x00 {
-        return Err("RSA OAEP: decryption error".into());
+    // Length is public (modulus byte length). A buffer that cannot even hold
+    // `00 || maskedSeed || maskedDB` with a non-empty DB is a structural reject.
+    if em.len() < 2 * hlen + 2 {
+        return Err(RSA_PADDING_ERROR.into());
     }
     let masked_seed = &em[1..1 + hlen];
     let masked_db = &em[1 + hlen..];
@@ -1986,18 +1963,42 @@ fn rsa_oaep_unpad(pad: RsaCipherPadding, em: &[u8]) -> Result<Vec<u8>, String> {
         .map(|(a, b)| a ^ b)
         .collect();
     let lhash = rsa_oaep_hash(pad, &[]);
-    if db.len() < hlen || db[..hlen] != lhash[..] {
-        return Err("RSA OAEP: decryption error (lHash mismatch)".into());
+
+    let mut bad: u8 = 0;
+    // Leading byte Y must be 0x00.
+    bad |= ct_is_nonzero_u8(em[0]);
+    // lHash' (first hlen bytes of DB) must equal lHash. ct_eq_bytes touches
+    // every byte and returns 0xFF on full match, so invert to a failure mask.
+    bad |= !ct_eq_bytes(&db[..hlen], &lhash[..]);
+
+    // Scan DB[hlen..] for `PS(0x00*) || 0x01 || M`. We walk every byte once,
+    // latch the first 0x01 marker, and require that everything strictly before
+    // it is 0x00. `found_one` latches at the marker; once latched we stop
+    // updating `msg_start` but keep iterating (no early exit).
+    let mut found_one: u8 = 0; // 0xFF once the 0x01 marker has been seen
+    let mut bad_before: u8 = 0; // any non-zero byte seen before the marker
+    let mut msg_start: usize = 0;
+    for (j, &b) in db.iter().enumerate().skip(hlen) {
+        let is_one = ct_eq_u8(b, 0x01);
+        let is_zero = ct_eq_u8(b, 0x00);
+        // Marker is the first 0x01 while still in the PS region (!found_one).
+        let marker_here = is_one & !found_one;
+        // Record message start = index just after the marker (only the first).
+        msg_start |= ((j as u64 + 1) & (marker_here as u64).wrapping_neg()) as usize;
+        // Before the marker, every byte must be 0x00 (and not the marker).
+        // active = bytes we are still scrutinising as PS (before any marker).
+        let active = !found_one;
+        let not_pad = !is_zero & !marker_here; // byte that is neither 0x00 nor the marker
+        bad_before |= active & not_pad;
+        found_one |= is_one;
     }
-    // Skip the PS zero bytes, expect a single 0x01 marker, then the message.
-    let mut i = hlen;
-    while i < db.len() && db[i] == 0x00 {
-        i += 1;
+    bad |= bad_before;
+    bad |= !found_one; // a 0x01 marker must exist
+
+    if bad != 0 {
+        return Err(RSA_PADDING_ERROR.into());
     }
-    if i >= db.len() || db[i] != 0x01 {
-        return Err("RSA OAEP: decryption error (no 0x01 marker)".into());
-    }
-    Ok(db[i + 1..].to_vec())
+    Ok(db[msg_start..].to_vec())
 }
 
 /// RSA public-key encryption (ENCRYPT/WRAP): pad then `m^e mod n`.
@@ -2303,7 +2304,15 @@ impl FieldElement256 {
         Self::pow_mod(a, &p_minus_2, p)
     }
 
-    /// Modular exponentiation (Montgomery ladder for constant-time).
+    /// Modular exponentiation via a Montgomery ladder.
+    ///
+    /// nb-crypto-impl VULN(2): the ladder gives a *uniform operation sequence*
+    /// (exactly one multiply + one square per bit), but the per-bit register
+    /// assignment is still selected by a secret-dependent `if`, and the
+    /// underlying `mul_mod` is not formally constant-time. Treat as
+    /// timing-hardened-but-not-guaranteed, NOT a certified side-channel-resistant
+    /// primitive. (`pow_mod` is used here only for field inversion / square
+    /// roots over the public prime `p`, not over secret exponents.)
     pub fn pow_mod(base: &Self, exp: &Self, p: &Self) -> Self {
         let mut r0 = Self::ONE;
         let mut r1 = *base;
@@ -2477,7 +2486,15 @@ impl EcPoint {
         EcPoint::new(x3, y3)
     }
 
-    /// Scalar multiplication using Montgomery ladder (constant-time).
+    /// Scalar multiplication via a Montgomery ladder.
+    ///
+    /// nb-crypto-impl VULN(2): the ladder keeps the operation sequence uniform
+    /// (one point-add + one point-double per scalar bit), but the register
+    /// assignment is chosen by a secret-dependent `if`, and `EcPoint::add` /
+    /// `double` / `mul_mod` are not formally constant-time (e.g. the `infinity`
+    /// early-out and modular reduction branch). This is timing-hardened in
+    /// structure but NOT a certified side-channel-resistant scalar multiply; for
+    /// adversary-exposed key operations prefer the audited `p256` crate.
     pub fn scalar_mul(point: &EcPoint, scalar: &FieldElement256) -> EcPoint {
         let mut r0 = EcPoint::infinity();
         let mut r1 = *point;
@@ -2536,10 +2553,13 @@ impl Ecdsa {
 
     /// ECDSA sign with SHA-256 hash (algorithm: SHA256withECDSA / NONEwithECDSA-32).
     ///
-    /// Same RFC 6979 / NIST FIPS 186-4 ECDSA construction as `sign_sha384`,
-    /// but uses SHA-256 (32 bytes) as the message digest — which is what
+    /// Uses SHA-256 (32 bytes) as the message digest — which is what
     /// `Signature.getInstance("SHA256withECDSA")` produces and what every
     /// real-world TLS / JWT / X.509-on-EC stack consumes.
+    ///
+    /// nb-crypto-impl VULN(2): the prior doc claimed an "RFC 6979" construction.
+    /// It is NOT — see `sign_with_digest`, which draws a fresh random per-message
+    /// nonce. Both signing entry points share the same non-deterministic nonce.
     pub fn sign_sha256(key: &EcdsaPrivateKey, message: &[u8]) -> Vec<u8> {
         let hash_full = Sha256::digest(message);
         Self::sign_with_digest(key, &hash_full)
@@ -2553,7 +2573,20 @@ impl Ecdsa {
 
     /// Internal: ECDSA sign on an already-hashed digest (truncated/extended
     /// to the curve order's bit length).  Shared by `sign_sha256` /
-    /// `sign_sha384` so both stay byte-identical for the same hash bytes.
+    /// `sign_sha384`.
+    ///
+    /// nb-crypto-impl VULN(2): the per-signature nonce `k` is drawn FRESH from
+    /// the OS CSPRNG (`SecureRandom`) on every call — this is NOT the RFC 6979
+    /// deterministic-nonce construction, so two signatures over the same digest
+    /// differ. That is safe *as long as* the CSPRNG is sound and never repeats a
+    /// `k` for a given key (a repeated or biased `k` trivially recovers the
+    /// private key). The point-multiply (`EcPoint::scalar_mul`) and the modular
+    /// inverse (`k_inv`) also run in variable time over the non-constant-time
+    /// `BigUint`/`FieldElement256` cores, so this path is NOT hardened against a
+    /// timing/power adversary. For adversary-exposed signing prefer the audited
+    /// `p256`/`ecdsa` crates (RFC 6979 + constant-time scalar mul). Retained as a
+    /// native fallback only because that routing is a cross-crate change outside
+    /// this module's scope.
     pub fn sign_with_digest(key: &EcdsaPrivateKey, digest: &[u8]) -> Vec<u8> {
         let mut z_bytes = [0u8; 32];
         let dn = digest.len().min(32);
@@ -5314,5 +5347,98 @@ mod tests {
         // Empty subject Name never matches (an unparsed cert can't be anchor).
         let empty = mock_cert("", "", 0, i64::MAX);
         assert!(!empty.subject_der_matches(b""));
+    }
+
+    // -----------------------------------------------------------------------
+    // nb-crypto-impl VULN(1) — RSA padding-oracle regression tests.
+    //
+    // Every PKCS#1 v1.5 and OAEP padding failure must collapse to the SAME
+    // opaque error string (`RSA_PADDING_ERROR`); none may leak which structural
+    // check failed. Valid padding must still round-trip.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pkcs1_unpad_roundtrip_ok() {
+        let k = 128; // RSA-1024 modulus byte length
+        let msg = b"hello pkcs1";
+        let em = rsa_pkcs1_type2_pad(msg, k).unwrap();
+        assert_eq!(em.len(), k);
+        assert_eq!(rsa_pkcs1_type2_unpad(&em).unwrap(), msg.to_vec());
+    }
+
+    #[test]
+    fn pkcs1_unpad_all_failures_indistinguishable() {
+        let k = 128;
+        let good = rsa_pkcs1_type2_pad(b"x", k).unwrap();
+
+        // Wrong leading byte.
+        let mut a = good.clone();
+        a[0] = 0x01;
+        // Wrong block type.
+        let mut b = good.clone();
+        b[1] = 0x01;
+        // No 0x00 separator anywhere after the type byte.
+        let mut c = good.clone();
+        for byte in c.iter_mut().skip(2) {
+            *byte = 0xFF;
+        }
+        // Separator too early -> PS shorter than 8 bytes.
+        let mut d = vec![0x00u8, 0x02, 0x01, 0x02, 0x00];
+        d.extend(std::iter::repeat(0xAAu8).take(k - d.len()));
+        // Too short to hold any valid padding.
+        let e = vec![0x00u8, 0x02, 0x00];
+
+        for bad in [&a, &b, &c, &d, &e] {
+            let err = rsa_pkcs1_type2_unpad(bad).unwrap_err();
+            assert_eq!(err, RSA_PADDING_ERROR, "PKCS1 error string leaked detail");
+        }
+    }
+
+    #[test]
+    fn oaep_unpad_roundtrip_ok() {
+        let k = 256; // RSA-2048
+        for pad in [RsaCipherPadding::OaepSha1, RsaCipherPadding::OaepSha256] {
+            let msg = b"oaep payload";
+            let em = rsa_oaep_pad(pad, msg, k).unwrap();
+            assert_eq!(em.len(), k);
+            assert_eq!(rsa_oaep_unpad(pad, &em).unwrap(), msg.to_vec());
+        }
+    }
+
+    #[test]
+    fn oaep_unpad_all_failures_indistinguishable() {
+        let k = 256;
+        let pad = RsaCipherPadding::OaepSha256;
+        let good = rsa_oaep_pad(pad, b"y", k).unwrap();
+
+        // Corrupt leading Y byte (must be 0x00) -> Manger oracle bait.
+        let mut a = good.clone();
+        a[0] ^= 0x01;
+        // Corrupt the masked DB so the recovered lHash mismatches.
+        let mut b = good.clone();
+        let last = b.len() - 1;
+        b[last] ^= 0xFF;
+        // Corrupt the masked seed region (also perturbs DB unmask -> mismatch).
+        let mut c = good.clone();
+        c[1] ^= 0xFF;
+        // Too short to hold `00 || seed || DB`.
+        let d = vec![0u8; 2 * pad.hlen() + 1];
+
+        for bad in [&a, &b, &c, &d] {
+            let err = rsa_oaep_unpad(pad, bad).unwrap_err();
+            assert_eq!(err, RSA_PADDING_ERROR, "OAEP error string leaked detail");
+        }
+    }
+
+    #[test]
+    fn ct_helpers_behave() {
+        assert_eq!(ct_eq_u8(0x42, 0x42), 0xFF);
+        assert_eq!(ct_eq_u8(0x42, 0x43), 0x00);
+        assert_eq!(ct_is_nonzero_u8(0), 0x00);
+        assert_eq!(ct_is_nonzero_u8(1), 0xFF);
+        assert_eq!(ct_is_nonzero_u8(0xFF), 0xFF);
+        assert_eq!(ct_eq_bytes(b"abc", b"abc"), 0xFF);
+        assert_eq!(ct_eq_bytes(b"abc", b"abd"), 0x00);
+        assert_eq!(ct_eq_bytes(b"abc", b"ab"), 0x00);
     }
 }

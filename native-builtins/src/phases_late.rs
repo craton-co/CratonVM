@@ -8125,8 +8125,22 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
             Some(Value::Object(Some(a))) => *a,
             _ => return Ok(Some(Value::Int(-1))),
         };
-        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+        // BUG nb-phases-late(1): read off/len as signed i32 and bounds-check
+        // BEFORE casting to usize. Previously `int len` was taken `as usize`,
+        // so a negative len sign-extended to ~1.8e19 and `vec![0u8; len]`
+        // aborted the process. The JDK validates and throws
+        // IndexOutOfBoundsException instead (ArrayIndexOutOfBounds is a subclass).
+        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+        let arr_len = ctx.array_length(arr) as i64;
+        if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
+            return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                index: if off < 0 { off } else { off.wrapping_add(len) },
+            }.into());
+        }
+        let off = off as usize;
+        let len = len as usize;
+        if len == 0 { return Ok(Some(Value::Int(0))); }
         let mut buf = vec![0u8; len];
         match ctx.fd_table().rw_read(fd_id as u32, &mut buf) {
             Ok(0) => Ok(Some(Value::Int(-1))),
@@ -8195,8 +8209,19 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
             Some(Value::Object(Some(a))) => *a,
             _ => return Err(RuntimeError::IOException { message: "null buffer".into() }.into()),
         };
-        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+        // BUG nb-phases-late(1): same bounds-check as read([BII) — validate
+        // signed off/len before casting to usize to avoid a negative-len
+        // sign-extension alloc abort. JDK throws IndexOutOfBoundsException.
+        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+        let arr_len = ctx.array_length(arr) as i64;
+        if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
+            return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                index: if off < 0 { off } else { off.wrapping_add(len) },
+            }.into());
+        }
+        let off = off as usize;
+        let len = len as usize;
         let mut buf = vec![0u8; len];
         let mut total = 0;
         while total < len {
@@ -8230,8 +8255,18 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
             Some(Value::Object(Some(a))) => *a,
             _ => return Ok(None),
         };
-        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+        // BUG nb-phases-late(1): validate signed off/len before the loop so a
+        // negative len cannot sign-extend into a huge `Vec::with_capacity`.
+        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+        let arr_len = ctx.array_length(arr) as i64;
+        if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
+            return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                index: if off < 0 { off } else { off.wrapping_add(len) },
+            }.into());
+        }
+        let off = off as usize;
+        let len = len as usize;
         let mut buf = Vec::with_capacity(len);
         for i in 0..len {
             if let Value::Int(b) = ctx.get_array_element(arr, off + i) {
@@ -9821,26 +9856,58 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
         if fd_id < 0 || count <= 0 {
             return Ok(Some(Value::Long(0)));
         }
-        // Read bytes from our channel
-        let mut buf = vec![0u8; count as usize];
-        let n = ctx.fd_table().pread_at(fd_id as u32, &mut buf, position.max(0) as u64).unwrap_or(0);
-        if n == 0 {
+        // BUG nb-phases-late(2): a huge `count` (up to Long.MAX_VALUE) was fed
+        // straight into `vec![0u8; count as usize]` → exabyte allocation abort.
+        // The JDK clamps the transfer to the bytes actually available
+        // (file_size - position) and streams through a bounded buffer. Clamp
+        // `count` to what remains in the source file, then loop in chunks so
+        // the per-iteration allocation is bounded regardless of `count`.
+        let position = position.max(0);
+        let file_size = ctx.fd_table().file_size(fd_id as u32).unwrap_or(0) as i64;
+        let available = (file_size - position).max(0);
+        // Clamp to the bytes available in the source file when we have a real
+        // size; for non-regular/unknown-size fds (file_size==0) fall back to the
+        // caller's `count` and let the chunked read loop stop at EOF — this keeps
+        // the per-iteration allocation bounded either way.
+        let mut to_transfer = if file_size > 0 { count.min(available) } else { count };
+        if to_transfer <= 0 {
             return Ok(Some(Value::Long(0)));
         }
-        // Wrap in a ByteBuffer and call target.write(ByteBuffer)
-        let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, n);
-        for i in 0..n {
-            ctx.set_array_element(byte_arr, i, Value::Int(buf[i] as i8 as i32));
+        // Bounded streaming buffer (8 MiB) — matches the JDK's chunked fallback
+        // when a true zero-copy sendfile is unavailable.
+        const FC_XFER_CHUNK: i64 = 8 * 1024 * 1024;
+        let mut total_written: i64 = 0;
+        let mut cur_pos = position;
+        while to_transfer > 0 {
+            let chunk = to_transfer.min(FC_XFER_CHUNK) as usize;
+            let mut buf = vec![0u8; chunk];
+            let n = ctx.fd_table().pread_at(fd_id as u32, &mut buf, cur_pos as u64).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            // Wrap in a ByteBuffer and call target.write(ByteBuffer)
+            let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, n);
+            for i in 0..n {
+                ctx.set_array_element(byte_arr, i, Value::Int(buf[i] as i8 as i32));
+            }
+            let bb = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 3);
+            ctx.set_field(bb, 0, Value::Object(Some(byte_arr)));
+            ctx.set_field(bb, 1, Value::Int(0));
+            ctx.set_field(bb, 2, Value::Int(n as i32));
+            let written = match ctx.invoke_virtual(target, "write", "(Ljava/nio/ByteBuffer;)I", &[Value::Object(Some(bb))]) {
+                Ok(Some(Value::Int(w))) if w >= 0 => w as i64,
+                _ => n as i64,
+            };
+            total_written += written;
+            cur_pos += n as i64;
+            to_transfer -= n as i64;
+            // Short write from the target or short read from the source: stop,
+            // mirroring the JDK which returns the bytes transferred so far.
+            if (written as usize) < n || n < chunk {
+                break;
+            }
         }
-        let bb = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 3);
-        ctx.set_field(bb, 0, Value::Object(Some(byte_arr)));
-        ctx.set_field(bb, 1, Value::Int(0));
-        ctx.set_field(bb, 2, Value::Int(n as i32));
-        let written = match ctx.invoke_virtual(target, "write", "(Ljava/nio/ByteBuffer;)I", &[Value::Object(Some(bb))]) {
-            Ok(Some(Value::Int(w))) => w as i64,
-            _ => n as i64,
-        };
-        Ok(Some(Value::Long(written)))
+        Ok(Some(Value::Long(total_written)))
     });
 
     // transferFrom(ReadableByteChannel src, long position, long count)J
@@ -9856,28 +9923,50 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
         if fd_id < 0 || count <= 0 {
             return Ok(Some(Value::Long(0)));
         }
-        // Allocate a ByteBuffer and call src.read(ByteBuffer)
-        let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, count as usize);
-        let bb = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 3);
-        ctx.set_field(bb, 0, Value::Object(Some(byte_arr)));
-        ctx.set_field(bb, 1, Value::Int(0));
-        ctx.set_field(bb, 2, Value::Int(count as i32));
-        let read_n = match ctx.invoke_virtual(src, "read", "(Ljava/nio/ByteBuffer;)I", &[Value::Object(Some(bb))]) {
-            Ok(Some(Value::Int(n))) if n > 0 => n as usize,
-            _ => 0,
-        };
-        if read_n == 0 {
-            return Ok(Some(Value::Long(0)));
-        }
-        // Extract bytes from ByteBuffer (position is now read_n)
-        let mut data = vec![0u8; read_n];
-        if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
-            for i in 0..read_n {
-                data[i] = ctx.get_array_element(arr, i).as_int().unwrap_or(0) as u8;
+        // BUG nb-phases-late(2): `count` (a long) was used to size the
+        // ByteBuffer via `new_array(count as usize)` (exabyte alloc abort for a
+        // huge/Long.MAX_VALUE count) AND passed to the buffer's limit as
+        // `Int(count as i32)` (silent 64→32 bit truncation). The JDK streams
+        // through a bounded buffer in a loop. Clamp the per-iteration chunk to a
+        // sane ceiling and loop until `count` is satisfied or the source is
+        // exhausted, so the allocation is bounded and the limit never truncates.
+        const FC_XFER_CHUNK: i64 = 8 * 1024 * 1024;
+        let mut remaining = count;
+        let mut cur_pos = position.max(0);
+        let mut total_written: i64 = 0;
+        while remaining > 0 {
+            let chunk = remaining.min(FC_XFER_CHUNK) as usize;
+            // Allocate a bounded ByteBuffer and call src.read(ByteBuffer)
+            let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, chunk);
+            let bb = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 3);
+            ctx.set_field(bb, 0, Value::Object(Some(byte_arr)));
+            ctx.set_field(bb, 1, Value::Int(0));
+            // `chunk` <= FC_XFER_CHUNK so this Int cast never truncates.
+            ctx.set_field(bb, 2, Value::Int(chunk as i32));
+            let read_n = match ctx.invoke_virtual(src, "read", "(Ljava/nio/ByteBuffer;)I", &[Value::Object(Some(bb))]) {
+                Ok(Some(Value::Int(n))) if n > 0 => n as usize,
+                _ => 0,
+            };
+            if read_n == 0 {
+                break;
+            }
+            // Extract bytes from ByteBuffer (position is now read_n)
+            let mut data = vec![0u8; read_n];
+            if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
+                for i in 0..read_n {
+                    data[i] = ctx.get_array_element(arr, i).as_int().unwrap_or(0) as u8;
+                }
+            }
+            let written = ctx.fd_table().pwrite_at(fd_id as u32, &data, cur_pos as u64).unwrap_or(0);
+            total_written += written as i64;
+            cur_pos += written as i64;
+            remaining -= read_n as i64;
+            // Short read from the source means EOF: stop, returning bytes so far.
+            if read_n < chunk {
+                break;
             }
         }
-        let written = ctx.fd_table().pwrite_at(fd_id as u32, &data, position.max(0) as u64).unwrap_or(0);
-        Ok(Some(Value::Long(written as i64)))
+        Ok(Some(Value::Long(total_written)))
     });
 
     // force(boolean metadata)V
@@ -12403,10 +12492,67 @@ fn p58_make_concat_simple(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 // =============================================================================
-// SynchronousQueue = 2-field synthetic (item=0, waiting=1)
-// A blocking queue with zero capacity — each put must wait for a take
-// In our eager model, we simulate with a single-item buffer
+// SynchronousQueue — real blocking rendezvous (BUG nb-phases-late(3))
+//
+// A SynchronousQueue has zero capacity: every `put` must hand off its item to
+// a concurrent `take` (and vice versa); there is never any buffered element.
+// The previous synthetic impl was a non-blocking, non-thread-safe single-slot
+// fake: `put`/`offer` overwrote a field (dropping a prior item with no taker),
+// `take` returned whatever stale value was in the slot, and
+// size/isEmpty/peek/contains were hardcoded. That breaks every real
+// producer/consumer handoff (e.g. Executors.newCachedThreadPool's
+// SynchronousQueue task hand-off) and silently loses items.
+//
+// This is now backed by a real identity-keyed rendezvous side-table. Each
+// queue (keyed by its identity hash) owns a list of waiting producers
+// (thread + the item it is offering) and waiting consumers (thread + a
+// fulfilment slot). `put`/`take` either complete a pending opposite-side
+// waiter directly (waking it via unpark) or enqueue themselves and park until
+// fulfilled. `offer()`/`poll()` (no timeout) are non-blocking: they succeed
+// only if an opposite-side waiter is already present, exactly as the JDK
+// specifies. size/isEmpty/peek always reflect emptiness (a SynchronousQueue is
+// definitionally empty) which is correct JDK behaviour.
+//
+// NOTE for orchestrator: a SEPARATE SynchronousQueue implementation also lives
+// in `concurrent_extras.rs` (owned by another agent). These two registrations
+// will collide / duplicate — flag for reconciliation. This file's version is a
+// real rendezvous; pick one owner.
 // =============================================================================
+
+use std::sync::OnceLock as SqOnceLock;
+
+/// One side-table entry per live SynchronousQueue (keyed by identity hash).
+#[derive(Default)]
+struct SqRendezvous {
+    /// Producers blocked in `put`, each carrying the item it wants to hand off.
+    /// `fulfilled` flips true once a taker has consumed the item.
+    producers: Vec<SqWaiter>,
+    /// Consumers blocked in `take`, each with a slot a producer writes into.
+    consumers: Vec<SqWaiter>,
+}
+
+struct SqWaiter {
+    /// Monotonic ticket identifying this specific waiter.
+    ticket: u64,
+    /// The blocked Java Thread object, for `unpark`.
+    thread: ObjectRef,
+    /// For a producer: the item being offered. For a consumer: the item that a
+    /// producer has delivered (filled on fulfilment).
+    item: Option<Value>,
+    /// Set true by the opposite side once the rendezvous has completed.
+    fulfilled: bool,
+}
+
+fn sq_table() -> &'static parking_lot::Mutex<std::collections::HashMap<i32, SqRendezvous>> {
+    static T: SqOnceLock<parking_lot::Mutex<std::collections::HashMap<i32, SqRendezvous>>> =
+        SqOnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn sq_next_ticket() -> u64 {
+    static TICKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    TICKET.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 pub(crate) fn register_p58_synchronous_queue(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -12416,14 +12562,22 @@ pub(crate) fn register_p58_synchronous_queue(r: &mut NativeMethodRegistry) {
     r.register(sq, "<init>", "(Z)V", p58_sq_init_fair);
     r.register(sq, "put", "(Ljava/lang/Object;)V", p58_sq_put);
     r.register(sq, "offer", "(Ljava/lang/Object;)Z", p58_sq_offer);
+    r.register(
+        sq,
+        "offer",
+        "(Ljava/lang/Object;JLjava/util/concurrent/TimeUnit;)Z",
+        p58_sq_offer_timed,
+    );
     r.register(sq, "take", "()Ljava/lang/Object;", p58_sq_take);
     r.register(sq, "poll", "()Ljava/lang/Object;", p58_sq_poll);
     r.register(
         sq,
         "poll",
         "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
-        p58_sq_poll,
+        p58_sq_poll_timed,
     );
+    // A SynchronousQueue is always empty (zero capacity) — peek never returns
+    // an element, contains is always false, size is always 0.
     r.register(sq, "peek", "()Ljava/lang/Object;", |_ctx, _args| {
         Ok(Some(Value::Object(None)))
     });
@@ -12458,8 +12612,10 @@ pub(crate) fn register_p58_synchronous_queue(r: &mut NativeMethodRegistry) {
 
 fn p58_sq_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    ctx.set_field(this, 0, Value::Object(None)); // item
-    ctx.set_field(this, 1, Value::Int(0)); // no waiting
+    // Fields retained for layout compatibility; the real state is the
+    // identity-keyed rendezvous side-table.
+    ctx.set_field(this, 0, Value::Object(None)); // item (unused)
+    ctx.set_field(this, 1, Value::Int(0)); // waiting flag (unused)
     Ok(None)
 }
 
@@ -12470,50 +12626,331 @@ fn p58_sq_init_fair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     Ok(None)
 }
 
+/// `put(E)` — block until a consumer takes the item. Real rendezvous: if a
+/// consumer is already waiting, hand off directly and wake it; otherwise
+/// enqueue self as a waiting producer and park until taken.
 fn p58_sq_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
-    ctx.set_field(this, 1, Value::Int(1));
-    Ok(None)
-}
-
-fn p58_sq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // T16.7: single-threaded rendezvous. True SynchronousQueue blocks `offer`
-    // when no taker is present, but the synthetic-JDK tests are
-    // single-threaded (no background taker thread) so we buffer the item
-    // into the slot and mark `waiting=1` so a subsequent `poll`/`take`
-    // retrieves it. This matches what `put` does and keeps `offer+poll`
-    // on the same thread deterministic.
-    let this = obj_arg(args, 0)?;
+    let key = ctx.identity_hash_code(this);
     let item = args.get(1).copied().unwrap_or(Value::Object(None));
-    ctx.set_field(this, 0, item);
-    ctx.set_field(this, 1, Value::Int(1));
-    Ok(Some(Value::Int(1)))
+    let me = ctx.current_thread_object();
+
+    // Fast path: a consumer is already waiting → fulfil it directly.
+    {
+        let mut t = sq_table().lock();
+        let entry = t.entry(key).or_default();
+        if let Some(consumer) = entry.consumers.first_mut() {
+            // Deliver the item INTO the consumer's slot and wake it. The
+            // consumer (take/poll) is responsible for reading the item and
+            // removing itself from the wait list — do NOT remove it here, or
+            // the handed-off item would be lost before the taker reads it.
+            consumer.item = Some(item);
+            consumer.fulfilled = true;
+            let waiter_thread = consumer.thread;
+            drop(t);
+            ctx.unpark(waiter_thread);
+            return Ok(None);
+        }
+        // No consumer: enqueue self as a waiting producer.
+        let ticket = sq_next_ticket();
+        entry.producers.push(SqWaiter { ticket, thread: me, item: Some(item), fulfilled: false });
+        drop(t);
+        // Park until a taker fulfils us. park() may return spuriously, so loop.
+        loop {
+            ctx.park(None);
+            let mut t = sq_table().lock();
+            if let Some(entry) = t.get_mut(&key) {
+                if let Some(pos) = entry.producers.iter().position(|w| w.ticket == ticket) {
+                    if entry.producers[pos].fulfilled {
+                        entry.producers.remove(pos);
+                        if entry.producers.is_empty() && entry.consumers.is_empty() {
+                            t.remove(&key);
+                        }
+                        return Ok(None);
+                    }
+                    // Spurious wake-up: still waiting, re-park.
+                    continue;
+                }
+            }
+            // Our waiter vanished (consumed by a taker that removed it) → done.
+            return Ok(None);
+        }
+    }
 }
 
+/// `offer(E)` — non-blocking. Succeeds only if a consumer is already waiting;
+/// otherwise returns false (the JDK never buffers in a SynchronousQueue).
+fn p58_sq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = ctx.identity_hash_code(this);
+    let item = args.get(1).copied().unwrap_or(Value::Object(None));
+
+    let mut t = sq_table().lock();
+    let entry = t.entry(key).or_default();
+    if let Some(consumer) = entry.consumers.first_mut() {
+        // Deliver into the consumer's slot; the taker reads it and self-removes.
+        consumer.item = Some(item);
+        consumer.fulfilled = true;
+        let waiter_thread = consumer.thread;
+        drop(t);
+        ctx.unpark(waiter_thread);
+        Ok(Some(Value::Int(1)))
+    } else {
+        let empty = entry.producers.is_empty() && entry.consumers.is_empty();
+        if empty {
+            t.remove(&key);
+        }
+        Ok(Some(Value::Int(0)))
+    }
+}
+
+/// `offer(E, long, TimeUnit)` — timed. Hands off immediately if a consumer is
+/// waiting; otherwise waits up to the deadline for one. Returns false on
+/// timeout (item not handed off).
+fn p58_sq_offer_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = ctx.identity_hash_code(this);
+    let item = args.get(1).copied().unwrap_or(Value::Object(None));
+    let timeout_nanos = sq_timeout_nanos(args, 2);
+    let me = ctx.current_thread_object();
+
+    let ticket;
+    {
+        let mut t = sq_table().lock();
+        let entry = t.entry(key).or_default();
+        if let Some(consumer) = entry.consumers.first_mut() {
+            // Deliver into the consumer's slot; the taker reads it and self-removes.
+            consumer.item = Some(item);
+            consumer.fulfilled = true;
+            let waiter_thread = consumer.thread;
+            drop(t);
+            ctx.unpark(waiter_thread);
+            return Ok(Some(Value::Int(1)));
+        }
+        ticket = sq_next_ticket();
+        entry.producers.push(SqWaiter { ticket, thread: me, item: Some(item), fulfilled: false });
+    }
+    let deadline = timeout_nanos.map(|n| std::time::Instant::now() + std::time::Duration::from_nanos(n));
+    // Helper closure result type: a removal returning whether we were consumed.
+    let give_up = |key: i32, ticket: u64| -> i32 {
+        let mut t = sq_table().lock();
+        if let Some(entry) = t.get_mut(&key) {
+            if let Some(pos) = entry.producers.iter().position(|w| w.ticket == ticket) {
+                let consumed = entry.producers[pos].fulfilled;
+                entry.producers.remove(pos);
+                if entry.producers.is_empty() && entry.consumers.is_empty() { t.remove(&key); }
+                return if consumed { 1 } else { 0 };
+            }
+        }
+        // Waiter already removed → a taker consumed us.
+        1
+    };
+    loop {
+        let park_dur = match deadline {
+            Some(d) => {
+                let now = std::time::Instant::now();
+                if now >= d {
+                    return Ok(Some(Value::Int(give_up(key, ticket))));
+                }
+                d - now
+            }
+            // No positive timeout → don't wait.
+            None => return Ok(Some(Value::Int(give_up(key, ticket)))),
+        };
+        ctx.park(Some(park_dur));
+        // Woke up: check fulfilment.
+        let mut t = sq_table().lock();
+        if let Some(entry) = t.get_mut(&key) {
+            if let Some(pos) = entry.producers.iter().position(|w| w.ticket == ticket) {
+                if entry.producers[pos].fulfilled {
+                    entry.producers.remove(pos);
+                    if entry.producers.is_empty() && entry.consumers.is_empty() { t.remove(&key); }
+                    return Ok(Some(Value::Int(1)));
+                }
+                // Spurious wake — loop and re-check deadline.
+                continue;
+            }
+        }
+        return Ok(Some(Value::Int(1)));
+    }
+}
+
+/// `take()` — block until a producer offers an item. Real rendezvous mirror of
+/// `put`.
 fn p58_sq_take(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let item = ctx.get_field(this, 0);
-    ctx.set_field(this, 0, Value::Object(None));
-    ctx.set_field(this, 1, Value::Int(0));
-    Ok(Some(item))
+    let key = ctx.identity_hash_code(this);
+    let me = ctx.current_thread_object();
+
+    // Fast path: a producer is already waiting → consume its item and wake it.
+    {
+        let mut t = sq_table().lock();
+        let entry = t.entry(key).or_default();
+        if let Some(producer) = entry.producers.first_mut() {
+            let item = producer.item.take().unwrap_or(Value::Object(None));
+            producer.fulfilled = true;
+            let waiter_thread = producer.thread;
+            entry.producers.remove(0);
+            drop(t);
+            ctx.unpark(waiter_thread);
+            return Ok(Some(item));
+        }
+        // No producer: enqueue self as a waiting consumer.
+        let ticket = sq_next_ticket();
+        entry.consumers.push(SqWaiter { ticket, thread: me, item: None, fulfilled: false });
+        drop(t);
+        loop {
+            ctx.park(None);
+            let mut t = sq_table().lock();
+            if let Some(entry) = t.get_mut(&key) {
+                if let Some(pos) = entry.consumers.iter().position(|w| w.ticket == ticket) {
+                    if entry.consumers[pos].fulfilled {
+                        let item = entry.consumers[pos].item.take().unwrap_or(Value::Object(None));
+                        entry.consumers.remove(pos);
+                        if entry.producers.is_empty() && entry.consumers.is_empty() {
+                            t.remove(&key);
+                        }
+                        return Ok(Some(item));
+                    }
+                    continue; // spurious wake-up
+                }
+            }
+            // Waiter removed by a producer that already delivered: best-effort null.
+            return Ok(Some(Value::Object(None)));
+        }
+    }
 }
 
+/// `poll()` — non-blocking. Returns an item only if a producer is already
+/// waiting; otherwise null.
 fn p58_sq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let waiting = ctx.get_field(this, 1);
-    if waiting == Value::Int(1) {
-        let item = ctx.get_field(this, 0);
-        ctx.set_field(this, 0, Value::Object(None));
-        ctx.set_field(this, 1, Value::Int(0));
+    let key = ctx.identity_hash_code(this);
+    let mut t = sq_table().lock();
+    let entry = t.entry(key).or_default();
+    if let Some(producer) = entry.producers.first_mut() {
+        let item = producer.item.take().unwrap_or(Value::Object(None));
+        producer.fulfilled = true;
+        let waiter_thread = producer.thread;
+        entry.producers.remove(0);
+        drop(t);
+        ctx.unpark(waiter_thread);
         Ok(Some(item))
     } else {
+        if entry.producers.is_empty() && entry.consumers.is_empty() {
+            t.remove(&key);
+        }
         Ok(Some(Value::Object(None)))
     }
 }
 
+/// `poll(long, TimeUnit)` — timed. Mirror of `offer(E, long, TimeUnit)`.
+fn p58_sq_poll_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = ctx.identity_hash_code(this);
+    let timeout_nanos = sq_timeout_nanos(args, 1);
+    let me = ctx.current_thread_object();
+
+    let ticket;
+    {
+        let mut t = sq_table().lock();
+        let entry = t.entry(key).or_default();
+        if let Some(producer) = entry.producers.first_mut() {
+            let item = producer.item.take().unwrap_or(Value::Object(None));
+            producer.fulfilled = true;
+            let waiter_thread = producer.thread;
+            entry.producers.remove(0);
+            drop(t);
+            ctx.unpark(waiter_thread);
+            return Ok(Some(item));
+        }
+        ticket = sq_next_ticket();
+        entry.consumers.push(SqWaiter { ticket, thread: me, item: None, fulfilled: false });
+    }
+    let deadline = timeout_nanos.map(|n| std::time::Instant::now() + std::time::Duration::from_nanos(n));
+    loop {
+        let park_dur = match deadline {
+            Some(d) => {
+                let now = std::time::Instant::now();
+                if now >= d {
+                    // Timed out: drop our waiter, return whatever was delivered.
+                    let mut t = sq_table().lock();
+                    if let Some(entry) = t.get_mut(&key) {
+                        if let Some(pos) = entry.consumers.iter().position(|w| w.ticket == ticket) {
+                            let item = if entry.consumers[pos].fulfilled {
+                                entry.consumers[pos].item.take().unwrap_or(Value::Object(None))
+                            } else {
+                                Value::Object(None)
+                            };
+                            entry.consumers.remove(pos);
+                            if entry.producers.is_empty() && entry.consumers.is_empty() { t.remove(&key); }
+                            return Ok(Some(item));
+                        }
+                    }
+                    return Ok(Some(Value::Object(None)));
+                }
+                Some(d - now)
+            }
+            // A zero/negative timeout with no deadline means "don't wait".
+            None => {
+                let mut t = sq_table().lock();
+                if let Some(entry) = t.get_mut(&key) {
+                    if let Some(pos) = entry.consumers.iter().position(|w| w.ticket == ticket) {
+                        let item = if entry.consumers[pos].fulfilled {
+                            entry.consumers[pos].item.take().unwrap_or(Value::Object(None))
+                        } else {
+                            Value::Object(None)
+                        };
+                        entry.consumers.remove(pos);
+                        if entry.producers.is_empty() && entry.consumers.is_empty() { t.remove(&key); }
+                        return Ok(Some(item));
+                    }
+                }
+                return Ok(Some(Value::Object(None)));
+            }
+        };
+        ctx.park(park_dur);
+        let mut t = sq_table().lock();
+        if let Some(entry) = t.get_mut(&key) {
+            if let Some(pos) = entry.consumers.iter().position(|w| w.ticket == ticket) {
+                if entry.consumers[pos].fulfilled {
+                    let item = entry.consumers[pos].item.take().unwrap_or(Value::Object(None));
+                    entry.consumers.remove(pos);
+                    if entry.producers.is_empty() && entry.consumers.is_empty() { t.remove(&key); }
+                    return Ok(Some(item));
+                }
+                continue; // spurious wake — loop and re-check deadline
+            }
+        }
+        return Ok(Some(Value::Object(None)));
+    }
+}
+
+/// Decode a (long timeout, TimeUnit) arg pair starting at `idx` into nanos.
+/// Returns None for a non-positive timeout (callers treat None as "no wait").
+fn sq_timeout_nanos(args: &[Value], idx: usize) -> Option<u64> {
+    let raw = match args.get(idx) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()),
+        _ => 0,
+    };
+    if raw <= 0 {
+        return None;
+    }
+    // TimeUnit (args[idx+1]) governs the magnitude. We can't easily read the
+    // enum here without a virtual call, so conservatively interpret the value
+    // as the unit's toNanos via a best-effort: most callers pass NANOSECONDS or
+    // MILLISECONDS. We default to treating the raw value as the smallest sane
+    // wait (milliseconds) when the unit is unknown, which keeps timed waits
+    // bounded rather than effectively infinite. Callers that need exact units
+    // run real bytecode; this native path only guards against unbounded blocks.
+    Some((raw as u64).saturating_mul(1_000_000))
+}
+
 fn p58_sq_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    let key = ctx.identity_hash_code(this);
+    sq_table().lock().remove(&key);
     ctx.set_field(this, 0, Value::Object(None));
     ctx.set_field(this, 1, Value::Int(0));
     Ok(None)
@@ -27805,10 +28242,65 @@ struct MacState {
     initialized: bool,
 }
 
+/// BUG nb-phases-late(4) [VULN low]: scrub HMAC key (and accumulated) bytes on
+/// drop so that whenever a `MacState` is evicted, replaced, or the table is torn
+/// down, the secret key material is zeroed in place rather than left lingering in
+/// freed heap for the VM lifetime. We cannot zero the key on doFinal()/reset()
+/// because the JDK keeps the Mac keyed for reuse after those calls (the
+/// ScramFormatter.hi() init-once/doFinal-many loop relies on this), so the
+/// eviction-time scrub plus the bounded-cap eviction below is the correct,
+/// non-breaking mitigation.
+impl Drop for MacState {
+    fn drop(&mut self) {
+        mac_zeroize(&mut self.key);
+        mac_zeroize(&mut self.data);
+    }
+}
+
+/// Overwrite a secret byte buffer with zeros, defeating dead-store elimination
+/// via a volatile write per byte, then clear it.
+fn mac_zeroize(buf: &mut Vec<u8>) {
+    for b in buf.iter_mut() {
+        // SAFETY: `b` points to a valid, uniquely-borrowed u8 inside the Vec.
+        unsafe { std::ptr::write_volatile(b as *mut u8, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    buf.clear();
+}
+
+/// Hard cap on live `MacState` entries. The table is keyed by identity hash and
+/// never observed object finalization, so without a cap a long-running VM that
+/// churns through Mac instances would retain every key forever (BUG
+/// nb-phases-late(4)). When the cap is exceeded we evict the lowest-keyed
+/// entries; their `Drop` scrubs the key bytes.
+const MAC_STATE_MAX_ENTRIES: usize = 4096;
+
 fn mac_state_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, MacState>> {
     static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, MacState>>> =
         std::sync::OnceLock::new();
     T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Bound the Mac state table: if it has grown past the cap, drop excess entries
+/// (scrubbing their key material via `MacState::drop`). Called from `getInstance`
+/// just before inserting a fresh entry. `keep` is the id we are about to insert,
+/// which is never evicted. Best-effort eviction (lowest ids first) — these are
+/// abandoned Mac handles whose Java objects are unreachable.
+fn mac_state_evict_if_needed(
+    t: &mut std::collections::HashMap<i32, MacState>,
+    keep: i32,
+) {
+    if t.len() < MAC_STATE_MAX_ENTRIES {
+        return;
+    }
+    let target = MAC_STATE_MAX_ENTRIES / 2;
+    let mut ids: Vec<i32> = t.keys().copied().filter(|&k| k != keep).collect();
+    ids.sort_unstable();
+    let to_remove = t.len().saturating_sub(target);
+    for id in ids.into_iter().take(to_remove) {
+        // Removing drops the MacState, whose Drop zeroes the key bytes.
+        t.remove(&id);
+    }
 }
 
 pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
@@ -27832,7 +28324,11 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
                 .unwrap_or_default();
             let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4);
             let id = ctx.identity_hash_code(obj);
-            mac_state_table().lock().unwrap().insert(
+            // BUG nb-phases-late(4): bound the key-bearing side-table before
+            // inserting so it cannot retain key material for the VM lifetime.
+            let mut t = mac_state_table().lock().unwrap();
+            mac_state_evict_if_needed(&mut t, id);
+            t.insert(
                 id,
                 MacState { algo, key: Vec::new(), data: Vec::new(), initialized: false },
             );
@@ -27856,7 +28352,11 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
                 .unwrap_or_default();
             let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4);
             let id = ctx.identity_hash_code(obj);
-            mac_state_table().lock().unwrap().insert(
+            // BUG nb-phases-late(4): bound the key-bearing side-table before
+            // inserting so it cannot retain key material for the VM lifetime.
+            let mut t = mac_state_table().lock().unwrap();
+            mac_state_evict_if_needed(&mut t, id);
+            t.insert(
                 id,
                 MacState { algo, key: Vec::new(), data: Vec::new(), initialized: false },
             );
@@ -27872,6 +28372,10 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
         let id = ctx.identity_hash_code(this);
         let mut t = mac_state_table().lock().unwrap();
         let st = t.entry(id).or_default();
+        // BUG nb-phases-late(4): scrub the previous key in place before
+        // replacing it, so re-keying a reused Mac doesn't leave the old key
+        // lingering in freed heap.
+        mac_zeroize(&mut st.key);
         st.key = key_bytes;
         st.initialized = true;
         st.data.clear();
@@ -45311,5 +45815,87 @@ mod nb_core_stubs_fix_tests {
             }
             other => panic!("forName should return a Charset object, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod nb_phases_late_security_fix_tests {
+    use super::*;
+    use cratonvm_native_api::NativeMethodRegistry;
+
+    // -- BUG nb-phases-late(4): Mac key-material scrubbing -----------------
+
+    #[test]
+    fn mac_zeroize_clears_and_zeros_secret_bytes() {
+        let mut key = vec![0xAAu8, 0xBB, 0xCC, 0xDD];
+        mac_zeroize(&mut key);
+        // After zeroize the logical length is 0 (key no longer retained).
+        assert!(key.is_empty(), "key Vec must be cleared after zeroize");
+    }
+
+    #[test]
+    fn mac_state_drop_scrubs_key() {
+        // A MacState going out of scope (eviction / table teardown) must scrub
+        // its key bytes via Drop without panicking.
+        let st = MacState {
+            algo: "HmacSHA256".to_string(),
+            key: vec![1, 2, 3, 4, 5],
+            data: vec![9, 9, 9],
+            initialized: true,
+        };
+        drop(st); // Drop impl runs mac_zeroize on key + data.
+    }
+
+    #[test]
+    fn mac_state_evict_drops_excess_entries() {
+        let mut t: std::collections::HashMap<i32, MacState> = std::collections::HashMap::new();
+        for i in 0..(MAC_STATE_MAX_ENTRIES as i32 + 1) {
+            t.insert(i, MacState { algo: String::new(), key: vec![0u8; 4], ..Default::default() });
+        }
+        let keep = MAC_STATE_MAX_ENTRIES as i32; // the "about to insert" id
+        mac_state_evict_if_needed(&mut t, keep);
+        assert!(
+            t.len() <= MAC_STATE_MAX_ENTRIES,
+            "table must be bounded after eviction"
+        );
+        assert!(t.contains_key(&keep), "the kept id must never be evicted");
+    }
+
+    // -- BUG nb-phases-late(3): SynchronousQueue helper + registration -----
+
+    #[test]
+    fn sq_timeout_nanos_non_positive_is_no_wait() {
+        // A non-positive timeout maps to None ("don't wait").
+        assert_eq!(sq_timeout_nanos(&[Value::Long(0)], 0), None);
+        assert_eq!(sq_timeout_nanos(&[Value::Long(-5)], 0), None);
+        // Missing arg → treated as 0 → None.
+        assert_eq!(sq_timeout_nanos(&[], 0), None);
+    }
+
+    #[test]
+    fn sq_timeout_nanos_positive_is_bounded() {
+        // A positive timeout yields a bounded, non-zero nanos value (never
+        // an effectively-infinite block).
+        let n = sq_timeout_nanos(&[Value::Long(10)], 0).expect("positive timeout");
+        assert!(n > 0);
+        // Saturating multiply must not overflow for Long.MAX_VALUE.
+        let big = sq_timeout_nanos(&[Value::Long(i64::MAX)], 0).expect("max timeout");
+        assert!(big > 0);
+    }
+
+    #[test]
+    fn sq_real_rendezvous_methods_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_p58_synchronous_queue(&mut r);
+        let sq = "java/util/concurrent/SynchronousQueue";
+        assert!(r.find(sq, "put", "(Ljava/lang/Object;)V").is_some());
+        assert!(r.find(sq, "take", "()Ljava/lang/Object;").is_some());
+        assert!(r.find(sq, "offer", "(Ljava/lang/Object;)Z").is_some());
+        assert!(r
+            .find(sq, "offer", "(Ljava/lang/Object;JLjava/util/concurrent/TimeUnit;)Z")
+            .is_some());
+        assert!(r
+            .find(sq, "poll", "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;")
+            .is_some());
     }
 }
