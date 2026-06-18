@@ -46131,7 +46131,9 @@ mod nb_phases_late_security_fix_tests {
     fn mac_state_evict_drops_excess_entries() {
         let mut t: std::collections::HashMap<i32, MacState> = std::collections::HashMap::new();
         for i in 0..(MAC_STATE_MAX_ENTRIES as i32 + 1) {
-            t.insert(i, MacState { algo: String::new(), key: vec![0u8; 4], ..Default::default() });
+            // NB: list all fields explicitly — MacState impls Drop (key-zeroing),
+            // so the `..Default::default()` functional-update form is rejected (E0509).
+            t.insert(i, MacState { algo: String::new(), key: vec![0u8; 4], data: Vec::new(), initialized: false });
         }
         let keep = MAC_STATE_MAX_ENTRIES as i32; // the "about to insert" id
         mac_state_evict_if_needed(&mut t, keep);
