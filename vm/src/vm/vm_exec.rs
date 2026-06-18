@@ -9052,6 +9052,18 @@ fn invoke_on_class_shared_inner(
                         // path when the engine lookup fails).
                         || (class_name == "java/security/Provider"
                             && method_name == "getEngineName")
+                        // kafka-0617 #4: our synthetic `java.security.MessageDigest`
+                        // (built by `native_md_get_instance` without a real SPI)
+                        // carries the running digest state in MD_FIELD_ALGO/DATA.
+                        // The real `MessageDigest.digest(...)` bytecode delegates to
+                        // the abstract `MessageDigestSpi.engineDigest()` (no Code), so
+                        // unless we force the override the *concrete* `digest([BII)I`
+                        // overload runs its JDK body and AME's on `engineDigest()[B`
+                        // (Kafka `SkimpyOffsetMap.hashInto` / OffsetMapTest). Force our
+                        // digest natives (native_md_digest / *_input / *_buf) to win
+                        // for every `digest` overload.
+                        || (class_name == "java/security/MessageDigest"
+                            && method_name == "digest")
                         // Spring Boot 3.2 fat-jar launcher: Archive.create(File)
                         // takes `URI.getSchemeSpecificPart()` (e.g. `/C:/foo.jar`)
                         // and feeds it to `new File(...)`. Rust's
