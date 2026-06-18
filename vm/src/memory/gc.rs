@@ -227,6 +227,16 @@ pub fn update_all_roots(
             .update_after_gc(pointer_map);
     }
 
+    // 9b. NIO selector side-table — the `sun.nio.ch.SelectionKeyImpl` registry
+    // (nio_selector `sk_table` + per-selector key state) stores raw channel /
+    // selector / attachment / key ObjectRefs. Without remapping them after a
+    // moving collection, `SelectionKey.channel()` returns a stale (relocated)
+    // channel, and the Apache NIO reactor closing that session then dereferences
+    // a moved-away object → `monitorenter ... null` on its `closeLock` and the
+    // reactor worker dies (ES testManyAsyncRequests under burst load). The helper
+    // early-returns when nothing moved (non-moving GC).
+    cratonvm_native_io::nio_selector::sk_table_update_after_gc(pointer_map);
+
     // 10. Thread-local ObjectRefs — java_thread_obj, pending_async_exception
     if let Some(ref mut obj_ref) = thread.java_thread_obj {
         let old_addr = obj_ref.as_ptr() as usize;
