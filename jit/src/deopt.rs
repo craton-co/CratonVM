@@ -563,10 +563,52 @@ pub fn reconstruct_frame_owned(mut deopt: DeoptimizationPoint) -> ReconstructedF
     frame
 }
 
-/// Materialize virtual objects back to the heap. Returns a list of
-/// `(index, heap_address)` pairs. In a real implementation the addresses
-/// would come from the GC; here we assign monotonically increasing
-/// placeholder addresses starting at `0x1000_0000`.
+/// Identify which local/stack slots hold scalar-replaced (virtual) objects
+/// that would need to be re-materialized on the heap during a deopt, and
+/// return placeholder `(index, heap_address)` pairs.
+///
+/// # ⚠ NOT WIRED TO A LIVE DEOPT PATH — placeholder addresses are NOT real objects
+///
+/// This function is **diagnostic/skeleton only**. It is currently called
+/// exclusively from the unit test `materialize_virtual_objects_count`,
+/// which validates slot-index extraction and address distinctness — it does
+/// NOT exercise a real deopt. No VM code path invokes it (verified: no
+/// references outside this module's tests). In particular the in-progress
+/// live deopt machinery (the `FrameState`/`DeoptimizationPoint` plumbing that
+/// `reconstruct_frame{,_owned}` feed) does **not** call this.
+///
+/// The returned addresses are FAKE: monotonically increasing placeholders
+/// starting at `0x1000_0000`, stepping by `0x100`. They do **not** point at
+/// GC-allocated, header-initialized, field-populated heap objects. Treating
+/// a returned address as a live object reference is **memory-unsafe** — it
+/// would hand the interpreter (and then the GC, on its next root scan) a
+/// dangling pointer into an unmapped/foreign region, almost certainly
+/// crashing or corrupting the heap.
+///
+/// ## What the real fix requires (GC-backed materialization)
+///
+/// A correct implementation cannot run against a borrowed `&FrameState`
+/// alone — re-materialization is a heap-mutating, GC-coordinated operation.
+/// It must, for each `FrameValue::VirtualObject(state)`:
+///   1. Allocate an object of `state.class_id` via the live allocator/TLAB
+///      (which may trigger a GC; the surrounding deopt frame must already be
+///      a valid GC root set so the half-built object survives).
+///   2. Write the real object header (class id, mark word, etc.).
+///   3. Recursively materialize/store each `state.field_values[i]`, resolving
+///      nested `VirtualObject`s and patching any back-references (cyclic
+///      scalar-replaced graphs).
+///   4. Return the *real* heap address from the allocator.
+/// This needs a handle to the VM heap/allocator threaded in from the deopt
+/// path, so it belongs with the live-deopt feature work in the VM crate, not
+/// here. Until then this stays a placeholder.
+///
+/// # Guard
+///
+/// To make sure the fake addresses can never be silently consumed by real
+/// VM execution, this function is hard-gated to test builds. In a non-test
+/// build it is unreachable: any accidental wiring onto a live path will fail
+/// to compile / panic loudly rather than mint bogus object references.
+#[cfg(test)]
 pub fn materialize_virtual_objects(frame: &FrameState) -> Vec<(usize, u64)> {
     let mut result = Vec::new();
     let mut next_addr: u64 = 0x1000_0000;
@@ -584,6 +626,33 @@ pub fn materialize_virtual_objects(frame: &FrameState) -> Vec<(usize, u64)> {
     collect(&frame.stack, &mut result, &mut next_addr);
 
     result
+}
+
+/// Non-test stub for [`materialize_virtual_objects`].
+///
+/// The real (test-only) implementation hands back FAKE placeholder heap
+/// addresses (see that function's docs). To guarantee those cannot leak into
+/// a live deopt and be mistaken for real objects, the placeholder body is
+/// compiled only under `cfg(test)`. If a future caller wires this onto a real
+/// deopt path before the GC-backed materialization above is implemented, this
+/// stub makes the mistake impossible to miss: it never returns a fabricated
+/// address — it panics. Replace it with the GC-allocating implementation
+/// described above when the live-deopt heap plumbing lands.
+#[cfg(not(test))]
+pub fn materialize_virtual_objects(frame: &FrameState) -> Vec<(usize, u64)> {
+    // Hard guard: virtual-object re-materialization needs a live heap/allocator
+    // (see doc above). There is intentionally no placeholder-address path in a
+    // real build — fail loud instead of producing fake object references.
+    debug_assert!(
+        false,
+        "materialize_virtual_objects is a placeholder not wired to a live deopt \
+         path; it needs GC-backed allocation before it can run for real"
+    );
+    let _ = frame;
+    panic!(
+        "materialize_virtual_objects called on a live path without GC-backed \
+         materialization — refusing to mint fake heap addresses (see deopt.rs)"
+    );
 }
 
 /// Count how many virtual objects need materialization across locals and
