@@ -178,6 +178,16 @@ zip-index hot spot. 🔴 open (handoff).
 `readObject`/`readResolve` work on CV (verified); the gap is Hibernate's
 `SessionFactoryRegistry.findSessionFactory(uuid,name)` returning null after deser. 🔴 open.
 
+## Hibernate full-suite census (dev 2026-06-17) — additional docs
+
+Per-run bug reports relocated here from the (gitignored) `apps/hibernate-orm/cratonvm-bug-reports/dev-run-20260617/`:
+- [hibernate-json-function-sigsegv-al_state-foreign-receiver.md](hibernate-json-function-sigsegv-al_state-foreign-receiver.md) — ✅ **FIXED** (`al_state` ArrayList-layout guard; 4 `function.json.*` SIGSEGV classes).
+- [hibernate-throwable-stacktrace-order-reversed-FIXED.md](hibernate-throwable-stacktrace-order-reversed-FIXED.md) — ✅ **FIXED** (`getStackTrace()`/`printStackTrace()` were reversed).
+- [hibernate-jta-txcontrol-getinetaddress-per-class-report.md](hibernate-jta-txcontrol-getinetaddress-per-class-report.md) — per-class companion to the JTA Narayana known-issue (entry crash ✅ fixed; XA/socket layers 🔴 open).
+- [hibernate-hang-clusters-summary.md](hibernate-hang-clusters-summary.md) — overview of the 22 census hangs grouped by root cause (JAXB/class-load, ByteBuddy MethodGraph, JTA/socket).
+
+Also fixed on dev this run (no standalone doc — see commit): `Locale.toLanguageTag()` dropped all subtags for real Locales (`13e8c761`).
+
 ## Consolidation log
 
 - **2026-06-17:** Merged `precise-jit-stack-maps-multithread-fjp-worker-testcase.md`
