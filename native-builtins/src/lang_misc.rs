@@ -178,9 +178,21 @@ pub(crate) fn fill_stack_trace_element(
         // mirror so `computeFormat()` (which does
         // `getfield declaringClassObject; invokevirtual getClassLoader0`)
         // operates on a genuine Class — not null (NPE) and not a String
-        // (NoSuchMethodError). Leave null if the class isn't loaded yet;
-        // `computeFormat` tolerates a null here via its catch-all handler.
-        if let Some(cid) = ctx.class_id_by_name(class_slashed) {
+        // (NoSuchMethodError).
+        //
+        // ES-FAIL-06: the earlier assumption that "computeFormat tolerates a
+        // null here" is WRONG for JDK 25 — `StackTraceElement.computeFormat()`
+        // does `declaringClassObject.getClassLoader0()` with no null guard, so
+        // a single null element NPEs the whole `getStackTrace()`. That fails
+        // ~every Elasticsearch `ESTestCase` (RandomizedRunner augments a suite
+        // throwable's stack trace). When the frame's class can't be resolved by
+        // name (lambdas, not-yet-loaded, etc.), fall back to `java/lang/Object`'s
+        // bootstrap-loaded mirror so `computeFormat` runs cleanly — only the
+        // module/loader display prefix is affected, never correctness.
+        let mirror_cid = ctx
+            .class_id_by_name(class_slashed)
+            .or_else(|| ctx.class_id_by_name("java/lang/Object"));
+        if let Some(cid) = mirror_cid {
             let mirror = ctx.get_class_mirror(cid);
             ctx.set_field_by_name(ste, "declaringClassObject", Value::Object(Some(mirror)));
         }
@@ -430,6 +442,7 @@ pub(crate) fn native_init_stack_trace_elements(
     // NOT change the capture. Reverse only here, when materialising the
     // user-facing `StackTraceElement[]`, so it matches the JDK (throw site at
     // [0], `main` last) instead of being upside-down.
+    let mut filled = 0usize;
     for (i, (cls_slashed, meth, file, line)) in trace_data.iter().rev().take(cap).enumerate() {
         let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
         let cls_dotted = match ctx.class_id_by_name(cls_slashed) {
@@ -446,6 +459,21 @@ pub(crate) fn native_init_stack_trace_elements(
             *line,
         );
         ctx.set_array_element(elements, i, Value::Object(Some(ste)));
+        filled = i + 1;
+    }
+    // ES-FAIL-06 (cont.): `StackTraceElement.of` pre-fills the array with empty
+    // `new StackTraceElement()` objects (null `declaringClass`). When the array
+    // length (from getStackTraceDepth) exceeds the captured frame count, the
+    // trailing slots stay empty — and consumers like RandomizedRunner's
+    // `seedFromThrowable` do `element.getClassName().startsWith(...)`, NPEing on
+    // the null class name. Backfill any remaining slots with a populated
+    // placeholder so no element ever has a null `declaringClass`/`methodName`.
+    if filled < cap {
+        for i in filled..cap {
+            let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
+            fill_stack_trace_element(ctx, ste, "java/lang/Thread", "java.lang.Thread", "<unknown>", None, -1);
+            ctx.set_array_element(elements, i, Value::Object(Some(ste)));
+        }
     }
     Ok(None)
 }

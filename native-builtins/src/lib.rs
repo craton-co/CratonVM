@@ -5091,6 +5091,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // depth)` which allocates the STE[] and delegates here. A no-op left
     // every real-JDK `printStackTrace()` / `getStackTrace()` empty.
     registry.register("java/lang/StackTraceElement", "initStackTraceElements", "([Ljava/lang/StackTraceElement;Ljava/lang/Object;I)V", native_init_stack_trace_elements);
+    // ES-FAIL-06: JDK 25 `StackTraceElement.computeFormat()` does
+    // `declaringClassObject.getClassLoader0()` with no null guard. Elements
+    // created by the *public* `StackTraceElement(String,String,String,int)`
+    // constructor (e.g. RandomizedRunner's synthetic `__randomizedtesting.
+    // SeedInfo.seed(...)` frame) leave `declaringClassObject` null, so when the
+    // trace is formatted the whole `getStackTrace()` NPEs — failing ~every
+    // Elasticsearch ESTestCase. Override computeFormat as a null-safe no-op:
+    // `format` stays 0, so toString renders plain `class.method(file:line)`
+    // (no module/loader prefix). Correct output, never a crash; covers every
+    // element-creation path, not just the VM-fill one.
+    registry.register("java/lang/StackTraceElement", "computeFormat", "()V", native_noop_with_this);
 
     // --- java/lang/reflect/Executable + Field ---
     registry.register("java/lang/reflect/Executable", "getParameters0", "()[Ljava/lang/reflect/Parameter;", |_ctx, _args| Ok(Some(Value::Object(None))));
