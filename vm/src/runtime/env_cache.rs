@@ -125,13 +125,37 @@ pub fn intrinsics_disabled() -> bool {
 /// out. The increment-1 invoke-site message is unconditionally on (it shipped
 /// already) and is unaffected by this flag. Semantics match `disable_jit()`:
 /// empty or `"0"` is off, anything else is on.
+/// Process-global override set once at VM init from the parsed
+/// `-XX:±ShowCodeDetailsInExceptionMessages` flag (see
+/// [`set_show_code_details_in_exception_messages`]). `-1` = unset (use the
+/// built-in default), `0` = off, `1` = on. The `CRATONVM_HELPFUL_NPE_OPCODES`
+/// env var, when present, takes precedence over this.
+static SHOW_CODE_DETAILS: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Apply the HotSpot `-XX:±ShowCodeDetailsInExceptionMessages` VM flag. Called
+/// once at VM startup (from `vm-cli`, before `Vm::new` runs any bytecode) with
+/// the resolved [`crate::config::VmConfig`] value. The interim
+/// `CRATONVM_HELPFUL_NPE_OPCODES` env var still overrides this when set.
+#[inline]
+pub fn set_show_code_details_in_exception_messages(on: bool) {
+    SHOW_CODE_DETAILS.store(if on { 1 } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[inline]
 pub fn helpful_npe_opcodes() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("CRATONVM_HELPFUL_NPE_OPCODES") {
-        Ok(v) => !v.is_empty() && v != "0",
-        Err(_) => false,
-    })
+    // Explicit env override wins (interim developer knob), parsed once.
+    static ENV: OnceLock<Option<bool>> = OnceLock::new();
+    let env = *ENV.get_or_init(|| match std::env::var("CRATONVM_HELPFUL_NPE_OPCODES") {
+        Ok(v) => Some(!v.is_empty() && v != "0"),
+        Err(_) => None,
+    });
+    if let Some(b) = env {
+        return b;
+    }
+    // Otherwise honor `-XX:±ShowCodeDetailsInExceptionMessages`; an unset
+    // override falls back to the built-in default (off, pending the compliance
+    // soak — HotSpot's own default is on).
+    SHOW_CODE_DETAILS.load(std::sync::atomic::Ordering::Relaxed) == 1
 }
 
 // Cache the per-native-call GC root snapshot's *frozen* lower frames and
