@@ -6,8 +6,38 @@
 | **Kind** | Wrong dispatch (mock returns the wrong stub / fails to intercept) |
 | **Surfaced by** | `org.apache.kafka.clients.ClientUtilsTest` (`testParseAndValidateAddressesWithReverseLookup`) |
 | **CratonVM** | FAIL · **HotSpot** OK |
-| **Status** | OPEN — root-caused to the Mockito-on-CratonVM dispatch layer; **recommended for handoff** |
-| **Recommendation** | Handoff (deep mock-maker / dispatch work; same family as the known Mockito bug-09 / bug-24 cluster) |
+| **Status** | **FIXED on `dev`** (dispatch + native-shadow layer). One narrow residual remains — a JIT issue, tracked separately. |
+| **Residual** | [`kafka-bug-B-mockstatic-capturing-lambda-jit.md`](kafka-bug-B-mockstatic-capturing-lambda-jit.md) — `mockStatic` capturing-lambda stub bypassed by stale JIT call target after redefine (works with `--nojit`). |
+
+## Resolution (landed on `dev`)
+
+The dispatch corruption described below was root-caused to two distinct CratonVM defects in
+the JVMTI-redefine + native-shadow layers, both fixed on `dev`:
+
+1. **Redefine matched methods/fields positionally.** Mockito's inline mock-maker retransforms
+   the target class; CratonVM's redefine paired old/new members by index, so any reorder
+   misrouted a call to a *different* method's stub (the `isUnresolved()` → `getHostName()`
+   String misroute). Fixed by set-matching members by **name + descriptor** and reordering.
+2. **Native/intrinsic shadows beat woven bytecode for redefined classes.** Per-class native
+   and intrinsic implementations (e.g. `InetAddress.getCanonicalHostName`) shadowed the
+   agent-woven bytecode, so the mock advice never ran. Fixed by **suppressing the shadow when
+   `redefine_generation > 0`** (gated on `any_class_redefined`), seeding retransform from the
+   **original** bytes (no double-weave), and — for the `mockStatic`+`mock` combination —
+   **evicting a cached native/intrinsic shadow on cache-hit** so subsequent calls re-resolve
+   to the woven body (the inline cache otherwise kept serving the shadow after the first slow
+   call). A missing `ArrayListSubList.toArray(T[])` native (a `dev` regression that broke
+   Mockito's internals) was also restored.
+
+Verified: standalone JDK-class mocks (`InetAddress`/`Random`), the `mockStatic`+`mock`
+same-class combination (`MockProbe` P1/P2/P3), and non-mock behaviour (`Sanity`,
+`ArrayList.subList().toArray`) all match HotSpot. The original ~1 GB crash is gone.
+
+The remaining `MockClientUtils` failure is a **separate JIT bug** (a capturing lambda's
+static-mock call dispatches a stale JIT target after redefine) — see the residual doc above.
+
+---
+
+_Original report (root-cause history below):_
 
 ## Symptom
 
