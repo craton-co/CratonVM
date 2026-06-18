@@ -117,23 +117,36 @@ Known first-cut limitations / follow-ups (in rough priority order):
    instead of pushing real interpreter `Frame`s and resuming at `bci` — that
    needs the IR path in VM dispatch (today's `CompiledMethod`s from `lower()`
    are `try_call`'d directly). This is the gap between "frame reconstructed"
-   and step 3's "resumes in the interpreter".
+   and step 3's "resumes in the interpreter". STRUCTURAL — needs the IR path
+   in production dispatch (it can't yet compile a ternary; see
+   `activate-ir-optimizer.md`) or an `x64.rs` backport. Deferred.
 2. **`StackSlot`-only provenance.** Every value spills, so `Register`/XMM
    provenance is unexercised (the resolver handles `Register`, but nothing
-   emits it). Real register provenance arrives with regalloc.
+   emits it). Real register provenance arrives with regalloc. STRUCTURAL —
+   the naive lowerer has no regalloc. Deferred.
 3. **No type tags.** Resolved `StackSlot`/`Register` values become `Int`; an
-   object-ref slot can't be distinguished from a primitive yet. Needs the
-   verifier-style abstract type state per slot.
+   object-ref slot can't be distinguished from a primitive yet. PREMATURE
+   today: the IR lowerer emits no ref/float/double-producing ops (Load/New/…
+   hit the `_ => {}` arm), so every value it produces is int/long and `Int` is
+   already correct. Becomes load-bearing the moment ref ops are lowered — then
+   resolve from each node's `IrType` (`Ref → Object`, `Float/Double → Float`).
 4. **VirtualObject = Phase B.** `reconstruct_frame_from_machine_state` passes
    `VirtualObject` through unresolved; GC-backed materialization
-   (`materialize_virtual_objects`, still the `deopt.rs` panic stub) is Phase B.
+   (`materialize_virtual_objects`, still the `deopt.rs` panic stub) is Phase B,
+   needs VM heap/allocator threading. Deferred.
 5. **DCE vs. safepoint liveness.** `replace_all_uses` is safepoint-aware but
-   `use_counts`/DCE is not — a value kept live *only* by a safepoint could be
-   killed. Tests run on the un-optimized graph to avoid this; making
-   safepoint refs DCE roots is required before enabling on the optimized path.
-6. **Win64 shadow-space overlap.** The shared stub assumes the top 32 bytes of
-   the frame (reserved `shadow`) aren't claimed by a spill slot. True for
-   small methods; needs an explicit reserve guard before scaling.
+   DCE is intentionally NOT seeded from safepoints — attempted and reverted:
+   because the builder records a snapshot at *every* bci, pinning all
+   safepoint refs as DCE roots keeps every transient operand alive and breaks
+   DCE/reassociation/folding (regressed `ir_optimize` reassoc tests). The real
+   fix is a **model change**: record/pin safepoints only at actual deopt sites
+   (guard bcis, call returns) instead of every bci, or recompute safepoint
+   liveness *after* optimization. Until then deopt is exercised on the
+   un-optimized graph; a value DCE'd out resolves to `Undefined`.
+6. ~~**Win64 shadow-space overlap.**~~ DONE. `alloc_slot` now caps spill
+   offsets at `frame_size - DEOPT_SHADOW_SPACE` (32) so no spill slot overlaps
+   the caller shadow space the deopt stub's `call` needs; `frame_size` already
+   budgeted it, so no valid method is rejected.
 
 ## Design
 

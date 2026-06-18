@@ -630,6 +630,16 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
     let mut reachable: FxHashSet<NodeId> = FxHashSet::default();
     let mut worklist = vec![graph.exit];
 
+    // real-frame-deopt (#5): safepoint snapshots are NOT seeded as DCE roots.
+    // The builder records a snapshot at *every* bytecode boundary, so pinning
+    // every safepoint-referenced value would keep every transient operand
+    // alive and defeat DCE/reassociation/folding. Making safepoints DCE-safe
+    // needs the model to change first — record/pin only at real deopt sites
+    // (guard bcis, call returns), or recompute safepoint liveness AFTER
+    // optimization — rather than this build-time every-bci snapshot. Until
+    // then the deopt path is exercised on the un-optimized graph (see
+    // `ir_lower` tests); a value killed here resolves to `Undefined`.
+
     // Also keep all control nodes reachable from exit
     while let Some(id) = worklist.pop() {
         if !reachable.insert(id) {

@@ -26,6 +26,11 @@ const DEOPT_ARG0: u8 = 7; // RDI
 #[cfg(not(target_os = "windows"))]
 const DEOPT_ARG1: u8 = 6; // RSI
 
+/// Bytes of caller shadow space reserved above `rsp` for the deopt stub's
+/// `call ir_deopt_entry` (Win64 requires 32; harmless on SysV). Kept clear of
+/// spill slots by `alloc_slot`. See its doc comment.
+const DEOPT_SHADOW_SPACE: i32 = 32;
+
 // x86-64 register constants
 #[allow(dead_code)]
 const RAX: u8 = 0;
@@ -108,13 +113,24 @@ impl<'a> Lowerer<'a> {
 
     /// Allocate a frame slot for a node result.
     /// Panics if the spill offset exceeds the allocated frame capacity.
+    ///
+    /// real-frame-deopt (#6): the deopt stub calls `ir_deopt_entry` while the
+    /// frame is live, with `rsp = rbp - frame_size`. The Win64 ABI requires 32
+    /// bytes of caller shadow space at `[rsp, rsp+32)` — i.e. frame offsets
+    /// `(frame_size-32 .. frame_size]`. A spill slot at offset `o` occupies
+    /// `[rbp-o, rbp-o+8)`; to keep it clear of the shadow region we cap
+    /// `o <= frame_size - DEOPT_SHADOW_SPACE`. `frame_size` already budgets the
+    /// 32-byte shadow (plus a 16-byte stack-arg reserve), so this never rejects
+    /// a method the old `o < frame_size` bound accepted.
     fn alloc_slot(&mut self, id: NodeId) -> i32 {
         let offset = self.next_spill;
         assert!(
-            offset < self.frame_size,
-            "JIT lowerer: spill offset {} exceeds frame capacity {}",
+            offset <= self.frame_size - DEOPT_SHADOW_SPACE,
+            "JIT lowerer: spill offset {} exceeds frame capacity {} \
+             (less {}-byte deopt-call shadow reserve)",
             offset,
             self.frame_size,
+            DEOPT_SHADOW_SPACE,
         );
         self.next_spill += 8;
         self.node_slot[id as usize] = offset;
