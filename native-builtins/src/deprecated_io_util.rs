@@ -257,52 +257,257 @@ fn register_date_constructors(r: &mut NativeMethodRegistry) {
     });
 
     // <init>(Ljava/lang/String;)V — Date.parse(String) form
-    // Simplified: attempt to parse a date string, default to epoch 0 on failure.
+    //
+    // Parses the formats documented for the deprecated `Date(String)` ctor /
+    // `Date.parse`: the `Date.toString` form ("EEE MMM dd HH:mm:ss zzz yyyy"),
+    // RFC-1123 / RFC-822 ("EEE, dd MMM yyyy HH:mm:ss zzz"), and the ISO-ish
+    // numeric forms ("YYYY-MM-DD" / "YYYY/MM/DD" with optional time).
+    //
+    // Like the real `Date.parse`, a genuinely unparseable string throws
+    // `IllegalArgumentException` — it must NOT silently fall back to epoch 0,
+    // which would hand callers a wrong-but-valid date and mask the error.
     r.register(date, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let str_obj = obj_arg(args, 1)?;
         let text = ctx.read_string(str_obj).unwrap_or_default();
-        // Attempt a simple parse: "Mon DD HH:MM:SS YYYY" or numeric forms.
-        // Full Date.parse is extremely complex; we handle common patterns.
-        let millis = parse_date_string(&text);
-        set_date_millis(ctx, this, millis);
-        Ok(None)
+        match parse_date_string(&text) {
+            Some(millis) => {
+                set_date_millis(ctx, this, millis);
+                Ok(None)
+            }
+            None => Err(RuntimeError::IllegalArgumentException {
+                message: text,
+            }
+            .into()),
+        }
     });
 }
 
-/// Simple date string parser for the deprecated Date(String) constructor.
-/// Handles "yyyy/mm/dd", "yyyy-mm-dd", and falls back to epoch 0.
-fn parse_date_string(s: &str) -> i64 {
-    let s = s.trim();
-    // Try "YYYY/MM/DD" or "YYYY-MM-DD" optionally with "HH:MM:SS"
-    let parts: Vec<&str> = s.splitn(2, |c: char| c == ' ' || c == 'T').collect();
-    let date_part = parts.first().unwrap_or(&"");
-    let time_part = parts.get(1).unwrap_or(&"");
-
-    let date_nums: Vec<i32> = date_part
-        .split(|c: char| c == '/' || c == '-')
-        .filter_map(|p| p.parse::<i32>().ok())
-        .collect();
-
-    if date_nums.len() >= 3 {
-        let (year, month_1, day) = (date_nums[0], date_nums[1], date_nums[2]);
-        let (hour, min, sec) = parse_time_part(time_part);
-        return to_epoch_millis(year, month_1 - 1, day, hour, min, sec);
+/// Map a 3-letter (or longer) English month name to a 0-based month index.
+/// Case-insensitive; only the first three letters are significant, matching
+/// `java.util.Date.parse`.
+fn month_name_to_index(name: &str) -> Option<i32> {
+    let key: String = name.chars().take(3).flat_map(|c| c.to_lowercase()).collect();
+    match key.as_str() {
+        "jan" => Some(0),
+        "feb" => Some(1),
+        "mar" => Some(2),
+        "apr" => Some(3),
+        "may" => Some(4),
+        "jun" => Some(5),
+        "jul" => Some(6),
+        "aug" => Some(7),
+        "sep" => Some(8),
+        "oct" => Some(9),
+        "nov" => Some(10),
+        "dec" => Some(11),
+        _ => None,
     }
-
-    0 // fallback to epoch
 }
 
-fn parse_time_part(s: &str) -> (i32, i32, i32) {
-    let nums: Vec<i32> = s
-        .split(':')
-        .filter_map(|p| p.trim().parse::<i32>().ok())
-        .collect();
-    (
-        *nums.first().unwrap_or(&0),
-        *nums.get(1).unwrap_or(&0),
-        *nums.get(2).unwrap_or(&0),
+/// True if `tok` looks like a day-of-week name (Sun..Sat, prefix match) — these
+/// are ignored by `Date.parse` but appear in the toString / RFC-1123 forms.
+fn is_weekday_token(tok: &str) -> bool {
+    let key: String = tok.chars().take(3).flat_map(|c| c.to_lowercase()).collect();
+    matches!(
+        key.as_str(),
+        "sun" | "mon" | "tue" | "wed" | "thu" | "fri" | "sat"
     )
+}
+
+/// True if `tok` is a recognised time-zone token (named zone or numeric
+/// offset). Used to keep an otherwise-unknown alphabetic/offset token from
+/// failing the parse when it's a zone we accept but don't apply an offset for.
+fn is_timezone_token(tok: &str) -> bool {
+    timezone_offset_minutes(tok).is_some()
+        || tok.starts_with("GMT")
+        || tok.starts_with("UTC")
+}
+
+/// Minutes to ADD to the parsed local time to get UTC, for the time-zone tokens
+/// `Date.parse` understands. Returns `None` for tokens that aren't time zones.
+/// Numeric offsets like "+0100" / "GMT-0530" are also handled.
+fn timezone_offset_minutes(tok: &str) -> Option<i32> {
+    // Named zones (subset of what java.util.Date.parse recognises).
+    let named = match tok {
+        "UT" | "UTC" | "GMT" | "Z" => Some(0),
+        "EST" => Some(5 * 60),
+        "EDT" => Some(4 * 60),
+        "CST" => Some(6 * 60),
+        "CDT" => Some(5 * 60),
+        "MST" => Some(7 * 60),
+        "MDT" => Some(6 * 60),
+        "PST" => Some(8 * 60),
+        "PDT" => Some(7 * 60),
+        _ => None,
+    };
+    if named.is_some() {
+        return named;
+    }
+    // Numeric offset, optionally prefixed by GMT/UTC: "+HH:MM", "+HHMM", "-HHMM".
+    let body = tok
+        .strip_prefix("GMT")
+        .or_else(|| tok.strip_prefix("UTC"))
+        .unwrap_or(tok);
+    let (sign, digits) = if let Some(rest) = body.strip_prefix('+') {
+        (1, rest)
+    } else if let Some(rest) = body.strip_prefix('-') {
+        (-1, rest)
+    } else {
+        return None;
+    };
+    let digits: String = digits.chars().filter(|c| *c != ':').collect();
+    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let hh: i32 = digits[0..2].parse().ok()?;
+    let mm: i32 = digits[2..4].parse().ok()?;
+    // East-of-UTC ("+0100") means local is AHEAD of UTC, so SUBTRACT to reach
+    // UTC → the offset-to-add is negative.
+    Some(-sign * (hh * 60 + mm))
+}
+
+/// Parse a date string for the deprecated `Date(String)` constructor.
+///
+/// Recognised formats:
+///   * `Date.toString`:  "EEE MMM dd HH:mm:ss zzz yyyy"  (e.g. "Wed Jun 17 14:30:45 GMT 2026")
+///   * RFC-1123/RFC-822: "EEE, dd MMM yyyy HH:mm:ss zzz" (e.g. "Wed, 17 Jun 2026 14:30:45 GMT")
+///   * ISO numeric:      "YYYY-MM-DD" / "YYYY/MM/DD" with an optional "HH:MM:SS" time.
+///
+/// Returns `Some(epoch_millis)` on success, or `None` when the string cannot be
+/// parsed (the caller throws `IllegalArgumentException`).
+fn parse_date_string(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // Try the purely-numeric ISO forms first (no alphabetic month name).
+    if let Some(ms) = parse_iso_numeric(s) {
+        return Some(ms);
+    }
+
+    // Otherwise treat it as a token-based textual date (toString / RFC-1123).
+    parse_textual(s)
+}
+
+/// Handle "YYYY-MM-DD" / "YYYY/MM/DD" optionally followed by " HH:MM:SS" or
+/// "THH:MM:SS". Returns `None` if the leading date part isn't three integers.
+fn parse_iso_numeric(s: &str) -> Option<i64> {
+    let (date_part, time_part) = match s.split_once(|c: char| c == ' ' || c == 'T') {
+        Some((d, t)) => (d, t),
+        None => (s, ""),
+    };
+
+    // The date part must be exactly three integer components separated by '/' or '-'.
+    let nums: Vec<&str> = date_part
+        .split(|c: char| c == '/' || c == '-')
+        .filter(|p| !p.is_empty())
+        .collect();
+    if nums.len() != 3 {
+        return None;
+    }
+    let year: i32 = nums[0].parse().ok()?;
+    let month_1: i32 = nums[1].parse().ok()?;
+    let day: i32 = nums[2].parse().ok()?;
+    if !(1..=12).contains(&month_1) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    let (hour, min, sec) = parse_time_part(time_part)?;
+    Some(to_epoch_millis(year, month_1 - 1, day, hour, min, sec))
+}
+
+/// Parse the textual `Date.toString` / RFC-1123 forms by scanning whitespace-
+/// and comma-separated tokens for: a month name, a 4-digit year, a 1-2 digit
+/// day-of-month, an "HH:MM[:SS]" time, and an optional time-zone token. Order is
+/// tolerant so both layouts ("Wed Jun 17 14:30:45 GMT 2026" and
+/// "Wed, 17 Jun 2026 14:30:45 GMT") parse. Returns `None` if month, day, or
+/// year cannot be determined.
+fn parse_textual(s: &str) -> Option<i64> {
+    let mut month: Option<i32> = None;
+    let mut year: Option<i32> = None;
+    let mut day: Option<i32> = None;
+    let mut time = (0i32, 0i32, 0i32);
+    let mut tz_offset_min = 0i32;
+
+    for raw in s.split(|c: char| c.is_whitespace() || c == ',') {
+        let tok = raw.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        if is_weekday_token(tok) {
+            continue;
+        }
+        if let Some(m) = month_name_to_index(tok) {
+            month.get_or_insert(m);
+            continue;
+        }
+        if tok.contains(':') {
+            // "HH:MM" or "HH:MM:SS"
+            match parse_time_part(tok) {
+                Some(t) => time = t,
+                None => return None,
+            }
+            continue;
+        }
+        if let Some(off) = timezone_offset_minutes(tok) {
+            tz_offset_min = off;
+            continue;
+        }
+        // A bare integer is either the year (4 digits / >31) or day-of-month.
+        if let Ok(n) = tok.parse::<i32>() {
+            if tok.len() >= 4 || n > 31 {
+                year.get_or_insert(n);
+            } else if (1..=31).contains(&n) {
+                // Prefer filling day first; a later 4-digit number is the year.
+                if day.is_none() {
+                    day = Some(n);
+                } else {
+                    year.get_or_insert(n);
+                }
+            } else {
+                return None;
+            }
+            continue;
+        }
+        // Recognised-but-ignored zone tokens (e.g. "GMT+1" variants already
+        // handled above) shouldn't fail the parse; any genuinely unknown
+        // alphabetic token should.
+        if is_timezone_token(tok) {
+            continue;
+        }
+        return None;
+    }
+
+    let month = month?;
+    let day = day?;
+    let year = year?;
+    let (hour, min, sec) = time;
+    let local = to_epoch_millis(year, month, day, hour, min, sec);
+    Some(local + tz_offset_min as i64 * 60_000)
+}
+
+/// Parse an "HH", "HH:MM", or "HH:MM:SS" time component. Returns `None` if any
+/// present field isn't an integer (so the caller can reject the whole string).
+fn parse_time_part(s: &str) -> Option<(i32, i32, i32)> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Some((0, 0, 0));
+    }
+    let mut h = 0;
+    let mut m = 0;
+    let mut sec = 0;
+    for (i, field) in s.split(':').enumerate() {
+        let v: i32 = field.trim().parse().ok()?;
+        match i {
+            0 => h = v,
+            1 => m = v,
+            2 => sec = v,
+            _ => return None,
+        }
+    }
+    Some((h, m, sec))
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,6 +1546,80 @@ mod tests {
         let ms = get_date_millis(&mut ctx, date_obj);
         // 2000-01-01 00:00:00 UTC
         assert_eq!(ms, 946684800000);
+    }
+
+    #[test]
+    fn test_date_init_string_tostring_form() {
+        // Date.toString form: "EEE MMM dd HH:mm:ss zzz yyyy"
+        let reg = setup();
+        let mut ctx = MockNativeContext::new();
+        let date_obj = alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4);
+        let str_obj = ctx.create_string("Sat Jan 01 00:00:00 GMT 2000");
+        let result = call_native(
+            &reg, &mut ctx, "java/util/Date", "<init>", "(Ljava/lang/String;)V",
+            &[Value::Object(Some(date_obj)), Value::Object(Some(str_obj))],
+        );
+        assert!(result.is_ok());
+        assert_eq!(get_date_millis(&mut ctx, date_obj), 946684800000);
+    }
+
+    #[test]
+    fn test_date_init_string_rfc1123_form() {
+        // RFC-1123 form: "EEE, dd MMM yyyy HH:mm:ss zzz"
+        let reg = setup();
+        let mut ctx = MockNativeContext::new();
+        let date_obj = alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4);
+        let str_obj = ctx.create_string("Sat, 01 Jan 2000 00:00:00 GMT");
+        let result = call_native(
+            &reg, &mut ctx, "java/util/Date", "<init>", "(Ljava/lang/String;)V",
+            &[Value::Object(Some(date_obj)), Value::Object(Some(str_obj))],
+        );
+        assert!(result.is_ok());
+        assert_eq!(get_date_millis(&mut ctx, date_obj), 946684800000);
+    }
+
+    #[test]
+    fn test_date_init_string_numeric_tz_offset() {
+        // "+0100" means local is one hour ahead of UTC → 01:00 local == 00:00 UTC.
+        let reg = setup();
+        let mut ctx = MockNativeContext::new();
+        let date_obj = alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4);
+        let str_obj = ctx.create_string("Sat, 01 Jan 2000 01:00:00 +0100");
+        let result = call_native(
+            &reg, &mut ctx, "java/util/Date", "<init>", "(Ljava/lang/String;)V",
+            &[Value::Object(Some(date_obj)), Value::Object(Some(str_obj))],
+        );
+        assert!(result.is_ok());
+        assert_eq!(get_date_millis(&mut ctx, date_obj), 946684800000);
+    }
+
+    #[test]
+    fn test_date_init_string_unparseable_throws() {
+        // A genuinely unparseable string must throw IllegalArgumentException,
+        // NOT silently fall back to epoch 0.
+        let reg = setup();
+        let mut ctx = MockNativeContext::new();
+        let date_obj = alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4);
+        let str_obj = ctx.create_string("not a date at all");
+        let result = call_native(
+            &reg, &mut ctx, "java/util/Date", "<init>", "(Ljava/lang/String;)V",
+            &[Value::Object(Some(date_obj)), Value::Object(Some(str_obj))],
+        );
+        assert!(result.is_err(), "unparseable string should throw, got {result:?}");
+    }
+
+    #[test]
+    fn test_parse_date_string_helper() {
+        // ISO numeric still works.
+        assert_eq!(parse_date_string("1970-01-01"), Some(0));
+        assert_eq!(parse_date_string("1970/01/01 00:00:00"), Some(0));
+        // toString + RFC-1123 textual forms agree on the same instant.
+        assert_eq!(parse_date_string("Thu Jan 01 00:00:00 GMT 1970"), Some(0));
+        assert_eq!(parse_date_string("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        // Unparseable / empty → None.
+        assert_eq!(parse_date_string(""), None);
+        assert_eq!(parse_date_string("garbage"), None);
+        assert_eq!(parse_date_string("Jan 1970"), None); // no day-of-month
     }
 
     // --- T8.2.2 Date getters/setters ---

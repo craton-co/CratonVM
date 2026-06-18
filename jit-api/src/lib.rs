@@ -22,10 +22,16 @@
 //! trait remain in-tree because removing them is a public-API break that
 //! is out of scope for the current soundness round.
 //!
-//! TODO(round-9): if `gpu-lowering` still has zero consumers at the start
-//! of round 9, delete the feature, the module, and the `docs/gpu/`
-//! README. There is no point keeping a feature-gated public API that
-//! exists only to be referenced by its own documentation.
+//! Round-10 decision: the module is **kept but is dead by default**. It
+//! is compiled only under `--features gpu-lowering` (the `default`
+//! feature set is empty), so the off-by-default CPU JIT never links it
+//! and pays nothing for it. Rather than delete the public seam — which a
+//! future GPU-offload integration is still expected to implement (see
+//! `docs/gpu/README.md`) — the error type's `Display`/`Error` impls now
+//! carry `#[cfg(test)]` coverage so the code is at least exercised when
+//! the feature is built. If `gpu-lowering` still has zero consumers when
+//! the GPU-offload plan is formally abandoned, delete the feature, this
+//! module, and `docs/gpu/` together.
 
 #[cfg(feature = "gpu-lowering")]
 pub mod gpu_lowering;
@@ -386,7 +392,10 @@ impl JitRuntimeHelpers {
     /// error message rather than failing on the first one. (Round-9
     /// fix: the previous bool-returning, dead-loop implementation
     /// silently returned `true` on a null `tlab_post_init` because the
-    /// 33-element bulk array did not include it.)
+    /// hand-maintained bulk array did not include it. The validator now
+    /// iterates the macro-generated `all_fields()` list — all 41 fields,
+    /// 34 of which are required pointers — so no field can be silently
+    /// uncovered.)
     pub fn validate(&self) -> Result<(), Vec<&'static str>> {
         let nulls = self.null_pointers();
         if nulls.is_empty() {
@@ -415,7 +424,7 @@ impl JitRuntimeHelpers {
 // literal init) and the only callers of the Builder were this crate's own
 // tests. The stringly-typed `set(name: &str, addr: usize)` silently
 // `eprintln!`-degraded on typos, providing no compile-time safety while
-// duplicating the 32-field list across five call sites. If a future
+// duplicating the field list across five call sites. If a future
 // caller wants a builder pattern, use the struct literal directly or
 // generate it from a declarative macro keyed on `field_names()`.
 
@@ -838,8 +847,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 40.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 40);
+        // And the macro-driven count is the canonical 41.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 41);
     }
 
     #[test]
@@ -926,8 +935,8 @@ mod tests {
 
     #[test]
     fn jit_runtime_helpers_all_fields_classified() {
-        // The macro must classify every field. 33 RequiredPtr + 3
-        // Offset + 2 OptionalPtr = 38. A new field whose classification
+        // The macro must classify every field. 34 RequiredPtr + 4
+        // Offset + 3 OptionalPtr = 41. A new field whose classification
         // is omitted will fail to compile (the macro requires both
         // arms); this test pins the *counts* so a reclassification
         // (e.g. demoting a RequiredPtr to OptionalPtr) is also a
@@ -937,8 +946,8 @@ mod tests {
         let req = f.iter().filter(|e| e.kind == FieldKind::RequiredPtr).count();
         let opt = f.iter().filter(|e| e.kind == FieldKind::OptionalPtr).count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
-        assert_eq!(req, 33, "required-pointer count drifted");
-        assert_eq!(opt, 2, "optional-pointer count drifted");
+        assert_eq!(req, 34, "required-pointer count drifted");
+        assert_eq!(opt, 3, "optional-pointer count drifted");
         assert_eq!(off, 4, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }
@@ -947,9 +956,9 @@ mod tests {
     fn jit_runtime_helpers_validate_ignores_offsets() {
         // `class_id_offset_in_obj` is 0 by contract; the validator
         // must NOT reject on that. (Regression for the round-9 fix —
-        // the previous `validate()` looped over a 33-element array
+        // the previous `validate()` looped over a hand-maintained array
         // that omitted all offset/optional fields, so this was true
-        // by accident. The new validator iterates ALL 38 fields and
+        // by accident. The new validator iterates ALL 41 fields and
         // must still pass when offsets are zero.)
         let mut h = make_helpers();
         h.tlab_cursor_offset_in_thread = 0;
@@ -981,7 +990,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::RequiredPtr)
             .map(|e| e.name)
             .collect();
-        assert_eq!(names.len(), 33);
+        assert_eq!(names.len(), 34);
         for name in names {
             let mut h = make_helpers();
             // Zero the field by name via a match — the macro doesn't
@@ -1008,6 +1017,58 @@ mod tests {
                 name,
                 nulls,
             );
+        }
+    }
+
+    #[test]
+    fn jit_runtime_helpers_all_required_null_reports_every_name() {
+        // Zero EVERY required pointer at once: `null_pointers()` must
+        // return the complete set of 34 required-field names (and
+        // `validate()` must reject). This complements the per-field
+        // sweep above — it proves the validator does not stop at the
+        // first miss and that the offset/optional fields (left non-zero
+        // for offsets, zero for unwired optionals) never leak into the
+        // report.
+        let mut h = make_helpers();
+        let required: Vec<&'static str> = h
+            .all_fields()
+            .iter()
+            .filter(|e| e.kind == FieldKind::RequiredPtr)
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(required.len(), 34, "expected 34 required pointers");
+        // throw_exception is the round-10 addition — pin it explicitly so
+        // a regression that drops it from the required set is caught here
+        // and not just by the count.
+        assert!(
+            required.contains(&"throw_exception"),
+            "throw_exception must be a required (null-rejected) pointer",
+        );
+
+        for name in &required {
+            zero_field_by_name(&mut h, name);
+        }
+
+        let nulls = h.null_pointers();
+        assert_eq!(
+            nulls.len(),
+            required.len(),
+            "null_pointers() should report all {} required fields; got {:?}",
+            required.len(),
+            nulls,
+        );
+        for name in &required {
+            assert!(
+                nulls.contains(name),
+                "null_pointers() omitted required field `{}`; got {:?}",
+                name,
+                nulls,
+            );
+        }
+        // And validate() must fail with the same complete list.
+        match h.validate() {
+            Ok(()) => panic!("validate() returned Ok with all required pointers null"),
+            Err(err) => assert_eq!(err.len(), required.len()),
         }
     }
 
@@ -1049,6 +1110,11 @@ mod tests {
             "uncommon_trap" => h.uncommon_trap = 0,
             "math_fma_double" => h.math_fma_double = 0,
             "math_fma_float" => h.math_fma_float = 0,
+            // round-10: throw_exception was added as a RequiredPtr after
+            // the original 33-field sweep was written. Without this arm the
+            // sweep panics on it and the required-null coverage is silently
+            // incomplete (the exact failure mode this test guards against).
+            "throw_exception" => h.throw_exception = 0,
             other => panic!("unknown required-pointer field name in test: {}", other),
         }
     }

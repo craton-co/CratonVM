@@ -403,6 +403,26 @@ pub struct SpscEventRing {
     /// [`SpscEventRing::with_shutdown_timeout`] to override (mainly for tests
     /// that intentionally wedge a consumer).
     shutdown_timeout_nanos: AtomicU64,
+    /// Set to `true` by the owning producer thread's `Drop` guard
+    /// (`RegisteredRingGuard` held in `THREAD_REGISTERED_RING`) when that
+    /// thread exits. A retired ring will never receive another producer push
+    /// (its producer is gone), so once it has also been fully drained the
+    /// registry can drop its clone and reclaim the 1024-slot shard.
+    ///
+    /// Registry-leak fix (HIGH, 2026-06-17): `ThreadRingRegistry::rings`
+    /// previously only ever grew — `register_current_thread` pushed a clone
+    /// per producer thread and nothing was ever removed, so a finished
+    /// producer thread leaked its shard forever and `drain_all` paid an
+    /// O(dead_threads) cost walking corpses. This flag lets `drain_all`
+    /// `retain()` out retired + empty shards lazily under its write lock.
+    ///
+    /// Relaxed: this is a one-way `false -> true` liveness hint, not a
+    /// synchronisation point. The producer that flips it (in its thread-exit
+    /// Drop) has, by definition, completed all of its own pushes before the
+    /// thread can unwind; a drainer that observes `retired == true` then
+    /// independently checks `is_empty()` (Acquire loads of head/tail) before
+    /// reclaiming, so it never drops a ring with unread events.
+    retired: AtomicBool,
 }
 
 /// Default `SpscEventRing` shutdown timeout — bounded wait for an in-flight
@@ -466,6 +486,8 @@ impl SpscEventRing {
             consumer_busy: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
             shutdown_timeout_nanos: AtomicU64::new(timeout_nanos),
+            // Registry-leak fix (2026-06-17): live until the owning thread exits.
+            retired: AtomicBool::new(false),
         }
     }
 
@@ -663,6 +685,23 @@ impl SpscEventRing {
     pub fn is_empty(&self) -> bool {
         self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Acquire)
     }
+
+    /// Mark this ring as retired — its owning producer thread has exited and
+    /// will never push again. Registry-leak fix (2026-06-17): called from the
+    /// per-thread `RegisteredRingGuard::drop`. Idempotent; Relaxed because it
+    /// is a one-way liveness hint (see the `retired` field doc).
+    #[inline]
+    pub(crate) fn mark_retired(&self) {
+        self.retired.store(true, Ordering::Relaxed);
+    }
+
+    /// True once the owning producer thread has exited (see [`mark_retired`]).
+    /// A retired ring receives no further pushes, so once it is also empty the
+    /// registry may drop its clone.
+    #[inline]
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for SpscEventRing {
@@ -807,6 +846,42 @@ impl Drop for SpscEventRing {
     }
 }
 
+/// Owns the producer thread's clone of its `Arc<SpscEventRing>` and, on the
+/// thread's exit (when this guard's TLS slot is dropped), marks the ring
+/// `retired` so the registry can later reclaim the shard.
+///
+/// Registry-leak fix (HIGH, 2026-06-17): without this, a finished producer
+/// thread's shard stayed in `ThreadRingRegistry::rings` forever (unbounded
+/// 1024-slot-per-dead-thread leak + O(dead_threads) drain cost). The guard's
+/// `Drop` is the unregistration *signal*; the registry does the actual
+/// `retain()` lazily in `drain_all` so we never touch the registry lock on a
+/// thread-exit path (and never drop a ring that still has unread events).
+///
+/// The inner `Arc` is exposed via [`RegisteredRingGuard::ring`] so
+/// `register_current_thread`'s fast path is a cheap clone of the same `Arc`
+/// the registry holds.
+struct RegisteredRingGuard {
+    ring: Arc<SpscEventRing>,
+}
+
+impl RegisteredRingGuard {
+    #[inline]
+    fn ring(&self) -> &Arc<SpscEventRing> {
+        &self.ring
+    }
+}
+
+impl Drop for RegisteredRingGuard {
+    fn drop(&mut self) {
+        // Thread is exiting: the (unique) producer for this shard is gone, so
+        // flag the ring retired. The registry keeps its own clone alive; a
+        // later `drain_all` will drop that clone once the ring is also empty.
+        // We deliberately do NOT take the registry lock here — thread-exit TLS
+        // destructors must stay cheap and lock-free.
+        self.ring.mark_retired();
+    }
+}
+
 thread_local! {
     /// Thread-local instance of the simple `ThreadEventRing` (single-threaded
     /// view, kept for API completeness; production emit paths should use
@@ -818,7 +893,12 @@ thread_local! {
     /// `push_to_thread_ring` (or `global_ring_registry().register_current_thread()`).
     /// The `Arc<SpscEventRing>` is also inserted into the global registry so
     /// the dumper can find and drain it from another thread.
-    static THREAD_REGISTERED_RING: RefCell<Option<Arc<SpscEventRing>>> =
+    ///
+    /// Registry-leak fix (2026-06-17): the cell now holds a
+    /// `RegisteredRingGuard` (rather than a bare `Arc<SpscEventRing>`) whose
+    /// `Drop` marks the ring `retired` when the thread exits, letting
+    /// `drain_all` reclaim the shard.
+    static THREAD_REGISTERED_RING: RefCell<Option<RegisteredRingGuard>> =
         const { RefCell::new(None) };
 }
 
@@ -881,14 +961,24 @@ impl ThreadRingRegistry {
     /// it; the producer keeps its own clone in the thread-local cell for fast
     /// re-access.
     pub fn register_current_thread(&self) -> Arc<SpscEventRing> {
-        // Fast path: already registered for this thread.
-        if let Some(existing) = THREAD_REGISTERED_RING.with(|cell| cell.borrow().clone()) {
+        // Fast path: already registered for this thread. Clone the inner Arc
+        // out of the thread-local `RegisteredRingGuard` (the guard itself stays
+        // in the cell so its thread-exit Drop still fires).
+        if let Some(existing) =
+            THREAD_REGISTERED_RING.with(|cell| cell.borrow().as_ref().map(|g| Arc::clone(g.ring())))
+        {
             return existing;
         }
-        // Slow path: allocate, install into thread-local, and publish to registry.
+        // Slow path: allocate, install a Drop guard into the thread-local, and
+        // publish to registry.
         let ring = Arc::new(SpscEventRing::new(self.shard_capacity));
+        // Registry-leak fix (2026-06-17): wrap the producer's clone in a
+        // `RegisteredRingGuard` so the ring is marked `retired` when this
+        // thread exits, letting `drain_all` reclaim the shard later.
         THREAD_REGISTERED_RING.with(|cell| {
-            *cell.borrow_mut() = Some(Arc::clone(&ring));
+            *cell.borrow_mut() = Some(RegisteredRingGuard {
+                ring: Arc::clone(&ring),
+            });
         });
         // Publish a clone to the global registry so drainers can find it.
         // Write lock — held only for the duration of the push (one Arc-clone +
@@ -923,10 +1013,52 @@ impl ThreadRingRegistry {
             guard.iter().map(Arc::clone).collect()
         };
         let mut out = Vec::new();
+        let mut reclaimable = false;
         for shard in shards {
             shard.drain_into(&mut out);
+            // Registry-leak fix (HIGH, 2026-06-17): note whether any shard is
+            // now both retired (its producer thread exited) AND empty (this
+            // drain — or a prior one — took its last event). Such a shard can
+            // never receive another event, so it is safe to drop from the
+            // registry. We only *flag* it here under the read lock; the actual
+            // `retain()` takes the write lock once below, and only if needed.
+            if shard.is_retired() && shard.is_empty() {
+                reclaimable = true;
+            }
+        }
+        // Lazy reclamation: prune retired + empty shards under the write lock.
+        // Cheap-path: skip the write lock entirely when nothing is reclaimable
+        // (the common steady-state case where all producers are still live).
+        if reclaimable {
+            self.reclaim_retired_shards();
         }
         out
+    }
+
+    /// Drop registry clones of shards whose owning producer thread has exited
+    /// (`is_retired()`) and which hold no unread events (`is_empty()`).
+    ///
+    /// Registry-leak fix (HIGH, 2026-06-17): the registry `rings` vector
+    /// previously only grew. This `retain()` is the removal path that bounds
+    /// it to (roughly) the live producer count.
+    ///
+    /// Correctness — never drops unread events:
+    ///   * A ring is only removed when BOTH `is_retired()` and `is_empty()`
+    ///     hold. `is_retired()` is set by the producer thread's exit Drop, so
+    ///     once it is true no further `push` can occur (the unique producer is
+    ///     gone). With no producer, `is_empty()` is therefore *stable* — a ring
+    ///     that is retired+empty here cannot transition back to non-empty.
+    ///   * A retired-but-non-empty ring (e.g. a shard whose last drain lost the
+    ///     `consumer_busy` CAS, or whose events have not yet been drained) is
+    ///     RETAINED — its events remain reachable to the next `drain_all`.
+    ///   * Dropping the registry's `Arc` clone does not destroy the ring while
+    ///     a producer clone still exists; but a retired ring's producer clone
+    ///     was held only by the now-dropped thread-local guard, so after
+    ///     removal the `Arc` strong count typically falls to zero and the shard
+    ///     (its 1024 slots) is freed — exactly the leak we are fixing.
+    fn reclaim_retired_shards(&self) {
+        let mut guard = self.rings.write();
+        guard.retain(|ring| !(ring.is_retired() && ring.is_empty()));
     }
 
     /// Number of registered thread shards. Useful for tests and diagnostics.
@@ -1028,11 +1160,11 @@ pub fn push_to_thread_ring(ev: EventInstance) {
     // by value. The closure returns the event back if there is no shard yet
     // so we can install one on the slow path.
     let leftover = THREAD_REGISTERED_RING.with(|cell| {
-        if let Some(ring) = cell.borrow().as_ref() {
+        if let Some(guard) = cell.borrow().as_ref() {
             // Push may fail (full); on overflow the event is dropped
             // (drop-newest) and `push` bumps the shard's dropped counter so
             // the loss is observable rather than silent.
-            let _ = ring.push(ev);
+            let _ = guard.ring().push(ev);
             None
         } else {
             Some(ev)
@@ -1615,6 +1747,120 @@ mod tests {
                 other => panic!("unexpected field variant: {:?}", other),
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Registry-leak fix (HIGH, 2026-06-17): retired-shard reclamation tests.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn drain_all_reclaims_retired_empty_shards() {
+        // A retired + empty shard must be removed from the registry by
+        // `drain_all`, bounding the otherwise unbounded `rings` growth.
+        let registry = ThreadRingRegistry::new(8);
+
+        // Register two shards directly (each Arc stands in for a producer
+        // thread's clone). We don't spawn real threads here so the test is
+        // deterministic — instead we manually mark one shard retired, which is
+        // exactly what `RegisteredRingGuard::drop` does on real thread exit.
+        let live = Arc::new(SpscEventRing::new(8));
+        let dead = Arc::new(SpscEventRing::new(8));
+        registry.rings.write().push(Arc::clone(&live));
+        registry.rings.write().push(Arc::clone(&dead));
+        assert_eq!(registry.registered_thread_count(), 2);
+
+        // The dead thread emitted one event, then exited.
+        dead.push(make_event(EventTypeId(1), 1, 2)).unwrap();
+        dead.mark_retired();
+
+        // First drain takes the dead shard's event. The shard is now retired
+        // AND empty, so this same `drain_all` reclaims it.
+        let drained = registry.drain_all();
+        assert_eq!(drained.len(), 1, "the dead shard's event must still be drained");
+        assert_eq!(
+            registry.registered_thread_count(),
+            1,
+            "retired + empty shard must be reclaimed, leaving only the live one"
+        );
+
+        // The live shard is untouched and still usable.
+        live.push(make_event(EventTypeId(2), 3, 4)).unwrap();
+        let drained2 = registry.drain_all();
+        assert_eq!(drained2.len(), 1);
+        assert_eq!(registry.registered_thread_count(), 1);
+    }
+
+    #[test]
+    fn drain_all_keeps_retired_shard_with_unread_events() {
+        // A retired shard that still holds unread events (e.g. a drainer lost
+        // the consumer CAS) must NOT be reclaimed — dropping it would lose
+        // those events. We simulate "unread" by latching `consumer_busy` so
+        // `drain_into` is a no-op for the dead shard during this pass.
+        use std::sync::atomic::Ordering;
+
+        let registry = ThreadRingRegistry::new(8);
+        let dead = Arc::new(SpscEventRing::new(8));
+        registry.rings.write().push(Arc::clone(&dead));
+
+        dead.push(make_event(EventTypeId(1), 10, 11)).unwrap();
+        dead.mark_retired();
+        // Wedge the consumer gate so this drain cannot take the event.
+        assert!(dead
+            .consumer_busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok());
+
+        let drained = registry.drain_all();
+        assert_eq!(drained.len(), 0, "gate is held, so nothing drains this pass");
+        assert_eq!(
+            registry.registered_thread_count(),
+            1,
+            "retired but non-empty shard must be retained — its event is unread"
+        );
+
+        // Release the gate; the next drain must recover the event and only then
+        // reclaim the now-empty retired shard.
+        dead.consumer_busy.store(false, Ordering::Release);
+        let drained2 = registry.drain_all();
+        assert_eq!(drained2.len(), 1, "event must survive and drain on the next pass");
+        assert_eq!(
+            registry.registered_thread_count(),
+            0,
+            "shard reclaimed only after its last event was drained"
+        );
+    }
+
+    #[test]
+    fn registered_ring_guard_marks_ring_retired_on_thread_exit() {
+        // The thread-local Drop guard must flag the ring retired when the
+        // producer thread exits. Spawn a thread that registers + emits, then
+        // joins; afterwards the shard it created must report `is_retired()`.
+        use std::thread;
+
+        let registry = Arc::new(ThreadRingRegistry::new(8));
+        let reg = Arc::clone(&registry);
+        let shard = thread::spawn(move || {
+            let ring = reg.register_current_thread();
+            ring.push(make_event(EventTypeId(1), 1, 2)).unwrap();
+            // Return the registry's view of this thread's shard.
+            ring
+        })
+        .join()
+        .expect("worker panicked");
+
+        // The worker thread has fully exited, so its `RegisteredRingGuard`
+        // TLS destructor ran and marked the shard retired.
+        assert!(
+            shard.is_retired(),
+            "ring must be retired after its producer thread exits"
+        );
+        // It still holds the unread event, so it would NOT yet be reclaimed.
+        assert!(!shard.is_empty());
+
+        // Draining recovers the event and reclaims the now retired+empty shard.
+        let drained = registry.drain_all();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(registry.registered_thread_count(), 0);
     }
 
     #[test]

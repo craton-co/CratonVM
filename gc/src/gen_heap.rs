@@ -3581,6 +3581,21 @@ impl GenerationalHeap {
         if selective_on {
             let is_y = |a: usize| -> bool { a >= from_base && a < from_end && (a & 0x7) == 0 };
 
+            // PERF: compute the sorted young free-block view (and `used`) ONCE
+            // per sweep and reuse it across every selective-promotion pass.
+            // `free_blocks_sorted()` collect-and-sorts the WHOLE free list, and
+            // it was previously rebuilt at least three times per non-moving
+            // sweep (evacuate pass (2), fixup pass (3a), and SP_VERIFY). The
+            // `young_from` lock is held for the entire function and NOTHING in
+            // this block mutates its free list or `used()` — all free-list
+            // mutations (`add_free_block` / `clear_free_list` / `reset`) and any
+            // `young_from` allocation happen strictly AFTER the `selective_on`
+            // block, and evacuation only allocates into `old_gen`. So this
+            // single snapshot is valid for every pass below; behavior is
+            // identical, we just skip the redundant collect+sort each pass.
+            let sweep_free_blocks = young_from.free_blocks_sorted();
+            let sweep_used = young_from.used();
+
             // (1) Pin set: every root / finalizer value that lands in young.
             // (1) Pin set: every root / finalizer value that lands in young.
             // Stage B (precise oop maps, B-K relocation track): EXCLUDE addresses
@@ -3605,9 +3620,9 @@ impl GenerationalHeap {
             // fills (leave the remainder in young — correctness over completeness).
             let mut evacuated: Vec<*mut u8> = Vec::new();
             {
-                let free_blocks = young_from.free_blocks_sorted();
-                let mut free_iter = free_blocks.iter().peekable();
-                let used = young_from.used();
+                // PERF: reuse the once-computed sorted free-block snapshot.
+                let mut free_iter = sweep_free_blocks.iter().peekable();
+                let used = sweep_used;
                 let mut cursor = 0usize;
                 let mut old_full = false;
                 while cursor < used && !old_full {
@@ -3764,9 +3779,9 @@ impl GenerationalHeap {
                 // (3a) References inside surviving (pinned / non-evacuated) young
                 // objects → rewrite to the evacuated copies in old gen.
                 {
-                    let free_blocks = young_from.free_blocks_sorted();
-                    let mut free_iter = free_blocks.iter().peekable();
-                    let used = young_from.used();
+                    // PERF: reuse the once-computed sorted free-block snapshot.
+                    let mut free_iter = sweep_free_blocks.iter().peekable();
+                    let used = sweep_used;
                     let mut cursor = 0usize;
                     while cursor < used {
                         if let Some(&&(off, sz)) = free_iter.peek() {
@@ -3865,9 +3880,9 @@ impl GenerationalHeap {
                         for_each_ref(oaddr, h, &mut bump);
                     }
                     let mut missed_young = 0usize;
-                    let fb = young_from.free_blocks_sorted();
-                    let mut fi = fb.iter().peekable();
-                    let used = young_from.used();
+                    // PERF: reuse the once-computed sorted free-block snapshot.
+                    let mut fi = sweep_free_blocks.iter().peekable();
+                    let used = sweep_used;
                     let mut c = 0usize;
                     while c < used {
                         if let Some(&&(off, sz)) = fi.peek() {
@@ -5326,16 +5341,55 @@ impl GenerationalHeap {
         // a dirty card range. Preserves the original semantics (an object
         // is a root iff the card containing its *header* is dirty).
         let objects = old_gen.walk_objects_in_card_ranges(&dirty_ranges);
-        for (obj_ptr, _total_size) in objects {
+        for (obj_ptr, total_size) in objects {
             // SAFETY: `obj_ptr` is from `old_gen.walk_objects_in_card_ranges()`, pointing to a valid old-gen object header.
             let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+
+            // [LOW gc-genheap-cards] Plausibility cap, mirroring the non-moving
+            // sweep walker (gen_object_total_size + the `num_slots <= 1<<24` /
+            // `array_length <= i32::MAX` re-sync checks ~4239-4246). Previously
+            // the ref-slot loops below trusted `header.num_slots` /
+            // `header.array_length` verbatim, so a corrupt old-gen header (e.g.
+            // an inline-alloc path that left a garbage slot count, or a header
+            // straddling a buffer that walk_objects_in_card_ranges mis-bounded)
+            // would drive an out-of-range slot scan reading past the object.
+            //
+            // `gen_object_total_size` returns 0 for an implausible header
+            // (oversized num_slots, kind=Object-with-array_length, bad array
+            // length); skip such an object with a diagnostic rather than
+            // scanning bogus slots. Then bound the per-object iteration to the
+            // ref-slot count that actually fits in `total_size` (the object's
+            // region size as established by the walker), so even a header that
+            // passes the coarse plausibility gate but reports more slots than
+            // its bytes hold cannot read out of bounds.
+            let safe_size = gen_object_total_size(header);
+            if safe_size < HEADER_SIZE || safe_size != total_size {
+                tracing::warn!(
+                    "GC scan_dirty_cards: implausible/inconsistent old-gen header \
+                     (class_id={} kind=0x{:02x} num_slots={} array_length={} \
+                     gen_size={} walker_size={}) — skipping ref-slot scan",
+                    header.class_id.as_u32(),
+                    header.kind as u8,
+                    header.num_slots,
+                    header.array_length,
+                    safe_size,
+                    total_size,
+                );
+                continue;
+            }
+            // Field/element bytes available in this object's region (total
+            // minus header). Used to cap the slot/element count.
+            let body_bytes = total_size - HEADER_SIZE;
 
             // Scan ref slots: ref arrays use compact 8-byte pointers,
             // object fields use 16-byte Value.
             if header.kind == ObjectKind::Array {
                 if header.element_type == ArrayElementType::Reference {
-                    for i in 0..header.array_length as usize {
-                        // SAFETY: `i` < `array_length`; offset within array data region.
+                    // Cap element count at what the array's data region holds.
+                    let max_elems = body_bytes / REF_ELEMENT_SIZE;
+                    let elems = (header.array_length as usize).min(max_elems);
+                    for i in 0..elems {
+                        // SAFETY: `i` < capped element count; offset within array data region.
                         let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
                         let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
                         if raw != 0 {
@@ -5349,8 +5403,11 @@ impl GenerationalHeap {
                     }
                 }
             } else {
-                for slot_idx in 0..header.num_slots as usize {
-                    // SAFETY: `slot_idx` is within `num_slots`; offset within the object's field region.
+                // Cap slot count at what the object's field region holds.
+                let max_slots = body_bytes / SLOT_SIZE;
+                let slots = (header.num_slots as usize).min(max_slots);
+                for slot_idx in 0..slots {
+                    // SAFETY: `slot_idx` < capped slot count; offset within the object's field region.
                     let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
                     let value = unsafe { std::ptr::read(s_ptr as *const Value) };
                     if let Value::Object(Some(ref_obj)) = value {
@@ -5410,13 +5467,41 @@ impl GenerationalHeap {
     pub fn walk_objects(&self) -> Vec<(*mut u8, usize)> {
         let mut result = Vec::new();
 
-        // Walk young generation (from-space only — to-space is GC scratch)
+        // Walk young generation (from-space only — to-space is GC scratch).
+        //
+        // BUGFIX [gc-genheap]: after `sweep_young_non_moving` the from-space is
+        // NOT a dense run of live objects from offset 0. The non-moving sweep
+        // leaves (a) zeroed dead spans published on the free list and (b)
+        // sub-`HEADER_SIZE` GAP_FILLER sentinels left in place (see
+        // `install_tail_filler` / the sweep loop ~4129-4152). Walking linearly
+        // from offset 0 with no hole-skipping and no sentinel handling reads a
+        // zeroed free span as a `num_slots=0` 40-byte object (or worse, a
+        // class_id=0/kind=Object 0-size header → break, or a non-grid stride →
+        // desync into a live object's interior). A zeroed-but-unpublished gap
+        // can even decode as size 0 and spin.
+        //
+        // Mirror `OldGen::walk_objects` / the sweep loop / `clear_all_mark_bits_in_arena`:
+        // take `free_blocks_sorted()` and skip known free blocks, stride over
+        // GAP_FILLER sentinels by their offset-4 length, and use
+        // `gen_object_total_size` (which flags corrupt headers as size 0) with
+        // the same `total_size < HEADER_SIZE` corruption stop.
         {
             let young = self.young_from.lock();
             let base = young.base_ptr() as usize;
             let used = young.used();
-            let mut offset = 0;
+            let free_blocks = young.free_blocks_sorted();
+            let mut free_iter = free_blocks.iter().peekable();
+            let mut offset: usize = 0;
             while offset < used {
+                // Skip known free blocks — their bytes are stale dead spans and
+                // must never be parsed as object headers.
+                if let Some(&&(off, sz)) = free_iter.peek() {
+                    if offset == off {
+                        offset += sz;
+                        free_iter.next();
+                        continue;
+                    }
+                }
                 let ptr = (base + offset) as *mut u8;
                 // SAFETY: `ptr` is within `young_from.used()` region; reading the header is valid.
                 let header = unsafe { &*(ptr as *const ObjectHeader) };
@@ -5429,30 +5514,29 @@ impl GenerationalHeap {
                 if header.kind == ObjectKind::HumongousFiller {
                     break;
                 }
-                let total_size = if header.kind == ObjectKind::Array {
-                    // A malformed `array_length` makes `array_data_size`
-                    // overflow/fail. Do NOT silently treat it as a 0-byte
-                    // payload — that would advance the cursor by only
-                    // HEADER_SIZE and mis-parse the rest of the arena as
-                    // bogus objects. Treat it as heap corruption and stop
-                    // the walk cleanly, matching the `size < HEADER_SIZE`
-                    // handling below.
-                    match array_data_size(header.array_length as usize, header.element_type) {
-                        Ok(data) => HEADER_SIZE + data,
-                        Err(_) => {
-                            tracing::warn!(
-                                "GC: stopping young-gen heap walk at {:p} — implausible \
-                                 array_length {} (element_type={:?}); suspected corrupt header",
-                                ptr,
-                                header.array_length,
-                                header.element_type,
-                            );
-                            break;
-                        }
+                // Bug-D fix: stride over a GAP-filler sentinel (a sub-`HEADER_SIZE`
+                // TLAB tail left in place by the sweep). It carries its exact byte
+                // length at offset 4; it is dead filler, not a live object, so it
+                // is not pushed to `result`. This MUST run before
+                // `gen_object_total_size`, whose `num_slots` read (offset 16) would
+                // fall outside an 8-byte gap.
+                if header.class_id.as_u32() == crate::tlab::GAP_FILLER_CLASS_ID.as_u32() {
+                    // SAFETY: offset 4 lies within the >=8-byte gap.
+                    let gap = unsafe {
+                        std::ptr::read((ptr as *const u8).add(4) as *const u32)
+                    } as usize;
+                    if gap >= 8 && gap < HEADER_SIZE && offset + gap <= used {
+                        offset += gap;
+                        continue;
                     }
-                } else {
-                    HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
-                };
+                    // Malformed sentinel (should be impossible) — fall through to
+                    // the corrupt-header stop below.
+                }
+                // `gen_object_total_size` returns 0 for an array with an
+                // implausible length or a kind=Object header with a non-zero
+                // array_length / oversized num_slots; the `< HEADER_SIZE` check
+                // below then stops the walk cleanly (matching the sweep).
+                let total_size = gen_object_total_size(header);
                 if total_size < HEADER_SIZE || offset + total_size > used {
                     break;
                 }

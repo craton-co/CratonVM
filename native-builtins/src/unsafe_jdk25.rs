@@ -148,7 +148,18 @@ pub fn native_unsafe_copy_swap_memory(
     }
 
     // Fallback: legacy slot-by-slot swap for non-array (object-field) targets.
-    let count = bytes;
+    //
+    // `bytes` is interpreted as a slot count here, so it MUST be bounded by the
+    // real field count of BOTH the source (read) and destination (write)
+    // objects. Without this bound an attacker-controlled (offset, bytes) walks
+    // `get_field`/`set_field` past the last slot — an OOB heap read on `src`
+    // and, worse, an OOB heap WRITE on `dst` that scribbles over neighbouring
+    // objects. Clamp the iteration to whatever range fits in both objects.
+    let src_fields = ctx.object_num_fields(src);
+    let dst_fields = ctx.object_num_fields(dst);
+    let src_room = src_fields.saturating_sub(src_offset);
+    let dst_room = dst_fields.saturating_sub(dest_offset);
+    let count = bytes.min(src_room).min(dst_room);
     for i in 0..count {
         let val = ctx.get_field(src, src_offset + i);
         let swapped = swap_value(val, elem_size);
@@ -551,6 +562,60 @@ mod tests {
             ],
         ).unwrap();
         assert_eq!(result, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 9: copySwapMemory clamps an over-long `bytes` to the destination's
+    // real field count — a too-large length must NOT write past the dst object
+    // (the OOB-field-write fix).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn t12_copy_swap_memory_clamps_oversize_to_dst_fields() {
+        let mut ctx = MockNativeContext::new();
+        let src = make_test_obj(&mut ctx, 8);
+        let dst = make_test_obj(&mut ctx, 2);
+        // A neighbour allocated AFTER dst, pre-filled with a sentinel; if the
+        // loop ran past dst's 2 slots it would scribble into adjacent storage.
+        let neighbour = make_test_obj(&mut ctx, 2);
+        ctx.set_field(neighbour, 0, Value::Int(0x5151_5151));
+        ctx.set_field(neighbour, 1, Value::Int(0x5252_5252));
+
+        for i in 0..8usize {
+            ctx.set_field(src, i, Value::Int((i as i32) + 1));
+        }
+
+        // bytes=8 but dst only has 2 slots → must copy exactly 2, no panic.
+        let result = native_unsafe_copy_swap_memory(
+            &mut ctx,
+            &[
+                dummy_this(),
+                Value::Object(Some(src)),
+                Value::Long(0),
+                Value::Object(Some(dst)),
+                Value::Long(0),
+                Value::Long(8), // oversize
+                Value::Long(4),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, None);
+
+        // The two in-range slots are written (byte-swapped); the neighbour's
+        // sentinel values are untouched.
+        assert_eq!(ctx.get_field(dst, 0), Value::Int(1i32.swap_bytes()));
+        assert_eq!(ctx.get_field(dst, 1), Value::Int(2i32.swap_bytes()));
+        assert_eq!(ctx.get_field(neighbour, 0), Value::Int(0x5151_5151));
+        assert_eq!(ctx.get_field(neighbour, 1), Value::Int(0x5252_5252));
+        // The loop must NOT have addressed slots past dst's original count.
+        // (Under the production VM that would be an out-of-bounds field write
+        // into a neighbouring object; under the auto-resizing mock it would
+        // instead grow dst from 2 to 8 slots. Either way, the field count must
+        // stay 2 with the clamp in place.)
+        assert_eq!(
+            ctx.object_num_fields(dst),
+            2,
+            "copySwapMemory wrote past dst's field count (OOB-write guard failed)"
+        );
     }
 
     #[test]

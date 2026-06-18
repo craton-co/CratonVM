@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_native_api::{MethodMetadata, NativeContext, NativeMethodRegistry};
@@ -149,6 +150,12 @@ pub(crate) struct ObjectInputFilterState {
     pub(crate) rejected: bool,
     /// Reason string used to build the `IOException` message.
     pub(crate) reason: String,
+    /// Compiled class-name pattern clauses (FQCN / glob / `!`-reject) from
+    /// the same filter string the numeric limits came from. `None` means the
+    /// spec carried no pattern clauses (limits-only). The synthetic read path
+    /// consults this via `evaluate_serial_filters` so per-stream pattern
+    /// filters are honored, not just the four resource limits.
+    pub(crate) patterns: Option<SerialFilter>,
 }
 
 impl ObjectInputFilterState {
@@ -164,19 +171,75 @@ fn ois_filter_state() -> &'static Mutex<HashMap<usize, ObjectInputFilterState>> 
     INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// PERF: count of currently-installed per-stream filter states.
+///
+/// The hot deserialization path (`ois_buf_read` → `filter_account_bytes`,
+/// plus `filter_enter_depth` / `filter_exit_depth` / `filter_account_ref`
+/// in `ois_read_value`) consults `ois_filter_state` on EVERY byte/ref/depth
+/// op. Acquiring the process-wide `ois_filter_state` mutex and hashing the
+/// stream address per op is pure overhead for the overwhelmingly common case
+/// where the stream installed no JEP-290 filter at all (no `setObjectInput-
+/// Filter`, no `parse_serial_filter`, and no class ever rejected). This
+/// atomic mirrors `ois_filter_state().len()` exactly so those accessors can
+/// short-circuit to their "unbounded / proceed" answer with a single relaxed
+/// load — no lock, no hash — when the map is empty.
+///
+/// CORRECTNESS: the counter must move in lock-step with map membership. We
+/// keep it consistent by funnelling every insert through `filter_state_set`
+/// and every removal/clear through `filter_state_remove` / `filter_state_-
+/// clear_all`, each of which updates the count while holding the map lock so
+/// the count is never observed to under-report a live entry. A short-circuit
+/// only fires when the count reads zero, which (because increments happen
+/// before/with the insert under the lock) can only mean no entry exists for
+/// ANY address — strictly the same outcome the locked lookup would have
+/// produced (`None` → proceed). When the count is non-zero we always take the
+/// original locked path, so behaviour for streams that DO have a filter is
+/// byte-for-byte unchanged.
+fn ois_filter_state_count() -> &'static AtomicUsize {
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    &COUNT
+}
+
+/// Insert/replace a filter-state entry, keeping `ois_filter_state_count` in
+/// sync with map membership (increment only when a brand-new key is added).
+fn filter_state_set(addr: usize, state: ObjectInputFilterState) {
+    let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
+    if map.insert(addr, state).is_none() {
+        ois_filter_state_count().fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Remove a filter-state entry, keeping the count in sync (decrement only
+/// when an entry was actually present).
+fn filter_state_remove(addr: usize) {
+    let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
+    if map.remove(&addr).is_some() {
+        ois_filter_state_count().fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Drop every filter-state entry and reset the count (process reset / tests).
+fn filter_state_clear_all() {
+    let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
+    map.clear();
+    ois_filter_state_count().store(0, Ordering::Relaxed);
+}
+
 /// Install (or replace) the filter state for a stream. Returning a
 /// fresh `unbounded()` is also the natural lazy-init in `ois_buf_read`
 /// when no explicit state was set yet — that path keeps existing
 /// callers that don't care about JEP-290 limits working unchanged.
 pub(crate) fn ois_set_filter_state(addr: usize, state: ObjectInputFilterState) {
-    let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
-    map.insert(addr, state);
+    // PERF: funnel through `filter_state_set` so `ois_filter_state_count`
+    // stays in lock-step with map membership (enables the no-lock fast path
+    // in the per-op `filter_*` accessors).
+    filter_state_set(addr, state);
 }
 
 /// Drop the per-stream filter state — called from `ObjectInputStream.close()`.
 fn ois_clear_filter_state(addr: usize) {
-    let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
-    map.remove(&addr);
+    // PERF: funnel through `filter_state_remove` to keep the count in sync.
+    filter_state_remove(addr);
 }
 
 /// Read-only snapshot of the filter state for tests / introspection.
@@ -193,6 +256,12 @@ fn ois_get_filter_state(addr: usize) -> Option<ObjectInputFilterState> {
 /// zero-padding so we don't need a hard failure path here, just the
 /// sticky flag for `readObject` to surface as `IOException`).
 fn filter_account_bytes(addr: usize, n: usize) -> bool {
+    // PERF fast path: no filter installed for ANY stream → no byte cap to
+    // enforce. Skip the process-wide lock + per-call hash entirely. Identical
+    // result to the locked `get_mut` returning `None` (→ `true`, "unbounded").
+    if ois_filter_state_count().load(Ordering::Relaxed) == 0 {
+        return true;
+    }
     let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
     let st = match map.get_mut(&addr) {
         Some(s) => s,
@@ -217,6 +286,13 @@ fn filter_account_bytes(addr: usize, n: usize) -> bool {
 /// exceeded; the caller should stop recursing and surface
 /// `IOException` once control returns to `readObject`.
 fn filter_enter_depth(addr: usize) -> bool {
+    // PERF fast path: no filter installed → no depth cap. Same result as the
+    // locked `get_mut` returning `None` (→ `true`, "unbounded"). Because no
+    // state exists, there is nothing to increment; the matching
+    // `filter_exit_depth` is likewise a no-op for this stream.
+    if ois_filter_state_count().load(Ordering::Relaxed) == 0 {
+        return true;
+    }
     let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
     let st = match map.get_mut(&addr) {
         Some(s) => s,
@@ -239,6 +315,13 @@ fn filter_enter_depth(addr: usize) -> bool {
 
 /// Pop recursion depth on the way out of `ois_read_value`.
 fn filter_exit_depth(addr: usize) {
+    // PERF fast path: no filter installed → nothing to decrement. Same result
+    // as the locked `get_mut` returning `None` (no-op). `saturating_sub`
+    // already floors `depth` at 0, so even if a filter is installed mid-graph
+    // (between an enter and its exit) this can never underflow.
+    if ois_filter_state_count().load(Ordering::Relaxed) == 0 {
+        return;
+    }
     let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(st) = map.get_mut(&addr) {
         st.depth = st.depth.saturating_sub(1);
@@ -247,6 +330,11 @@ fn filter_exit_depth(addr: usize) {
 
 /// Account one back-reference and check `max_refs`.
 fn filter_account_ref(addr: usize) -> bool {
+    // PERF fast path: no filter installed → no ref cap. Same result as the
+    // locked `get_mut` returning `None` (→ `true`, "unbounded").
+    if ois_filter_state_count().load(Ordering::Relaxed) == 0 {
+        return true;
+    }
     let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
     let st = match map.get_mut(&addr) {
         Some(s) => s,
@@ -270,6 +358,11 @@ fn filter_account_ref(addr: usize) -> bool {
 /// Check an array allocation against `max_array`. Returns `false` if
 /// `length > max_array` (trips the reject flag too).
 fn filter_check_array(addr: usize, length: usize) -> bool {
+    // PERF fast path: no filter installed → no array-length cap. Same result
+    // as the locked `get_mut` returning `None` (→ `true`, "unbounded").
+    if ois_filter_state_count().load(Ordering::Relaxed) == 0 {
+        return true;
+    }
     let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
     let st = match map.get_mut(&addr) {
         Some(s) => s,
@@ -291,17 +384,75 @@ fn filter_check_array(addr: usize, length: usize) -> bool {
 
 /// Poll the sticky reject flag.
 fn filter_is_rejected(addr: usize) -> Option<String> {
+    // PERF fast path: no filter installed for any stream → nothing could have
+    // been rejected. Same result as the locked `get` returning `None`.
+    if ois_filter_state_count().load(Ordering::Relaxed) == 0 {
+        return None;
+    }
     let map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
     map.get(&addr).filter(|s| s.rejected).map(|s| s.reason.clone())
+}
+
+/// SECURITY (JEP-290 deserialization filter bypass, CRITICAL): mark the
+/// per-stream filter state sticky-rejected because a class was rejected by
+/// the serial filter (a per-stream `setObjectInputFilter` rule or the
+/// process-wide `jdk.serialFilter`). The synthetic read-path
+/// (`ois_read_object` / `ois_read_array` / `TC_ENUM`) instantiates classes
+/// directly without ever passing through the JDK `resolveClass` natives, so
+/// before this fix the filter was simply never consulted and gadget classes
+/// were never blocked. Callers invoke this *before* `ensure_class_initialized`
+/// and then abort the read; the top-level `readObject` / `readUnshared`
+/// natives poll `filter_is_rejected` and turn the sticky flag into the
+/// `IOException("filter status: REJECTED: ...")` flow (`InvalidClassException`
+/// extends `IOException`). Lazily creates an `unbounded()` state entry if the
+/// stream had no resource-limit filter installed, so the reject is recorded
+/// even when only a pattern-based filter (no `=N` clauses) is in force.
+fn filter_reject_class(addr: usize, class_name: &str) {
+    let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
+    // PERF/CORRECTNESS: `or_insert_with` can create a brand-new entry here
+    // (lazy `unbounded()` when only a pattern filter, or none, was installed).
+    // Whenever it does, bump `ois_filter_state_count` so the no-lock fast path
+    // in the per-op accessors never under-reports this now-live entry.
+    let existed = map.contains_key(&addr);
+    let st = map.entry(addr).or_insert_with(ObjectInputFilterState::unbounded);
+    if !existed {
+        ois_filter_state_count().fetch_add(1, Ordering::Relaxed);
+    }
+    if !st.rejected {
+        st.rejected = true;
+        st.reason = format!(
+            "class \"{}\" rejected by ObjectInputFilter (InvalidClassException)",
+            class_name
+        );
+    }
+}
+
+/// SECURITY (JEP-290 deserialization filter bypass, CRITICAL): run a class
+/// name through the serial filter from inside the synthetic read-path. If
+/// the merged decision is `Rejected`, trip the sticky reject flag (via
+/// `filter_reject_class`) and return `true` so the caller aborts the read
+/// *before* initializing or instantiating the class. `Allowed` and
+/// `Undecided` both return `false` (proceed) — matching the JDK, where an
+/// undecided filter falls through to normal resolution.
+fn synthetic_read_class_rejected(addr: usize, class_name: &str) -> bool {
+    if evaluate_serial_filters(addr, class_name) == FilterStatus::Rejected {
+        filter_reject_class(addr, class_name);
+        true
+    } else {
+        false
+    }
 }
 
 /// Parse a JEP-290 serial-filter string into an `ObjectInputFilterState`.
 ///
 /// Recognises the four resource-limit clauses (`maxdepth=N`, `maxrefs=N`,
-/// `maxbytes=N`, `maxarray=N`). Pattern clauses (FQCN, glob, `!`-prefixed
-/// reject patterns) are accepted lexically and discarded — limit
-/// enforcement is the load-bearing part of this parser and the pattern
-/// matcher lives in the existing `ObjectInputFilter` plumbing.
+/// `maxbytes=N`, `maxarray=N`) AND the class-name pattern clauses (FQCN,
+/// glob, `!`-prefixed reject patterns). The numeric limits drive the
+/// running per-stream counters; the pattern clauses are compiled into a
+/// `SerialFilter` (the same FQCN/glob/`!`-reject matcher used for the
+/// process-wide `jdk.serialFilter`) and stored in `patterns` so the
+/// synthetic read path can honor per-stream class-name filters — not just
+/// the resource limits — via `evaluate_serial_filters`.
 ///
 /// Multiple clauses are separated by `;`. Whitespace is trimmed.
 /// Unknown clauses are silently ignored so the parser is forward-
@@ -316,10 +467,11 @@ pub(crate) fn parse_serial_filter(spec: &str) -> ObjectInputFilterState {
         if clause.is_empty() {
             continue;
         }
-        // `key=N` clauses are the only ones we enforce.
+        // `key=N` clauses are the only ones we enforce here as limits; every
+        // other (non-`=`) clause is a class-name pattern handled below.
         let (key, value) = match clause.split_once('=') {
             Some((k, v)) => (k.trim(), v.trim()),
-            None => continue, // pattern clause — preserved for downstream matcher
+            None => continue, // pattern clause — compiled below via SerialFilter::parse
         };
         match key {
             "maxdepth" => {
@@ -346,6 +498,21 @@ pub(crate) fn parse_serial_filter(spec: &str) -> ObjectInputFilterState {
                 // Unknown limit clause — silently ignore.
             }
         }
+    }
+    // Compile the class-name pattern clauses with the existing glob matcher.
+    // `SerialFilter::parse` walks the whole spec but only retains the
+    // `FilterEntry::Class` rules for matching (limit clauses become inert
+    // `FilterEntry::Limit` entries `check()` skips), so we feed it the raw
+    // spec instead of re-tokenising. Store the result only when at least one
+    // class-name rule is present — a limits-only spec yields no patterns and
+    // leaves `patterns` as `None` (no behavioural change for those callers).
+    let compiled = SerialFilter::parse(spec);
+    if compiled
+        .entries
+        .iter()
+        .any(|e| matches!(e, FilterEntry::Class { .. }))
+    {
+        state.patterns = Some(compiled);
     }
     state
 }
@@ -471,6 +638,14 @@ fn ois_buf_load(addr: usize, data: Vec<u8>) {
 /// `max_bytes` has already been tripped the read still returns zeros
 /// — the sticky `rejected` flag is what `readObject` consults at the
 /// end of a frame to raise `IOException("filter status: REJECTED")`.
+///
+/// SECURITY (deserialization DoS via unbounded allocation, HIGH): the
+/// short-read fall-back previously allocated `vec![0u8; n]` for an
+/// arbitrary attacker-controlled `n` (e.g. a `TC_LONGSTRING` length of
+/// `0x7FFF_FFFF_FFFF_FFFF` → ~9.2 EB → OOM abort). We now never allocate
+/// more than the bytes actually remaining in the buffer, and use checked
+/// arithmetic for the `pos + n` bound so a near-`usize::MAX` length can
+/// never overflow into a passing comparison.
 fn ois_buf_read(addr: usize, n: usize) -> Vec<u8> {
     // Account first so that an exactly-at-limit final read still
     // surfaces the reject (otherwise short-reads near the cap would
@@ -478,14 +653,35 @@ fn ois_buf_read(addr: usize, n: usize) -> Vec<u8> {
     let _ok = filter_account_bytes(addr, n);
     let mut map = ois_buffers().lock().unwrap_or_else(|e| e.into_inner());
     if let Some((buf, pos)) = map.get_mut(&addr) {
-        if *pos + n <= buf.len() {
-            let slice = buf[*pos..*pos + n].to_vec();
-            *pos += n;
-            return slice;
+        // Checked add: a malicious `n` close to `usize::MAX` must not
+        // wrap past `buf.len()` and pass the bounds check.
+        if let Some(end) = pos.checked_add(n) {
+            if end <= buf.len() {
+                let slice = buf[*pos..end].to_vec();
+                *pos = end;
+                return slice;
+            }
         }
     }
-    vec![0u8; n] // return zeroes if no data
+    // Short read / no data for this stream. The historical contract is to
+    // return an `n`-length zero pad so fixed-width primitive readers
+    // (`readInt` etc., which index `bytes[0..n]`) keep working at
+    // end-of-stream. We preserve that contract but CAP the synthesised
+    // allocation: an attacker-controlled `n` (e.g. a `TC_LONGSTRING`
+    // length of `0x7FFF_FFFF_FFFF_FFFF`) must never let this allocate
+    // multiple exabytes. Length-prefixed readers (strings, arrays) clamp
+    // `n` to the bytes actually remaining *before* calling, so they never
+    // depend on the pad past this cap, and short reads still decode to an
+    // empty/truncated value rather than an OOM abort.
+    vec![0u8; n.min(MAX_SERIAL_BUF_READ_PAD)]
 }
+
+/// Upper bound on the zero-padding `ois_buf_read` will synthesise on a
+/// short read. Large enough to satisfy any legitimate fixed-width
+/// primitive read (8 bytes) with head-room; small enough that an
+/// attacker-controlled length can never weaponise the short-read
+/// fall-back into an out-of-memory abort.
+const MAX_SERIAL_BUF_READ_PAD: usize = 64;
 
 /// Peek at remaining bytes in an OIS buffer.
 fn ois_buf_remaining(addr: usize) -> usize {
@@ -694,7 +890,27 @@ pub(crate) fn reset_serialization_globals() {
     oos_buffers().lock().unwrap_or_else(|e| e.into_inner()).clear();
     ois_buffers().lock().unwrap_or_else(|e| e.into_inner()).clear();
     handle_registry().lock().unwrap_or_else(|e| e.into_inner()).clear();
-    ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    // PERF: clear via the helper so `ois_filter_state_count` is reset too.
+    filter_state_clear_all();
+    // Clear the per-stream and process-wide JEP-290 filters too, so leftover
+    // filter installs from a prior test can never bleed into the next one
+    // (the synthetic read-path now consults these globals — see C3).
+    ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *process_serial_filter().lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Test-only serialization guard. The (de)serialization machinery keeps its
+/// buffers, handle registry, and JEP-290 filter state in process-global
+/// `Mutex`-protected maps. cargo runs unit tests in parallel by default, so a
+/// test that calls `reset_serialization_globals()` (which clears those *global*
+/// maps) can wipe a concurrently-running test's buffer/filter mid-read. Every
+/// test that touches the global serialization state acquires this guard first
+/// so those tests run serially with respect to one another. (Poisoning is
+/// ignored — a panicked test must not wedge the rest.)
+#[cfg(test)]
+pub(crate) fn serialization_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 // ---------------------------------------------------------------------------
@@ -703,6 +919,15 @@ pub(crate) fn reset_serialization_globals() {
 
 const STREAM_MAGIC: u16 = 0xACED;
 const STREAM_VERSION: u16 = 5;
+
+/// Hard ceiling on the byte length of a single `TC_LONGSTRING` we will
+/// allocate, independent of any configured JEP-290 `maxarray` filter.
+/// `TC_LONGSTRING` carries an attacker-controlled u64 length; this cap is
+/// the last line of defence against a deserialization DoS (unbounded
+/// allocation) when no `maxarray` clause is installed. 256 MiB comfortably
+/// exceeds any legitimate serialized string while staying far below the
+/// out-of-memory regime an attacker is fishing for.
+const MAX_SERIAL_STRING_BYTES: usize = 256 * 1024 * 1024;
 
 // Type codes (TC_*)
 const TC_NULL: u8 = 0x70;
@@ -1528,10 +1753,32 @@ fn ois_read_value(ctx: &mut dyn NativeContext, addr: usize) -> Value {
         }
         TC_LONGSTRING => {
             let lb = ois_buf_read(addr, 8);
-            let len = u64::from_be_bytes([
+            let wire_len = u64::from_be_bytes([
                 lb[0], lb[1], lb[2], lb[3], lb[4], lb[5], lb[6], lb[7],
-            ]) as usize;
-            let str_bytes = ois_buf_read(addr, len);
+            ]);
+
+            // SECURITY (deserialization DoS via unbounded allocation, HIGH):
+            // `TC_LONGSTRING` carries a full u64 length straight off the wire.
+            // The previous code passed it verbatim to `ois_buf_read`, so a
+            // hostile length such as `0x7FFF_FFFF_FFFF_FFFF` requested ~9.2 EB
+            // → OOM abort. We mirror `ois_read_array`'s maxarray discipline:
+            //   1. clamp to the bytes actually remaining in the stream (a
+            //      valid string can never be longer than what's left), and
+            //   2. run the clamped length through `filter_check_array` so any
+            //      configured JEP-290 `maxarray` cap trips the sticky reject
+            //      flag, plus a hard ceiling independent of the filter.
+            let remaining = ois_buf_remaining(addr) as u64;
+            let clamped = wire_len.min(remaining).min(MAX_SERIAL_STRING_BYTES as u64) as usize;
+
+            // Honour a configured `maxarray` (the JEP-290 cap that bounds
+            // attacker-controlled element counts). A reject here trips the
+            // sticky flag; `readObject`/`readUnshared` surface it as the
+            // `IOException("filter status: REJECTED")` flow.
+            if !filter_check_array(addr, clamped) {
+                return Value::Object(None);
+            }
+
+            let str_bytes = ois_buf_read(addr, clamped);
             let s = String::from_utf8_lossy(&str_bytes).to_string();
             let obj = ctx.create_string(&s);
             ois_push_handle(addr, Some(obj));
@@ -1543,7 +1790,16 @@ fn ois_read_value(ctx: &mut dyn NativeContext, addr: usize) -> Value {
             Value::Object(None)
         }
         TC_ENUM => {
-            skip_class_desc(addr);
+            // SECURITY (JEP-290 deserialization filter bypass, CRITICAL):
+            // filter the enum class too. We read (rather than skip) the class
+            // descriptor so we have the enum type name to evaluate; a reject
+            // trips the sticky flag and aborts before the constant name is
+            // materialized or a wire handle is reserved. `read_class_desc_name`
+            // consumes the same descriptor bytes `skip_class_desc` would.
+            let enum_class = read_class_desc_name(addr);
+            if synthetic_read_class_rejected(addr, &enum_class) {
+                return Value::Object(None);
+            }
             let name_val = ois_read_value(ctx, addr);
             ois_push_handle(
                 addr,
@@ -1568,6 +1824,16 @@ fn ois_read_object(ctx: &mut dyn NativeContext, addr: usize) -> Value {
         Some(d) => d,
         None => return Value::Object(None),
     };
+    // SECURITY (JEP-290 deserialization filter bypass, CRITICAL): consult the
+    // serial filter BEFORE initializing or instantiating the class. The
+    // synthetic read-path does not go through the JDK `resolveClass` native
+    // (the only place the filter used to be checked), so without this gate a
+    // gadget class would be loaded and instantiated unfiltered. A reject
+    // trips the sticky flag and aborts the read; `readObject` surfaces it as
+    // `IOException("filter status: REJECTED: ...")`.
+    if synthetic_read_class_rejected(addr, &desc.class_name) {
+        return Value::Object(None);
+    }
     let resolved = ctx.ensure_class_initialized(&desc.class_name);
     let serialized_count = desc.field_types.len().max(2);
     let obj = if let Ok(class_id) = resolved {
@@ -1695,6 +1961,15 @@ fn ois_read_array(ctx: &mut dyn NativeContext, addr: usize) -> Value {
         Some(d) => d,
         None => return Value::Object(None),
     };
+    // SECURITY (JEP-290 deserialization filter bypass, CRITICAL): the array
+    // class descriptor (e.g. `[Lcom.evil.Gadget;`) must clear the serial
+    // filter before we allocate or populate the array — the JDK runs the
+    // filter on the array class too. Checked here, before the length is even
+    // read, because the synthetic path never reaches the JDK `resolveClass`
+    // native where the filter used to be enforced.
+    if synthetic_read_class_rejected(addr, &desc.class_name) {
+        return Value::Object(None);
+    }
     let len_bytes = ois_buf_read(addr, 4);
     let length =
         i32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]).max(0)
@@ -3118,9 +3393,25 @@ fn process_serial_filter_obj() -> &'static Mutex<Option<ObjectRef>> {
 /// Returns the merged decision per JEP-290 (UNDECIDED ⇒ allow at
 /// resolveClass time, REJECTED ⇒ throw).
 fn evaluate_serial_filters(ois_addr: usize, class_name: &str) -> FilterStatus {
+    // Per-stream filter installed via `setObjectInputFilter` (synthetic
+    // ALLOW/REJECT objects compiled to `SerialFilter`).
     {
         let map = ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(f) = map.get(&ois_addr) {
+            match f.check(class_name) {
+                FilterStatus::Rejected => return FilterStatus::Rejected,
+                FilterStatus::Allowed => return FilterStatus::Allowed,
+                FilterStatus::Undecided => { /* fall through */ }
+            }
+        }
+    }
+    // Per-stream class-name patterns parsed from a filter *string* (the
+    // `parse_serial_filter` path, installed via `ois_set_filter_state`).
+    // Still a per-stream filter, so it precedes the process-wide one but
+    // follows any explicit `setObjectInputFilter` install above.
+    {
+        let map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(f) = map.get(&ois_addr).and_then(|s| s.patterns.as_ref()) {
             match f.check(class_name) {
                 FilterStatus::Rejected => return FilterStatus::Rejected,
                 FilterStatus::Allowed => return FilterStatus::Allowed,
@@ -4665,8 +4956,8 @@ mod serialization_tests {
 
     #[test]
     fn jep290_parse_mixed_with_class_patterns() {
-        // Class-name patterns are accepted lexically and ignored;
-        // limit clauses are still picked up.
+        // Class-name patterns are now compiled into `patterns` (no longer a
+        // silent no-op); limit clauses are still picked up alongside them.
         let s = parse_serial_filter(
             "!com.evil.*;java.util.*;maxdepth=5;maxbytes=1024;com.example.Foo",
         );
@@ -4675,6 +4966,59 @@ mod serialization_tests {
         // Pattern-only clauses leave maxrefs/maxarray unbounded.
         assert_eq!(s.max_refs, 0);
         assert_eq!(s.max_array, 0);
+
+        // The class-name clauses are compiled and matchable (first match
+        // wins, left-to-right, dot/slash agnostic — same matcher used for
+        // the process-wide `jdk.serialFilter`).
+        let pats = s.patterns.as_ref().expect("class patterns compiled");
+        assert_eq!(pats.check("com.evil.Gadget"), FilterStatus::Rejected);
+        assert_eq!(pats.check("com/evil/Gadget"), FilterStatus::Rejected);
+        assert_eq!(pats.check("java.util.HashMap"), FilterStatus::Allowed);
+        assert_eq!(pats.check("com.example.Foo"), FilterStatus::Allowed);
+        // No matching clause => undecided (falls through to process-wide).
+        assert_eq!(pats.check("org.other.Thing"), FilterStatus::Undecided);
+    }
+
+    #[test]
+    fn jep290_limits_only_spec_has_no_patterns() {
+        // A spec with only `=N` clauses must leave `patterns` as `None` so
+        // limits-only callers see no behavioural change.
+        let s = parse_serial_filter("maxdepth=4;maxrefs=2;maxbytes=32;maxarray=8");
+        assert!(s.patterns.is_none());
+    }
+
+    #[test]
+    fn jep290_perstream_pattern_filter_routed_on_synthetic_read_path() {
+        // Regression: per-stream class-name pattern filters installed from a
+        // filter STRING (via `parse_serial_filter` + `ois_set_filter_state`)
+        // must now be honored by `evaluate_serial_filters` — the decision
+        // point the synthetic read path consults — not just the numeric
+        // limits. Before the fix the patterns were discarded and every class
+        // was UNDECIDED (silently allowed).
+        let addr = 0x4A45_5070_usize;
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
+        ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+
+        ois_set_filter_state(addr, parse_serial_filter("!com.evil.**;java.util.*;maxdepth=10"));
+
+        // Reject pattern fires (recursive `**`).
+        assert_eq!(
+            evaluate_serial_filters(addr, "com/evil/sub/Gadget"),
+            FilterStatus::Rejected
+        );
+        // Allow pattern fires.
+        assert_eq!(
+            evaluate_serial_filters(addr, "java/util/HashMap"),
+            FilterStatus::Allowed
+        );
+        // No clause matches => undecided (no process-wide filter installed
+        // in this unit test).
+        assert_eq!(
+            evaluate_serial_filters(addr, "org/other/Thing"),
+            FilterStatus::Undecided
+        );
+
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
     }
 
     #[test]
@@ -4712,7 +5056,7 @@ mod serialization_tests {
     fn jep290_maxbytes_trips_reject_flag() {
         // Acceptance test 5(b): maxbytes=64 rejects a 100-byte payload.
         let addr = 0x4A45_5000_usize;
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         ois_buf_load(addr, vec![0u8; 100]);
         ois_set_filter_state(addr, parse_serial_filter("maxbytes=64"));
 
@@ -4736,7 +5080,7 @@ mod serialization_tests {
     #[test]
     fn jep290_maxbytes_not_tripped_when_under_limit() {
         let addr = 0x4A45_5001_usize;
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         ois_buf_load(addr, vec![0u8; 100]);
         ois_set_filter_state(addr, parse_serial_filter("maxbytes=200"));
         for _ in 0..100 {
@@ -4751,7 +5095,7 @@ mod serialization_tests {
     fn jep290_maxrefs_trips_reject_flag() {
         // Acceptance test 5(c): maxrefs=1 rejects a 2-back-reference graph.
         let addr = 0x4A45_5002_usize;
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         ois_set_filter_state(addr, parse_serial_filter("maxrefs=1"));
 
         // Two back-references — the second one must trip the cap.
@@ -4774,7 +5118,7 @@ mod serialization_tests {
         // in the wp02_tests module's neighbours; here we just confirm
         // the counter behaves correctly.
         let addr = 0x4A45_5003_usize;
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         ois_set_filter_state(addr, parse_serial_filter("maxdepth=2"));
 
         assert!(filter_enter_depth(addr), "depth 1");
@@ -4798,7 +5142,7 @@ mod serialization_tests {
         // Verifies `filter_check_array` returns false (and trips
         // `rejected`) when the on-wire array length exceeds maxarray.
         let addr = 0x4A45_5004_usize;
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         ois_set_filter_state(addr, parse_serial_filter("maxarray=10"));
 
         assert!(filter_check_array(addr, 5), "len 5 <= max 10 must pass");
@@ -4810,11 +5154,81 @@ mod serialization_tests {
     }
 
     #[test]
+    fn jep290_synthetic_path_rejects_filtered_class() {
+        let _serial_guard = super::serialization_test_guard();
+        // SECURITY regression (JEP-290 filter bypass, CRITICAL): a per-stream
+        // reject rule installed for a gadget class must trip the sticky flag
+        // when the synthetic read-path evaluates it, and a benign class in the
+        // same stream must NOT be rejected. This is the gate `ois_read_object`
+        // / `ois_read_array` / `TC_ENUM` now call before instantiating a class.
+        let addr = 0x4A45_5100_usize;
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
+        ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+
+        // Reject anything under `evil.**`, allow everything else.
+        ois_stream_filters()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(addr, SerialFilter::parse("!evil.**;*"));
+
+        // A benign class passes (proceed = false).
+        assert!(
+            !synthetic_read_class_rejected(addr, "java/util/ArrayList"),
+            "allowed class must not be rejected"
+        );
+        // A filtered gadget class is rejected (abort = true) and trips sticky.
+        assert!(
+            synthetic_read_class_rejected(addr, "evil/Gadget"),
+            "filtered class must be rejected"
+        );
+        let why = filter_is_rejected(addr).expect("reject must be sticky");
+        assert!(
+            why.contains("evil/Gadget") && why.contains("ObjectInputFilter"),
+            "reason must name the rejected class: {}",
+            why
+        );
+
+        ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+    }
+
+    #[test]
+    fn longstring_oversized_length_does_not_overallocate() {
+        let _serial_guard = super::serialization_test_guard();
+        // SECURITY regression (deserialization DoS, HIGH): `ois_buf_read`
+        // must never honour a hostile length past the bytes actually in the
+        // buffer. We register a tiny buffer and ask for a near-`usize::MAX`
+        // read; the result must be capped (no multi-exabyte allocation) and
+        // the checked `pos + n` arithmetic must not wrap.
+        let addr = 0x4A45_5101_usize;
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
+        ois_buf_load(addr, vec![1u8, 2, 3, 4]);
+
+        // Consume the 4 real bytes, then over-read.
+        let _ = ois_buf_read(addr, 4);
+        let huge = ois_buf_read(addr, usize::MAX); // would have OOM'd pre-fix
+        assert!(
+            huge.len() <= MAX_SERIAL_BUF_READ_PAD,
+            "short read must be capped at the pad bound, got {}",
+            huge.len()
+        );
+
+        // The TC_LONGSTRING clamp itself: a wire length far beyond remaining
+        // must clamp to remaining (here 0 once exhausted, small otherwise).
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
+        ois_buf_load(addr, b"hello".to_vec());
+        let remaining = ois_buf_remaining(addr) as u64;
+        let clamped =
+            (u64::MAX).min(remaining).min(MAX_SERIAL_STRING_BYTES as u64) as usize;
+        assert_eq!(clamped, 5, "clamp must bound to bytes remaining");
+        assert!(clamped <= MAX_SERIAL_STRING_BYTES, "clamp must honour hard cap");
+    }
+
+    #[test]
     fn jep290_unbounded_defaults_do_not_reject() {
         // Acceptance test 6: with no `=N` clauses present every check
         // returns ok regardless of magnitude.
         let addr = 0x4A45_5005_usize;
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         ois_set_filter_state(addr, parse_serial_filter("java.util.*;!evil.*"));
         for _ in 0..1000 {
             assert!(filter_account_ref(addr));
@@ -4831,7 +5245,7 @@ mod serialization_tests {
         // Acceptance test 5(d): single filter with several `=N` clauses
         // — each dimension is enforced on its own counter.
         let addr = 0x4A45_5006_usize;
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         ois_set_filter_state(
             addr,
             parse_serial_filter("maxdepth=4;maxrefs=2;maxbytes=32;maxarray=8"),
@@ -4845,7 +5259,7 @@ mod serialization_tests {
             filter_exit_depth(addr);
         }
         // Reset for isolated dimension check.
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         ois_set_filter_state(
             addr,
             parse_serial_filter("maxdepth=4;maxrefs=2;maxbytes=32;maxarray=8"),
@@ -4880,7 +5294,7 @@ mod serialization_tests {
         ctx.set_field(ois, 2, Value::Int(0)); // objects_read
 
         let addr = ois.as_ptr() as usize;
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         // Pre-install a tripped filter so the readObject path
         // immediately observes the sticky flag.
         let mut tripped = parse_serial_filter("maxdepth=1");
@@ -5207,6 +5621,7 @@ mod marshal_tests {
 
     #[test]
     fn primitive_and_string_and_nested_object_roundtrip() {
+        let _serial_guard = super::serialization_test_guard();
         let (mut ctx, point, holder) = setup();
 
         // Build a Point(3, 4) and a Holder(7, "hi", point).
@@ -5258,6 +5673,7 @@ mod marshal_tests {
 
     #[test]
     fn non_serializable_object_is_rejected() {
+        let _serial_guard = super::serialization_test_guard();
         let mut ctx = MockNativeContext::new();
         let _object = ctx.ensure_class_initialized("java/lang/Object").unwrap();
         let _serializable = ctx.ensure_class_initialized("java/io/Serializable").unwrap();
@@ -5281,6 +5697,7 @@ mod marshal_tests {
 
     #[test]
     fn cycle_writes_back_reference_not_infinite() {
+        let _serial_guard = super::serialization_test_guard();
         // Holder.p points at a Point, and we make a self-cycle:
         // h.p = h (re-using the same slot just to force a back-ref).
         let (mut ctx, _point, holder) = setup();
@@ -5323,6 +5740,7 @@ mod marshal_tests {
 
     #[test]
     fn int_array_field_roundtrip() {
+        let _serial_guard = super::serialization_test_guard();
         let mut ctx = MockNativeContext::new();
         let _object = ctx.ensure_class_initialized("java/lang/Object").unwrap();
         let serializable = ctx.ensure_class_initialized("java/io/Serializable").unwrap();

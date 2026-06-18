@@ -2679,6 +2679,93 @@ pub fn emit_java_error_throw_event(
     }
 }
 
+/// Read real host physical-memory totals cheaply, without pulling in a
+/// heavyweight `sysinfo`-style dependency.
+///
+/// STUB fix (2026-06-17): `jfr` has no `sysinfo`/`windows`/`winapi` dependency
+/// (see jfr/Cargo.toml), so this probes the OS directly:
+///   * Windows: `GlobalMemoryStatusEx` via raw FFI (same binding the VM crash
+///     handler already uses, `vm/src/runtime/crash_handler.rs`).
+///   * Linux: parse `MemTotal:` / `MemAvailable:` (kB) from `/proc/meminfo`.
+///   * Other targets / probe failure: returns `None`, so the caller's
+///     supplied values are used unchanged.
+///
+/// Returns `Some((total_bytes, used_bytes))` where `used = total - available`,
+/// clamped to `>= 0`, both as `i64` per the JFR `long` field type. `None` when
+/// the host could not be queried.
+fn host_physical_memory() -> Option<(i64, i64)> {
+    #[cfg(target_os = "windows")]
+    {
+        // Raw FFI mirror of `vm/src/runtime/crash_handler.rs` —
+        // `GlobalMemoryStatusEx`. Layout per the Win32 `MEMORYSTATUSEX` struct.
+        #[repr(C)]
+        struct MemoryStatusEx {
+            dw_length: u32,
+            dw_memory_load: u32,
+            ull_total_phys: u64,
+            ull_avail_phys: u64,
+            ull_total_page_file: u64,
+            ull_avail_page_file: u64,
+            ull_total_virtual: u64,
+            ull_avail_virtual: u64,
+            ull_avail_extended_virtual: u64,
+        }
+        extern "system" {
+            fn GlobalMemoryStatusEx(lp_buffer: *mut MemoryStatusEx) -> i32;
+        }
+        let mut status = MemoryStatusEx {
+            dw_length: std::mem::size_of::<MemoryStatusEx>() as u32,
+            dw_memory_load: 0,
+            ull_total_phys: 0,
+            ull_avail_phys: 0,
+            ull_total_page_file: 0,
+            ull_avail_page_file: 0,
+            ull_total_virtual: 0,
+            ull_avail_virtual: 0,
+            ull_avail_extended_virtual: 0,
+        };
+        let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+        if ok != 0 {
+            let total = status.ull_total_phys.min(i64::MAX as u64) as i64;
+            let avail = status.ull_avail_phys.min(i64::MAX as u64) as i64;
+            let used = total.saturating_sub(avail).max(0);
+            return Some((total, used));
+        }
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Parse the two kB-valued lines we need from /proc/meminfo. Cheap:
+        // one ~1-4 KiB read, no allocation beyond the file string.
+        let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let mut total_kb: Option<u64> = None;
+        let mut avail_kb: Option<u64> = None;
+        for line in contents.lines() {
+            // Lines look like: "MemTotal:       16331640 kB".
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                total_kb = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+            } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                avail_kb = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+            }
+            if total_kb.is_some() && avail_kb.is_some() {
+                break;
+            }
+        }
+        let total_kb = total_kb?;
+        // MemAvailable is absent on very old kernels; fall back to 0 available
+        // (i.e. used == total) rather than failing the whole probe.
+        let avail_kb = avail_kb.unwrap_or(0);
+        let total = total_kb.saturating_mul(1024).min(i64::MAX as u64) as i64;
+        let avail = avail_kb.saturating_mul(1024).min(i64::MAX as u64) as i64;
+        let used = total.saturating_sub(avail).max(0);
+        return Some((total, used));
+    }
+    #[allow(unreachable_code)]
+    {
+        None
+    }
+}
+
 /// Emit a physical-memory sample (round-7 #7).
 ///
 /// `jdk.PhysicalMemory` is a periodic event (EveryChunk) reporting host RAM
@@ -2686,24 +2773,34 @@ pub fn emit_java_error_throw_event(
 /// reads `/proc/meminfo` on Linux, `sysctl hw.memsize` on macOS, and
 /// `GlobalMemoryStatusEx` on Windows.
 ///
-/// TODO (round-7 wave-3): the `sysinfo` crate is not a `jfr` dependency
-/// today (see jfr/Cargo.toml). Either:
-///   (a) add `sysinfo = "0.30"` and probe `System::total_memory()` /
-///       `used_memory()` here, or
-///   (b) require callers to pass the values they obtained from the host
-///       VM's memory subsystem (the GC manager already tracks committed
-///       bytes).
+/// STUB fix (2026-06-17): this no longer reports caller stand-in values as
+/// host RAM by default. It first probes the real host via
+/// [`host_physical_memory`] (`GlobalMemoryStatusEx` on Windows, `/proc/meminfo`
+/// on Linux — no new dependency). When the probe succeeds those real totals
+/// are used. When it fails (unsupported target, or the syscall/parse errored)
+/// it falls back to the caller-supplied `total_size` / `used_size`, so the
+/// explicit-contract path is preserved: a caller that already has authoritative
+/// numbers from the host VM's memory subsystem (e.g. the GC manager's committed
+/// bytes) can still pass them and they are honoured on platforms where the
+/// host probe is unavailable. Both fields are `i64` per the JFR `long` type.
 ///
-/// Current signature takes the values explicitly so the periodic-sampler
-/// driver can wire them from whichever source it prefers without forcing
-/// a new dependency into `jfr`. Both fields are nanosecond-precise i64s
-/// per the JFR `long` type.
+/// FOLLOW-UP (out of this file's scope): the lone wired caller,
+/// `vm/src/vm/vm_init.rs`, currently passes `max_heap_size` for both `total`
+/// and `used` as a stand-in. With this change the host probe overrides that on
+/// Windows/Linux; the caller could be simplified to pass `0`/`0` (or its real
+/// committed bytes) now that the fallback is no longer the primary source.
 pub fn emit_physical_memory_event(
     recorder: &mut FlightRecorder,
     total_size: i64,
     used_size: i64,
     time_ns: u64,
 ) {
+    // Prefer the real host totals; fall back to the caller-supplied values
+    // when the host cannot be queried (unsupported OS / probe failure).
+    let (total_size, used_size) = match host_physical_memory() {
+        Some((total, used)) => (total, used),
+        None => (total_size, used_size),
+    };
     // Round-9 CRIT-2 fix (2026-05-17): PhysicalMemory is a one-shot startup
     // event emitted from vm_init for diagnostic/posterity purposes — it
     // records host RAM totals to the repository regardless of whether any

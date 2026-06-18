@@ -53,13 +53,26 @@ use identity_hash::seed as ih_seed;
 //
 //   * pointer matches an existing slot           -> reuse that slot's gen
 //     (steady state: same object, same address);
-//   * the hash bucket holds exactly one slot and
-//     the pointer differs                          -> that lone object was
-//     relocated by a moving GC; rebind the slot to the new pointer and reuse
-//     its gen (preserves the GC-move-stability contract the overlays rely on);
-//   * the bucket holds several slots and none match -> a genuine hash collision
-//     among simultaneously-live objects; allocate a fresh generation so the
-//     newcomer gets its own entry instead of aliasing an existing one.
+//   * the hash bucket holds exactly one slot, the pointer differs, AND the
+//     stored class-id marker still matches         -> that lone object was
+//     relocated by a moving GC (the class word moves with the header, so the
+//     class id is invariant across relocation); rebind the slot to the new
+//     pointer and reuse its gen (preserves the GC-move-stability contract the
+//     overlays rely on);
+//   * the bucket holds several slots and none match, OR the lone slot's
+//     class-id marker DIFFERS from the incoming object -> either a genuine
+//     32-bit hash collision among simultaneously-live objects, or a brand-new
+//     object that recycled a dead object's identity hash (a different class
+//     proves it is NOT the original); allocate a fresh generation so the
+//     newcomer gets its own entry instead of inheriting the dead/colliding
+//     object's slot and stale side-table state (fix item 1).
+//
+// Residual: a new object of the SAME class that recycles a dead object's
+// identity hash is still indistinguishable here by hash+class alone and would
+// inherit the lone slot. That window is closed by the GC-walk pruning (fix
+// item 2), which drops a dead object's registry slot when its overlay backing
+// is reclaimed, so the recycled identity no longer finds a stale lone slot to
+// inherit.
 //
 // The single-slot relocation fast path is what the `gc_relocation_harness`
 // integration test exercises (its mock hands out unique sequential hashes, so
@@ -73,12 +86,50 @@ struct ObjKeyEntry {
     last_ptr: usize,
     /// Per-(hash, object) disambiguator packed into the key's low 32 bits.
     generation: u32,
+    /// GC-invariant identity marker (fix item 1): the object's class id. A
+    /// moving GC copies the class word with the object header, so a genuine
+    /// relocation keeps the SAME class id; a *recycled* 32-bit identity hash
+    /// handed to a brand-new object of a DIFFERENT class is therefore
+    /// distinguishable. The single-slot "relocation" fast path below only
+    /// rebinds when this marker still matches — otherwise it would silently
+    /// hand the newcomer the dead object's overlay slot (and its stale
+    /// side-table state). Stored as the raw `ClassId` numeric value so the
+    /// registry stays a plain `Send` struct.
+    class_id: u32,
 }
 
-fn obj_key_registry() -> &'static Mutex<StdHashMap<u32, Vec<ObjKeyEntry>>> {
-    static REG: std::sync::OnceLock<Mutex<StdHashMap<u32, Vec<ObjKeyEntry>>>> =
-        std::sync::OnceLock::new();
-    REG.get_or_init(|| Mutex::new(StdHashMap::new()))
+// PERF (registry-shard): the identity-hash registry was a SINGLE global
+// `Mutex<HashMap>` taken on EVERY `widened_obj_key` call (every TreeMap /
+// TreeSet / LinkedHashMap / LinkedList side-table op, on every thread). Under
+// multi-threaded collection churn that one lock serialized all those ops and
+// became the dominant contention point. Shard it into `OBJ_KEY_SHARDS`
+// independent stripes, each its own `Mutex<HashMap>`, selected by the identity
+// hash. Because the shard is chosen deterministically from `hash` and every
+// per-hash bucket lives entirely inside one shard, the per-hash `Vec` and the
+// generation-disambiguation logic are bit-for-bit identical to the single-map
+// version — only the lock granularity changes. Contention drops ~N-fold since
+// threads touching different hashes now take different locks. The GC walks
+// (relocate / prune) iterate every shard, which is equivalent to iterating the
+// former single map. 64 is a power of two so the shard index is a cheap mask.
+const OBJ_KEY_SHARDS: usize = 64;
+
+type ObjKeyShard = Mutex<StdHashMap<u32, Vec<ObjKeyEntry>>>;
+
+fn obj_key_shards() -> &'static [ObjKeyShard; OBJ_KEY_SHARDS] {
+    static REG: std::sync::OnceLock<[ObjKeyShard; OBJ_KEY_SHARDS]> = std::sync::OnceLock::new();
+    REG.get_or_init(|| std::array::from_fn(|_| Mutex::new(StdHashMap::new())))
+}
+
+/// Select the registry shard for an identity hash. Mixes with the 64-bit
+/// Fibonacci/golden-ratio constant first because identity hashes can be
+/// low-entropy / sequentially assigned, which would otherwise cluster nearby
+/// objects onto a handful of shards; the masked high bits of the product are
+/// well distributed. Deterministic in `hash`, so a given object's bucket is
+/// always in the same shard (preserves the per-hash generation contract).
+#[inline]
+fn obj_key_shard_for(hash: u32) -> &'static ObjKeyShard {
+    let mixed = (hash as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    &obj_key_shards()[((mixed >> 58) as usize) & (OBJ_KEY_SHARDS - 1)]
 }
 
 /// GC-stable, collision-resistant side-table key. Replaces the former
@@ -88,8 +139,11 @@ fn obj_key_registry() -> &'static Mutex<StdHashMap<u32, Vec<ObjKeyEntry>>> {
 fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     let hash = ctx.identity_hash_code(this) as u32;
     let ptr = this.as_ptr() as usize;
+    let class_id = ctx.class_id_of_object(this).as_u32();
 
-    let mut reg = obj_key_registry().lock().unwrap();
+    // PERF (registry-shard): lock only this hash's shard, not a process-global
+    // mutex, so concurrent side-table ops on different hashes don't serialize.
+    let mut reg = obj_key_shard_for(hash).lock().unwrap();
     let slots = reg.entry(hash).or_default();
 
     // 1. Exact pointer match: same object at the same address.
@@ -97,19 +151,31 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
         return pack_obj_key(hash, slot.generation);
     }
 
-    // 2. Lone occupant of this hash bucket whose address changed: a moving GC
-    //    relocated it. Rebind to the new pointer and keep the same generation
-    //    so the overlay entry stays reachable.
-    if slots.len() == 1 {
+    // 2. Lone occupant of this hash bucket whose address changed. This is
+    //    AMBIGUOUS: either (a) a moving GC relocated the original object, or
+    //    (b) the original object died and a brand-new object was handed the
+    //    same recycled 32-bit identity hash. Case (b) must NOT inherit the
+    //    dead object's slot (fix item 1) — that would alias a new colliding
+    //    object onto a freed object's overlay/side-table state.
+    //
+    //    Disambiguate with the GC-invariant class-id marker: a relocation
+    //    preserves the class id (it moves with the header), so a class-id
+    //    match means it is safe to rebind the slot to the new pointer and
+    //    keep the generation (preserving the move-stability contract the
+    //    overlays rely on). A class-id MISMATCH proves a different object
+    //    recycled the hash → fall through to allocate it a fresh generation
+    //    instead of inheriting the slot.
+    if slots.len() == 1 && slots[0].class_id == class_id {
         slots[0].last_ptr = ptr;
         return pack_obj_key(hash, slots[0].generation);
     }
 
-    // 3. Genuine 32-bit collision among live objects (or the first object
-    //    seen for this hash): allocate a fresh generation so the newcomer
+    // 3. Genuine 32-bit collision among live objects, the first object seen
+    //    for this hash, or a recycled-identity newcomer that failed the
+    //    class-id check above: allocate a fresh generation so the newcomer
     //    never aliases an existing entry.
     let generation = slots.len() as u32;
-    slots.push(ObjKeyEntry { last_ptr: ptr, generation });
+    slots.push(ObjKeyEntry { last_ptr: ptr, generation, class_id });
     pack_obj_key(hash, generation)
 }
 
@@ -549,6 +615,54 @@ impl<'a> Drop for ChmMonitorGuard<'a> {
     }
 }
 
+/// Java `Double.toString(double)` formatting (fix item 4).
+///
+/// Local replica of native-builtins' `lang_string::format_double` (which is
+/// `pub(crate)` there and so unreachable from this crate). Rust's default
+/// `{}` float formatting already produces the shortest decimal that round-trips
+/// (Grisu/Ryū), matching Java's shortest-round-trip contract; the remaining
+/// Java-specific rules are: `Infinity` / `-Infinity` / `NaN` literals, and a
+/// mandatory decimal point (Java prints `1.0`, never `1`). Without this the
+/// wrapper `toString` path below rendered `Double`/`Float` via Rust's raw
+/// formatting, dropping the trailing `.0` and emitting `inf`/`-inf`/`NaN` Rust
+/// spellings instead of the Java literals.
+fn java_double_to_string(v: f64) -> String {
+    if v == f64::INFINITY {
+        "Infinity".to_string()
+    } else if v == f64::NEG_INFINITY {
+        "-Infinity".to_string()
+    } else if v.is_nan() {
+        "NaN".to_string()
+    } else {
+        let s = format!("{v}");
+        if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+            format!("{s}.0")
+        } else {
+            s
+        }
+    }
+}
+
+/// Java `Float.toString(float)` formatting (fix item 4). See
+/// [`java_double_to_string`] for the rules; the only difference is the
+/// narrower `f32` round-trip width.
+fn java_float_to_string(v: f32) -> String {
+    if v == f32::INFINITY {
+        "Infinity".to_string()
+    } else if v == f32::NEG_INFINITY {
+        "-Infinity".to_string()
+    } else if v.is_nan() {
+        "NaN".to_string()
+    } else {
+        let s = format!("{v}");
+        if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+            format!("{s}.0")
+        } else {
+            s
+        }
+    }
+}
+
 /// Try to read an object's string representation for display purposes.
 ///
 /// For objects that are not plain strings or primitives, this calls
@@ -603,8 +717,11 @@ fn obj_to_display_string(ctx: &mut dyn NativeContext, val: &Value) -> String {
                             };
                         }
                         Value::Long(v) => return v.to_string(),
-                        Value::Float(v) => return format!("{}", v),
-                        Value::Double(v) => return format!("{}", v),
+                        // Fix (item 4): Java shortest-round-trip formatting,
+                        // not Rust's default `{}` (which omits the trailing
+                        // `.0` and uses `inf`/`NaN` spellings).
+                        Value::Float(v) => return java_float_to_string(v),
+                        Value::Double(v) => return java_double_to_string(v),
                         _ => {}
                     }
                 }
@@ -636,8 +753,10 @@ fn obj_to_display_string(ctx: &mut dyn NativeContext, val: &Value) -> String {
         }
         Value::Int(v) => v.to_string(),
         Value::Long(v) => v.to_string(),
-        Value::Float(v) => format!("{}", v),
-        Value::Double(v) => format!("{}", v),
+        // Fix (item 4): Java shortest-round-trip formatting (see the boxed
+        // wrapper arms above) for bare primitive floats/doubles too.
+        Value::Float(v) => java_float_to_string(*v),
+        Value::Double(v) => java_double_to_string(*v),
         _ => "?".to_string(),
     }
 }
@@ -839,6 +958,47 @@ fn al_slots(ctx: &dyn NativeContext) -> (usize, usize, usize) {
     }
 }
 
+/// Receiver-aware slot resolution for the shared ArrayList-backed list natives.
+///
+/// `java.util.Vector` (and its subclass `java.util.Stack`) are registered against
+/// the same `native_al_*` implementations, but Vector is **not** an ArrayList and
+/// has a different field layout: `elementData` + `elementCount` (NOT `size`) +
+/// `capacityIncrement`. Using ArrayList's `(elementData, size)` slots on a Vector
+/// reads/writes the wrong fields (and the layout guard rejects it), so every
+/// Vector/Stack mutation silently no-ops (DF08: `Vector.add`/`Stack.push` lost
+/// the element → Xerces external-DTD entity stack empty → "Premature end of
+/// file"). Resolve against the receiver's actual class instead.
+fn al_slots_for(ctx: &dyn NativeContext, this: ObjectRef) -> (usize, usize, usize) {
+    let cid = ctx.class_id_of_object(this);
+    if let Some(vec_id) = ctx.class_id_by_name("java/util/Vector") {
+        if cid == vec_id || ctx.is_subclass(cid, vec_id) {
+            if let (Some(d), Some(s)) = (
+                ctx.resolve_field_index("java/util/Vector", "elementData"),
+                ctx.resolve_field_index("java/util/Vector", "elementCount"),
+            ) {
+                return (d, s, std::cmp::max(d, s) + 1);
+            }
+        }
+    }
+    al_slots(ctx)
+}
+
+/// `true` iff `obj` has a list layout the `native_al_*` natives can read at the
+/// receiver-aware slots — ArrayList (or subclass) **or** Vector (or subclass,
+/// e.g. Stack). See [`al_is_arraylist_layout`] for the foreign-receiver rationale.
+fn al_is_list_layout(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    if al_is_arraylist_layout(ctx, obj) {
+        return true;
+    }
+    let cid = ctx.class_id_of_object(obj);
+    if let Some(vec_id) = ctx.class_id_by_name("java/util/Vector") {
+        if cid == vec_id || ctx.is_subclass(cid, vec_id) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Allocate an ArrayList instance, sized to fit whichever field layout the
 /// runtime is using. Initializes elementData and size to (buf, init_size).
 fn alloc_arraylist_with(
@@ -893,7 +1053,7 @@ fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
     // throw, so callers reaching `al_state` are read-only. Mirrors the same
     // unwrap that `map_state` already performs for unmodifiable maps.
     let this = unwrap_unmod(ctx, this);
-    let (data_slot, size_slot, _) = al_slots(ctx);
+    let (data_slot, size_slot, _) = al_slots_for(ctx, this);
     // Receiver-layout guard. `al_state` is reached through `Collection`-
     // and `List`-interface natives (`size`, `forEach`, `stream`, …) whose
     // bytecode dispatcher can target *any* object — including non-list
@@ -922,7 +1082,7 @@ fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
     // ArrayList slots when the receiver actually has ArrayList layout; otherwise
     // return the empty sentinel so the caller falls back to the receiver's own
     // `iterator()` (equals) / virtual dispatch.
-    if !al_is_arraylist_layout(ctx, this) {
+    if !al_is_list_layout(ctx, this) {
         return (None, 0);
     }
     let data = match ctx.get_field(this, data_slot) {
@@ -974,7 +1134,7 @@ fn collection_elements_generic(
 
 #[inline]
 fn al_set_data(ctx: &mut dyn NativeContext, this: ObjectRef, buf: ObjectRef) {
-    let (data_slot, _, _) = al_slots(ctx);
+    let (data_slot, _, _) = al_slots_for(ctx, this);
     // Receiver-layout guard — see `al_state` for rationale. Skip the write
     // entirely on a wrong-class receiver to avoid the out-of-bounds GC guard
     // warning that pairs with the read-side fix above.
@@ -986,7 +1146,7 @@ fn al_set_data(ctx: &mut dyn NativeContext, this: ObjectRef, buf: ObjectRef) {
 
 #[inline]
 fn al_set_size(ctx: &mut dyn NativeContext, this: ObjectRef, size: i32) {
-    let (_, size_slot, _) = al_slots(ctx);
+    let (_, size_slot, _) = al_slots_for(ctx, this);
     if size_slot >= ctx.object_num_fields(this) {
         return;
     }
@@ -1142,6 +1302,8 @@ fn register_arraylist_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(c, "stream", "()Ljava/util/stream/Stream;", native_al_stream);
     r.set_category(__prev_cat);
+    // Fix (item 6): the backed-view class returned by `subList`.
+    register_al_sublist_natives(r);
 }
 
 pub fn native_al_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1832,7 +1994,7 @@ fn native_al_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Int(i)) => *i,
         _ => 0,
     };
-    let (data, size) = al_state(ctx, this);
+    let (_, size) = al_state(ctx, this);
     if from_i32 < 0 || from_i32 > size {
         return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
             index: from_i32,
@@ -1854,20 +2016,317 @@ fn native_al_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let from = from_i32 as usize;
     let to = to_i32 as usize;
     let sub_size = to.saturating_sub(from);
-    let __al_n_fields = al_slots(ctx).2;
-    let new_list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
-    let new_buf = alloc_ref_array(ctx, std::cmp::max(sub_size, AL_DEFAULT_CAPACITY));
+    // Fix (item 6): return a real BACKED VIEW, not a detached copy. The view
+    // shares the parent's backing array, so `get`/`set` read and WRITE THROUGH
+    // to the parent (the old copy silently diverged: mutations on either side
+    // were invisible to the other). Structural changes to the parent are
+    // detected via the captured parent size and surface as
+    // `ConcurrentModificationException`; structural mutation OF the sublist
+    // throws `UnsupportedOperationException` (fail loud) rather than diverging.
+    // See `register_al_sublist_natives` and the `ASL_*` handlers below.
+    let parent_size = size;
+    let view = alloc_synthetic(ctx, ASL_CLASS, ASL_NUM_FIELDS);
+    ctx.set_field(view, ASL_FIELD_PARENT, Value::Object(Some(this)));
+    ctx.set_field(view, ASL_FIELD_OFFSET, Value::Int(from as i32));
+    ctx.set_field(view, ASL_FIELD_SIZE, Value::Int(sub_size as i32));
+    ctx.set_field(view, ASL_FIELD_EXPECTED, Value::Int(parent_size));
+    Ok(Some(Value::Object(Some(view))))
+}
+
+// ---------------------------------------------------------------------------
+// ArrayList.subList backed view (fix item 6).
+//
+// `java.util.ArrayList.subList(from, to)` returns a *view* whose reads and
+// element writes go straight through to the parent list, and which fails fast
+// (ConcurrentModificationException) if the parent is structurally modified
+// through another path. The previous native returned an independent COPY, so
+// `subList().set(...)` never reached the parent and parent edits were invisible
+// to the sublist — a silent-divergence bug. This implements a genuine backed
+// view sharing the parent's `elementData`.
+//
+// Scope note: structural mutation of the *sublist itself* (add/remove/clear)
+// is modeled as a loud `UnsupportedOperationException` rather than the full
+// JDK behavior of mutating the parent and rippling offsets to sibling views.
+// That keeps the implementation bounded while honoring the project rule
+// (no silent divergence): callers either read/`set` through correctly or get
+// an explicit failure.
+// ---------------------------------------------------------------------------
+
+const ASL_CLASS: &str = "cratonvm/internal/ArrayListSubList";
+const ASL_FIELD_PARENT: usize = 0;
+const ASL_FIELD_OFFSET: usize = 1;
+const ASL_FIELD_SIZE: usize = 2;
+const ASL_FIELD_EXPECTED: usize = 3;
+const ASL_NUM_FIELDS: usize = 4;
+
+/// Read `(parent, offset, size, expected_parent_size)` from a sublist view.
+fn asl_state(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, i32, i32, i32)> {
+    let parent = match ctx.get_field(this, ASL_FIELD_PARENT) {
+        Value::Object(Some(p)) => p,
+        _ => return None,
+    };
+    let offset = match ctx.get_field(this, ASL_FIELD_OFFSET) {
+        Value::Int(o) => o,
+        _ => 0,
+    };
+    let size = match ctx.get_field(this, ASL_FIELD_SIZE) {
+        Value::Int(s) => s,
+        _ => 0,
+    };
+    let expected = match ctx.get_field(this, ASL_FIELD_EXPECTED) {
+        Value::Int(e) => e,
+        _ => 0,
+    };
+    Some((parent, offset, size, expected))
+}
+
+/// Fail fast if the parent list was structurally modified since the view was
+/// created — mirrors the JDK's `checkForComodification`. Detected by comparing
+/// the parent's current size against the size captured at `subList()` time.
+fn asl_check_comod(ctx: &dyn NativeContext, parent: ObjectRef, expected: i32) -> Result<(), MethodCallFailed> {
+    let (_, cur) = al_state(ctx, parent);
+    if cur != expected {
+        return Err(cratonvm_types::error::RuntimeError::ConcurrentModificationException.into());
+    }
+    Ok(())
+}
+
+fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let c = ASL_CLASS;
+    r.register(c, "size", "()I", native_asl_size);
+    r.register(c, "isEmpty", "()Z", native_asl_is_empty);
+    r.register(c, "get", "(I)Ljava/lang/Object;", native_asl_get);
+    r.register(c, "set", "(ILjava/lang/Object;)Ljava/lang/Object;", native_asl_set);
+    r.register(c, "iterator", "()Ljava/util/Iterator;", native_asl_iterator);
+    r.register(c, "toArray", "()[Ljava/lang/Object;", native_asl_to_array);
+    r.register(c, "toString", "()Ljava/lang/String;", native_asl_to_string);
+    // Remaining read methods delegate to a fresh snapshot ArrayList. Without
+    // these, an interface-level `Collection`/`List` native would be reached
+    // with an ASL receiver and read it through `al_state` (wrong layout →
+    // empty), silently reporting the sublist as empty. The snapshot is rebuilt
+    // each call so it always reflects the live parent slice (after the
+    // comod check).
+    r.register(c, "contains", "(Ljava/lang/Object;)Z", |ctx, args| {
+        asl_delegate_snapshot(ctx, args, "contains", "(Ljava/lang/Object;)Z")
+    });
+    r.register(c, "indexOf", "(Ljava/lang/Object;)I", |ctx, args| {
+        asl_delegate_snapshot(ctx, args, "indexOf", "(Ljava/lang/Object;)I")
+    });
+    r.register(c, "lastIndexOf", "(Ljava/lang/Object;)I", |ctx, args| {
+        asl_delegate_snapshot(ctx, args, "lastIndexOf", "(Ljava/lang/Object;)I")
+    });
+    r.register(c, "stream", "()Ljava/util/stream/Stream;", |ctx, args| {
+        asl_delegate_snapshot(ctx, args, "stream", "()Ljava/util/stream/Stream;")
+    });
+    r.register(c, "forEach", "(Ljava/util/function/Consumer;)V", |ctx, args| {
+        asl_delegate_snapshot(ctx, args, "forEach", "(Ljava/util/function/Consumer;)V")
+    });
+    r.register(c, "hashCode", "()I", |ctx, args| {
+        asl_delegate_snapshot(ctx, args, "hashCode", "()I")
+    });
+    r.register(c, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
+        asl_delegate_snapshot(ctx, args, "equals", "(Ljava/lang/Object;)Z")
+    });
+    // Structural mutators: fail loud rather than silently diverge from the
+    // parent (the full JDK ripple-to-parent behavior is out of scope here).
+    r.register(c, "add", "(Ljava/lang/Object;)Z", native_asl_unsupported);
+    r.register(c, "add", "(ILjava/lang/Object;)V", native_asl_unsupported);
+    r.register(c, "remove", "(I)Ljava/lang/Object;", native_asl_unsupported);
+    r.register(c, "remove", "(Ljava/lang/Object;)Z", native_asl_unsupported);
+    r.register(c, "clear", "()V", native_asl_unsupported);
+    r.register(c, "addAll", "(Ljava/util/Collection;)Z", native_asl_unsupported);
+    r.register(
+        c,
+        "removeIf",
+        "(Ljava/util/function/Predicate;)Z",
+        native_asl_unsupported,
+    );
+    r.set_category(__prev_cat);
+}
+
+fn native_asl_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    match asl_state(ctx, this) {
+        Some((parent, _, size, expected)) => {
+            asl_check_comod(ctx, parent, expected)?;
+            Ok(Some(Value::Int(size)))
+        }
+        None => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_asl_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    match asl_state(ctx, this) {
+        Some((parent, _, size, expected)) => {
+            asl_check_comod(ctx, parent, expected)?;
+            Ok(Some(Value::Int(i32::from(size == 0))))
+        }
+        None => Ok(Some(Value::Int(1))),
+    }
+}
+
+fn native_asl_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (parent, offset, size, expected) = match asl_state(ctx, this) {
+        Some(s) => s,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    asl_check_comod(ctx, parent, expected)?;
+    if index < 0 || index >= size {
+        return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            index,
+        }
+        .into());
+    }
+    // Write-through READ: index straight into the parent's live backing array.
+    let (data, _) = al_state(ctx, parent);
+    match data {
+        Some(d) => Ok(Some(ctx.get_array_element(d, (offset + index) as usize))),
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_asl_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    let (parent, offset, size, expected) = match asl_state(ctx, this) {
+        Some(s) => s,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    asl_check_comod(ctx, parent, expected)?;
+    if index < 0 || index >= size {
+        return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            index,
+        }
+        .into());
+    }
+    // Write-through SET: the element write lands in the PARENT's backing array.
+    let (data, _) = al_state(ctx, parent);
+    match data {
+        Some(d) => {
+            let old = ctx.get_array_element(d, (offset + index) as usize);
+            ctx.set_array_element(d, (offset + index) as usize, value);
+            Ok(Some(old))
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// Snapshot the current slice (offset..offset+size) of the parent into a fresh
+/// `Object[]`, used by both `toArray()` and `iterator()`.
+fn asl_snapshot(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
+    let (parent, offset, size, expected) = match asl_state(ctx, this) {
+        Some(s) => s,
+        None => return Ok(alloc_ref_array(ctx, 0)),
+    };
+    asl_check_comod(ctx, parent, expected)?;
+    let buf = alloc_ref_array(ctx, size as usize);
+    let (data, _) = al_state(ctx, parent);
     if let Some(d) = data {
-        if !ctx.bulk_array_copy(d, from, new_buf, 0, sub_size) {
-            for i in 0..sub_size {
-                let val = ctx.get_array_element(d, from + i);
-                ctx.set_array_element(new_buf, i, val);
-            }
+        for i in 0..(size as usize) {
+            let v = ctx.get_array_element(d, offset as usize + i);
+            ctx.set_array_element(buf, i, v);
         }
     }
-    al_set_data(ctx, new_list, new_buf);
-    al_set_size(ctx, new_list, sub_size as i32);
-    Ok(Some(Value::Object(Some(new_list))))
+    Ok(buf)
+}
+
+fn native_asl_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let buf = asl_snapshot(ctx, this)?;
+    Ok(Some(Value::Object(Some(buf))))
+}
+
+fn native_asl_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    use std::fmt::Write as _;
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // Build from the live slice snapshot (the ASL layout differs from
+    // ArrayList's, so the ArrayList toString cannot be reused directly).
+    let buf = asl_snapshot(ctx, this)?;
+    let len = ctx.array_length(buf);
+    let mut text = String::with_capacity(2 + len.saturating_mul(18));
+    text.push('[');
+    for i in 0..len {
+        if i > 0 {
+            text.push_str(", ");
+        }
+        let val = ctx.get_array_element(buf, i);
+        let _ = write!(text, "{}", obj_to_display_string(ctx, &val));
+    }
+    text.push(']');
+    let s = ctx.create_string(&text);
+    Ok(Some(Value::Object(Some(s))))
+}
+
+fn native_asl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let buf = asl_snapshot(ctx, this)?;
+    let len = ctx.array_length(buf);
+    // `make_iterator_from_array` already returns a `MethodCallResult`
+    // (`Ok(Some(Value::Object(Some(iterator))))`); forward it directly.
+    make_iterator_from_array(ctx, buf, len)
+}
+
+/// Delegate a read method to a freshly materialized snapshot `ArrayList` of
+/// the view's current slice. Keeps the less-common read methods correct
+/// without re-implementing each one against the offset/parent layout, while
+/// still failing fast on parent comodification (via `asl_snapshot`).
+fn asl_delegate_snapshot(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+    descriptor: &str,
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let buf = asl_snapshot(ctx, this)?;
+    let size = ctx.array_length(buf) as i32;
+    let snap = alloc_arraylist_with(ctx, buf, size);
+    ctx.invoke_virtual(snap, method, descriptor, &args[1..])
+}
+
+fn native_asl_unsupported(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // Fail loud (fix item 6): structural mutation of the backed sublist view is
+    // not supported here; the alternative — mutating only the view's own state —
+    // would silently diverge from the parent, exactly the bug this fix removes.
+    Err(cratonvm_types::error::RuntimeError::UnsupportedOperationException {
+        message: "structural modification of ArrayList.subList view is not supported".to_string(),
+    }
+    .into())
 }
 
 fn native_al_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -5698,7 +6157,14 @@ fn native_al_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let (data, size) = al_state(ctx, list);
     if cursor >= size {
-        return Ok(Some(Value::Object(None))); // NoSuchElementException (simplified)
+        // Fix (item 3): `Iterator.next()` past the end must throw
+        // `NoSuchElementException` per the JDK contract — returning `null`
+        // silently masks the over-read and lets callers treat exhausted
+        // iterators as holding a trailing `null` element.
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+            message: "no more elements".to_string(),
+        }
+        .into());
     }
     let data = match data {
         Some(d) => d,
@@ -7419,11 +7885,12 @@ fn native_al_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Int(0))),
     };
 
-    let data = match ctx.get_field(this, al_slots(ctx).0) {
+    let (al_data_slot, al_size_slot, _) = al_slots_for(ctx, this);
+    let data = match ctx.get_field(this, al_data_slot) {
         Value::Object(Some(arr)) => arr,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let size = match ctx.get_field(this, al_slots(ctx).1) {
+    let size = match ctx.get_field(this, al_size_slot) {
         Value::Int(s) => s as usize,
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -7477,11 +7944,12 @@ fn native_al_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(None),
     };
 
-    let data = match ctx.get_field(this, al_slots(ctx).0) {
+    let (al_data_slot, al_size_slot, _) = al_slots_for(ctx, this);
+    let data = match ctx.get_field(this, al_data_slot) {
         Value::Object(Some(arr)) => arr,
         _ => return Ok(None),
     };
-    let size = match ctx.get_field(this, al_slots(ctx).1) {
+    let size = match ctx.get_field(this, al_size_slot) {
         Value::Int(s) => s as usize,
         _ => return Ok(None),
     };
@@ -18520,6 +18988,15 @@ fn ts_array_table() -> &'static Mutex<StdHashMap<usize, TsArrayState>> {
 ///     LHMs that relocated must still be repointed; dead entries are not in the
 ///     `pointer_map` so their stale refs are left untouched (never read again).
 fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
+    // PERF (overlay-empty-skip): this runs on EVERY GC. Pruning keeps each
+    // overlay table bounded to live collections, but an app that uses none of a
+    // given collection type leaves that table empty — yet we still locked it and
+    // built an iterator every GC. Each block now early-skips when its table is
+    // empty (a single lock + `is_empty()` check, no iterator setup). For the
+    // LinkedHashMap block this additionally avoids acquiring the second
+    // `lhm_heap_backed` lock when there is nothing to walk. Behaviour is
+    // identical: iterating an empty map invokes `f` zero times.
+    //
     // Inner name -> Value overlays (LinkedList head/tail/size, LinkedHashMap
     // table/head/tail/…).
     if let Ok(mut ll) = ll_overlay().lock() {
@@ -18532,6 +19009,9 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
         }
     }
     if let Ok(mut lhm) = lhm_overlay().lock() {
+        if lhm.is_empty() {
+            // Nothing to root/remap — skip without taking `lhm_heap_backed`.
+        } else {
         // Hold the heap-backed set across the loop (lock order: heap_backed is
         // never taken while lhm_overlay is held elsewhere — `lhm_set` locks them
         // sequentially, not nested — so this order can't deadlock).
@@ -18552,6 +19032,7 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
                 }
             }
         }
+        } // end else (non-empty lhm)
     }
     // TreeMap array mode: backing `data` array + comparator.
     if let Ok(mut tm) = tm_array_table().lock() {
@@ -18587,6 +19068,15 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
             }
         }
     }
+    // ConcurrentSkipListMap custom comparators (fix item 5). The comparator is
+    // held only in this side-table (the synthetic CSLM has no object slot for
+    // it), so it is reachable only here — root + remap it like the TreeMap/
+    // TreeSet comparators above so a moving GC keeps it live and repointed.
+    if let Ok(mut cmps) = cslm_comparator_table().lock() {
+        for r in cmps.values_mut() {
+            f(r);
+        }
+    }
 }
 
 /// Push every top-level ObjectRef held by the overlay-backed collections onto
@@ -18608,6 +19098,118 @@ pub fn gc_update_collection_overlay_refs(pointer_map: &StdHashMap<usize, usize>)
             *r = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
         }
     });
+
+    // Fix item 1/2: keep the `obj_key_registry` `last_ptr` markers in step with
+    // the move so (a) the next `widened_obj_key` resolves a relocated object by
+    // exact-pointer match (rather than relying on the single-slot fallback) and
+    // (b) the liveness prune below tests each slot against its *current*
+    // address. A relocated collection object's identity-hash key (the overlay
+    // bucket key) is invariant across the move, so only the stored pointer
+    // changes — the overlay/cache entries stay correctly keyed.
+    // PERF (registry-shard): iterate every shard — equivalent to walking the
+    // former single map. Runs during GC (single-threaded), so per-shard locking
+    // adds no contention.
+    for shard in obj_key_shards().iter() {
+        if let Ok(mut reg) = shard.lock() {
+            for slots in reg.values_mut() {
+                for slot in slots.iter_mut() {
+                    if let Some(&new_addr) = pointer_map.get(&slot.last_ptr) {
+                        slot.last_ptr = new_addr;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Prune overlay/side-table entries whose backing collection object is no
+/// longer live, bounding the otherwise-unbounded growth of `obj_key_registry`,
+/// `lhm_overlay`, `lhm_ptr_cache`, `lhm_heap_backed`, and `ll_overlay`
+/// (fix item 2). Before this, every `LinkedHashMap`/`LinkedHashSet`/
+/// `LinkedList` ever touched left a permanent side-table entry — a steady leak,
+/// and an O(n)-per-GC walk in `for_each_overlay_ref` over dead entries.
+///
+/// `is_live(addr)` must report whether the heap object at `addr` survived the
+/// just-completed collection. It is supplied by the GC, which alone has the
+/// authoritative post-trace liveness information (the per-generation
+/// `pointer_map` handed to `gc_update_collection_overlay_refs` only covers the
+/// *collected* generation's survivors, so it cannot by itself classify an
+/// old-gen overlay object as dead — hence the explicit predicate).
+///
+/// MUST be called AFTER `gc_update_collection_overlay_refs` so the registry's
+/// `last_ptr` markers already point at post-GC addresses.
+///
+/// NOTE (cross-file wiring): the GC collection epilogue in
+/// `vm/src/memory/gc.rs` (the site that already calls
+/// `gc_update_collection_overlay_refs`) must call this with its `is_live`
+/// closure for the prune to take effect. That one-line wiring lives outside
+/// this crate's scope and is flagged in the change report rather than edited
+/// here.
+pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
+    // 1. Collect the packed keys of dead collection objects from the registry,
+    //    and rebuild the registry without their slots. Done as an explicit
+    //    two-pass walk (collect dead keys, then drop slots) to keep the
+    //    `dead_keys` mutation cleanly outside the `retain` predicate's borrow.
+    // PERF (registry-shard): walk every shard, collecting dead keys and dropping
+    // their slots per-shard. Equivalent to the former single-map walk (the union
+    // of all shards is the whole registry); runs under GC so per-shard locking is
+    // uncontended. Preserves the original early-return: if NO shard yielded a
+    // dead key, skip the overlay-cleanup pass entirely.
+    let mut dead_keys: Vec<usize> = Vec::new();
+    for shard in obj_key_shards().iter() {
+        if let Ok(mut reg) = shard.lock() {
+            for (&hash, slots) in reg.iter() {
+                for slot in slots.iter() {
+                    // A zero `last_ptr` is the unset/never-resolved sentinel; treat
+                    // it as live (defensive — never prune what we can't classify).
+                    let live = slot.last_ptr == 0 || is_live(slot.last_ptr);
+                    if !live {
+                        dead_keys.push(pack_obj_key(hash, slot.generation));
+                    }
+                }
+            }
+            // Drop the dead slots; remove buckets that become empty.
+            reg.retain(|_hash, slots| {
+                slots.retain(|slot| slot.last_ptr == 0 || is_live(slot.last_ptr));
+                !slots.is_empty()
+            });
+        }
+    }
+    if dead_keys.is_empty() {
+        return;
+    }
+
+    // 2. Drop the dead objects' overlay/cache entries everywhere they are keyed
+    //    by the packed `widened_obj_key`.
+    if let Ok(mut lhm) = lhm_overlay().lock() {
+        for k in &dead_keys {
+            lhm.remove(k);
+        }
+    }
+    if let Ok(mut hb) = lhm_heap_backed().lock() {
+        for k in &dead_keys {
+            hb.remove(k);
+        }
+    }
+    if let Ok(mut ll) = ll_overlay().lock() {
+        for k in &dead_keys {
+            ll.remove(k);
+        }
+    }
+    // CSLM custom-comparator side-table (fix item 5) is keyed by the same
+    // packed `widened_obj_key`; drop the dead maps' comparators too.
+    if let Ok(mut cmps) = cslm_comparator_table().lock() {
+        for k in &dead_keys {
+            cmps.remove(k);
+        }
+    }
+    // `lhm_ptr_cache` is keyed by the *raw* object pointer (not the packed
+    // key), mapping pointer -> packed key. Drop every entry whose mapped value
+    // is now a dead packed key.
+    if let Ok(mut cache) = lhm_ptr_cache().lock() {
+        let dead: std::collections::HashSet<usize> = dead_keys.iter().copied().collect();
+        cache.retain(|_ptr, packed| !dead.contains(packed));
+    }
 }
 
 /// Read a TreeSet "slot" (`TS_FIELD_DATA`/`SIZE`/`COMPARATOR`) from the
@@ -21688,7 +22290,7 @@ fn chm_seg_get(
     let seg_id = ctx.identity_hash_code(seg);
     // `parking_lot::RwLock::read` is infallible — no PoisonError to
     // recover from.
-    let _read_guard = chm_seg_lock_for(seg_id).read();
+    let read_guard = chm_seg_lock_for(seg_id).read();
     // Acquire-load the buckets array reference. If the writer has
     // begun publishing a new array, we see either the old one (with a
     // fully-linked chain) or the new one (also fully-linked) — never a
@@ -21717,18 +22319,24 @@ fn chm_seg_get(
         return Ok(None);
     }
     let idx = map_bucket_index(hash, cap);
+    // PERF (chm-narrow-lock): SNAPSHOT the bucket chain (each node's key+value)
+    // while holding the read-lock, then RELEASE the lock before running the
+    // key-equality comparisons. The lock exists only to serialize this chain
+    // walk against `map_resize_concurrent`'s in-place NEXT mutation; capturing a
+    // consistent, fully-linked view under the lock satisfies that contract
+    // exactly (same linearization point a lock-free JDK `get` uses). Holding the
+    // `parking_lot` read-lock across `map_keys_equal` was both a needlessly long
+    // critical section AND a latent self-deadlock: `map_keys_equal` can invoke a
+    // user-defined `equals(Object)` (arbitrary Java) which could re-enter a CHM
+    // resize and take the WRITE lock on the same stripe — parking_lot read→write
+    // on one thread is not reentrant. Resize only re-links NEXT pointers; it
+    // never rewrites a node's key/value, so a snapshot taken under the lock stays
+    // valid for comparison after the lock drops. Behaviour is identical: the same
+    // (key,value) pairs are examined in the same order.
+    let mut chain: Vec<(Value, Value)> = Vec::new();
     let mut node_val = ctx.get_array_element(buckets, idx);
     while let Value::Object(Some(node)) = node_val {
-        let node_key_field = get_node_key(ctx, node);
-        if is_null_key {
-            if matches!(node_key_field, Value::Object(None)) {
-                return Ok(Some(get_node_value(ctx, node)));
-            }
-        } else if let Value::Object(Some(node_key)) = node_key_field {
-            if map_keys_equal(ctx, node_key, key_ref.unwrap())? {
-                return Ok(Some(get_node_value(ctx, node)));
-            }
-        }
+        chain.push((get_node_key(ctx, node), get_node_value(ctx, node)));
         // Acquire-load the NEXT pointer. Pairs with the writer's
         // `set_field` of NEXT during chain construction — the writer
         // publishes the buckets array with `set_field_volatile` AFTER
@@ -21736,6 +22344,19 @@ fn chm_seg_get(
         // buckets array necessarily observes the corresponding NEXT
         // writes (happens-before via Release/Acquire).
         node_val = ctx.get_field_volatile(node, NODE_FIELD_NEXT);
+    }
+    drop(read_guard); // critical section ends — comparisons run lock-free
+
+    for (node_key_field, node_value) in chain {
+        if is_null_key {
+            if matches!(node_key_field, Value::Object(None)) {
+                return Ok(Some(node_value));
+            }
+        } else if let Value::Object(Some(node_key)) = node_key_field {
+            if map_keys_equal(ctx, node_key, key_ref.unwrap())? {
+                return Ok(Some(node_value));
+            }
+        }
     }
     Ok(None)
 }
@@ -26097,11 +26718,60 @@ fn cslm_stripe_for(
     &stripes[idx]
 }
 
+/// Per-CSLM custom `Comparator` side-table (fix item 5).
+///
+/// The synthetic `ConcurrentSkipListMap` class is declared with exactly THREE
+/// instance fields (`class_manager.rs`: keys/values/size), so there is no
+/// object slot to hold a `Comparator`. Rather than widen the synthetic layout
+/// (a cross-crate change), the comparator is kept here keyed by the map's
+/// GC-stable `widened_obj_key`, exactly as TreeMap/TreeSet keep their
+/// comparators out-of-object. The stored `ObjectRef` is rooted and remapped
+/// through `for_each_overlay_ref` so a moving GC keeps it live, and pruned by
+/// `gc_prune_dead_collection_overlays` when the map dies.
+fn cslm_comparator_table() -> &'static Mutex<StdHashMap<usize, ObjectRef>> {
+    static T: std::sync::OnceLock<Mutex<StdHashMap<usize, ObjectRef>>> = std::sync::OnceLock::new();
+    T.get_or_init(|| Mutex::new(StdHashMap::new()))
+}
+
+/// Read this CSLM's custom comparator (or `Value::Object(None)` for natural
+/// ordering).
+fn cslm_comparator(ctx: &dyn NativeContext, this: ObjectRef) -> Value {
+    let key = widened_obj_key(ctx, this);
+    match cslm_comparator_table().lock().unwrap().get(&key).copied() {
+        Some(cmp) => Value::Object(Some(cmp)),
+        None => Value::Object(None),
+    }
+}
+
+/// Store this CSLM's custom comparator. A `None` clears any prior entry.
+fn cslm_set_comparator(ctx: &dyn NativeContext, this: ObjectRef, cmp: Option<ObjectRef>) {
+    let key = widened_obj_key(ctx, this);
+    let mut t = cslm_comparator_table().lock().unwrap();
+    match cmp {
+        Some(c) => {
+            t.insert(key, c);
+        }
+        None => {
+            t.remove(&key);
+        }
+    }
+}
+
 fn register_concurrent_skip_list_map_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/concurrent/ConcurrentSkipListMap";
     r.register(c, "<init>", "()V", native_cslm_init);
+    // Fix item 5: the `(Comparator)` constructor. Without this, code that did
+    // `new ConcurrentSkipListMap(cmp)` over keys ordered ONLY by `cmp` (incl.
+    // non-`Comparable` keys) hit the no-arg `<init>` (or none), so every put
+    // fell back to natural ordering and silently dropped/misordered entries.
+    r.register(
+        c,
+        "<init>",
+        "(Ljava/util/Comparator;)V",
+        native_cslm_init_comparator,
+    );
     r.register(
         c,
         "put",
@@ -26134,21 +26804,33 @@ fn register_concurrent_skip_list_map_natives(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
-/// Binary search in the keys array using natural comparison.
+/// Binary search in the keys array using `comparator` (a custom `Comparator`)
+/// or natural ordering when `comparator` is `Value::Object(None)` (fix item 5).
 /// Returns Ok(index) if found, Err(insert_pos) if not found.
+///
+/// Previously this hardcoded `Value::Object(None)`, so a CSLM constructed with
+/// a custom comparator (or whose keys are ordered only by that comparator)
+/// silently used natural ordering — misordering keys and, for keys the natural
+/// comparison treated as equal, dropping puts. With the comparator threaded
+/// through, custom-ordered maps behave correctly. The natural-ordering path
+/// remains fail-loud on a non-`Comparable` key: `tree_compare` →
+/// `natural_compare` → `compare_via_compare_to` dispatches the key's real
+/// `compareTo`, which raises (NoSuchMethodError / AbstractMethodError /
+/// ClassCastException) and propagates here via `?` instead of silently
+/// collapsing the ordering and dropping the entry.
 fn cslm_binary_search(
     ctx: &mut dyn NativeContext,
+    comparator: &Value,
     keys: ObjectRef,
     size: i32,
     key: &Value,
 ) -> Result<Result<usize, usize>, MethodCallFailed> {
-    let comparator = Value::Object(None); // natural ordering
     let mut low: usize = 0;
     let mut high = size as usize;
     while low < high {
         let mid = low + (high - low) / 2;
         let mid_key = ctx.get_array_element(keys, mid);
-        let cmp = tree_compare(ctx, &comparator, mid_key, *key)?;
+        let cmp = tree_compare(ctx, comparator, mid_key, *key)?;
         if cmp < 0 {
             low = mid + 1;
         } else if cmp > 0 {
@@ -26210,6 +26892,31 @@ fn native_cslm_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     ctx.set_field(this, CSLM_FIELD_KEYS, Value::Object(Some(keys)));
     ctx.set_field(this, CSLM_FIELD_VALUES, Value::Object(Some(values)));
     ctx.set_field(this, CSLM_FIELD_SIZE, Value::Int(0));
+    // No custom comparator: natural ordering. Clear any stale side-table entry
+    // (an identity hash could be recycled across a freed map).
+    cslm_set_comparator(ctx, this, None);
+    Ok(None)
+}
+
+/// `ConcurrentSkipListMap(Comparator)` constructor (fix item 5). Stores the
+/// supplied comparator in the side-table so all ordering operations honor it.
+fn native_cslm_init_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let keys = alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY);
+    let values = alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY);
+    ctx.set_field(this, CSLM_FIELD_KEYS, Value::Object(Some(keys)));
+    ctx.set_field(this, CSLM_FIELD_VALUES, Value::Object(Some(values)));
+    ctx.set_field(this, CSLM_FIELD_SIZE, Value::Int(0));
+    // A null Comparator argument means "use natural ordering" (matches the JDK,
+    // which stores null and falls back to Comparable). A non-null one is kept.
+    let cmp = match args.get(1) {
+        Some(Value::Object(Some(c))) => Some(*c),
+        _ => None,
+    };
+    cslm_set_comparator(ctx, this, cmp);
     Ok(None)
 }
 
@@ -26220,6 +26927,8 @@ fn native_cslm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    // Fix item 5: honor the map's custom comparator (natural ordering if none).
+    let comparator = cslm_comparator(ctx, this);
     // Bug 1: serialise mutating ops on this map's lock stripe.
     let _guard = cslm_stripe_for(ctx, this).write();
     let (keys_opt, values_opt, size) = cslm_state(ctx, this);
@@ -26239,7 +26948,7 @@ fn native_cslm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             v
         }
     };
-    let search = cslm_binary_search(ctx, keys, size, &key)?;
+    let search = cslm_binary_search(ctx, &comparator, keys, size, &key)?;
     match search {
         Ok(idx) => {
             // Key exists — replace value, return old
@@ -26271,6 +26980,8 @@ fn native_cslm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    // Fix item 5: honor the map's custom comparator.
+    let comparator = cslm_comparator(ctx, this);
     // Bug 1: shared read lock — concurrent reads OK, blocks during writes.
     let _guard = cslm_stripe_for(ctx, this).read();
     let (keys_opt, values_opt, size) = cslm_state(ctx, this);
@@ -26282,7 +26993,7 @@ fn native_cslm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(v) => v,
         None => return Ok(Some(Value::Object(None))),
     };
-    match cslm_binary_search(ctx, keys, size, &key)? {
+    match cslm_binary_search(ctx, &comparator, keys, size, &key)? {
         Ok(idx) => Ok(Some(ctx.get_array_element(values_arr, idx))),
         Err(_) => Ok(Some(Value::Object(None))),
     }
@@ -26294,6 +27005,8 @@ fn native_cslm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    // Fix item 5: honor the map's custom comparator.
+    let comparator = cslm_comparator(ctx, this);
     // Bug 1: serialise mutating ops on this map's lock stripe.
     let _guard = cslm_stripe_for(ctx, this).write();
     let (keys_opt, values_opt, size) = cslm_state(ctx, this);
@@ -26305,7 +27018,7 @@ fn native_cslm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(v) => v,
         None => return Ok(Some(Value::Object(None))),
     };
-    match cslm_binary_search(ctx, keys, size, &key)? {
+    match cslm_binary_search(ctx, &comparator, keys, size, &key)? {
         Ok(idx) => {
             let old_val = ctx.get_array_element(values_arr, idx);
             let s = size as usize;
@@ -26358,6 +27071,8 @@ fn native_cslm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return Ok(Some(Value::Int(0))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    // Fix item 5: honor the map's custom comparator.
+    let comparator = cslm_comparator(ctx, this);
     // Bug 1: shared read lock.
     let _guard = cslm_stripe_for(ctx, this).read();
     let (keys_opt, _, size) = cslm_state(ctx, this);
@@ -26365,7 +27080,7 @@ fn native_cslm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(k) => k,
         None => return Ok(Some(Value::Int(0))),
     };
-    let found = cslm_binary_search(ctx, keys, size, &key)?.is_ok();
+    let found = cslm_binary_search(ctx, &comparator, keys, size, &key)?.is_ok();
     Ok(Some(Value::Int(i32::from(found))))
 }
 
@@ -26426,10 +27141,13 @@ fn native_cslm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Fix item 5: carry the map's custom comparator onto the key-set view so
+    // its ordering matches the map (the keys array is already sorted by it).
+    let comparator = cslm_comparator(ctx, this);
     // Bug 1: shared read lock — snapshot the keys array under the lock.
     let _guard = cslm_stripe_for(ctx, this).read();
     let (keys_opt, _, size) = cslm_state(ctx, this);
-    // Return a TreeSet with natural ordering containing all keys
+    // Return a TreeSet (ordered by the same comparator) containing all keys.
     let ts = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
     let buf = alloc_ref_array(ctx, std::cmp::max(size as usize, TS_DEFAULT_CAPACITY));
     if let Some(keys) = keys_opt {
@@ -26440,7 +27158,7 @@ fn native_cslm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     }
     ts_set_slot(ctx, ts, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, ts, TS_FIELD_SIZE, Value::Int(size));
-    ts_set_slot(ctx, ts, TS_FIELD_COMPARATOR, Value::Object(None));
+    ts_set_slot(ctx, ts, TS_FIELD_COMPARATOR, comparator);
     Ok(Some(Value::Object(Some(ts))))
 }
 
@@ -28550,6 +29268,47 @@ mod tests {
         assert_eq!(dbg_hmput(), expected);
         // Cached: second call returns the same value.
         assert_eq!(dbg_hmput(), expected);
+    }
+
+    // Fix item 4: Java shortest-round-trip Float/Double formatting helpers.
+    #[test]
+    fn java_double_to_string_matches_java_spec() {
+        use super::java_double_to_string;
+        // Always has a decimal point (Java prints "1.0", not "1").
+        assert_eq!(java_double_to_string(1.0), "1.0");
+        assert_eq!(java_double_to_string(0.0), "0.0");
+        assert_eq!(java_double_to_string(-2.0), "-2.0");
+        // Shortest round-trip fraction.
+        assert_eq!(java_double_to_string(0.1), "0.1");
+        // Special values use the Java literals (not Rust's inf/NaN spellings).
+        assert_eq!(java_double_to_string(f64::INFINITY), "Infinity");
+        assert_eq!(java_double_to_string(f64::NEG_INFINITY), "-Infinity");
+        assert_eq!(java_double_to_string(f64::NAN), "NaN");
+    }
+
+    #[test]
+    fn java_float_to_string_matches_java_spec() {
+        use super::java_float_to_string;
+        assert_eq!(java_float_to_string(1.0), "1.0");
+        assert_eq!(java_float_to_string(-2.0), "-2.0");
+        assert_eq!(java_float_to_string(f32::INFINITY), "Infinity");
+        assert_eq!(java_float_to_string(f32::NEG_INFINITY), "-Infinity");
+        assert_eq!(java_float_to_string(f32::NAN), "NaN");
+    }
+
+    // Fix item 1: a recycled identity hash on a different class must not inherit
+    // a dead object's slot — `pack_obj_key`/`ObjKeyEntry` carry a class marker.
+    #[test]
+    fn pack_obj_key_roundtrip() {
+        use super::pack_obj_key;
+        // Distinct generations under the same hash yield distinct packed keys.
+        let a = pack_obj_key(0xDEAD_BEEF, 0);
+        let b = pack_obj_key(0xDEAD_BEEF, 1);
+        assert_ne!(a, b);
+        // The high 32 bits carry the hash, the low 32 the generation.
+        assert_eq!((a >> 32) as u32, 0xDEAD_BEEF);
+        assert_eq!(a as u32, 0);
+        assert_eq!(b as u32, 1);
     }
 
     #[test]

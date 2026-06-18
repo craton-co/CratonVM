@@ -398,7 +398,26 @@ pub fn load_jks(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStor
                 let enc_key = r.bytes_u32len()?;
                 let key_der = jks_recover_key(&enc_key, password).unwrap_or(enc_key);
                 let chain_count = r.u32_be()? as usize;
-                let mut chain = Vec::with_capacity(chain_count);
+                // SECURITY: `chain_count` is attacker-controlled. A forged
+                // truststore (especially one loaded with an empty password,
+                // which skips the integrity MAC) could declare e.g.
+                // 0xFFFFFFFF certs and force `Vec::with_capacity(4G)` → OOM
+                // DoS before a single cert is parsed. Each chain element
+                // costs at minimum a u16 cert-type length (2 bytes) + a u32
+                // cert-der length (4 bytes) = 6 bytes in the stream, so a
+                // count larger than `remaining / 6` is structurally
+                // impossible — reject it as truncated rather than trusting it.
+                // We also cap the *reserved* capacity (not the loop bound) at
+                // the same realistic ceiling so we never pre-reserve for more
+                // certs than the buffer can physically contain, and let the
+                // per-element `need()` checks in the loop do the final
+                // enforcement (Vec grows incrementally via `push`).
+                const JKS_CHAIN_MIN_ELEM_BYTES: usize = 6; // u16 type-len + u32 der-len
+                let max_possible_chain = r.remaining() / JKS_CHAIN_MIN_ELEM_BYTES;
+                if chain_count > max_possible_chain {
+                    return Err(KeyStoreError::Truncated(r.pos()));
+                }
+                let mut chain = Vec::with_capacity(chain_count.min(max_possible_chain));
                 for _ in 0..chain_count {
                     let _cert_type = r.utf8_u16len()?;
                     let cert_der = r.bytes_u32len()?;
@@ -596,6 +615,12 @@ impl<'a> JksReader<'a> {
     }
     fn pos(&self) -> usize {
         self.cursor
+    }
+    /// Bytes left in the buffer from the current cursor. Used to bound
+    /// attacker-controlled element counts before reserving capacity, so a
+    /// forged count can never drive a huge `Vec::with_capacity` (OOM DoS).
+    fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.cursor)
     }
     fn need(&self, n: usize) -> Result<(), KeyStoreError> {
         if self.cursor + n > self.data.len() {

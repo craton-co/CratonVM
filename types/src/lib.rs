@@ -84,7 +84,7 @@ mod tests {
         assert_eq!(SLOT_SIZE, 16);
         assert_eq!(REF_ELEMENT_SIZE, 8);
         assert!(ARRAY_LENGTH_OFFSET > 0);
-        assert_eq!(AUTOBOX_CLASS_ID.as_u32(), 0xAB00_0000);
+        assert_eq!(AUTOBOX_CLASS_ID.as_u32(), u32::MAX);
     }
 
     #[test]

@@ -5,7 +5,13 @@
 //! `java.util.concurrent.locks.ReentrantReadWriteLock` backends.
 //!
 //! Both lock kinds are implemented as a process-wide `parking_lot::Mutex` +
-//! `Condvar` map keyed by the Java object's pointer address. The same
+//! `Condvar` map keyed by a GC-stable identity of the Java lock object. The
+//! `usize` key is computed by the caller (`lib.rs::gc_stable_lock_key`) from
+//! `identity_hash_code` (plus a generation to break hash collisions) rather
+//! than the raw heap address — a moving collector relocates the lock object,
+//! so a raw-address key computed at lock time would not match the key
+//! recomputed at unlock time, missing the slot (deadlock) or hitting a
+//! neighbour. To this module the key is an opaque, stable `usize`. The same
 //! `Mutex` guards the lock's logical state and acts as the "wait set" the
 //! Condvar parks on, so check-and-block is race-free — unlike the older
 //! native impl that did `monitor_enter; check; monitor_wait(5ms);
@@ -51,7 +57,7 @@
 //! per-thread reentrant counting, and fairness. We also need the lock to be
 //! released **across** the unwinding of a NativeContext call — which means
 //! the state must outlive any single ctx and live in a global. Hence the
-//! address-keyed map.
+//! identity-keyed map (GC-stable `usize` key supplied by the caller).
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -127,12 +133,13 @@ fn stamped_slot(addr: usize) -> std::sync::Arc<StampedLockSlot> {
         .clone()
 }
 
-/// `<init>()` — establish the slot at this object's address.
+/// `<init>()` — establish the slot for this lock's GC-stable identity key.
 pub fn stamped_init(addr: usize) {
-    // Always (re-)install a fresh slot so re-using a finalized object
-    // address can't expose stale state. In practice the heap allocator
-    // never reuses addresses while a Java thread holds a reference, so
-    // this is defensive.
+    // Always (re-)install a fresh slot so a recycled identity key can't
+    // expose stale state. The key is a GC-stable identity hash (+generation)
+    // supplied by `lib.rs::gc_stable_lock_key`, so a live lock keeps the same
+    // key across moving collections; this re-insert is purely defensive
+    // against a brand-new lock reusing a retired key.
     let mut t = stamped_table().lock();
     t.insert(addr, std::sync::Arc::new(StampedLockSlot::new()));
 }

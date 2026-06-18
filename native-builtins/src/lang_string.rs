@@ -2931,15 +2931,47 @@ pub(crate) fn native_string_last_index_of_char(
         _ => return Ok(Some(Value::Int(-1))),
     };
     let ch = match args.get(1) {
-        Some(Value::Int(c)) => char::from_u32(*c as u32).unwrap_or('\0'),
+        Some(Value::Int(c)) => *c,
         _ => return Ok(Some(Value::Int(-1))),
     };
     let s = ctx.read_string(this).unwrap_or_default();
-    let result = s
-        .rfind(ch)
-        .map(|byte_idx| s[..byte_idx].chars().count() as i32)
-        .unwrap_or(-1);
+    // bug nb-lang-string: lastIndexOf is defined over UTF-16 code UNITS, not
+    // Unicode code points. The old `rfind` + `chars().count()` returned a
+    // code-point index, off by the count of preceding supplementary chars.
+    // Encode both haystack and the target code point to UTF-16 and search the
+    // u16 slice (a supplementary `ch` becomes a surrogate pair).
+    let s_units: Vec<u16> = s.encode_utf16().collect();
+    let needle_units: Vec<u16> = match char::from_u32(ch as u32) {
+        Some(c) => {
+            let mut buf = [0u16; 2];
+            c.encode_utf16(&mut buf).to_vec()
+        }
+        None => return Ok(Some(Value::Int(-1))),
+    };
+    let result = last_index_of_units(&s_units, &needle_units);
     Ok(Some(Value::Int(result)))
+}
+
+/// Helper: last index (in UTF-16 code units) of `needle` within `haystack`.
+/// Returns -1 when not found. An empty needle returns `haystack.len()` to
+/// match `String.lastIndexOf("")` semantics used by the str variant.
+fn last_index_of_units(haystack: &[u16], needle: &[u16]) -> i32 {
+    if needle.is_empty() {
+        return haystack.len() as i32;
+    }
+    if needle.len() > haystack.len() {
+        return -1;
+    }
+    let mut i = haystack.len() - needle.len();
+    loop {
+        if &haystack[i..i + needle.len()] == needle {
+            return i as i32;
+        }
+        if i == 0 {
+            return -1;
+        }
+        i -= 1;
+    }
 }
 
 pub(crate) fn native_string_last_index_of_str(
@@ -2955,10 +2987,12 @@ pub(crate) fn native_string_last_index_of_str(
         _ => return Ok(Some(Value::Int(-1))),
     };
     let s = ctx.read_string(this).unwrap_or_default();
-    let result = s
-        .rfind(&needle)
-        .map(|byte_idx| s[..byte_idx].chars().count() as i32)
-        .unwrap_or(-1);
+    // bug nb-lang-string: lastIndexOf(String) must return a UTF-16 code-UNIT
+    // index. The old `rfind` + `chars().count()` returned a code-point index,
+    // off by preceding supplementary chars. Search over u16 code units.
+    let s_units: Vec<u16> = s.encode_utf16().collect();
+    let needle_units: Vec<u16> = needle.encode_utf16().collect();
+    let result = last_index_of_units(&s_units, &needle_units);
     Ok(Some(Value::Int(result)))
 }
 
@@ -2984,14 +3018,14 @@ pub(crate) fn native_string_get_chars(ctx: &mut dyn NativeContext, args: &[Value
         _ => 0,
     };
     let s = ctx.read_string(this).unwrap_or_default();
-    let chars: Vec<char> = s.chars().collect();
-    for (i, &ch) in chars
-        .iter()
-        .enumerate()
-        .take(src_end.min(chars.len()))
-        .skip(src_begin)
-    {
-        ctx.set_array_element(dst, dst_begin + (i - src_begin), Value::Int(ch as i32));
+    // bug nb-lang-string: getChars indexes over UTF-16 code UNITS, not Unicode
+    // code points. The old `s.chars()` (one entry per code point) put
+    // supplementary chars in a single slot and shifted every later index,
+    // corrupting the dest array. Decode to u16 and copy one code unit per slot.
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let end = src_end.min(units.len());
+    for (i, &cu) in units.iter().enumerate().take(end).skip(src_begin) {
+        ctx.set_array_element(dst, dst_begin + (i - src_begin), Value::Int(cu as i32));
     }
     Ok(None)
 }
@@ -3840,26 +3874,44 @@ pub(crate) fn native_string_region_matches_ic(
     };
 
     let s = ctx.read_string(this).unwrap_or_default();
-    let s_chars: Vec<char> = s.chars().collect();
-    let o_chars: Vec<char> = other.chars().collect();
+    // bug nb-lang-string: regionMatches offsets/len are in UTF-16 code UNITS,
+    // not Unicode code points. Index over u16 to agree with charAt/length.
+    let s_units: Vec<u16> = s.encode_utf16().collect();
+    let o_units: Vec<u16> = other.encode_utf16().collect();
 
-    if toffset + len > s_chars.len() || ooffset + len > o_chars.len() {
+    if toffset + len > s_units.len() || ooffset + len > o_units.len() {
         return Ok(Some(Value::Int(0)));
     }
 
     for i in 0..len {
-        let sc = s_chars[toffset + i];
-        let oc = o_chars[ooffset + i];
+        let su = s_units[toffset + i];
+        let ou = o_units[ooffset + i];
         let eq = if ignore_case {
-            sc.to_lowercase().eq(oc.to_lowercase())
+            code_unit_eq_ignore_case(su, ou)
         } else {
-            sc == oc
+            su == ou
         };
         if !eq {
             return Ok(Some(Value::Int(0)));
         }
     }
     Ok(Some(Value::Int(1)))
+}
+
+/// Case-insensitive comparison of two UTF-16 code units, mirroring
+/// `String.regionMatches(true, ...)`: equal directly, or after folding both to
+/// upper-case, or (per the JDK) to lower-case. Surrogate code units (which are
+/// not assignable to a `char` scalar) only compare equal when bit-identical.
+fn code_unit_eq_ignore_case(a: u16, b: u16) -> bool {
+    if a == b {
+        return true;
+    }
+    match (char::from_u32(a as u32), char::from_u32(b as u32)) {
+        (Some(ca), Some(cb)) => {
+            ca.to_uppercase().eq(cb.to_uppercase()) || ca.to_lowercase().eq(cb.to_lowercase())
+        }
+        _ => false,
+    }
 }
 
 /// regionMatches(int toffset, String other, int ooffset, int len) — case-sensitive
@@ -3886,15 +3938,17 @@ pub(crate) fn native_string_region_matches(ctx: &mut dyn NativeContext, args: &[
     };
 
     let s = ctx.read_string(this).unwrap_or_default();
-    let s_chars: Vec<char> = s.chars().collect();
-    let o_chars: Vec<char> = other.chars().collect();
+    // bug nb-lang-string: regionMatches offsets/len are in UTF-16 code UNITS,
+    // not Unicode code points. Index over u16 to agree with charAt/length.
+    let s_units: Vec<u16> = s.encode_utf16().collect();
+    let o_units: Vec<u16> = other.encode_utf16().collect();
 
-    if toffset + len > s_chars.len() || ooffset + len > o_chars.len() {
+    if toffset + len > s_units.len() || ooffset + len > o_units.len() {
         return Ok(Some(Value::Int(0)));
     }
 
     for i in 0..len {
-        if s_chars[toffset + i] != o_chars[ooffset + i] {
+        if s_units[toffset + i] != o_units[ooffset + i] {
             return Ok(Some(Value::Int(0)));
         }
     }
@@ -4145,25 +4199,29 @@ fn native_string_index_of_str_from(
     };
     let src = ctx.read_string(this).unwrap_or_default();
     let needle = ctx.read_string(tgt).unwrap_or_default();
-    let src_chars: Vec<char> = src.chars().collect();
-    let needle_chars: Vec<char> = needle.chars().collect();
-    let src_len = src_chars.len() as i32;
+    // bug nb-lang-string: index over UTF-16 code UNITS, not Unicode code
+    // points. Rust `char` is a code point, so `chars()`-based indexing is off
+    // by one per preceding supplementary (>U+FFFF) char and disagrees with
+    // charAt/length. Match `encode_utf16()` as charAt and the static helper do.
+    let src_units: Vec<u16> = src.encode_utf16().collect();
+    let needle_units: Vec<u16> = needle.encode_utf16().collect();
+    let src_len = src_units.len() as i32;
     let from = from_raw.max(0);
-    if needle_chars.is_empty() {
+    if needle_units.is_empty() {
         // JDK: empty needle → clamp(from, 0, length)
         return Ok(Some(Value::Int(from.min(src_len))));
     }
     if from >= src_len {
         return Ok(Some(Value::Int(-1)));
     }
-    let nlen = needle_chars.len();
-    if nlen > src_chars.len() {
+    let nlen = needle_units.len();
+    if nlen > src_units.len() {
         return Ok(Some(Value::Int(-1)));
     }
-    let max_start = src_chars.len() - nlen;
+    let max_start = src_units.len() - nlen;
     let mut i = from as usize;
     while i <= max_start {
-        if src_chars[i..i + nlen] == needle_chars[..] {
+        if src_units[i..i + nlen] == needle_units[..] {
             return Ok(Some(Value::Int(i as i32)));
         }
         i += 1;
@@ -4427,6 +4485,51 @@ mod tests {
     #[test]
     fn format_float_nan() {
         assert_eq!(format_float(f32::NAN), "NaN");
+    }
+
+    // -----------------------------------------------------------------------
+    // bug nb-lang-string: UTF-16 code-UNIT indexing helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn last_index_of_units_basic() {
+        // "abcabc" — last "bc" at code-unit index 4.
+        let h: Vec<u16> = "abcabc".encode_utf16().collect();
+        let n: Vec<u16> = "bc".encode_utf16().collect();
+        assert_eq!(last_index_of_units(&h, &n), 4);
+        // absent needle → -1
+        let z: Vec<u16> = "zz".encode_utf16().collect();
+        assert_eq!(last_index_of_units(&h, &z), -1);
+        // empty needle → haystack length (in code units)
+        assert_eq!(last_index_of_units(&h, &[]), 6);
+    }
+
+    #[test]
+    fn last_index_of_units_supplementary() {
+        // U+1F600 GRINNING FACE is a surrogate pair = 2 UTF-16 code units.
+        // "\u{1F600}a\u{1F600}b": code-unit indices: [0,1]=face,2='a',
+        // [3,4]=face,5='b'. lastIndexOf("a") (one unit) must be 2, and
+        // lastIndexOf(face) must be 3 — code-unit indices, not code points.
+        let s = "\u{1F600}a\u{1F600}b";
+        let h: Vec<u16> = s.encode_utf16().collect();
+        assert_eq!(h.len(), 6);
+        let a: Vec<u16> = "a".encode_utf16().collect();
+        assert_eq!(last_index_of_units(&h, &a), 2);
+        let face: Vec<u16> = "\u{1F600}".encode_utf16().collect();
+        assert_eq!(face.len(), 2);
+        assert_eq!(last_index_of_units(&h, &face), 3);
+    }
+
+    #[test]
+    fn code_unit_eq_ignore_case_works() {
+        let a: u16 = 'A' as u16;
+        let lower_a: u16 = 'a' as u16;
+        assert!(code_unit_eq_ignore_case(a, lower_a));
+        assert!(code_unit_eq_ignore_case(a, a));
+        assert!(!code_unit_eq_ignore_case('a' as u16, 'b' as u16));
+        // Lone surrogate code units only match when bit-identical.
+        assert!(code_unit_eq_ignore_case(0xD83D, 0xD83D));
+        assert!(!code_unit_eq_ignore_case(0xD83D, 0xDE00));
     }
 
     // -----------------------------------------------------------------------

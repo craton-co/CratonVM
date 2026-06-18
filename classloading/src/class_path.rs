@@ -20,7 +20,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tracing::debug;
 use zip::ZipArchive;
 
@@ -156,6 +156,39 @@ fn dbg_getresources() -> bool {
     })
 }
 
+/// Cached verdict for the `CRATONVM_HARDEN_MANIFEST_CLASSPATH` env var.
+///
+/// VULN (low) — manifest `Class-Path` filesystem reach: per the JAR
+/// spec, a JAR's `MANIFEST.MF` `Class-Path:` attribute can name
+/// *arbitrary* paths (`../../etc`, `file:/etc`, absolute drive roots)
+/// and those become additional classpath roots. HotSpot honours this
+/// verbatim — the manifest is part of the trusted application bundle,
+/// so a relative/absolute escape is the author's prerogative, and
+/// matching that behaviour is the default here so legitimate launchers
+/// (Surefire booter JARs, Spring Boot, fat JARs that point at a sibling
+/// `lib/`) keep working.
+///
+/// When set to a non-empty, non-`"0"` value this flag opts into a
+/// hardened policy: manifest `Class-Path` roots are restricted to
+/// descendants of the JAR's own directory (`jar_dir`), so a hostile or
+/// tampered manifest cannot pull in `file:/etc` or `..\..` outside the
+/// app bundle. Resolution still happens; out-of-tree roots are dropped
+/// (with a debug log) rather than silently honoured. Off by default to
+/// preserve HotSpot parity. Read once at process start (the env can't
+/// change mid-run), mirroring [`dbg_getresources`].
+static HARDEN_MANIFEST_CLASSPATH: OnceLock<bool> = OnceLock::new();
+
+/// `true` when `CRATONVM_HARDEN_MANIFEST_CLASSPATH` is set to a
+/// non-empty, non-`"0"` value. Computed once and cached for the process
+/// lifetime. See [`HARDEN_MANIFEST_CLASSPATH`].
+fn harden_manifest_classpath() -> bool {
+    *HARDEN_MANIFEST_CLASSPATH.get_or_init(|| {
+        std::env::var("CRATONVM_HARDEN_MANIFEST_CLASSPATH")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+    })
+}
+
 /// Bounded FIFO cache for [`fs::canonicalize`] results.
 ///
 /// Round 7 audit fix (HIGH #4): the previous unbounded `HashMap` had
@@ -227,6 +260,37 @@ pub struct ClassPath {
     canonicalize_cache: Mutex<CanonicalizeCache>,
 }
 
+/// Per-archive memoized signing state for a signed JAR.
+///
+/// Security fix (V3, unsigned-entry attack — JAR spec §"Signature
+/// Validation"): the archive-level signer *chain* alone is NOT a
+/// licence to stamp every `.class` in the JAR with the signer's
+/// certificates. The JAR spec only treats an entry as signed when the
+/// **manifest commits to it** with a per-entry `<alg>-Digest` that
+/// matches the entry's bytes. An entry that is present in the archive
+/// but absent from the manifest (or present without a digest) is
+/// **unsigned** — even inside a signed JAR — and an injected/swapped
+/// `.class` must NOT inherit the signer's identity.
+///
+/// We therefore memoize, alongside the verified `chain`, the set of
+/// entry names the manifest committed to (with the digest algorithm and
+/// expected value the signer authenticated). `find_class_code_source_info`
+/// consults `signed_entries` and re-hashes the specific class bytes
+/// before attaching `chain`; a class that is not in this map, or whose
+/// bytes don't match, is reported with an empty cert list (unsigned),
+/// matching HotSpot's per-entry `CodeSigner` semantics.
+struct JarSignerInfo {
+    /// Verified archive-level signer cert chain (leaf first), the union
+    /// of every signer block that passed full verification. Empty for an
+    /// unsigned JAR or one that failed verification.
+    chain: Vec<Vec<u8>>,
+    /// Entry name (JAR-internal path, e.g. `com/example/Foo.class`) →
+    /// the `(algorithm, expected-digest)` the manifest committed to for
+    /// that entry, restricted to manifests bound to a verified signer.
+    /// Only entries appearing here are eligible to inherit `chain`.
+    signed_entries: HashMap<String, (crate::jar_signer::DigestAlg, Vec<u8>)>,
+}
+
 enum ClassPathEntry {
     Directory(PathBuf),
     /// A JAR file read into memory. The `Mutex` provides interior mutability
@@ -242,7 +306,14 @@ enum ClassPathEntry {
         /// multi-release lookup so subsequent lookups skip
         /// `by_name` probes for absent versions. `None` means the
         /// cache hasn't been built yet.
-        versions_cache: Mutex<Option<BTreeSet<u32>>>,
+        ///
+        /// PERF: wrapped in `Arc` so `ensure_versions_cache` can hand
+        /// callers a cheap reference-count bump instead of deep-cloning
+        /// the whole `BTreeSet` on every multi-release class lookup (the
+        /// previous `cache.clone()` heap-allocated a fresh tree per
+        /// lookup). The set is immutable once built, so sharing it is
+        /// behavior-preserving.
+        versions_cache: Mutex<Option<Arc<BTreeSet<u32>>>>,
         /// Report P1 (perf): memoized verified signer cert chain (leaf+chain
         /// DER) for this archive. `extract_jar_signer_blocks` is a pure
         /// function of the archive — the `CodeSource` certificates are
@@ -251,10 +322,14 @@ enum ClassPathEntry {
         /// `*.RSA`/`*.SF`, PKCS#7 parse, RSA/ECDSA/DSA verify, trust-chain
         /// walk, and (post V1 fix) a MANIFEST.MF + per-entry digest re-hash.
         /// Populated once on the first signed lookup and cloned thereafter;
-        /// an empty `Vec` (unsigned, or failed verification) is also cached so
+        /// an empty chain (unsigned, or failed verification) is also cached so
         /// the rescan is skipped for unsigned JARs too. Security is unchanged
         /// — the full verification still runs, exactly once.
-        signer_cache: OnceLock<Vec<Vec<u8>>>,
+        ///
+        /// V3: now also carries the manifest-committed `signed_entries` map so
+        /// the signer chain is attached **per class** (only to entries the
+        /// signer committed to), not blanket to every class in the archive.
+        signer_cache: OnceLock<JarSignerInfo>,
     },
     /// A virtual directory inside a fat JAR (e.g. `BOOT-INF/classes/`).
     /// Entries are stored as a map from relative path to byte content.
@@ -277,7 +352,10 @@ enum ClassPathEntry {
         /// Report P1 (perf): memoized verified signer cert chain for this
         /// nested archive — see the matching field on `JarFile`. Populated
         /// once on the first signed lookup, cloned thereafter.
-        signer_cache: OnceLock<Vec<Vec<u8>>>,
+        ///
+        /// V3: carries the manifest-committed `signed_entries` map for
+        /// per-class cert attachment (see [`JarSignerInfo`]).
+        signer_cache: OnceLock<JarSignerInfo>,
     },
     /// A JDK 9+ JMOD file (ZIP with 4-byte `JM\x01\x00` prefix).
     /// All entries under `classes/` are pre-extracted into an in-memory cache
@@ -445,6 +523,34 @@ impl ManifestInfo {
         folded
     }
 
+    /// Decode a single JAR-manifest `Class-Path:` token into a filesystem
+    /// path.
+    ///
+    /// **SECURITY (VULN, low) — trusted-manifest filesystem reach.** This
+    /// deliberately honours `file:` URLs, absolute paths, Windows
+    /// drive-absolute paths, and `..` escapes, joining only genuinely
+    /// relative tokens to `jar_dir`. That means a JAR's manifest can add
+    /// *arbitrary* filesystem roots as classpath entries — e.g.
+    /// `Class-Path: file:/etc` or `Class-Path: ../../secret` — exactly as
+    /// HotSpot's `URLClassPath` does. The manifest is part of the trusted
+    /// application bundle (it ships inside the JAR the user chose to run),
+    /// so this is the spec-mandated behaviour and is REQUIRED by real
+    /// launchers (Surefire booter JARs emit absolute `file:/C:/...` tokens;
+    /// fat JARs point at sibling `lib/` dirs). We must NOT break it by
+    /// default.
+    ///
+    /// Defence in depth: every path produced here is still subject to the
+    /// downstream canonicalize/`is_safe_*` checks at *read* time, so a
+    /// decoded `..` cannot escape the resolved root of whatever entry it
+    /// becomes — this function only chooses the roots, it does not grant
+    /// raw file access.
+    ///
+    /// For environments that want to forbid out-of-bundle reach, the
+    /// caller [`ManifestInfo::resolve_class_path`] gates roots behind
+    /// [`harden_manifest_classpath`] (`CRATONVM_HARDEN_MANIFEST_CLASSPATH`),
+    /// restricting resolved roots to descendants of `jar_dir`. Decoding
+    /// itself is left permissive so the caller can make that policy
+    /// decision against the canonical form.
     fn decode_manifest_classpath_entry(entry: &str, jar_dir: &Path) -> PathBuf {
         let raw = entry.trim();
         // JAR manifests may carry file URLs (e.g. surefire booter jars emit
@@ -544,10 +650,26 @@ impl ManifestInfo {
         match &self.class_path {
             Some(cp) => cp
                 .split_whitespace()
-                .map(|entry| {
-                    Self::decode_manifest_classpath_entry(entry, jar_dir)
-                        .to_string_lossy()
-                        .into_owned()
+                .filter_map(|entry| {
+                    let resolved = Self::decode_manifest_classpath_entry(entry, jar_dir);
+                    // VULN (low) hardening opt-in: when
+                    // `CRATONVM_HARDEN_MANIFEST_CLASSPATH` is set, drop any
+                    // manifest `Class-Path` root that escapes the JAR's own
+                    // directory (absolute roots, `file:/etc`, `..` escapes).
+                    // Default-off preserves HotSpot's trusted-manifest
+                    // behaviour; see `decode_manifest_classpath_entry`.
+                    if harden_manifest_classpath()
+                        && !path_is_within(&resolved, jar_dir)
+                    {
+                        debug!(
+                            "manifest Class-Path entry {:?} resolves outside the \
+                             JAR directory {:?}; dropped \
+                             (CRATONVM_HARDEN_MANIFEST_CLASSPATH)",
+                            entry, jar_dir
+                        );
+                        return None;
+                    }
+                    Some(resolved.to_string_lossy().into_owned())
                 })
                 .collect(),
             None => Vec::new(),
@@ -651,6 +773,85 @@ pub(crate) fn is_safe_entry_name(name: &str) -> bool {
         }
     }
     true
+}
+
+/// VULN (low) hardening helper: returns `true` when `candidate` resolves
+/// to a location at or beneath `base`, using a purely *lexical*
+/// normalization (no filesystem access — `resolve_class_path` is a pure
+/// resolver and the paths may not exist yet).
+///
+/// Both paths are first lexically normalized: `.` components are dropped
+/// and `..` components pop the previous normal component (a leading or
+/// un-poppable `..` is preserved, which keeps the candidate firmly
+/// *outside* any relative base). The candidate is then required to share
+/// `base`'s full component prefix. A `base` that normalizes to empty
+/// (e.g. `"."`) admits any relative candidate but still rejects absolute
+/// ones and ones that climb above the current directory.
+///
+/// This is intentionally conservative: it only *adds* a restriction when
+/// `CRATONVM_HARDEN_MANIFEST_CLASSPATH` is set, so a false negative
+/// (dropping a borderline path) is preferable to admitting an escape.
+fn path_is_within(candidate: &Path, base: &Path) -> bool {
+    use std::path::Component;
+
+    // Lexically normalize a path into a component vector. Returns `None`
+    // if a `..` would climb above the root the path is anchored to, which
+    // for our purposes means "treat as outside" (the caller drops it).
+    fn normalize(p: &Path) -> Vec<Component<'_>> {
+        let mut stack: Vec<Component<'_>> = Vec::new();
+        for comp in p.components() {
+            match comp {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    match stack.last() {
+                        // Pop a real directory component.
+                        Some(Component::Normal(_)) => {
+                            stack.pop();
+                        }
+                        // A `..` at/above an anchor (root/prefix) or after
+                        // another preserved `..` is kept verbatim so the
+                        // prefix check below can reject the escape.
+                        _ => stack.push(comp),
+                    }
+                }
+                other => stack.push(other),
+            }
+        }
+        stack
+    }
+
+    let base_norm = normalize(base);
+    let cand_norm = normalize(candidate);
+
+    // An absolute candidate against a relative base (or vice-versa) can
+    // never be "within": their root/prefix components won't match, so the
+    // prefix check below handles it. The candidate must be at least as
+    // long as the base and agree on every base component.
+    if cand_norm.len() < base_norm.len() {
+        return false;
+    }
+    // Special case: a base that normalizes to empty (e.g. `"."`, used when
+    // the JAR has no parent dir) means "the JAR's own relative location".
+    // A relative candidate is admissible, but an *absolute* one (a
+    // root/prefix first component, e.g. manifest `file:/etc`) escapes it
+    // and must be rejected.
+    if base_norm.is_empty() {
+        if let Some(first) = cand_norm.first() {
+            if matches!(first, Component::Prefix(_) | Component::RootDir) {
+                return false;
+            }
+        }
+    }
+    base_norm
+        .iter()
+        .zip(cand_norm.iter())
+        .all(|(b, c)| b == c)
+        // A normalized candidate that still contains a leading `..` escaped
+        // above its anchor is never "within" a base lacking that same `..`.
+        && !cand_norm
+            .iter()
+            .skip(base_norm.len())
+            .any(|c| matches!(c, Component::ParentDir))
 }
 
 /// Percent-decode an RFC 3986 `file:` URI path.
@@ -786,14 +987,17 @@ impl ClassPath {
     /// absent version.
     fn ensure_versions_cache(
         archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>,
-        versions_cache: &Mutex<Option<BTreeSet<u32>>>,
-    ) -> BTreeSet<u32> {
-        // Fast-path under the lock; clone-out is cheap for a set of
-        // <= ~20 small integers.
+        versions_cache: &Mutex<Option<Arc<BTreeSet<u32>>>>,
+    ) -> Arc<BTreeSet<u32>> {
+        // PERF: hand back a shared `Arc` so the fast path (every
+        // multi-release class lookup after the first) is an atomic
+        // reference-count bump, not a heap-allocating deep `BTreeSet`
+        // clone. The cached set is immutable after construction, so all
+        // callers can safely share it; they only iterate over it.
         {
             let guard = versions_cache.lock();
             if let Some(cache) = guard.as_ref() {
-                return cache.clone();
+                return Arc::clone(cache);
             }
         }
         // Build by scanning the central directory once.
@@ -815,9 +1019,20 @@ impl ClassPath {
                 }
             }
         }
+        // PERF: store the set behind an `Arc` once; the build path no
+        // longer pays an extra `set.clone()` — the `Arc` and its return
+        // value share the single heap allocation.
+        let shared = Arc::new(set);
         let mut guard = versions_cache.lock();
-        *guard = Some(set.clone());
-        set
+        // Tolerate the benign race where another thread built the cache
+        // first; either set is identical (pure function of the archive),
+        // so adopt whichever is already published to keep all callers on
+        // one shared allocation.
+        if let Some(existing) = guard.as_ref() {
+            return Arc::clone(existing);
+        }
+        *guard = Some(Arc::clone(&shared));
+        shared
     }
 
     /// Look up an entry in a multi-release JAR archive.
@@ -835,7 +1050,7 @@ impl ClassPath {
     /// per-class 17 `by_name` round-trips.
     fn find_in_multi_release_archive(
         archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>,
-        versions_cache: &Mutex<Option<BTreeSet<u32>>>,
+        versions_cache: &Mutex<Option<Arc<BTreeSet<u32>>>>,
         name: &str,
     ) -> Option<Vec<u8>> {
         let present = Self::ensure_versions_cache(archive, versions_cache);
@@ -1793,10 +2008,24 @@ impl ClassPath {
                         let p = p.strip_prefix("//?/").unwrap_or(&p).to_string();
                         let p = p.trim_start_matches('/').to_string();
                         // Report P1 (perf): verify the signer blocks at most once
-                        // per archive, then clone the cached cert chain.
-                        let certs = signer_cache
-                            .get_or_init(|| Self::extract_jar_signer_blocks(archive))
-                            .clone();
+                        // per archive, then reuse the cached signing state.
+                        let info = signer_cache
+                            .get_or_init(|| Self::extract_jar_signer_blocks(archive));
+                        // V3 (unsigned-entry attack): attach the signer chain
+                        // ONLY if this exact class entry is committed-to by the
+                        // verified manifest and its bytes still match. A class
+                        // present in a signed JAR but absent from the manifest
+                        // (or whose bytes were swapped post-sign) is unsigned.
+                        // For multi-release JARs the *served* entry (possibly
+                        // `META-INF/versions/<N>/<class>`) is the one that must
+                        // be signed, so resolve it before checking.
+                        let mr_cache = if *multi_release { Some(versions_cache) } else { None };
+                        let certs = Self::certs_for_signed_class(
+                            info,
+                            archive,
+                            &relative_path,
+                            mr_cache,
+                        );
                         return Some((format!("file:/{p}"), certs));
                     }
                 }
@@ -1814,10 +2043,18 @@ impl ClassPath {
                         let outer = parent_jar.to_string_lossy().replace('\\', "/");
                         let outer = outer.trim_start_matches('/').to_string();
                         // Report P1 (perf): verify the signer blocks at most once
-                        // per nested archive, then clone the cached cert chain.
-                        let certs = signer_cache
-                            .get_or_init(|| Self::extract_jar_signer_blocks(archive))
-                            .clone();
+                        // per nested archive, then reuse the cached signing state.
+                        let info = signer_cache
+                            .get_or_init(|| Self::extract_jar_signer_blocks(archive));
+                        // V3 (unsigned-entry attack): per-class cert attachment —
+                        // see the matching `JarFile` arm above. Nested JARs are
+                        // not searched multi-release here, so pass `None`.
+                        let certs = Self::certs_for_signed_class(
+                            info,
+                            archive,
+                            &relative_path,
+                            None,
+                        );
                         return Some((format!("jar:file:/{outer}!/{nested_path}"), certs));
                     }
                 }
@@ -1863,7 +2100,7 @@ impl ClassPath {
     /// is hoisted out of `cratonvm-native-builtins` we plug it in here.
     fn extract_jar_signer_blocks(
         archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>,
-    ) -> Vec<Vec<u8>> {
+    ) -> JarSignerInfo {
         let mut guard = archive.lock();
         // Collect every safe META-INF entry name once; we need both the
         // `*.SF` companions (to feed into the integrity check) and the
@@ -1899,6 +2136,11 @@ impl ClassPath {
         }
 
         let mut out: Vec<Vec<u8>> = Vec::new();
+        // V3: union of every entry the bound manifest committed to (across
+        // all verified signer blocks). Only classes appearing here are
+        // eligible to inherit `out` (the signer chain).
+        let mut signed_entries: HashMap<String, (crate::jar_signer::DigestAlg, Vec<u8>)> =
+            HashMap::new();
         for name in signer_block_names {
             // Read signer block bytes (clamped against zip-bomb sizes,
             // streaming-bounded by `read_entry_capped` — V2).
@@ -1958,9 +2200,16 @@ impl ClassPath {
                 // rejects the whole signer block on any mismatch — so the
                 // certs are dropped (CodeSource reported as unsigned),
                 // matching HotSpot's "fails verify" behaviour.
-                if Self::verify_signed_entries(&mut guard, &sf_bytes) {
+                if let Some(entries) = Self::verify_signed_entries(&mut guard, &sf_bytes) {
                     for cert in vs.chain {
                         out.push(cert);
+                    }
+                    // V3: record exactly which entries this verified signer
+                    // committed to, so cert attachment can be gated per class.
+                    for (entry_name, alg, expected) in entries {
+                        signed_entries
+                            .entry(entry_name)
+                            .or_insert((alg, expected));
                     }
                 } else {
                     debug!(
@@ -1971,7 +2220,101 @@ impl ClassPath {
                 }
             }
         }
-        out
+        // V3: if no signer block fully verified, `out` is empty; the
+        // `signed_entries` map is then irrelevant (no chain to attach) and is
+        // returned empty too. An archive with a verified chain but a class
+        // absent from `signed_entries` will be reported unsigned per class.
+        JarSignerInfo {
+            chain: out,
+            signed_entries,
+        }
+    }
+
+    /// V3 (unsigned-entry attack, JAR spec §"Signature Validation"):
+    /// decide whether the archive-level signer `chain` may be attached to
+    /// the specific class entry `relative_path`.
+    ///
+    /// The chain is returned **only** when `relative_path` is one of the
+    /// entries the verified manifest committed to (recorded in
+    /// `info.signed_entries`) AND the class's *current* bytes still hash to
+    /// the digest the signer authenticated. Any other case — the entry is
+    /// not named in the manifest, has no digest, or its bytes were swapped
+    /// after signing — is treated as **unsigned** and yields an empty cert
+    /// list, so `Class.getCodeSource().getCertificates()` is empty/null,
+    /// matching HotSpot's per-entry `CodeSigner` behaviour.
+    ///
+    /// Re-hashing here (rather than trusting the one-time
+    /// `verify_signed_entries` pass) is cheap — a single SHA over the class
+    /// we are about to load anyway — and is robust against any in-memory
+    /// cache staleness; it also means the per-archive `info` can be cached
+    /// while the decision stays per class.
+    ///
+    /// `mr_versions` is `Some(versions_cache)` for a `Multi-Release: true`
+    /// JAR. In that case the *served* entry may be a
+    /// `META-INF/versions/<N>/<class>` override, and it is THAT entry name
+    /// (not the base `relative_path`) the signer must have committed to —
+    /// otherwise a versioned override could be smuggled in unsigned while
+    /// inheriting the base entry's certs. We resolve the served name with
+    /// the same descending search `find_in_multi_release_archive` uses.
+    fn certs_for_signed_class(
+        info: &JarSignerInfo,
+        archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>,
+        relative_path: &str,
+        mr_versions: Option<&Mutex<Option<Arc<BTreeSet<u32>>>>>,
+    ) -> Vec<Vec<u8>> {
+        // Unsigned JAR / failed verification: nothing to attach.
+        if info.chain.is_empty() {
+            return Vec::new();
+        }
+
+        // Resolve the entry name that actually serves this class. For a
+        // multi-release JAR the highest present versioned override wins; the
+        // base entry is the fallback. This mirrors
+        // `find_in_multi_release_archive` so the entry we digest-check is the
+        // one we hand to the classloader.
+        let served_name: String = match mr_versions {
+            Some(versions_cache) => {
+                let present = Self::ensure_versions_cache(archive, versions_cache);
+                let mut resolved: Option<String> = None;
+                for &ver in present.range(9..=JVM_FEATURE_VERSION).rev() {
+                    let versioned = format!("META-INF/versions/{ver}/{relative_path}");
+                    if Self::find_in_archive(archive, &versioned).is_some() {
+                        resolved = Some(versioned);
+                        break;
+                    }
+                }
+                resolved.unwrap_or_else(|| relative_path.to_string())
+            }
+            None => relative_path.to_string(),
+        };
+
+        // The served entry must be one the signer explicitly committed to.
+        let Some((alg, expected)) = info.signed_entries.get(&served_name) else {
+            // Present in a signed JAR but NOT named (with a digest) in the
+            // manifest → unsigned entry. Do not inherit the signer's certs.
+            debug!(
+                "jar signer: class entry {} is not committed-to by the signed \
+                 manifest — reporting CodeSource as unsigned",
+                served_name
+            );
+            return Vec::new();
+        };
+        // Re-read and re-hash the exact bytes we are about to load.
+        let Some(bytes) = Self::find_in_archive(archive, &served_name) else {
+            return Vec::new();
+        };
+        if crate::jar_signer::digest_matches(*alg, &bytes, expected) {
+            info.chain.clone()
+        } else {
+            // Manifest names this entry but the on-disk bytes don't match the
+            // signed digest (post-sign tamper) → unsigned.
+            debug!(
+                "jar signer: class entry {} digest mismatch vs signed manifest \
+                 — reporting CodeSource as unsigned",
+                served_name
+            );
+            Vec::new()
+        }
     }
 
     /// V1: bind a verified signer to the actual entry bytes.
@@ -1985,36 +2328,48 @@ impl ClassPath {
     ///      named entry and confirms its bytes hash to the manifest's
     ///      `<alg>-Digest` value.
     ///
-    /// Returns `true` only when the manifest is bound by the `.SF` **and**
-    /// every declared entry digest matches. Any missing manifest, missing
-    /// committed entry, unreadable entry, or digest mismatch returns
-    /// `false` (fail-closed). Directory entries (`Name:` ending in `/`)
-    /// carry no digest and are skipped by the parser.
+    /// Returns `Some(entries)` only when the manifest is bound by the `.SF`
+    /// **and** every declared entry digest matches; each tuple is
+    /// `(entry_name, algorithm, expected_digest)` for an entry the signer
+    /// committed to. Any missing manifest, missing committed entry,
+    /// unreadable entry, or digest mismatch returns `None` (fail-closed).
+    /// Directory entries (`Name:` ending in `/`) carry no digest and are
+    /// skipped by the parser.
+    ///
+    /// V3: the returned list is the authoritative set of *signed* entries
+    /// for this signer. `find_class_code_source_info` uses it to attach the
+    /// signer chain per class — entries absent from this list are unsigned
+    /// even though they live inside the signed JAR (closing the JAR-spec
+    /// unsigned-entry attack, where an injected `.class` not named in the
+    /// manifest would otherwise inherit the signer's certificates).
+    #[allow(clippy::type_complexity)]
     fn verify_signed_entries(
         archive: &mut ZipArchive<Cursor<Vec<u8>>>,
         sf_bytes: &[u8],
-    ) -> bool {
+    ) -> Option<Vec<(String, crate::jar_signer::DigestAlg, Vec<u8>)>> {
         // (1) Read MANIFEST.MF (streaming-bounded against zip-bombs).
         let manifest_bytes = match archive.by_name("META-INF/MANIFEST.MF").and_then(|mut e| {
             let size = e.size();
             Ok(read_entry_capped(&mut e, size)?)
         }) {
             Ok(d) => d,
-            Err(_) => return false,
+            Err(_) => return None,
         };
 
         // (2) The `.SF` must commit to this exact MANIFEST.MF.
         if !crate::jar_signer::verify_sf_binds_manifest(sf_bytes, &manifest_bytes) {
-            return false;
+            return None;
         }
 
         // (3) Every entry the manifest declares a digest for must match.
         let declared = crate::jar_signer::parse_manifest_entry_digests(&manifest_bytes);
+        let mut verified: Vec<(String, crate::jar_signer::DigestAlg, Vec<u8>)> =
+            Vec::with_capacity(declared.len());
         for entry in &declared {
             // Defence-in-depth: never let a manifest `Name:` smuggle a
             // traversal/drive-letter key into the lookup.
             if !is_safe_entry_name(&entry.name) {
-                return false;
+                return None;
             }
             let bytes = match archive.by_name(&entry.name).and_then(|mut e| {
                 let size = e.size();
@@ -2023,13 +2378,16 @@ impl ClassPath {
                 Ok(d) => d,
                 // A manifest that signs an entry which is absent or
                 // unreadable is a tampered/broken JAR — fail-closed.
-                Err(_) => return false,
+                Err(_) => return None,
             };
             if !crate::jar_signer::digest_matches(entry.alg, &bytes, &entry.expected) {
-                return false;
+                return None;
             }
+            // V3: this entry is committed-to by the signer and its bytes
+            // match — record it as a genuinely signed entry.
+            verified.push((entry.name.clone(), entry.alg, entry.expected.clone()));
         }
-        true
+        Some(verified)
     }
 
     /// Find a raw resource file by its classpath-relative name.
@@ -4689,5 +5047,75 @@ Implementation-Version: 999.999\n";
         let mut entries: Vec<ClassPathEntry> = Vec::new();
         ClassPath::load_jar_data(Path::new("corrupt.jar"), truncated, &mut entries);
         // No assertion on entry count: the contract is "does not panic".
+    }
+
+    // -- VULN (low) manifest Class-Path hardening: `path_is_within` --
+    //
+    // These exercise the pure lexical containment helper that backs the
+    // opt-in `CRATONVM_HARDEN_MANIFEST_CLASSPATH` policy. The env-gated
+    // wiring in `resolve_class_path` is not toggled here (the flag latches
+    // in a process-wide `OnceLock`), so we test the decision function
+    // directly.
+
+    #[test]
+    fn path_is_within_accepts_descendants() {
+        assert!(path_is_within(
+            Path::new("C:/app/lib/dep.jar"),
+            Path::new("C:/app")
+        ));
+        assert!(path_is_within(
+            Path::new("C:/app/lib/sub/dep.jar"),
+            Path::new("C:/app/lib")
+        ));
+        // Identical path is "within" itself.
+        assert!(path_is_within(Path::new("C:/app"), Path::new("C:/app")));
+    }
+
+    #[test]
+    fn path_is_within_rejects_dotdot_escape() {
+        // `..` that climbs out of the base directory must be rejected.
+        assert!(!path_is_within(
+            Path::new("C:/app/../secret/x.jar"),
+            Path::new("C:/app")
+        ));
+        assert!(!path_is_within(
+            Path::new("C:/app/lib/../../secret"),
+            Path::new("C:/app")
+        ));
+    }
+
+    #[test]
+    fn path_is_within_rejects_unrelated_absolute_root() {
+        // A sibling/foreign absolute root (e.g. manifest `file:/etc`) is
+        // not a descendant of the JAR directory.
+        assert!(!path_is_within(Path::new("C:/etc"), Path::new("C:/app")));
+        assert!(!path_is_within(
+            Path::new("D:/other/x.jar"),
+            Path::new("C:/app")
+        ));
+    }
+
+    #[test]
+    fn path_is_within_dot_dot_normalizes_back_inside() {
+        // `lib/../lib2` stays inside `C:/app`.
+        assert!(path_is_within(
+            Path::new("C:/app/lib/../lib2/dep.jar"),
+            Path::new("C:/app")
+        ));
+    }
+
+    #[test]
+    fn manifest_classpath_escape_preserved_by_default() {
+        // Regression guard for the DEFAULT (HotSpot-parity) behaviour: with
+        // the hardening flag OFF, a manifest Class-Path that escapes the
+        // JAR directory MUST still resolve (matching
+        // `manifest_classpath_relative_entries_still_resolve_against_jar_dir`).
+        // This protects the trusted-manifest contract `decode_manifest_classpath_entry`
+        // documents from accidental regression.
+        let data = b"Class-Path: ../../shared/b.jar\n";
+        let info = ManifestInfo::parse(data);
+        let cp = info.resolve_class_path(Path::new("C:/tmp/boot/booter.jar"));
+        assert_eq!(cp.len(), 1, "default policy must keep escaping entries: {cp:?}");
+        assert!(cp[0].replace('\\', "/").contains("../../shared/b.jar"));
     }
 }

@@ -7,6 +7,7 @@
 //! `java.awt.image.BufferedImage`. All pixel data is stored internally
 //! as ARGB u32 arrays regardless of the declared `ImageType`.
 
+use std::cell::Cell;
 use std::sync::OnceLock;
 
 use parking_lot::Mutex;
@@ -306,21 +307,121 @@ impl Clone for BufferedImageData {
 /// `flush()`: a CratonVM `BufferedImage` is memory-backed and therefore not
 /// reconstructable, so the JDK contract requires its raster to survive
 /// `flush()` (callers may legally read or re-`createGraphics()` afterwards).
-/// `destroy()` below performs the actual reclamation and is only safe to call
-/// at the image's true end-of-life; no native end-of-life hook for
-/// `BufferedImage` exists yet (a finalizer/Cleaner or a bounded LRU keyed on
-/// idle time would be the next step), so it is currently exercised only by
-/// tests. Do NOT wire `destroy()` to anything that can race a live raster.
+/// `destroy()` below performs the actual targeted reclamation.
+///
+/// Bug awt-font-image #2 — bounded raster memory: previously the only
+/// reclamation was `destroy()` (test-only, since no native end-of-life hook
+/// for `BufferedImage` exists — the VM exposes no GC→native callback or
+/// identity-hash→ObjectRef resolver to this crate), so every `createImage`
+/// leaked `width*height*4` bytes for the VM lifetime. We now bound the total
+/// raster memory with an LRU keyed on a last-touch logical clock (mirroring
+/// the font-metrics / glyph-atlas LRUs elsewhere in this crate). When a new
+/// image would push the registry over [`RASTER_BUDGET_BYTES`], the
+/// least-recently-touched rasters are evicted until the registry fits again
+/// (the just-created image is never evicted, so a single create always
+/// succeeds). Every `get`/`get_mut`/`create` refreshes the touched image's
+/// stamp, so any image an app is actively reading or drawing stays hot.
+///
+/// Tradeoff: the budget is deliberately large (default 256 MiB) so that under
+/// realistic workloads only truly idle rasters are reclaimed. A pathological
+/// app that holds live references to more than the budget of simultaneously
+/// idle images could see a long-untouched-but-still-referenced raster blanked
+/// (subsequent `getRGB` reads 0); this is the documented cost of having no GC
+/// end-of-life hook. The previous unbounded leak was strictly worse.
 pub struct ImageRegistry {
-    images: FxHashMap<u64, BufferedImageData>,
+    images: FxHashMap<u64, ImageEntry>,
     next_id: u64,
+    /// Monotonic logical clock; bumped on every touch (create / get / get_mut)
+    /// so LRU eviction can order entries by last use. `Cell` so `get(&self)`
+    /// can refresh a touch without requiring `&mut self` at every call site.
+    tick: Cell<u64>,
+    /// Running sum of every entry's `byte_len`, kept in step with inserts and
+    /// evictions so the budget check is O(1) instead of re-summing the map.
+    total_bytes: usize,
+    /// Soft ceiling on `total_bytes` before LRU eviction runs. Defaults to
+    /// [`RASTER_BUDGET_BYTES`]; overridable only in tests so the eviction path
+    /// can be exercised without allocating the full production budget.
+    budget_bytes: usize,
 }
+
+/// One registered image plus its LRU bookkeeping.
+struct ImageEntry {
+    data: BufferedImageData,
+    /// Value of [`ImageRegistry::tick`] at this entry's last access. `Cell`
+    /// so a `get(&self)` read can refresh it through a shared borrow.
+    last_touch: Cell<u64>,
+    /// Cached raster size in bytes (`width * height * 4`), so eviction can
+    /// maintain the running `total_bytes` without recomputing.
+    byte_len: usize,
+}
+
+/// Soft ceiling on total raster bytes held by the registry before LRU
+/// eviction kicks in. 256 MiB comfortably holds dozens of full-HD ARGB
+/// images; chosen large so eviction only ever reclaims genuinely idle rasters
+/// under realistic Swing/Java2D workloads.
+const RASTER_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 impl ImageRegistry {
     fn new() -> Self {
         ImageRegistry {
             images: FxHashMap::default(),
             next_id: 1,
+            tick: Cell::new(0),
+            total_bytes: 0,
+            budget_bytes: RASTER_BUDGET_BYTES,
+        }
+    }
+
+    /// Test-only constructor with a custom raster budget so the LRU eviction
+    /// path can be exercised without allocating the full production budget.
+    #[cfg(test)]
+    fn with_budget(budget_bytes: usize) -> Self {
+        ImageRegistry {
+            budget_bytes,
+            ..ImageRegistry::new()
+        }
+    }
+
+    /// Bump and return the logical clock.
+    #[inline]
+    fn next_tick(&self) -> u64 {
+        let t = self.tick.get().wrapping_add(1);
+        self.tick.set(t);
+        t
+    }
+
+    /// Byte footprint of a raster of these dimensions (ARGB = 4 bytes/pixel).
+    #[inline]
+    fn raster_bytes(data: &BufferedImageData) -> usize {
+        (data.width() as usize)
+            .saturating_mul(data.height() as usize)
+            .saturating_mul(4)
+    }
+
+    /// Evict least-recently-touched entries until total raster bytes fit
+    /// within [`RASTER_BUDGET_BYTES`], never touching `protect` (the image we
+    /// just inserted — evicting it would defeat the create). Bug
+    /// awt-font-image #2.
+    fn evict_until_within_budget(&mut self, protect: u64) {
+        while self.total_bytes > self.budget_bytes {
+            // Find the oldest (smallest last_touch) entry other than `protect`.
+            let victim = self
+                .images
+                .iter()
+                .filter(|(id, _)| **id != protect)
+                .min_by_key(|(_, e)| e.last_touch.get())
+                .map(|(id, _)| *id);
+            match victim {
+                Some(id) => {
+                    if let Some(e) = self.images.remove(&id) {
+                        self.total_bytes = self.total_bytes.saturating_sub(e.byte_len);
+                    }
+                }
+                // Nothing left to evict but the protected image — stop (a
+                // single image larger than the whole budget is kept rather
+                // than dropped, so the create still works).
+                None => break,
+            }
         }
     }
 
@@ -336,25 +437,53 @@ impl ImageRegistry {
         image_type: ImageType,
     ) -> Option<ImageId> {
         let data = BufferedImageData::try_new(width, height, image_type)?;
+        let byte_len = Self::raster_bytes(&data);
         let id = self.next_id;
         self.next_id += 1;
-        self.images.insert(id, data);
+        let touch = self.next_tick();
+        self.total_bytes = self.total_bytes.saturating_add(byte_len);
+        self.images.insert(
+            id,
+            ImageEntry {
+                data,
+                last_touch: Cell::new(touch),
+                byte_len,
+            },
+        );
+        // Bug awt-font-image #2: reclaim idle rasters so total memory stays
+        // bounded. Protect the image we just inserted.
+        self.evict_until_within_budget(id);
         Some(ImageId(id))
     }
 
-    /// Look up an image by ID (immutable).
+    /// Look up an image by ID (immutable). Refreshes the entry's LRU stamp so
+    /// an actively-read image is never treated as idle.
     pub fn get(&self, id: ImageId) -> Option<&BufferedImageData> {
-        self.images.get(&id.0)
+        // Compute the new stamp before borrowing the entry so the two shared
+        // (`&self`) borrows don't visually overlap; both only read `self`.
+        let touch = self.next_tick();
+        let entry = self.images.get(&id.0)?;
+        entry.last_touch.set(touch);
+        Some(&entry.data)
     }
 
-    /// Look up an image by ID (mutable).
+    /// Look up an image by ID (mutable). Refreshes the entry's LRU stamp.
     pub fn get_mut(&mut self, id: ImageId) -> Option<&mut BufferedImageData> {
-        self.images.get_mut(&id.0)
+        let touch = self.next_tick();
+        let entry = self.images.get_mut(&id.0)?;
+        entry.last_touch.set(touch);
+        Some(&mut entry.data)
     }
 
     /// Remove an image from the registry, freeing its pixel data.
     pub fn destroy(&mut self, id: ImageId) -> bool {
-        self.images.remove(&id.0).is_some()
+        match self.images.remove(&id.0) {
+            Some(e) => {
+                self.total_bytes = self.total_bytes.saturating_sub(e.byte_len);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Number of images currently registered.
@@ -365,6 +494,11 @@ impl ImageRegistry {
     /// Whether the registry is empty.
     pub fn is_empty(&self) -> bool {
         self.images.is_empty()
+    }
+
+    /// Total raster bytes currently held. Mainly for tests / diagnostics.
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
     }
 }
 
@@ -557,6 +691,44 @@ mod tests {
     fn registry_destroy_nonexistent() {
         let mut reg = ImageRegistry::new();
         assert!(!reg.destroy(ImageId(999)));
+    }
+
+    // ── Bounded raster memory (bug awt-font-image #2) ────────────────────
+
+    #[test]
+    fn registry_total_bytes_tracks_create_and_destroy() {
+        let mut reg = ImageRegistry::new();
+        assert_eq!(reg.total_bytes(), 0);
+        let id = reg.create(10, 10, ImageType::IntArgb).unwrap();
+        assert_eq!(reg.total_bytes(), 10 * 10 * 4);
+        reg.destroy(id);
+        assert_eq!(reg.total_bytes(), 0);
+    }
+
+    #[test]
+    fn registry_lru_evicts_idle_when_over_budget() {
+        // Budget holds two 10x10 (400 B) rasters but not three.
+        let mut reg = ImageRegistry::with_budget(900);
+        let a = reg.create(10, 10, ImageType::IntArgb).unwrap();
+        let b = reg.create(10, 10, ImageType::IntArgb).unwrap();
+        // Touch `a` so `b` becomes the least-recently-used.
+        assert!(reg.get(a).is_some());
+        // Third create pushes total to 1200 > 900: the idle one (`b`) is evicted.
+        let c = reg.create(10, 10, ImageType::IntArgb).unwrap();
+        assert!(reg.get(a).is_some(), "recently-touched image must survive");
+        assert!(reg.get(c).is_some(), "just-created image must survive");
+        assert!(reg.get(b).is_none(), "least-recently-used image is evicted");
+        assert!(reg.total_bytes() <= 900);
+    }
+
+    #[test]
+    fn registry_create_keeps_oversized_single_image() {
+        // A single image larger than the whole budget is kept (the create must
+        // still succeed); only the just-created image remains.
+        let mut reg = ImageRegistry::with_budget(100);
+        let id = reg.create(10, 10, ImageType::IntArgb).unwrap(); // 400 B > 100
+        assert!(reg.get(id).is_some());
+        assert_eq!(reg.len(), 1);
     }
 
     #[test]

@@ -4029,14 +4029,34 @@ fn try_compile_inner(
 
         // Build method_info map: scan bytecode for invokestatic operands,
         // resolve each CP index to an argument count via the invoke resolver.
+        //
+        // PERF (jit-lib-perf): this runs on the hot JIT compile path. The
+        // `aarch64` 0xb8 handler still consumes `method_info` to recover each
+        // invokestatic's argument count (see `aarch64_backend::compile_method`),
+        // so the scan cannot be elided — but the *redundant* work inside it can.
+        // A hot method commonly calls the same static target many times (loops,
+        // repeated helper calls); the previous code re-invoked the CP resolver
+        // (which allocates three `String`s per call) and re-parsed the
+        // descriptor (`count_param_slots`) at *every* call site, including
+        // duplicates. Skipping CP indices already resolved makes the resolver +
+        // descriptor parse run once per *distinct* index instead of once per
+        // occurrence. The resolved value for a given CP index is invariant, so
+        // `method_info`'s final contents are byte-for-byte identical.
         let mut method_info: HashMap<u16, usize> = HashMap::new();
         if let Some(resolver) = cp_invoke_resolver {
             let mut scan_pc = 0usize;
             while scan_pc < code.len() {
                 if code[scan_pc] == 0xb8 && scan_pc + 2 < code.len() {
                     let cp_idx = ((code[scan_pc + 1] as u16) << 8) | code[scan_pc + 2] as u16;
-                    if let Some((_class, _name, descriptor)) = resolver(cp_idx) {
-                        method_info.insert(cp_idx, count_param_slots(&descriptor));
+                    // Only resolve indices not seen yet — duplicates would
+                    // re-insert the identical value, so dedupe and skip the
+                    // resolver allocation + descriptor parse for them.
+                    if let std::collections::hash_map::Entry::Vacant(slot) =
+                        method_info.entry(cp_idx)
+                    {
+                        if let Some((_class, _name, descriptor)) = resolver(cp_idx) {
+                            slot.insert(count_param_slots(&descriptor));
+                        }
                     }
                     scan_pc += 3;
                 } else {

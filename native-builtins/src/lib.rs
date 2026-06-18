@@ -1691,6 +1691,53 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/io/Console", "istty", "()Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
+
+    // nontty-console: companion to `Console.istty()` for the modern
+    // (JDK 22+) console path. In JDK 25 the only two natives across the
+    // entire `System.console()` chain are:
+    //   1. `java/io/Console.istty()Z`                       (above)
+    //   2. `jdk/internal/io/JdkConsoleImpl.echo(Z)Z`        (here)
+    //
+    // `Console.instantiateConsole()` reads the `istty` field (seeded by the
+    // native above): when it is `false` — our default for every redirected /
+    // piped / daemon stdout — the `if (istty && cons == null)` arm that would
+    // `new JdkConsoleImpl(...)` is SKIPPED, so `System.console()` returns
+    // `null` exactly like HotSpot on a non-TTY. That is the common path and it
+    // works with `istty()` alone.
+    //
+    // `echo(boolean)` is only reached when a `JdkConsoleImpl` actually exists
+    // (i.e. `istty == true`) and the program calls `readLine`/`readPassword`,
+    // which toggle terminal echo around the read. If `istty()` ever reports
+    // `true` for an embedding (an interactive launch, or a future change that
+    // wires real TTY detection) WITHOUT this native, the `echo()` call hits the
+    // missing-native path in `vm_exec` mid-read — an `UnsatisfiedLinkError`
+    // raised deep inside `JdkConsoleImpl.readline()` that is NOT at a
+    // <clinit>/swallow boundary, manifesting as the picocli/JLine/Boot-logger
+    // "probe System.console() then crash/hang" symptom (the daemon-gating bug).
+    //
+    // The OpenJDK Windows/Unix native flips the OS echo flag via a console
+    // ioctl and returns the PREVIOUS echo state. CratonVM has no JNI binding
+    // and must never block on a controlling-terminal ioctl, so we model a
+    // non-interactive terminal: echo is treated as already in the requested
+    // state, the call is a pure no-op, and we return the requested flag (`on`).
+    // This is non-blocking, never throws (the `throws IOException` is unused),
+    // and keeps `readLine`/`readPassword` from faulting if a Console is ever
+    // instantiated. Args: [0] = boolean `on` (this is a STATIC native, so there
+    // is no receiver in args).
+    registry.register(
+        "jdk/internal/io/JdkConsoleImpl", "echo", "(Z)Z",
+        |_ctx, args| {
+            let on = match args.first() {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            // Return the requested state (== "previous state was already this"):
+            // a faithful no-op for a non-interactive terminal that never
+            // touches a real tty ioctl.
+            Ok(Some(Value::Int(on)))
+        },
+    );
+
     registry.register(
         "java/lang/String", "toString", "()Ljava/lang/String;",
         |_ctx, args| {
@@ -32273,9 +32320,15 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
     // readers=0, both bump it to 1, neither would exclude a writer).
     // Real exclusion is now via a Mutex+Condvar slot keyed on the parent
     // RWL's address.
+    // Pattern-A fix (bug nb-lib-gckeys §1): key the ReentrantReadWriteLock
+    // state table by a GC-stable identity of the parent RWL object (see
+    // `gc_stable_lock_key`) rather than its raw heap address. A read/write
+    // view obtained before a GC must unlock against the SAME slot afterwards;
+    // `parent.as_ptr()` shifts under a moving collector and the lock/unlock
+    // pair would diverge, deadlocking the lock or corrupting a neighbour slot.
     fn rwl_parent_addr(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<usize> {
         match ctx.get_field(this, 0) {
-            Value::Object(Some(parent)) => Some(parent.as_ptr() as usize),
+            Value::Object(Some(parent)) => Some(gc_stable_lock_key(ctx, parent)),
             _ => None,
         }
     }
@@ -32493,66 +32546,132 @@ fn native_rwl_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 const STAMPED_ORIGIN: i64 = crate::stamped_lock::STAMPED_ORIGIN;
 
-fn stamped_addr(args: &[Value]) -> Option<usize> {
+// ---------------------------------------------------------------------------
+// GC-stable lock-identity key (Pattern-A fix, bug nb-lib-gckeys §1)
+//
+// The StampedLock / ReentrantReadWriteLock state tables in `stamped_lock`
+// are keyed by a `usize` derived from the Java lock object. The previous
+// derivation — `o.as_ptr() as usize` — is NOT stable under a moving GC:
+// a thread that locks before a young-gen collection computes one key, the
+// object is relocated, and the matching `unlock` (after the GC) recomputes
+// a DIFFERENT key from the new address → it misses the slot it locked,
+// leaving the original slot permanently write-/read-held (deadlock) or
+// corrupting an unrelated slot that happens to land at the freed address.
+//
+// Fix: derive the key from a GC-stable identity. `ctx.identity_hash_code`
+// survives relocation (the header hash is preserved/remapped by the
+// collector), and a small per-hash generation registry disambiguates the
+// rare genuine 32-bit identity-hash collision among live lock objects —
+// exactly the scheme `properties_sidetable::key_for` and
+// `native-collections`' `widened_obj_key` use. Routing both `stamped_addr`
+// and `rwl_parent_addr` through this single helper keeps the lock and
+// unlock paths agreeing on a key that no GC can shift.
+struct LockKeyEntry {
+    last_ptr: usize,
+    generation: u32,
+}
+
+fn lock_key_registry() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<u32, Vec<LockKeyEntry>>> {
+    static R: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<u32, Vec<LockKeyEntry>>>> =
+        std::sync::OnceLock::new();
+    R.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+#[inline]
+fn pack_lock_key(hash: u32, generation: u32) -> usize {
+    ((hash as usize) << 32) | (generation as usize)
+}
+
+/// Map a Java lock object (or the parent RWL of a read/write view) to a
+/// GC-stable `usize` key for the `stamped_lock` state tables. See the
+/// module-level note above for the moving-GC deadlock this prevents. The
+/// algorithm mirrors `properties_sidetable::key_for`:
+///   1. same object seen again at the same address → reuse its generation;
+///   2. lone occupant of this hash whose address moved (GC relocation) →
+///      rebind to the new address (only when `hash != 0`, i.e. a real
+///      assigned identity — hash 0 means "identity not yet assigned" and
+///      DISTINCT objects all bucket there, so we must NOT merge them);
+///   3. otherwise a new object / genuine collision → fresh generation.
+fn gc_stable_lock_key(ctx: &mut dyn NativeContext, obj: ObjectRef) -> usize {
+    let hash = ctx.identity_hash_code(obj) as u32;
+    let ptr = obj.as_ptr() as usize;
+    let mut reg = lock_key_registry().lock();
+    let slots = reg.entry(hash).or_default();
+    if let Some(slot) = slots.iter().find(|s| s.last_ptr == ptr) {
+        return pack_lock_key(hash, slot.generation);
+    }
+    if hash != 0 && slots.len() == 1 {
+        slots[0].last_ptr = ptr;
+        return pack_lock_key(hash, slots[0].generation);
+    }
+    let generation = slots.len() as u32;
+    slots.push(LockKeyEntry { last_ptr: ptr, generation });
+    pack_lock_key(hash, generation)
+}
+
+// Pattern-A fix (bug nb-lib-gckeys §1): key the StampedLock state table by a
+// GC-stable identity (see `gc_stable_lock_key`) instead of the raw, moving
+// heap address that the lock/unlock pair could disagree on across a GC.
+fn stamped_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<usize> {
     match args.first() {
-        Some(Value::Object(Some(o))) => Some(o.as_ptr() as usize),
+        Some(Value::Object(Some(o))) => Some(gc_stable_lock_key(ctx, *o)),
         _ => None,
     }
 }
 
-fn native_stamped_init(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if let Some(addr) = stamped_addr(args) {
+fn native_stamped_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(addr) = stamped_addr(ctx, args) {
         crate::stamped_lock::stamped_init(addr);
     }
     Ok(None)
 }
 
-fn native_stamped_write_lock(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(args) {
+fn native_stamped_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = match stamped_addr(ctx, args) {
         Some(a) => a,
         None => return Ok(Some(Value::Long(0))),
     };
     Ok(Some(Value::Long(crate::stamped_lock::stamped_write_lock(addr))))
 }
 
-fn native_stamped_read_lock(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(args) {
+fn native_stamped_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = match stamped_addr(ctx, args) {
         Some(a) => a,
         None => return Ok(Some(Value::Long(0))),
     };
     Ok(Some(Value::Long(crate::stamped_lock::stamped_read_lock(addr))))
 }
 
-fn native_stamped_try_read_lock(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(args) {
+fn native_stamped_try_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = match stamped_addr(ctx, args) {
         Some(a) => a,
         None => return Ok(Some(Value::Long(0))),
     };
     Ok(Some(Value::Long(crate::stamped_lock::stamped_try_read_lock(addr))))
 }
 
-fn native_stamped_try_write_lock(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(args) {
+fn native_stamped_try_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = match stamped_addr(ctx, args) {
         Some(a) => a,
         None => return Ok(Some(Value::Long(0))),
     };
     Ok(Some(Value::Long(crate::stamped_lock::stamped_try_write_lock(addr))))
 }
 
-fn native_stamped_optimistic(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(args) {
+fn native_stamped_optimistic(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = match stamped_addr(ctx, args) {
         Some(a) => a,
         None => return Ok(Some(Value::Long(STAMPED_ORIGIN))),
     };
     Ok(Some(Value::Long(crate::stamped_lock::stamped_try_optimistic_read(addr))))
 }
 
-fn native_stamped_validate(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_stamped_validate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let stamp = match args.get(1) {
         Some(Value::Long(v)) => *v,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let addr = match stamped_addr(args) {
+    let addr = match stamped_addr(ctx, args) {
         Some(a) => a,
         None => return Ok(Some(Value::Int(0))),
     };
@@ -32560,58 +32679,58 @@ fn native_stamped_validate(_ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     Ok(Some(Value::Int(i32::from(valid))))
 }
 
-fn native_stamped_unlock_read(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if let Some(addr) = stamped_addr(args) {
+fn native_stamped_unlock_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(addr) = stamped_addr(ctx, args) {
         crate::stamped_lock::stamped_unlock_read(addr);
     }
     Ok(None)
 }
 
-fn native_stamped_unlock_write(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if let Some(addr) = stamped_addr(args) {
+fn native_stamped_unlock_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(addr) = stamped_addr(ctx, args) {
         crate::stamped_lock::stamped_unlock_write(addr);
     }
     Ok(None)
 }
 
-fn native_stamped_try_convert_to_write(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_stamped_try_convert_to_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let stamp = match args.get(1) {
         Some(Value::Long(v)) => *v,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let addr = match stamped_addr(args) {
+    let addr = match stamped_addr(ctx, args) {
         Some(a) => a,
         None => return Ok(Some(Value::Long(0))),
     };
     Ok(Some(Value::Long(crate::stamped_lock::stamped_try_convert_to_write(addr, stamp))))
 }
 
-fn native_stamped_try_convert_to_read(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(args) {
+fn native_stamped_try_convert_to_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = match stamped_addr(ctx, args) {
         Some(a) => a,
         None => return Ok(Some(Value::Long(0))),
     };
     Ok(Some(Value::Long(crate::stamped_lock::stamped_try_convert_to_read(addr))))
 }
 
-fn native_stamped_is_write_locked(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(args) {
+fn native_stamped_is_write_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = match stamped_addr(ctx, args) {
         Some(a) => a,
         None => return Ok(Some(Value::Int(0))),
     };
     Ok(Some(Value::Int(i32::from(crate::stamped_lock::stamped_is_write_locked(addr)))))
 }
 
-fn native_stamped_is_read_locked(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(args) {
+fn native_stamped_is_read_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = match stamped_addr(ctx, args) {
         Some(a) => a,
         None => return Ok(Some(Value::Int(0))),
     };
     Ok(Some(Value::Int(i32::from(crate::stamped_lock::stamped_is_read_locked(addr)))))
 }
 
-fn native_stamped_get_read_lock_count(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(args) {
+fn native_stamped_get_read_lock_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = match stamped_addr(ctx, args) {
         Some(a) => a,
         None => return Ok(Some(Value::Int(0))),
     };
@@ -34664,10 +34783,13 @@ fn native_array_new_instance_multi(
 // mirror — see the doc-comment on `vm::runtime::proxy::last_interfaces`
 // for the rationale and the known multi-threaded-creation limitation.
 
-/// Most recently created proxy's interfaces array (raw `ObjectRef::as_u64`).
-/// `0` = no proxy ever created. Read by `lang_class::native_class_get_interfaces`
-/// when the receiver class mirror names `Proxy$Instance`.
-static PROXY_LAST_INTERFACES_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// bug nb-lib-gckeys §2: the last-proxy interfaces array is no longer stored
+// here as a raw `AtomicU64` pointer (which was never a GC root and could
+// dangle after a moving collection). It now lives as a GC-tracked `ObjectRef`
+// in `lang_class` (`set_proxy_last_interfaces` / `proxy_last_interfaces`),
+// rooted and remapped by the annotation-proxy GC hooks. The
+// `proxy_last_interfaces_bits()` accessor below is retained for the WP2.5
+// white-box test and now derives from that GC-tracked cell.
 
 /// Total proxies created in this process. Diagnostic only.
 static PROXY_INSTANCES_CREATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -34686,11 +34808,16 @@ static PROXY_CLASS_CACHE: parking_lot::RwLock<
 static PROXY_CLASS_COUNTER: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
-/// Public accessor for `lang_class::native_class_get_interfaces` to
-/// pick up the interfaces array of the most recently created proxy.
-/// Also public so WP2.5 tests can sanity-check the symbol exists.
+/// Public accessor exposing the most-recently-created proxy's interfaces
+/// array as a raw pointer for the WP2.5 white-box test. Derives from the
+/// GC-tracked cell in `lang_class` (bug nb-lib-gckeys §2) — returns the
+/// CURRENT (post-relocation) address, or `0` if no proxy has been created.
+/// Reflection itself no longer goes through this raw form; it reads the
+/// tracked `ObjectRef` directly via `lang_class::proxy_last_interfaces`.
 pub fn proxy_last_interfaces_bits() -> u64 {
-    PROXY_LAST_INTERFACES_BITS.load(std::sync::atomic::Ordering::Acquire)
+    lang_class::proxy_last_interfaces()
+        .map(|arr| arr.as_ptr() as u64)
+        .unwrap_or(0)
 }
 
 /// Total proxies created in this process — for diagnostics.
@@ -34889,8 +35016,14 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // synthetic-mode fallback) still work even when the per-class
     // interfaces array is also reachable via the generated class's
     // `interfaces[]` table.
+    //
+    // bug nb-lib-gckeys §2: store the array as a GC-TRACKED `ObjectRef`
+    // (rooted + remapped by the annotation-proxy GC hooks) instead of a raw
+    // `arr.as_ptr()` in an `AtomicU64` that was never rooted — a moving GC
+    // could relocate/reclaim the array, leaving the shared-mirror
+    // `getInterfaces()` reader to dereference a dangling pointer.
     if let Value::Object(Some(arr)) = interfaces {
-        PROXY_LAST_INTERFACES_BITS.store(arr.as_ptr() as u64, std::sync::atomic::Ordering::Release);
+        lang_class::set_proxy_last_interfaces(arr);
     }
     PROXY_INSTANCES_CREATED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
@@ -37737,6 +37870,59 @@ mod concurrency_tests {
         // tryOptimisticRead should return STAMPED_ORIGIN (256) since no writer
         let stamp = native_stamped_optimistic(&mut ctx, &[Value::Object(Some(sl))]).unwrap().unwrap();
         assert_eq!(stamp, Value::Long(STAMPED_ORIGIN));
+    }
+
+    // bug nb-lib-gckeys §1 regression: the StampedLock/RWL state tables must
+    // be keyed by a GC-STABLE identity, not the raw moving heap address.
+    // Here we verify the contract `gc_stable_lock_key` guarantees:
+    //   (a) the SAME object yields the SAME key on every call (so a thread
+    //       that locks before a GC unlocks the same slot afterwards), and
+    //   (b) DISTINCT objects yield DISTINCT keys (no cross-lock aliasing).
+    // We can't simulate a real relocation under MockNativeContext (its
+    // `identity_hash_code` is derived from the address), but the stability +
+    // distinctness invariants are exactly what the production key must hold.
+    #[test]
+    fn m18_gc_stable_lock_key_is_stable_and_distinct() {
+        let _guard = stamped_test_lock();
+        let mut ctx = make_ctx();
+        let a = ctx.alloc_object(ClassId::new(0), 1);
+        let b = ctx.alloc_object(ClassId::new(0), 1);
+
+        let ka1 = gc_stable_lock_key(&mut ctx, a);
+        let ka2 = gc_stable_lock_key(&mut ctx, a);
+        let kb = gc_stable_lock_key(&mut ctx, b);
+
+        // (a) stable for the same object across calls
+        assert_eq!(ka1, ka2, "key must be stable for the same lock object");
+        // (b) distinct objects → distinct keys
+        assert_ne!(ka1, kb, "distinct lock objects must not alias the same slot");
+    }
+
+    // bug nb-lib-gckeys §1 regression: a full write-lock / unlock round-trip
+    // through the native entry points (which now route the key via `ctx` and
+    // `gc_stable_lock_key`) must leave the lock un-held, proving lock and
+    // unlock agree on the same GC-stable slot.
+    #[test]
+    fn m18_stamped_roundtrip_via_gc_stable_key() {
+        let _guard = stamped_test_lock();
+        let mut ctx = make_ctx();
+        let sl = ctx.alloc_object(ClassId::new(0), 1);
+        native_stamped_init(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
+
+        // Acquire the write lock, then release it.
+        let stamp = native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))])
+            .unwrap()
+            .unwrap();
+        assert!(matches!(stamp, Value::Long(v) if v & 1 != 0));
+        native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), Value::Long(0)]).unwrap();
+
+        // After unlock the lock must NOT report write-locked — i.e. the unlock
+        // hit the SAME slot the lock established (would fail under the old
+        // raw-address keying if lock and unlock disagreed on the key).
+        let locked = native_stamped_is_write_locked(&mut ctx, &[Value::Object(Some(sl))])
+            .unwrap()
+            .unwrap();
+        assert_eq!(locked, Value::Int(0), "lock/unlock must agree on the slot");
     }
 
     #[test]

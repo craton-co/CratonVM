@@ -148,6 +148,31 @@ pub struct MarkQueue {
 /// Number of shards for the mark queue. Must be a power of two for fast modulo.
 const MARK_QUEUE_SHARDS: usize = 8;
 
+// gc-concmark MEDIUM fix — the `nonempty_shards` hint is an `AtomicU8`, so it
+// has exactly one bit per shard for at most 8 shards. The hint is set/cleared
+// with `1u8 << idx` where `idx` ranges over `0..MARK_QUEUE_SHARDS`. If anyone
+// bumps `MARK_QUEUE_SHARDS` above 8 while tuning, every `1u8 << idx` for
+// `idx >= 8` overflows the shift width: in debug builds it panics, and in
+// release builds the shift amount wraps mod 8, so shards >= 8 silently alias
+// the low shards' bits — the hint becomes wrong and `pop` can skip a populated
+// shard (the full-probe fallback still keeps it *correct*, just slower, but the
+// hint is also actively corrupted for shards 0..8). Turn that latent landmine
+// into a compile error: if you raise the shard count past 8, you must also
+// widen `nonempty_shards` to `AtomicU16`/`U32`/`U64` (and the `1u8 <<` /
+// `!(1u8 <<` masks below) to match. The shift expressions are written
+// `1u8 << idx`, so the matching atomic width is `u8` ⇒ 8 shards max.
+const _: () = assert!(
+    MARK_QUEUE_SHARDS <= 8,
+    "nonempty_shards is AtomicU8 (8 bits); widen it (and the `1u8 <<` masks in \
+     push/pop) to AtomicU16/U32/U64 before raising MARK_QUEUE_SHARDS above 8"
+);
+// Sanity: the shard count must also be a power of two, because both
+// `shard_for` and the round-robin `pop` cursor index with `& (SHARDS - 1)`.
+const _: () = assert!(
+    MARK_QUEUE_SHARDS.is_power_of_two(),
+    "MARK_QUEUE_SHARDS must be a power of two (masked with `& (SHARDS - 1)`)"
+);
+
 /// Round-5 HIGH #6 — defensive cap on a single mark-queue shard.
 ///
 /// The original `MarkQueue::push` was an unbounded `Vec` (well, `VecDeque`)
@@ -429,14 +454,27 @@ impl ConcurrentMarker {
         // overwritten during concurrent marking. We must mark them to
         // prevent live objects from being collected.
         //
-        // Round-5 CRIT #4: use `deactivate_and_drain` so the barrier
-        // gate transition is atomic with respect to mutator log pushes.
-        // The previous `drain()` + later `deactivate()` left a window
-        // where a mutator could observe "active", be preempted, and
-        // push its old-reference into a shard after the drain returned
-        // — its entry would never be marked and the live object would
-        // be reaped by `concurrent_sweep` despite still being reachable.
-        let satb_entries = self.satb_queue.deactivate_and_drain();
+        // gc-concmark HIGH fix — keep the SATB barrier ACTIVE across the
+        // remark closure. The previous code called
+        // `deactivate_and_drain()` HERE (before the closure below), which
+        // flipped the gate straight to INACTIVE while the mark bitmap was
+        // still being computed. Between that INACTIVE store and the start
+        // of `concurrent_sweep`, the SATB pre-barrier (gated on
+        // `satb_queue.is_active()`) stops logging, so a mutator that
+        // overwrites a still-live old-gen reference is NOT recorded — its
+        // target object's bit stays clear in the bitmap and the sweep
+        // frees it while it is still reachable (floating-garbage free →
+        // use-after-free). Correctness of the sweep requires the bitmap
+        // to be FINAL, which means every overwritten old reference up to
+        // the moment mutators are quiesced must be marked.
+        //
+        // Fix: drain WITHOUT deactivating so the barrier keeps logging
+        // any concurrent overwrites into the queue while we build the
+        // closure below; we run a final `deactivate_and_drain()` (which
+        // also captures late writers via its shard-lock barrier) only
+        // after the closure, and re-mark whatever it returns before the
+        // gate is allowed to go INACTIVE. See the closing block.
+        let satb_entries = self.satb_queue.drain();
         for addr in satb_entries {
             if addr != 0 && old_gen.contains(addr as *const u8) {
                 if self.bitmap.try_mark(addr) {
@@ -456,7 +494,62 @@ impl ConcurrentMarker {
             }
         }
 
-        // Drain the queue fully (mark transitive closure from new roots).
+        // Drain the queue fully (mark transitive closure from new roots),
+        // including the overflow fallback. NOTE: the SATB barrier is STILL
+        // ACTIVE at this point (we used `drain()` above, not
+        // `deactivate_and_drain()`), so any reference a mutator overwrites
+        // while we compute this closure is logged and will be captured by
+        // the final drain below.
+        discovered += self.drain_closure(old_gen);
+
+        // gc-concmark HIGH fix — final quiescing drain.
+        //
+        // Now that the closure from the snapshot + roots is complete, flip
+        // the barrier off ATOMICALLY with a final drain. `deactivate_and_drain`
+        // transitions ACTIVE→DRAINING (loggers keep logging), drains, then
+        // takes each shard lock exclusively to capture any late writer that
+        // observed ACTIVE before the CAS, and only then stores INACTIVE.
+        //
+        // This closes the window the old code left open: between the moment
+        // the gate went INACTIVE and the sweep, an overwritten live old-gen
+        // reference could go unlogged and be swept while reachable. Here the
+        // gate is not allowed to go INACTIVE until every entry logged up to
+        // the drain barrier has been returned to us — and we mark every one
+        // of them (plus its transitive closure) BEFORE returning, so the
+        // bitmap handed to `concurrent_sweep` is final.
+        //
+        // In a true STW remark mutators are already stopped, so this drain
+        // typically returns nothing; in a (mostly-)concurrent remark it
+        // reaps the stragglers. Either way the bitmap is final on exit.
+        let late_entries = self.satb_queue.deactivate_and_drain();
+        for addr in late_entries {
+            if addr != 0 && old_gen.contains(addr as *const u8) {
+                if self.bitmap.try_mark(addr) {
+                    self.queue.push(addr as *mut u8);
+                    discovered += 1;
+                }
+            }
+        }
+        // Mark the transitive closure of any late entries (again with the
+        // overflow fallback). The gate is INACTIVE now, but mutators are
+        // quiesced past the drain barrier, so no further live overwrite can
+        // escape the bitmap.
+        discovered += self.drain_closure(old_gen);
+
+        self.state.set_phase(ConcurrentGcPhase::ConcurrentSweep);
+
+        discovered
+    }
+
+    /// Drain the mark queue to its transitive closure, then run the
+    /// graceful overflow fallback (Round-9 gc HIGH-5) until no shard has
+    /// overflowed. Returns the number of objects scanned. Extracted so the
+    /// remark closure can be re-run after the final SATB quiescing drain
+    /// (gc-concmark fix) without duplicating the overflow logic.
+    fn drain_closure(&self, old_gen: &OldGen) -> usize {
+        let mut discovered = 0;
+
+        // Drain the queue fully (mark transitive closure).
         while let Some(obj_ptr) = self.queue.pop() {
             self.scan_object(obj_ptr, old_gen);
             discovered += 1;
@@ -512,10 +605,6 @@ impl ConcurrentMarker {
                 discovered += 1;
             }
         }
-
-        // Round-5 CRIT #4: SATB barrier was already deactivated atomically
-        // by `deactivate_and_drain` above. No further `deactivate()` needed.
-        self.state.set_phase(ConcurrentGcPhase::ConcurrentSweep);
 
         discovered
     }
@@ -790,6 +879,71 @@ mod tests {
         // Phase 4: sweep — B should NOT be freed
         let swept = marker.concurrent_sweep(&mut og);
         assert_eq!(swept, 0); // Both A and B are live
+    }
+
+    // gc-concmark HIGH regression — the SATB barrier must stay ACTIVE
+    // across the remark closure, so a live old-gen reference overwritten
+    // by a mutator DURING remark (after the snapshot drain, before sweep)
+    // is still logged, marked, and NOT swept.
+    //
+    // Before the fix, `remark` called `deactivate_and_drain()` at the very
+    // top, flipping the gate to INACTIVE before the closure was computed.
+    // An SATB entry flushed after that point (modelling a write the barrier
+    // would have logged had it still been active) was never captured by the
+    // mark phase, leaving B's bit clear so the sweep freed a live object.
+    #[test]
+    fn satb_active_through_remark_closure() {
+        let mut og = OldGen::new(65536);
+        let size = HEADER_SIZE + 1 * SLOT_SIZE;
+
+        // Object A (root, no live refs to B by remark time).
+        let ptr_a = og.alloc(size, 8).unwrap();
+        unsafe {
+            let h = &mut *(ptr_a as *mut ObjectHeader);
+            h.class_id = ClassId::new(1);
+            h.kind = ObjectKind::Object;
+            h.num_slots = 1;
+            h.gc_flags = 0x01;
+        }
+
+        // Object B — only ever reachable via the SATB log of an overwrite.
+        let ptr_b = og.alloc(size, 8).unwrap();
+        unsafe {
+            let h = &mut *(ptr_b as *mut ObjectHeader);
+            h.class_id = ClassId::new(2);
+            h.kind = ObjectKind::Object;
+            h.num_slots = 1;
+            h.gc_flags = 0x01;
+        }
+
+        let marker = ConcurrentMarker::new(og.base_ptr() as usize, og.capacity());
+
+        // Phases 1–2: A is the only root; B is not reachable from A.
+        marker.initial_mark(&[ptr_a], &og);
+        marker.concurrent_mark(&og);
+
+        // The barrier must still be active going into remark — that is the
+        // invariant whose violation caused the bug.
+        assert!(marker.satb_queue.is_active());
+
+        // Model a mutator overwriting a live reference to B *during* the
+        // concurrent window: the pre-barrier logs B's old address. With the
+        // fix, `remark` drains this WITHOUT deactivating and marks B; the
+        // final quiescing drain then closes the gate.
+        marker.satb_queue.flush(vec![ptr_b as usize]);
+
+        let discovered = marker.remark(&[ptr_a], &og);
+        assert!(discovered > 0, "B must be discovered from the SATB log");
+        assert!(
+            marker.bitmap.is_marked(ptr_b as usize),
+            "B must be marked — the SATB-logged live ref was not lost"
+        );
+        // Gate must be off once the closure is final.
+        assert!(!marker.satb_queue.is_active());
+
+        // Sweep must keep B (it is live via the SATB snapshot).
+        let swept = marker.concurrent_sweep(&mut og);
+        assert_eq!(swept, 0, "neither A nor B may be freed");
     }
 
     #[test]

@@ -134,11 +134,17 @@ pub enum EventValue {
 /// directions to catch the mismatch at emit time.
 ///
 /// Both `String` and `Str` collapse to `FieldKind::String` (they share
-/// encoding). `Null` is the wildcard — it is accepted for any field type
-/// because the JFR null-string tag (encoding-type 0) is a valid runtime
-/// value for any nullable field on read-back. (For numeric fields this is
-/// debatable, but matching the existing relaxed write-side semantics is
-/// safer than tightening it here.)
+/// encoding). `Null` is the wildcard — it is accepted for any field type.
+///
+/// LOW fix (2026-06-17): a `Null` in a numeric/boolean field is no longer a
+/// write/read tag desync. `dump::encode_event_value` now emits the declared
+/// kind's fixed-width zero for a numeric/boolean Null (4 bytes for `float`,
+/// 8 for `double`, 1 compressed-long `0` for `int`/`long`, 1 byte for
+/// `boolean`), so the reader stays byte-aligned and the value round-trips
+/// deterministically to a typed zero. A `Null` in a `string` field still
+/// encodes as the canonical 1-byte JFR null-string tag (encoding-type 0) and
+/// round-trips back to [`EventValue::Null`]. The wildcard acceptance here is
+/// therefore now sound for every declared kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldKind {
     Int,
@@ -184,12 +190,14 @@ impl FieldKind {
 
     /// Returns `true` if a runtime value of kind `self` is compatible with
     /// the declared kind `declared`. `Null` is the wildcard on the runtime
-    /// side — it matches every declared type because it encodes as the
-    /// distinct null-tag on the wire and the reader accepts it for any
-    /// string-typed field. For non-string declared types, `Null` is still
-    /// accepted on write to preserve the existing write-side semantics
-    /// (`dump::encode_event_value` accepts `Null` unconditionally), but
-    /// callers should prefer typed zero values for numeric fields.
+    /// side — it matches every declared type. The writer
+    /// (`dump::encode_event_value`) now makes a Null self-describing per
+    /// declared kind: a string-field Null is the 1-byte null tag, while a
+    /// numeric/boolean Null is the kind's fixed-width zero. Either way the
+    /// reader stays byte-aligned, so accepting Null for any declared kind is
+    /// safe (no chunk desync). Callers may still prefer explicit typed zeros
+    /// for numeric fields for clarity, but Null is no longer a correctness
+    /// hazard.
     #[inline]
     pub fn matches_declared(self, declared: FieldKind) -> bool {
         if self == FieldKind::Null { return true; }
