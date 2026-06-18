@@ -1310,23 +1310,59 @@ fn read_byte_buffer_slice(
         };
     }
 
-    // Direct-buffer fallback: capacity slot still tells us how many
-    // bytes were "allocated"; we can't read raw native memory here,
-    // so we report an empty slice (the backend will then surface a
-    // ClassFormatError because the bytes have no magic). Real direct
-    // buffers used by `defineClass2` are uncommon in our app workloads
-    // — Quarkus / WildFly use the byte[] path.
+    // Direct-buffer case: a `java.nio.DirectByteBuffer` keeps its native
+    // base in the `Buffer.address` long (the synthetic slot-0 array is
+    // absent). Read the address + capacity and memcpy the bytes through
+    // the context so an `Unsafe.allocateMemory` arena handle is routed to
+    // the off-heap store rather than dereferenced raw (a raw memcpy from a
+    // synthetic handle SIGSEGVs); a real pointer falls through to a raw
+    // copy. This lets `Lookup.defineClass`/`defineClass2` accept direct
+    // buffers, matching the heap path above. (cf. async_socket.rs /
+    // nio_native.rs which use the same address + copy_from_native_memory
+    // pattern.)
+    let addr = match ctx.get_field_by_name(bb, "address") {
+        Value::Long(a) => a,
+        _ => 0,
+    };
+    // Honor the buffer's position/limit window, then add the caller's
+    // (off, len) which are buffer-relative coordinates.
+    let pos = ctx.get_field(bb, pos_slot).as_int().unwrap_or(0).max(0) as usize;
     let cap = ctx
         .get_field(bb, capacity_slot)
         .as_int()
         .unwrap_or(0)
         .max(0) as usize;
+    let limit = ctx
+        .get_field(bb, limit_slot)
+        .as_int()
+        .unwrap_or(cap as i32)
+        .max(0) as usize;
     if cap == 0 {
         return Err("direct ByteBuffer is empty".to_string());
     }
-    Err(format!(
-        "direct ByteBuffer with capacity {cap} not readable in defineClass2 path"
-    ))
+    if addr == 0 {
+        return Err(format!(
+            "direct ByteBuffer with capacity {cap} has no native address"
+        ));
+    }
+    let absolute_off = pos.saturating_add(off);
+    let upper = limit.min(cap);
+    if absolute_off > upper {
+        return Err(format!(
+            "direct ByteBuffer offset+pos ({absolute_off}) exceeds limit ({limit}) or capacity ({cap})"
+        ));
+    }
+    let actual_len = len.min(upper - absolute_off);
+    let mut out = vec![0u8; actual_len];
+    if actual_len > 0 {
+        let src = addr.wrapping_add(absolute_off as i64);
+        if !ctx.copy_from_native_memory(src, &mut out) {
+            return Err(format!(
+                "direct ByteBuffer copy failed (addr={src:#x}, len={actual_len})"
+            ));
+        }
+    }
+    Ok(out)
 }
 
 /// Bind the loader-id used to register the new class. We look up the
@@ -1702,11 +1738,19 @@ pub fn register_classloader_define_class(r: &mut NativeMethodRegistry) {
 // likely a null/short bytecode array being deref'd by the underlying
 // `define_class_full` plumbing.
 //
-// Fix: validate args up-front (null bytecode → null result; oversized
-// bytecode → null result), then delegate to the same backend used by the
-// public `ClassLoader.defineClass(String, byte[], int, int, ProtectionDomain)`
-// overload. Adding the defensive check is the win even if cglib doesn't
-// fully work — it prevents the process crash.
+// Fix: validate args up-front, then delegate to the same backend used by
+// the public `ClassLoader.defineClass(String, byte[], int, int,
+// ProtectionDomain)` overload. The defensive check prevents the process
+// crash even if cglib doesn't fully work.
+//
+// Error contract (no silent-wrong-result stubs): instead of returning a
+// null Class on failure (which only NPEs later in the caller), we throw
+// the exception HotSpot's `Unsafe.defineClass` would:
+//   * null bytecode array        → NullPointerException
+//   * out-of-bounds off/len      → ArrayIndexOutOfBoundsException
+//   * zero/oversize/bad-magic/    → ClassFormatError
+//     parse panic/backend reject
+//   * backend "not found" reason → NoClassDefFoundError
 //
 // Signature: `defineClass(String name, byte[] b, int off, int len,
 //                         ClassLoader loader, ProtectionDomain pd) -> Class`
@@ -1722,14 +1766,15 @@ pub fn register_classloader_define_class(r: &mut NativeMethodRegistry) {
 /// Max class file size we accept on the Unsafe.defineClass path. cglib
 /// proxies for typical Spring/Hibernate classes are <200 KB; anything
 /// over 1 MB is almost certainly a misinterpreted argument (off/len
-/// mismatch reading past the array end) and we'd rather return null
-/// than try to parse it.
+/// mismatch reading past the array end) and we throw ClassFormatError
+/// rather than try to parse it.
 const UNSAFE_DEFINE_CLASS_MAX_BYTES: usize = 1024 * 1024;
 
 fn unsafe_define_class_defensive(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    use cratonvm_types::error::{LinkageError, RuntimeError};
     // arg[0] = this (Unsafe singleton), ignored
     // arg[1] = name : String (may be null — bytecode carries this_class)
     // arg[2] = b : byte[]
@@ -1738,14 +1783,30 @@ fn unsafe_define_class_defensive(
     // arg[5] = loader : ClassLoader (may be null — system loader)
     // arg[6] = pd : ProtectionDomain (may be null)
 
-    // Defensive arg[2] check: null array → return null instead of segfaulting.
+    // Resolve the (possibly null) requested name up-front so it can be
+    // attached to thrown exceptions for diagnostics.
+    let name_str = match args.get(1) {
+        Some(Value::Object(Some(name_obj))) => {
+            let dotted = ctx.read_string(*name_obj).unwrap_or_default();
+            dotted.replace('.', "/")
+        }
+        _ => String::new(),
+    };
+
+    // arg[2] check: a null bytecode array is a programming error on the
+    // caller's side. HotSpot's Unsafe.defineClass NPEs here; throw the
+    // same so the Java caller observes the real fault instead of an NPE
+    // later on a null Class return.
     let byte_array = match args.get(2) {
         Some(Value::Object(Some(arr))) => *arr,
         _ => {
             tracing::warn!(
-                "Unsafe.defineClass: null bytecode array — returning null"
+                "Unsafe.defineClass({name_str}): null bytecode array — throwing NPE"
             );
-            return Ok(Some(Value::Object(None)));
+            return Err(RuntimeError::NullPointerException {
+                message: Some("Unsafe.defineClass: bytecode array must not be null".into()),
+            }
+            .into());
         }
     };
 
@@ -1761,36 +1822,40 @@ fn unsafe_define_class_defensive(
         _ => array_len,
     };
 
-    // Sanity-cap: cglib proxies are small. Reject obviously-bogus sizes.
+    // Sanity-cap: cglib proxies are small. A zero-length or absurdly large
+    // length can't be a valid class file → ClassFormatError (the bytes are
+    // structurally malformed), not a silent null.
     if length == 0 || length > UNSAFE_DEFINE_CLASS_MAX_BYTES {
         tracing::warn!(
-            "Unsafe.defineClass: rejecting bytecode of length {length} \
+            "Unsafe.defineClass({name_str}): rejecting bytecode of length {length} \
              (max={UNSAFE_DEFINE_CLASS_MAX_BYTES})"
         );
-        return Ok(Some(Value::Object(None)));
+        return Err(LinkageError::ClassFormatError {
+            class_name: name_str,
+            message: format!(
+                "Unsafe.defineClass: bytecode length {length} out of range (max {UNSAFE_DEFINE_CLASS_MAX_BYTES})"
+            ),
+        }
+        .into());
     }
 
-    // Bounds: offset+length must fit inside the array.
+    // Bounds: offset+length must fit inside the array. An out-of-bounds
+    // slice is an AIOOBE on the caller's side (HotSpot's Unsafe range
+    // checks throw before parsing), so surface that rather than a null.
     // checked_add prevents wrap-around on pathological inputs.
     if offset
         .checked_add(length)
         .map_or(true, |end| end > array_len)
     {
         tracing::warn!(
-            "Unsafe.defineClass: offset/length out of bounds \
-             (off={offset}, len={length}, array={array_len}) — returning null"
+            "Unsafe.defineClass({name_str}): offset/length out of bounds \
+             (off={offset}, len={length}, array={array_len}) — throwing AIOOBE"
         );
-        return Ok(Some(Value::Object(None)));
-    }
-
-    // Extract class name (may be null — define_class_full will read this_class).
-    let name_str = match args.get(1) {
-        Some(Value::Object(Some(name_obj))) => {
-            let dotted = ctx.read_string(*name_obj).unwrap_or_default();
-            dotted.replace('.', "/")
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+            index: offset.saturating_add(length).min(i32::MAX as usize) as i32,
         }
-        _ => String::new(),
-    };
+        .into());
+    }
 
     // Copy bytes defensively. Any out-of-band element read returns 0 byte.
     // Wrap in `catch_unwind` so a panic during the copy (corrupt array
@@ -1811,9 +1876,13 @@ fn unsafe_define_class_defensive(
         Err(_) => {
             tracing::error!(
                 "Unsafe.defineClass({name_str}): panic while reading byte array; \
-                 returning null"
+                 throwing ClassFormatError"
             );
-            return Ok(Some(Value::Object(None)));
+            return Err(LinkageError::ClassFormatError {
+                class_name: name_str,
+                message: "Unsafe.defineClass: failed to read bytecode array".into(),
+            }
+            .into());
         }
     };
 
@@ -1821,11 +1890,16 @@ fn unsafe_define_class_defensive(
     // already checks this, but doing it here keeps the warn log clear
     // about WHO rejected the bytecode. Require at least 8 bytes
     // (magic + minor + major) so the backend never reads past EOF.
+    // Malformed bytes → ClassFormatError (JVMS 5.3.5), not a silent null.
     if class_bytes.len() < 8 || class_bytes[0..4] != CLASS_FILE_MAGIC {
         tracing::warn!(
-            "Unsafe.defineClass({name_str}): bad magic — returning null"
+            "Unsafe.defineClass({name_str}): bad magic — throwing ClassFormatError"
         );
-        return Ok(Some(Value::Object(None)));
+        return Err(LinkageError::ClassFormatError {
+            class_name: name_str,
+            message: "Unsafe.defineClass: not a valid class file (bad magic)".into(),
+        }
+        .into());
     }
 
     // cglib SEGV guard — this is the hottest path for the cglib_probe
@@ -1862,8 +1936,9 @@ fn unsafe_define_class_defensive(
         ..Default::default()
     };
     // catch_unwind: malformed cglib bytes (10-50 KB) can crash the
-    // backend parser. Translate panic → null so the Java caller sees
-    // an NPE (recoverable) instead of process exit.
+    // backend parser. Translate panic → ClassFormatError so the Java
+    // caller sees a recoverable linkage error instead of a process exit
+    // (or a null Class that NPEs later).
     let define_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ctx.define_class_full(&name_str, &class_bytes, loader_id, opts)
     }));
@@ -1872,9 +1947,14 @@ fn unsafe_define_class_defensive(
         Err(_) => {
             tracing::error!(
                 "Unsafe.defineClass({name_str}): panic inside define_class_full; \
-                 returning null"
+                 throwing ClassFormatError"
             );
-            return Ok(Some(Value::Object(None)));
+            return Err(LinkageError::ClassFormatError {
+                class_name: name_str,
+                message: "Unsafe.defineClass: panic inside backend (likely malformed bytecode)"
+                    .into(),
+            }
+            .into());
         }
     };
     match define_result {
@@ -1883,10 +1963,30 @@ fn unsafe_define_class_defensive(
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => {
+            // Backend rejected the bytes. A "not found" style failure maps
+            // to NoClassDefFoundError; everything else is a malformed-class
+            // (ClassFormatError). Either way the caller observes the real
+            // fault rather than an NPE on a null Class.
             tracing::warn!(
-                "Unsafe.defineClass({name_str}) backend failed: {msg} — returning null"
+                "Unsafe.defineClass({name_str}) backend failed: {msg} — throwing"
             );
-            Ok(Some(Value::Object(None)))
+            let lower = msg.to_ascii_lowercase();
+            if lower.contains("not found") || lower.contains("no class def") {
+                Err(LinkageError::NoClassDefFoundError {
+                    class_name: if name_str.is_empty() {
+                        msg.clone()
+                    } else {
+                        name_str
+                    },
+                }
+                .into())
+            } else {
+                Err(LinkageError::ClassFormatError {
+                    class_name: name_str,
+                    message: format!("Unsafe.defineClass: {msg}"),
+                }
+                .into())
+            }
         }
     }
 }
@@ -2846,11 +2946,13 @@ fn ucl_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 fn ucl_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let urls = args.first().copied().unwrap_or(Value::Object(None));
     let obj = alloc_url_classloader(ctx);
-    let count = match urls {
-        Value::Object(Some(arr)) => ctx.array_length(arr) as i32,
-        _ => 0,
-    };
-    ctx.set_field(obj, UCL_URL_COUNT, Value::Int(count));
+    // FIX: previously this only stored UCL_URL_COUNT and dropped the URL[]
+    // entirely, so the returned loader couldn't search the supplied URLs.
+    // Route through `ucl_setup` (the same code the `<init>` natives use) so
+    // the URLs are copied into UCL_URLS_ARRAY and their paths registered on
+    // the dynamic classpath. The loader id assigned by `alloc_url_classloader`
+    // is preserved (ucl_setup doesn't touch UCL_LOADER_ID).
+    ucl_setup(ctx, obj, urls, Value::Object(None));
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -2858,12 +2960,10 @@ fn ucl_new_instance_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let urls = args.first().copied().unwrap_or(Value::Object(None));
     let parent = args.get(1).copied().unwrap_or(Value::Object(None));
     let obj = alloc_url_classloader(ctx);
-    let count = match urls {
-        Value::Object(Some(arr)) => ctx.array_length(arr) as i32,
-        _ => 0,
-    };
-    ctx.set_field(obj, UCL_URL_COUNT, Value::Int(count));
-    ctx.set_field(obj, UCL_PARENT_REF, parent);
+    // FIX: mirror the `<init>(URL[], ClassLoader)` path — store the URL[] and
+    // register its paths so the loader actually searches them (was dropping
+    // the URLs and only recording their count). See `ucl_new_instance`.
+    ucl_setup(ctx, obj, urls, parent);
     Ok(Some(Value::Object(Some(obj))))
 }
 

@@ -9667,14 +9667,62 @@ pub(crate) fn pbkdf2_prf_code(alg: &str) -> Option<i32> {
     }
 }
 
-/// Identity-hash-keyed PRF table for PBKDF2 `SecretKeyFactory` synthetics.
+/// GC-stable, collision-disambiguated identity key for the PBKDF2 PRF table.
+///
+/// Keying by the bare 32-bit `identity_hash_code` is unsafe: two distinct
+/// `SecretKeyFactory` synthetics can share a 32-bit identity hash (genuine
+/// collision) or, more commonly, a freed object's identity hash can be
+/// recycled by a later allocation. A recycled hash would then inherit the
+/// previous instance's PRF code, so a SHA-1 factory could derive a key with
+/// the SHA-256 PRF (or vice versa) — a silently WRONG key. We pack the
+/// identity hash with a small per-hash generation that disambiguates
+/// collisions/recycling, mirroring `properties_sidetable::key_for` and
+/// `gc_stable_lock_key`. The result is a stable `usize` key that uniquely
+/// identifies a live `SecretKeyFactory` instance for the table's lifetime, so
+/// the PRF is deterministic per instance.
+struct Pbkdf2KeyEntry {
+    last_ptr: usize,
+    generation: u32,
+}
+
+fn pbkdf2_key_registry() -> &'static std::sync::Mutex<std::collections::HashMap<u32, Vec<Pbkdf2KeyEntry>>> {
+    static R: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, Vec<Pbkdf2KeyEntry>>>> =
+        std::sync::OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn pbkdf2_key_for(ctx: &dyn NativeContext, obj: ObjectRef) -> usize {
+    let hash = ctx.identity_hash_code(obj) as u32;
+    let ptr = obj.as_ptr() as usize;
+    let mut reg = pbkdf2_key_registry().lock().unwrap();
+    let slots = reg.entry(hash).or_default();
+    // 1. Same object seen again at the same address.
+    if let Some(slot) = slots.iter().find(|s| s.last_ptr == ptr) {
+        return ((hash as usize) << 32) | (slot.generation as usize);
+    }
+    // 2. Lone occupant whose address moved (GC relocated it): rebind. Only safe
+    //    for a real assigned identity (non-zero hash); hash 0 means "identity
+    //    not yet assigned" and distinct objects all bucket there, so merging
+    //    them would re-introduce exactly the cross-contamination this avoids.
+    if hash != 0 && slots.len() == 1 {
+        slots[0].last_ptr = ptr;
+        return ((hash as usize) << 32) | (slots[0].generation as usize);
+    }
+    // 3. New object for this hash (or a genuine 32-bit collision): fresh slot.
+    let generation = slots.len() as u32;
+    slots.push(Pbkdf2KeyEntry { last_ptr: ptr, generation });
+    ((hash as usize) << 32) | (generation as usize)
+}
+
+/// PRF table for PBKDF2 `SecretKeyFactory` synthetics, keyed by the GC-stable,
+/// collision-disambiguated identity from `pbkdf2_key_for`.
 /// A heap field can't hold the PRF code reliably — `SecretKeyFactory`'s real
 /// slot 0 is an `Object` (`spi`), so an `Int` written there reads back wrong
-/// and every algorithm collapsed to the SHA-256 default. Keying by
-/// `identity_hash_code` (stable across GC) is the same pattern the Cipher
-/// dispatch uses for its state.
-fn pbkdf2_prf_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, i32>> {
-    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, i32>>> =
+/// and every algorithm collapsed to the SHA-256 default. The previous keying
+/// by the bare 32-bit `identity_hash_code` could collide or inherit a stale
+/// PRF when an identity hash was recycled; `pbkdf2_key_for` fixes that.
+fn pbkdf2_prf_table() -> &'static std::sync::Mutex<std::collections::HashMap<usize, i32>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, i32>>> =
         std::sync::OnceLock::new();
     T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -9692,7 +9740,10 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
     match pbkdf2_prf_code(&alg) {
         Some(code) => {
             let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/SecretKeyFactory", 1);
-            let key = ctx.identity_hash_code(obj);
+            // GC-stable, collision-disambiguated key (was the bare 32-bit
+            // identity hash, which could collide or inherit a stale PRF on a
+            // recycled hash and derive a WRONG key).
+            let key = pbkdf2_key_for(ctx, obj);
             pbkdf2_prf_table().lock().unwrap().insert(key, code);
             Ok(Some(Value::Object(Some(obj))))
         }
@@ -9709,7 +9760,9 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
 /// `getEncoded()` yields the derived key (what `PEMFile` reads).
 pub(crate) fn pbkdf2_generate_secret(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let key = ctx.identity_hash_code(this);
+    // Same GC-stable, collision-disambiguated key used by `getInstance` so the
+    // PRF is looked up deterministically for THIS factory instance.
+    let key = pbkdf2_key_for(ctx, this);
     let prf = pbkdf2_prf_table()
         .lock()
         .unwrap()

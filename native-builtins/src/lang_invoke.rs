@@ -960,6 +960,31 @@ fn vh_values_match(current: &Value, expected: &Value) -> bool {
     }
 }
 
+/// LOW-finding fix (VarHandle RMW atomicity): run `body` while holding the
+/// monitor of `cid`'s class mirror so that read-modify-write VarHandle
+/// operations on a *static* field are linearizable w.r.t. each other.
+///
+/// Instance- and array-element RMWs use the VM's `compare_and_swap_field`
+/// (a real per-object CAS lock), but the trait exposes no CAS primitive for
+/// static slots, so we serialize them on the per-class mirror object — a
+/// stable, unique lock shared by every VarHandle targeting that class's
+/// statics (`get_class_mirror` returns the same `Class` object each call).
+/// The monitor is always released (the closure here only does infallible
+/// `Value` get/set, so it cannot unwind, but we keep enter/exit balanced).
+fn vh_with_static_lock<R>(
+    ctx: &mut dyn NativeContext,
+    cid: ClassId,
+    body: impl FnOnce(&mut dyn NativeContext) -> R,
+) -> R {
+    let lock = ctx.get_class_mirror(cid);
+    ctx.monitor_enter(lock);
+    // Reborrow so `ctx` is still usable for `monitor_exit` after the closure
+    // (a bare `body(ctx)` would move the `&mut dyn` reference).
+    let r = body(&mut *ctx);
+    ctx.monitor_exit(lock);
+    r
+}
+
 /// Read class+field names for a STATIC VarHandle: prefer the meta side table,
 /// fall back to the synthetic VH_CLASS / VH_FIELD string slots.
 fn vh_static_class_field(
@@ -1246,26 +1271,14 @@ fn varhandle_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let this = obj_arg(args, 0)?;
     // C38: Array-element CAS — args = [vh, array, idx, expected, new_value].
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
-        let current = ctx.get_array_element(arr, idx);
         let expected = args.get(3).cloned().unwrap_or(Value::Int(0));
         let new_val = args.get(4).cloned().unwrap_or(Value::Int(0));
-        let matches = match (&current, &expected) {
-            (Value::Int(a), Value::Int(b)) => a == b,
-            (Value::Long(a), Value::Long(b)) => a == b,
-            (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
-            (Value::Double(a), Value::Double(b)) => a.to_bits() == b.to_bits(),
-            (Value::Object(a), Value::Object(b)) => match (a, b) {
-                (Some(ra), Some(rb)) => ra.as_ptr() == rb.as_ptr(),
-                (None, None) => true,
-                _ => false,
-            },
-            _ => false,
-        };
-        if matches {
-            ctx.set_array_element(arr, idx, new_val);
-            return Ok(Some(Value::Int(1)));
-        }
-        return Ok(Some(Value::Int(0)));
+        // LOW-finding fix: atomic compare-and-set. The old get/compare/set was
+        // a non-atomic RMW (could spuriously succeed against a value another
+        // thread changed). `compare_and_swap_field` does the compare+write
+        // under the VM's per-element CAS lock and returns whether it swapped.
+        let ok = ctx.compare_and_swap_field(arr, idx, expected, new_val);
+        return Ok(Some(Value::Int(ok as i32)));
     }
     // Round-7 HIGH-2 fix: fetch meta once and reuse across the kind probe
     // and the class/field fallback below.
@@ -1288,12 +1301,18 @@ fn varhandle_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         let Some((cid, sidx)) = vh_static_slot(ctx, &class, &field) else {
             return Ok(Some(Value::Int(0)));
         };
-        let current = ctx.get_static_field(cid, sidx);
-        if vh_values_match(&current, &expected) {
-            ctx.set_static_field(cid, sidx, new_val);
-            return Ok(Some(Value::Int(1)));
-        }
-        return Ok(Some(Value::Int(0)));
+        // LOW-finding fix: atomic static CAS — serialize the compare+set on the
+        // per-class mirror monitor (no CAS primitive exists for static slots).
+        let ok = vh_with_static_lock(ctx, cid, |ctx| {
+            let current = ctx.get_static_field(cid, sidx);
+            if vh_values_match(&current, &expected) {
+                ctx.set_static_field(cid, sidx, new_val);
+                true
+            } else {
+                false
+            }
+        });
+        return Ok(Some(Value::Int(ok as i32)));
     }
     if kind != VH_KIND_INSTANCE {
         // Unsupported VarHandle kind — report CAS failure rather than a
@@ -1329,31 +1348,13 @@ fn varhandle_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         }
     };
 
-    let current = ctx.get_field(receiver, idx);
-
-    // Compare current vs expected
-    let matches = match (&current, &expected) {
-        (Value::Int(a), Value::Int(b)) => a == b,
-        (Value::Long(a), Value::Long(b)) => a == b,
-        (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
-        (Value::Double(a), Value::Double(b)) => a.to_bits() == b.to_bits(),
-        (Value::Object(a), Value::Object(b)) => {
-            // Reference equality
-            match (a, b) {
-                (Some(ra), Some(rb)) => ra.as_ptr() == rb.as_ptr(),
-                (None, None) => true,
-                _ => false,
-            }
-        }
-        _ => false,
-    };
-
-    if matches {
-        ctx.set_field(receiver, idx, new_val);
-        Ok(Some(Value::Int(1)))
-    } else {
-        Ok(Some(Value::Int(0)))
-    }
+    // LOW-finding fix: atomic compare-and-set on the instance field. The old
+    // get/compare/set was a non-atomic RMW (could spuriously succeed against a
+    // value another thread changed between the read and the write).
+    // `compare_and_swap_field` does the compare+write under the VM's per-object
+    // CAS lock and returns whether the swap happened.
+    let ok = ctx.compare_and_swap_field(receiver, idx, expected, new_val);
+    Ok(Some(Value::Int(ok as i32)))
 }
 
 /// VarHandle.compareAndExchange(receiver, expected, new) → witness value
@@ -1362,22 +1363,19 @@ fn varhandle_compare_and_exchange(ctx: &mut dyn NativeContext, args: &[Value]) -
     let this = obj_arg(args, 0)?;
     // C38: Array-element compareAndExchange — args = [vh, array, idx, expected, new].
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
-        let current = ctx.get_array_element(arr, idx);
         let expected = args.get(3).cloned().unwrap_or(Value::Int(0));
         let new_val = args.get(4).cloned().unwrap_or(Value::Int(0));
-        let matches = match (&current, &expected) {
-            (Value::Int(a), Value::Int(b)) => a == b,
-            (Value::Long(a), Value::Long(b)) => a == b,
-            (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
-            (Value::Double(a), Value::Double(b)) => a.to_bits() == b.to_bits(),
-            (Value::Object(Some(ra)), Value::Object(Some(rb))) => ra.as_ptr() == rb.as_ptr(),
-            (Value::Object(None), Value::Object(None)) => true,
-            _ => false,
-        };
-        if matches {
-            ctx.set_array_element(arr, idx, new_val);
+        // LOW-finding fix: atomic compare-and-exchange. The previous
+        // get/compare/set was a non-atomic RMW (lost updates under
+        // contention). `compare_and_swap_field` runs the compare+write under
+        // the VM's per-element CAS lock (its impl handles array refs).
+        // compareAndExchange returns the *witness*: on a successful swap the
+        // witness equals `expected`; otherwise it is the value that caused the
+        // mismatch, which we re-read with volatile semantics.
+        if ctx.compare_and_swap_field(arr, idx, expected.clone(), new_val) {
+            return Ok(Some(expected));
         }
-        return Ok(Some(current));
+        return Ok(Some(ctx.get_array_element(arr, idx)));
     }
     // Meta side-table FIRST — real-JDK VarHandles don't carry our synthetic
     // 6-field layout (see `varhandle_get_and_bitwise`).
@@ -1400,10 +1398,16 @@ fn varhandle_compare_and_exchange(ctx: &mut dyn NativeContext, args: &[Value]) -
         let Some((cid, sidx)) = vh_static_slot(ctx, &class, &field) else {
             return Ok(Some(Value::Object(None)));
         };
-        let current = ctx.get_static_field(cid, sidx);
-        if vh_values_match(&current, &expected) {
-            ctx.set_static_field(cid, sidx, new_val);
-        }
+        // LOW-finding fix: no CAS primitive exists for static slots, so make
+        // the compare-and-exchange atomic by serializing get+set on the
+        // per-class mirror monitor (see `vh_with_static_lock`).
+        let current = vh_with_static_lock(ctx, cid, |ctx| {
+            let current = ctx.get_static_field(cid, sidx);
+            if vh_values_match(&current, &expected) {
+                ctx.set_static_field(cid, sidx, new_val);
+            }
+            current
+        });
         return Ok(Some(current));
     }
     if kind != VH_KIND_INSTANCE {
@@ -1436,20 +1440,15 @@ fn varhandle_compare_and_exchange(ctx: &mut dyn NativeContext, args: &[Value]) -
         }
     };
 
-    let current = ctx.get_field(receiver, idx);
-    let matches = match (&current, &expected) {
-        (Value::Int(a), Value::Int(b)) => a == b,
-        (Value::Long(a), Value::Long(b)) => a == b,
-        (Value::Object(Some(ra)), Value::Object(Some(rb))) => ra.as_ptr() == rb.as_ptr(),
-        (Value::Object(None), Value::Object(None)) => true,
-        _ => false,
-    };
-
-    if matches {
-        ctx.set_field(receiver, idx, new_val);
+    // LOW-finding fix: atomic compare-and-exchange on the instance field.
+    // The old get/compare/set was a non-atomic RMW and lost updates under
+    // contention; `compare_and_swap_field` performs the compare+write under
+    // the VM's per-object CAS lock. compareAndExchange returns the witness:
+    // `expected` on a successful swap, else the value found on mismatch.
+    if ctx.compare_and_swap_field(receiver, idx, expected.clone(), new_val) {
+        return Ok(Some(expected));
     }
-    // Return the witness (old value)
-    Ok(Some(current))
+    Ok(Some(ctx.get_field_volatile(receiver, idx)))
 }
 
 /// VarHandle.getAndSet(receiver, new) → old value
@@ -1458,8 +1457,20 @@ fn varhandle_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let this = obj_arg(args, 0)?;
     // C38: Array-element getAndSet — args = [vh, array, idx, new_value].
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
-        let old = ctx.get_array_element(arr, idx);
         let new_val = args.get(3).cloned().unwrap_or(Value::Int(0));
+        // LOW-finding fix: atomic getAndSet via a bounded CAS retry loop
+        // (was a non-atomic get-then-set → lost updates under contention).
+        // `compare_and_swap_field` runs on array refs; mirrors the
+        // AtomicReferenceFieldUpdater.getAndSet pattern in atomic_updater.rs.
+        for _ in 0..1024 {
+            let old = ctx.get_array_element(arr, idx);
+            if ctx.compare_and_swap_field(arr, idx, old.clone(), new_val.clone()) {
+                return Ok(Some(old));
+            }
+        }
+        // Heavily contended: fall back to a definite store (matches the JDK's
+        // "the value is written" guarantee), returning the last observed old.
+        let old = ctx.get_array_element(arr, idx);
         ctx.set_array_element(arr, idx, new_val);
         return Ok(Some(old));
     }
@@ -1482,8 +1493,13 @@ fn varhandle_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         let Some((cid, sidx)) = vh_static_slot(ctx, &class, &field) else {
             return Ok(Some(Value::Object(None)));
         };
-        let old = ctx.get_static_field(cid, sidx);
-        ctx.set_static_field(cid, sidx, new_val);
+        // LOW-finding fix: atomic static getAndSet — serialize get+set on the
+        // per-class mirror monitor (no CAS primitive for static slots).
+        let old = vh_with_static_lock(ctx, cid, |ctx| {
+            let old = ctx.get_static_field(cid, sidx);
+            ctx.set_static_field(cid, sidx, new_val);
+            old
+        });
         return Ok(Some(old));
     }
     if kind != VH_KIND_INSTANCE {
@@ -1515,8 +1531,17 @@ fn varhandle_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         }
     };
 
-    let old = ctx.get_field(receiver, idx);
-    ctx.set_field(receiver, idx, new_val);
+    // LOW-finding fix: atomic instance getAndSet via a bounded CAS retry loop
+    // (was a non-atomic get-then-set → lost updates under contention).
+    // Mirrors AtomicReferenceFieldUpdater.getAndSet in atomic_updater.rs.
+    for _ in 0..1024 {
+        let old = ctx.get_field_volatile(receiver, idx);
+        if ctx.compare_and_swap_field(receiver, idx, old.clone(), new_val.clone()) {
+            return Ok(Some(old));
+        }
+    }
+    let old = ctx.get_field_volatile(receiver, idx);
+    ctx.set_field_volatile(receiver, idx, new_val);
     Ok(Some(old))
 }
 
@@ -1545,15 +1570,36 @@ fn varhandle_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         }
     }
 
+    // LOW-finding fix: atomic getAndAdd on an array element via a bounded CAS
+    // retry loop (was a non-atomic get/add/set → lost updates under
+    // contention). The add is recomputed from the freshly-read `old` each
+    // iteration so a racing update is never clobbered.
+    fn array_get_and_add(
+        ctx: &mut dyn NativeContext,
+        arr: ObjectRef,
+        idx: usize,
+        delta: &Value,
+    ) -> Value {
+        for _ in 0..1024 {
+            let old = ctx.get_array_element(arr, idx);
+            let new_val = add_values(&old, delta);
+            if ctx.compare_and_swap_field(arr, idx, old.clone(), new_val) {
+                return old;
+            }
+        }
+        // Heavily contended: definite store of the last-computed sum.
+        let old = ctx.get_array_element(arr, idx);
+        let new_val = add_values(&old, delta);
+        ctx.set_array_element(arr, idx, new_val);
+        old
+    }
+
     // C38: Array-element getAndAdd — args = [vh, array, idx, delta]. Route first
     // so real-JDK VarHandleLongs$Array / VarHandleInts$Array calls work even
     // when the VH's slot 0 is not our synthetic VH_KIND Int.
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
         let delta = args.get(3).cloned().unwrap_or(Value::Int(0));
-        let old = ctx.get_array_element(arr, idx);
-        let new_val = add_values(&old, &delta);
-        ctx.set_array_element(arr, idx, new_val);
-        return Ok(Some(old));
+        return Ok(Some(array_get_and_add(ctx, arr, idx, &delta)));
     }
 
     // Resolve kind + field via the meta side-table FIRST (real-JDK VarHandles —
@@ -1588,10 +1634,8 @@ fn varhandle_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 _ => 0,
             };
             let delta = args.get(3).cloned().unwrap_or(Value::Int(0));
-            let old = ctx.get_array_element(arr, idx);
-            let new_val = add_values(&old, &delta);
-            ctx.set_array_element(arr, idx, new_val);
-            Ok(Some(old))
+            // LOW-finding fix: atomic via the shared CAS retry helper.
+            Ok(Some(array_get_and_add(ctx, arr, idx, &delta)))
         }
         VH_KIND_INSTANCE => {
             let receiver = match args.get(1) {
@@ -1617,9 +1661,20 @@ fn varhandle_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                     None => return Ok(Some(Value::Int(0))),
                 }
             };
-            let old = ctx.get_field(receiver, idx);
+            // LOW-finding fix: atomic instance getAndAdd via a bounded CAS
+            // retry loop (was a non-atomic get/add/set → lost updates under
+            // contention). The sum is recomputed from the freshly-read `old`
+            // each iteration so a racing update is never clobbered.
+            for _ in 0..1024 {
+                let old = ctx.get_field_volatile(receiver, idx);
+                let new_val = add_values(&old, &delta);
+                if ctx.compare_and_swap_field(receiver, idx, old.clone(), new_val) {
+                    return Ok(Some(old));
+                }
+            }
+            let old = ctx.get_field_volatile(receiver, idx);
             let new_val = add_values(&old, &delta);
-            ctx.set_field(receiver, idx, new_val);
+            ctx.set_field_volatile(receiver, idx, new_val);
             Ok(Some(old))
         }
         VH_KIND_STATIC => {
@@ -1632,9 +1687,15 @@ fn varhandle_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 ),
             };
             if let Some((cid, sidx)) = vh_static_slot(ctx, &class, &field) {
-                let old = ctx.get_static_field(cid, sidx);
-                let new_val = add_values(&old, &delta);
-                ctx.set_static_field(cid, sidx, new_val);
+                // LOW-finding fix: atomic static getAndAdd — serialize the
+                // get/add/set on the per-class mirror monitor (no CAS
+                // primitive exists for static slots).
+                let old = vh_with_static_lock(ctx, cid, |ctx| {
+                    let old = ctx.get_static_field(cid, sidx);
+                    let new_val = add_values(&old, &delta);
+                    ctx.set_static_field(cid, sidx, new_val);
+                    old
+                });
                 Ok(Some(old))
             } else {
                 Ok(Some(Value::Int(0)))
@@ -1681,13 +1742,34 @@ fn varhandle_get_and_bitwise(
         }
     }
 
+    // LOW-finding fix: atomic getAndBitwise* on an array element via a bounded
+    // CAS retry loop (was a non-atomic get/apply/set → lost updates under
+    // contention). Same shape as the getAndAdd array helper; the masked value
+    // is recomputed from the freshly-read `old` each iteration.
+    fn array_get_and_bitwise(
+        ctx: &mut dyn NativeContext,
+        arr: ObjectRef,
+        idx: usize,
+        mask: &Value,
+        op: VhBitOp,
+    ) -> Value {
+        for _ in 0..1024 {
+            let old = ctx.get_array_element(arr, idx);
+            let new_val = apply(&old, mask, op);
+            if ctx.compare_and_swap_field(arr, idx, old.clone(), new_val) {
+                return old;
+            }
+        }
+        let old = ctx.get_array_element(arr, idx);
+        let new_val = apply(&old, mask, op);
+        ctx.set_array_element(arr, idx, new_val);
+        old
+    }
+
     // Array-element form — args = [vh, array, idx, mask].
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
         let mask = args.get(3).cloned().unwrap_or(Value::Int(0));
-        let old = ctx.get_array_element(arr, idx);
-        let new_val = apply(&old, &mask, op);
-        ctx.set_array_element(arr, idx, new_val);
-        return Ok(Some(old));
+        return Ok(Some(array_get_and_bitwise(ctx, arr, idx, &mask, op)));
     }
 
     // Resolve kind + field via the meta side-table FIRST (real-JDK VarHandles —
@@ -1721,10 +1803,8 @@ fn varhandle_get_and_bitwise(
                 _ => 0,
             };
             let mask = args.get(3).cloned().unwrap_or(Value::Int(0));
-            let old = ctx.get_array_element(arr, idx);
-            let new_val = apply(&old, &mask, op);
-            ctx.set_array_element(arr, idx, new_val);
-            Ok(Some(old))
+            // LOW-finding fix: atomic via the shared CAS retry helper.
+            Ok(Some(array_get_and_bitwise(ctx, arr, idx, &mask, op)))
         }
         VH_KIND_INSTANCE => {
             let receiver = match args.get(1) {
@@ -1750,9 +1830,20 @@ fn varhandle_get_and_bitwise(
                     None => return Ok(Some(Value::Int(0))),
                 }
             };
-            let old = ctx.get_field(receiver, idx);
+            // LOW-finding fix: atomic instance getAndBitwise* via a bounded CAS
+            // retry loop (was a non-atomic get/apply/set → lost updates under
+            // contention). The masked value is recomputed from the
+            // freshly-read `old` each iteration so a racing update is kept.
+            for _ in 0..1024 {
+                let old = ctx.get_field_volatile(receiver, idx);
+                let new_val = apply(&old, &mask, op);
+                if ctx.compare_and_swap_field(receiver, idx, old.clone(), new_val) {
+                    return Ok(Some(old));
+                }
+            }
+            let old = ctx.get_field_volatile(receiver, idx);
             let new_val = apply(&old, &mask, op);
-            ctx.set_field(receiver, idx, new_val);
+            ctx.set_field_volatile(receiver, idx, new_val);
             Ok(Some(old))
         }
         VH_KIND_STATIC => {
@@ -1765,9 +1856,15 @@ fn varhandle_get_and_bitwise(
                 ),
             };
             if let Some((cid, sidx)) = vh_static_slot(ctx, &class, &field) {
-                let old = ctx.get_static_field(cid, sidx);
-                let new_val = apply(&old, &mask, op);
-                ctx.set_static_field(cid, sidx, new_val);
+                // LOW-finding fix: atomic static getAndBitwise* — serialize the
+                // get/apply/set on the per-class mirror monitor (no CAS
+                // primitive exists for static slots).
+                let old = vh_with_static_lock(ctx, cid, |ctx| {
+                    let old = ctx.get_static_field(cid, sidx);
+                    let new_val = apply(&old, &mask, op);
+                    ctx.set_static_field(cid, sidx, new_val);
+                    old
+                });
                 Ok(Some(old))
             } else {
                 Ok(Some(Value::Int(0)))
@@ -5888,6 +5985,103 @@ mod tests {
         .unwrap();
         assert_eq!(witness, Some(Value::Int(30)), "witness must be old value via meta");
         assert_eq!(ctx.get_field(recv, 0), Value::Int(77), "field must be updated on match");
+    }
+
+    // LOW-finding fix regression: on a compareAndExchange whose `expected`
+    // does NOT match the current field value, the atomic CAS must leave the
+    // field unchanged and return the *witnessed* current value (not silently
+    // overwrite it). The previous non-atomic get/compare/set already declined
+    // to write on mismatch, but routing through `compare_and_swap_field`
+    // exercises the new linearizable path.
+    #[test]
+    fn compare_and_exchange_mismatch_does_not_write() {
+        let mut ctx = MockNativeContext::new();
+        let vh = vh_with_garbage_kind(&mut ctx);
+        let recv = match ctx.new_object("Cell").unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            _ => unreachable!(),
+        };
+        ctx.set_field(recv, 0, Value::Int(30));
+        let cid = ctx.class_id_of_object(recv).as_u32();
+        vh_meta_put(
+            &mut ctx,
+            vh,
+            VarHandleMeta {
+                kind: VH_KIND_INSTANCE,
+                class_name: "Cell".to_string(),
+                field_name: "x".to_string(),
+                field_desc: "I".to_string(),
+                field_index: 0,
+                class_id: cid,
+            },
+        );
+        // expected = 99 (wrong) → no swap; witness is the real current 30.
+        let witness = varhandle_compare_and_exchange(
+            &mut ctx,
+            &[
+                Value::Object(Some(vh)),
+                Value::Object(Some(recv)),
+                Value::Int(99),
+                Value::Int(77),
+            ],
+        )
+        .unwrap();
+        assert_eq!(witness, Some(Value::Int(30)), "witness must be the current value on mismatch");
+        assert_eq!(ctx.get_field(recv, 0), Value::Int(30), "field must be unchanged on mismatch");
+    }
+
+    // LOW-finding fix regression: `varhandle_compare_and_set` now routes the
+    // instance path through the linearizable `compare_and_swap_field`. Verify
+    // both the success (matching expected → swap, return 1) and the failure
+    // (wrong expected → no swap, return 0) outcomes.
+    #[test]
+    fn compare_and_set_instance_atomic_success_and_failure() {
+        let mut ctx = MockNativeContext::new();
+        let vh = vh_with_garbage_kind(&mut ctx);
+        let recv = match ctx.new_object("Slot").unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            _ => unreachable!(),
+        };
+        ctx.set_field(recv, 0, Value::Int(5));
+        let cid = ctx.class_id_of_object(recv).as_u32();
+        vh_meta_put(
+            &mut ctx,
+            vh,
+            VarHandleMeta {
+                kind: VH_KIND_INSTANCE,
+                class_name: "Slot".to_string(),
+                field_name: "v".to_string(),
+                field_desc: "I".to_string(),
+                field_index: 0,
+                class_id: cid,
+            },
+        );
+        // Wrong expected → no swap, returns 0 (false).
+        let miss = varhandle_compare_and_set(
+            &mut ctx,
+            &[
+                Value::Object(Some(vh)),
+                Value::Object(Some(recv)),
+                Value::Int(999),
+                Value::Int(42),
+            ],
+        )
+        .unwrap();
+        assert_eq!(miss, Some(Value::Int(0)), "mismatch must report CAS failure");
+        assert_eq!(ctx.get_field(recv, 0), Value::Int(5), "field must be unchanged on mismatch");
+        // Correct expected → swap, returns 1 (true).
+        let hit = varhandle_compare_and_set(
+            &mut ctx,
+            &[
+                Value::Object(Some(vh)),
+                Value::Object(Some(recv)),
+                Value::Int(5),
+                Value::Int(42),
+            ],
+        )
+        .unwrap();
+        assert_eq!(hit, Some(Value::Int(1)), "match must report CAS success");
+        assert_eq!(ctx.get_field(recv, 0), Value::Int(42), "field must hold new value on success");
     }
 }
 

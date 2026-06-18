@@ -3878,12 +3878,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "getName", "(I)Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let idx = match args[1] {
-            Value::Int(i) => i as usize,
+            Value::Int(i) => i,
             _ => 0,
         };
         let p = p57_read_path(ctx, this);
         let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
-        let name = parts.get(idx).unwrap_or(&"");
+        // FIX (finding 4): match the JDK — index < 0 or >= name count throws
+        // IllegalArgumentException instead of silently returning an empty path.
+        if idx < 0 || idx as usize >= parts.len() {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("Invalid index: {idx}"),
+            }
+            .into());
+        }
+        let name = parts[idx as usize];
         let result = p57_alloc_path(ctx, name);
         Ok(Some(Value::Object(Some(result))))
     });
@@ -3891,16 +3899,25 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "subpath", "(II)Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let begin = match args[1] {
-            Value::Int(i) => i as usize,
+            Value::Int(i) => i,
             _ => 0,
         };
         let end = match args[2] {
-            Value::Int(i) => i as usize,
+            Value::Int(i) => i,
             _ => 0,
         };
         let p = p57_read_path(ctx, this);
         let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
-        let sub: Vec<&str> = parts.get(begin..end).unwrap_or(&[]).to_vec();
+        let count = parts.len() as i32;
+        // FIX (finding 4): match the JDK — beginIndex must be in [0,count),
+        // endIndex in (beginIndex,count]; otherwise IllegalArgumentException.
+        if begin < 0 || begin >= count || end <= begin || end > count {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("Invalid subpath range: begin={begin}, end={end}, count={count}"),
+            }
+            .into());
+        }
+        let sub: Vec<&str> = parts[begin as usize..end as usize].to_vec();
         let result = p57_alloc_path(ctx, &sub.join("/"));
         Ok(Some(Value::Object(Some(result))))
     });
@@ -6430,10 +6447,17 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
     r.register(path, "getName", "(I)Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let idx = match args[1] { Value::Int(i) => i as usize, _ => 0 };
+        let idx = match args[1] { Value::Int(i) => i, _ => 0 };
         let p = p57_read_path(ctx, this);
         let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
-        let name = parts.get(idx).copied().unwrap_or("");
+        // FIX (finding 4): JDK throws IllegalArgumentException for out-of-range index.
+        if idx < 0 || idx as usize >= parts.len() {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("Invalid index: {idx}"),
+            }
+            .into());
+        }
+        let name = parts[idx as usize];
         let result = p57_alloc_path(ctx, name);
         Ok(Some(Value::Object(Some(result))))
     });
@@ -6495,11 +6519,19 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
     r.register(path, "subpath", "(II)Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let begin = match args[1] { Value::Int(i) => i as usize, _ => 0 };
-        let end = match args[2] { Value::Int(i) => i as usize, _ => 0 };
+        let begin = match args[1] { Value::Int(i) => i, _ => 0 };
+        let end = match args[2] { Value::Int(i) => i, _ => 0 };
         let p = p57_read_path(ctx, this);
         let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
-        let sub: Vec<&str> = parts.get(begin..end).unwrap_or(&[]).to_vec();
+        let count = parts.len() as i32;
+        // FIX (finding 4): JDK throws IllegalArgumentException for an out-of-range range.
+        if begin < 0 || begin >= count || end <= begin || end > count {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("Invalid subpath range: begin={begin}, end={end}, count={count}"),
+            }
+            .into());
+        }
+        let sub: Vec<&str> = parts[begin as usize..end as usize].to_vec();
         let result = p57_alloc_path(ctx, &sub.join("/"));
         Ok(Some(Value::Object(Some(result))))
     });
@@ -7514,7 +7546,12 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
     // ProcessBuilder.start() — real process execution via std::process::Command
     r.register(pb, "start", "()Ljava/lang/Process;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        eprintln!("[PB-START-ENTRY] this={:?}", this);
+        // FIX (finding 5): this was an UNCONDITIONAL stderr print on every
+        // ProcessBuilder.start() — noisy in production. Gate it behind the
+        // standard CRATONVM_DBG_PB debug flag.
+        if std::env::var_os("CRATONVM_DBG_PB").is_some() {
+            eprintln!("[PB-START-ENTRY] this={:?}", this);
+        }
 
         // --- Extract command strings from the `command` field ---
         // Three cases are possible:
@@ -7591,7 +7628,11 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
                         let cname = ctx.class_name_of_id(cid).unwrap_or_else(|| "<?>".into());
                         let cmd_cid = ctx.class_id_of_object(cmd_obj);
                         let cmd_cname = ctx.class_name_of_id(cmd_cid).unwrap_or_else(|| "<?>".into());
-                        eprintln!("[PB-DIAG] data field is not an array: data_class={} cmd_class={} cmd_obj={:?} data={:?} size_by_name={:?}", cname, cmd_cname, cmd_obj, data, size_by_name);
+                        // Gated behind the same debug flag (finding 5): keep the
+                        // diagnostic available but off by default in production.
+                        if std::env::var_os("CRATONVM_DBG_PB").is_some() {
+                            eprintln!("[PB-DIAG] data field is not an array: data_class={} cmd_class={} cmd_obj={:?} data={:?} size_by_name={:?}", cname, cmd_cname, cmd_obj, data, size_by_name);
+                        }
                         // Skip the array_length call to avoid noisy guard print.
                     } else {
                         let len = ctx.array_length(data);
@@ -9973,10 +10014,25 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
     r.register(fc, "force", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
-        // The FileChannel from RAF only stores fd_id. We can't directly call File::sync_all on
-        // an internal fd, but fd_table handles flush semantics via its underlying File.
-        // Best effort: no-op for positional force (data is already flushed at OS level per write).
-        let _ = (ctx, fd_id, args);
+        // FIX (finding 2): honor durability instead of being a silent no-op.
+        // `clone_file` flushes any buffered writer for the fd and hands back a
+        // std::fs::File referring to the same kernel file; sync_data/sync_all then
+        // issue a real fsync (POSIX fsync / Windows FlushFileBuffers under the hood).
+        // `metadata == true` → flush file contents AND metadata (sync_all); false →
+        // at least the file contents (sync_data). We only fall back to best-effort
+        // (no error surfaced) when the fd genuinely isn't a real file (e.g. a pipe).
+        if fd_id >= 0 {
+            let metadata = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
+            if let Ok(file) = ctx.fd_table().clone_file(fd_id as u32) {
+                let res = if metadata { file.sync_all() } else { file.sync_data() };
+                if let Err(e) = res {
+                    return Err(RuntimeError::IOException {
+                        message: format!("FileChannel.force failed: {e}"),
+                    }.into());
+                }
+            }
+            // Non-file-backed fd (pipe/socket/etc.): nothing to sync — best effort.
+        }
         Ok(None)
     });
 
@@ -11348,6 +11404,62 @@ fn p98_do_select(ctx: &mut dyn NativeContext, selector: ObjectRef) -> MethodCall
 // ZipOutputStream = 2-field (out=0, currentEntry=1)
 // =============================================================================
 
+/// Default cap on the total number of inflated bytes a single GZIP/Zip input
+/// stream may produce (256 MiB). Overridable at runtime via
+/// `CRATONVM_MAX_INFLATED_BYTES` (decimal byte count; `0` disables the cap).
+///
+/// FIX (finding 3): these synthetic streams eagerly inflate the WHOLE input in
+/// `<init>`. Without a bound, a few-KB "zip/gzip bomb" can inflate to gigabytes
+/// and exhaust the heap before any Java code runs. The cap turns that into a
+/// loud `IOException` instead of an OOM crash.
+const GZIP_DEFAULT_MAX_INFLATED: u64 = 256 * 1024 * 1024;
+
+/// Resolve the configured max inflated-size cap. Returns `None` when the cap is
+/// explicitly disabled (`CRATONVM_MAX_INFLATED_BYTES=0`).
+fn gzip_max_inflated_bytes() -> Option<u64> {
+    match std::env::var("CRATONVM_MAX_INFLATED_BYTES") {
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(0) => None,             // explicitly disabled
+            Ok(n) => Some(n),
+            Err(_) => Some(GZIP_DEFAULT_MAX_INFLATED),
+        },
+        Err(_) => Some(GZIP_DEFAULT_MAX_INFLATED),
+    }
+}
+
+/// Inflate `reader` fully into a `Vec<u8>`, refusing to exceed `cap` bytes.
+///
+/// Reads in chunks so memory grows incrementally; as soon as the running total
+/// would exceed `cap` we stop and return `Err` (compression-bomb defense). When
+/// `cap` is `None` the read is unbounded (legacy behavior, opt-in only).
+fn inflate_bounded<R: std::io::Read>(
+    mut reader: R,
+    cap: Option<u64>,
+) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::Read;
+    let mut out: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        if let Some(limit) = cap {
+            if out.len() as u64 + n as u64 > limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "inflated size exceeds CRATONVM_MAX_INFLATED_BYTES cap ({limit} bytes) \
+                         — possible compression bomb"
+                    ),
+                ));
+            }
+        }
+        out.extend_from_slice(&chunk[..n]);
+    }
+    Ok(out)
+}
+
 pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -11424,13 +11536,32 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
                 let count = archive.len();
                 let names_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
                 let data_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
+                // Bound the CUMULATIVE inflated size across all entries so a zip
+                // bomb (many/large entries) throws instead of exhausting the heap
+                // (finding 3). `remaining` tracks the budget left for this archive.
+                let cap = gzip_max_inflated_bytes();
+                let mut remaining: Option<u64> = cap;
                 for i in 0..count {
-                    if let Ok(mut entry) = archive.by_index(i) {
+                    if let Ok(entry) = archive.by_index(i) {
                         let name = ctx.create_string(entry.name());
                         ctx.set_array_element(names_arr, i, Value::Object(Some(name)));
-                        let mut entry_bytes = Vec::new();
-                        use std::io::Read;
-                        let _ = entry.read_to_end(&mut entry_bytes);
+                        let entry_bytes = match inflate_bounded(entry, remaining) {
+                            Ok(b) => b,
+                            Err(_) => {
+                                // Cap exceeded mid-archive → fail loud.
+                                return Err(RuntimeError::IOException {
+                                    message: format!(
+                                        "ZipInputStream: inflated size exceeds \
+                                         CRATONVM_MAX_INFLATED_BYTES cap ({} bytes) \
+                                         — possible compression bomb",
+                                        cap.unwrap_or(0)
+                                    ),
+                                }.into());
+                            }
+                        };
+                        if let Some(rem) = remaining.as_mut() {
+                            *rem = rem.saturating_sub(entry_bytes.len() as u64);
+                        }
                         let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, entry_bytes.len());
                         for (j, &b) in entry_bytes.iter().enumerate() {
                             ctx.set_array_element(byte_arr, j, Value::Int(b as i8 as i32));
@@ -11728,15 +11859,24 @@ fn p58_gzip_in_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             }
         }
     }
-    // Decompress with flate2 GzDecoder
+    // Decompress with flate2 GzDecoder, bounded by the inflated-size cap so a
+    // gzip bomb throws an IOException instead of exhausting the heap (finding 3).
     let decompressed = if !compressed.is_empty() {
         use flate2::read::GzDecoder;
-        use std::io::Read;
-        let mut decoder = GzDecoder::new(&compressed[..]);
-        let mut buf = Vec::new();
-        match decoder.read_to_end(&mut buf) {
-            Ok(_) => buf,
-            Err(_) => compressed, // If not valid gzip, return raw bytes
+        let decoder = GzDecoder::new(&compressed[..]);
+        let cap = gzip_max_inflated_bytes();
+        match inflate_bounded(decoder, cap) {
+            Ok(buf) => buf,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData
+                && e.to_string().contains("compression bomb") =>
+            {
+                // Cap exceeded: fail loud rather than OOM.
+                return Err(RuntimeError::IOException {
+                    message: format!("GZIPInputStream: {e}"),
+                }.into());
+            }
+            // Genuinely-not-gzip input keeps the lenient raw-passthrough behavior.
+            Err(_) => compressed,
         }
     } else {
         Vec::new()
@@ -42634,7 +42774,27 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+/// Read exactly four hex digits as a u16 from the char iterator, advancing it.
+/// Returns None if fewer than four hex digits are available (malformed `\u`).
+fn json_read_u16_hex(chars: &mut std::str::Chars<'_>) -> Option<u16> {
+    let mut code: u16 = 0;
+    for _ in 0..4 {
+        let d = chars.next()?.to_digit(16)?;
+        code = code.wrapping_shl(4) | (d as u16);
+    }
+    Some(code)
+}
+
 /// Unescape a JSON string value (handles \\n, \\t, \\uXXXX, etc.).
+///
+/// FIX (finding 1): correctly decode UTF-16 surrogate PAIRS. A `😀`
+/// sequence is two escapes that together form one astral code point (U+1F600).
+/// The previous code fed each half to `char::from_u32`, which returns `None` for
+/// any surrogate (0xD800..=0xDFFF), so emoji and other supplementary-plane chars
+/// were SILENTLY DROPPED. We now combine a high surrogate with a following low
+/// surrogate; unpaired/invalid surrogates become U+FFFD instead of vanishing.
+/// Operates purely on `char`s, so it is inherently UTF-8-boundary safe and never
+/// panics on malformed multi-byte input.
 fn json_unescape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -42650,11 +42810,44 @@ fn json_unescape(s: &str) -> String {
                 Some('b') => out.push('\x08'),
                 Some('f') => out.push('\x0C'),
                 Some('u') => {
-                    let hex: String = chars.by_ref().take(4).collect();
-                    if let Ok(code) = u32::from_str_radix(&hex, 16) {
-                        if let Some(ch) = char::from_u32(code) {
-                            out.push(ch);
+                    match json_read_u16_hex(&mut chars) {
+                        Some(unit) => {
+                            if (0xD800..=0xDBFF).contains(&unit) {
+                                // High surrogate: try to consume a following `\uDCxx` low surrogate.
+                                let mut lookahead = chars.clone();
+                                let low = if lookahead.next() == Some('\\')
+                                    && lookahead.next() == Some('u')
+                                {
+                                    json_read_u16_hex(&mut lookahead)
+                                } else {
+                                    None
+                                };
+                                match low {
+                                    Some(lo) if (0xDC00..=0xDFFF).contains(&lo) => {
+                                        // Valid surrogate pair → astral code point.
+                                        let cp = 0x10000
+                                            + (((unit as u32) - 0xD800) << 10)
+                                            + ((lo as u32) - 0xDC00);
+                                        // SAFETY: cp is in 0x10000..=0x10FFFF, always a valid char.
+                                        out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                                        chars = lookahead; // consume the low-surrogate escape
+                                    }
+                                    _ => {
+                                        // Unpaired high surrogate → replacement char.
+                                        out.push('\u{FFFD}');
+                                    }
+                                }
+                            } else if (0xDC00..=0xDFFF).contains(&unit) {
+                                // Unpaired low surrogate → replacement char.
+                                out.push('\u{FFFD}');
+                            } else {
+                                // BMP scalar value (never a surrogate here).
+                                out.push(char::from_u32(unit as u32).unwrap_or('\u{FFFD}'));
+                            }
                         }
+                        // Malformed `\u` with fewer than 4 hex digits: emit replacement
+                        // rather than panicking or silently dropping.
+                        None => out.push('\u{FFFD}'),
                     }
                 }
                 Some(other) => { out.push('\\'); out.push(other); }
@@ -42665,6 +42858,37 @@ fn json_unescape(s: &str) -> String {
         }
     }
     out
+}
+
+/// Number of bytes occupied by the UTF-8 character whose leading byte sits at
+/// `bytes[i]`. Returns at least 1, and clamps so the result never runs past the
+/// slice end.
+///
+/// FIX (finding 1): the byte-level scanners below skip an *escaped* character by
+/// advancing past the backslash and then over the escaped char. If that char is
+/// multi-byte UTF-8 (e.g. `\é`, `\😀`), a blind `+= 2` lands the cursor in the
+/// MIDDLE of a UTF-8 sequence; the later `&s[start..i]` slice then panics with
+/// "byte index N is not a char boundary". Skipping the full UTF-8 width keeps the
+/// cursor on a char boundary so malformed input degrades gracefully (never panics).
+#[inline]
+fn json_utf8_char_len(bytes: &[u8], i: usize) -> usize {
+    if i >= bytes.len() {
+        return 0;
+    }
+    let b = bytes[i];
+    let n = if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else if b >> 3 == 0b11110 {
+        4
+    } else {
+        // Continuation/invalid leading byte: advance one byte to make progress.
+        1
+    };
+    n.min(bytes.len() - i)
 }
 
 /// Simple JSON tokenizer for deserialization.
@@ -42695,15 +42919,17 @@ fn parse_json_object(json: &str) -> Vec<(String, String)> {
         let key_start = i;
         while i < bytes.len() {
             if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                i += 2; // skip escaped char pair (handles \" correctly)
+                // Skip the backslash, then the FULL escaped char (UTF-8 width-aware,
+                // finding 1) so `i` stays on a char boundary even for `\é`, `\😀`, etc.
+                i += 1 + json_utf8_char_len(bytes, i + 1);
             } else if bytes[i] == b'"' {
                 break;
             } else {
-                i += 1;
+                i += json_utf8_char_len(bytes, i);
             }
         }
         if i >= bytes.len() { break; } // unterminated string
-        let raw_key = &inner[key_start..i];
+        let raw_key = &inner[key_start..i.min(inner.len())];
         let key = json_unescape(raw_key);
         i += 1; // skip closing quote
 
@@ -42778,14 +43004,16 @@ fn read_json_value(s: &str, i: &mut usize) -> String {
             let start = *i;
             while *i < bytes.len() {
                 if bytes[*i] == b'\\' && *i + 1 < bytes.len() {
-                    *i += 2; // skip escaped char pair
+                    // Skip backslash + full escaped char (UTF-8-width aware, finding 1)
+                    // so `*i` stays on a char boundary for the slice below.
+                    *i += 1 + json_utf8_char_len(bytes, *i + 1);
                 } else if bytes[*i] == b'"' {
                     break;
                 } else {
-                    *i += 1;
+                    *i += json_utf8_char_len(bytes, *i);
                 }
             }
-            let val = json_unescape(&s[start..*i]);
+            let val = json_unescape(&s[start..(*i).min(bytes.len())]);
             if *i < bytes.len() { *i += 1; } // skip closing quote
             val
         }
@@ -42795,19 +43023,20 @@ fn read_json_value(s: &str, i: &mut usize) -> String {
             let mut in_string = false;
             while *i < bytes.len() {
                 if in_string {
-                    if bytes[*i] == b'\\' && *i + 1 < bytes.len() { *i += 2; continue; }
+                    // UTF-8-width-aware escape skip keeps `*i` on a char boundary (finding 1).
+                    if bytes[*i] == b'\\' && *i + 1 < bytes.len() { *i += 1 + json_utf8_char_len(bytes, *i + 1); continue; }
                     if bytes[*i] == b'"' { in_string = false; }
                 } else {
                     match bytes[*i] {
                         b'"' => in_string = true,
                         b'{' => depth += 1,
-                        b'}' => { depth -= 1; if depth == 0 { *i += 1; return s[start..*i].to_string(); } }
+                        b'}' => { depth -= 1; if depth == 0 { *i += 1; return s[start..(*i).min(bytes.len())].to_string(); } }
                         _ => {}
                     }
                 }
-                *i += 1;
+                *i += json_utf8_char_len(bytes, *i);
             }
-            s[start..*i].to_string()
+            s[start..(*i).min(bytes.len())].to_string()
         }
         b'[' => {
             let start = *i;
@@ -42815,19 +43044,20 @@ fn read_json_value(s: &str, i: &mut usize) -> String {
             let mut in_string = false;
             while *i < bytes.len() {
                 if in_string {
-                    if bytes[*i] == b'\\' && *i + 1 < bytes.len() { *i += 2; continue; }
+                    // UTF-8-width-aware escape skip keeps `*i` on a char boundary (finding 1).
+                    if bytes[*i] == b'\\' && *i + 1 < bytes.len() { *i += 1 + json_utf8_char_len(bytes, *i + 1); continue; }
                     if bytes[*i] == b'"' { in_string = false; }
                 } else {
                     match bytes[*i] {
                         b'"' => in_string = true,
                         b'[' => depth += 1,
-                        b']' => { depth -= 1; if depth == 0 { *i += 1; return s[start..*i].to_string(); } }
+                        b']' => { depth -= 1; if depth == 0 { *i += 1; return s[start..(*i).min(bytes.len())].to_string(); } }
                         _ => {}
                     }
                 }
-                *i += 1;
+                *i += json_utf8_char_len(bytes, *i);
             }
-            s[start..*i].to_string()
+            s[start..(*i).min(bytes.len())].to_string()
         }
         _ => {
             // Number, boolean, null
@@ -45897,5 +46127,101 @@ mod nb_phases_late_security_fix_tests {
         assert!(r
             .find(sq, "poll", "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;")
             .is_some());
+    }
+}
+
+#[cfg(test)]
+mod nb_phases_late_robustness_fix_tests {
+    use super::*;
+
+    // -- finding 1: JSON unescape surrogate pairs + multi-byte safety --------
+
+    #[test]
+    fn json_unescape_decodes_astral_surrogate_pair() {
+        // U+1F600 GRINNING FACE encoded as a UTF-16 surrogate pair.
+        let s = json_unescape("\\uD83D\\uDE00");
+        assert_eq!(s, "\u{1F600}", "surrogate pair must combine into one astral char");
+    }
+
+    #[test]
+    fn json_unescape_lone_surrogate_becomes_replacement_not_dropped() {
+        // A lone high surrogate must not silently vanish.
+        let hi = json_unescape("a\\uD83Db");
+        assert_eq!(hi, "a\u{FFFD}b");
+        // A lone low surrogate likewise.
+        let lo = json_unescape("a\\uDE00b");
+        assert_eq!(lo, "a\u{FFFD}b");
+    }
+
+    #[test]
+    fn json_unescape_handles_bmp_and_basic_escapes() {
+        assert_eq!(json_unescape("\\u0041\\n\\t\\\""), "A\n\t\"");
+    }
+
+    #[test]
+    fn json_unescape_malformed_u_escape_does_not_panic() {
+        // Fewer than 4 hex digits after \u → replacement, no panic.
+        assert_eq!(json_unescape("\\u12"), "\u{FFFD}");
+        assert_eq!(json_unescape("\\uZZZZ"), "\u{FFFD}");
+    }
+
+    #[test]
+    fn json_utf8_char_len_classifies_widths() {
+        assert_eq!(json_utf8_char_len("a".as_bytes(), 0), 1);
+        assert_eq!(json_utf8_char_len("é".as_bytes(), 0), 2); // 0xC3 0xA9
+        assert_eq!(json_utf8_char_len("€".as_bytes(), 0), 3); // 3-byte
+        assert_eq!(json_utf8_char_len("😀".as_bytes(), 0), 4); // 4-byte
+        // Out-of-range index returns 0.
+        assert_eq!(json_utf8_char_len("a".as_bytes(), 5), 0);
+    }
+
+    #[test]
+    fn read_json_value_no_panic_on_escaped_multibyte() {
+        // `\é` inside a string would previously skip into the middle of the
+        // 2-byte 'é' and panic on the slice. Now it parses cleanly.
+        let s = "\"x\\éy\"";
+        let mut i = 0usize;
+        let v = read_json_value(s, &mut i);
+        // The unescaped value keeps the backslash-prefixed unknown escape as `\é`.
+        assert!(v.contains('é'), "value should retain the multi-byte char, got {v:?}");
+    }
+
+    #[test]
+    fn parse_json_object_no_panic_on_escaped_multibyte_key() {
+        // Malformed/odd escapes with multi-byte chars must not panic.
+        let pairs = parse_json_object("{\"k\\é\":\"v\"}");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].1, "v");
+    }
+
+    // -- finding 3: bounded inflation (compression-bomb defense) -------------
+
+    #[test]
+    fn inflate_bounded_rejects_oversize() {
+        let data = vec![0u8; 1024];
+        // Cap below the data size → error.
+        let res = inflate_bounded(&data[..], Some(512));
+        assert!(res.is_err(), "exceeding the cap must error");
+        let e = res.unwrap_err();
+        assert!(e.to_string().contains("compression bomb"));
+    }
+
+    #[test]
+    fn inflate_bounded_allows_within_cap_and_unbounded() {
+        let data = vec![7u8; 1024];
+        // Within cap → full read.
+        let ok = inflate_bounded(&data[..], Some(4096)).expect("within cap");
+        assert_eq!(ok.len(), 1024);
+        // Cap disabled (None) → unbounded read.
+        let un = inflate_bounded(&data[..], None).expect("unbounded");
+        assert_eq!(un.len(), 1024);
+    }
+
+    #[test]
+    fn gzip_max_inflated_default_is_positive() {
+        // With no env override the default cap is a sane positive value.
+        // (Reads process env; default branch returns Some(default).)
+        let cap = gzip_max_inflated_bytes();
+        assert!(cap.map(|c| c > 0).unwrap_or(true));
     }
 }

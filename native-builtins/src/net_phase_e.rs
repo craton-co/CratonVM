@@ -2796,12 +2796,32 @@ fn http_decode_chunked(mut data: &[u8]) -> std::io::Result<Vec<u8>> {
         let size_str = std::str::from_utf8(&data[..nl])
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let size_str = size_str.split(';').next().unwrap_or("0").trim();
+        // FIX(net-phase-e #1): parse the hex chunk-length defensively.
+        // `usize::from_str_radix` itself errors (not panics) on numeric
+        // overflow, but a crafted-but-in-range giant size still drove
+        // `n + 2` to overflow (panic in debug builds) and `&data[..n]`
+        // to slice out of range (panic). Reject empty/non-hex sizes, and
+        // cap the chunk at a sane maximum so the subsequent arithmetic and
+        // slicing can never overflow or wrap — on any violation return a
+        // protocol error instead of panicking.
+        const MAX_CHUNK: usize = 64 * 1024 * 1024; // 64 MiB hard cap per chunk
+        if size_str.is_empty() || !size_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bad chunk size",
+            ));
+        }
         let n = usize::from_str_radix(size_str, 16)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size"))?;
+            .ok()
+            .filter(|&n| n <= MAX_CHUNK)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "chunk size too large")
+            })?;
         data = &data[nl + 2..];
         if n == 0 {
             break;
         }
+        // `n <= MAX_CHUNK` guarantees `n + 2` cannot overflow `usize`.
         if data.len() < n + 2 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -3631,60 +3651,29 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // semantically equivalent but entirely inside our VM infrastructure.
     // -----------------------------------------------------------------------
     // -----------------------------------------------------------------------
-    // Spring `ConfigurationClassEnhancer.enhance(Class, ClassLoader)`
+    // (REMOVED) Spring `ConfigurationClassEnhancer.enhance(Class, ClassLoader)`
+    // identity-bypass shim.
     //
-    // Spring uses CGLIB to subclass every `@Configuration`-annotated class so
-    // that calls between `@Bean` methods return shared bean instances rather
-    // than fresh ones.  CGLIB's `Enhancer.createClass()` exercises a large
-    // bytecode-generation + ClassLoader.defineClass pipeline that is
-    // currently incomplete in this VM and throws a bare
-    // `IllegalStateException` (no message) deep inside.  The exception
-    // surfaces in `ConfigurationClassPostProcessor.enhanceConfigurationClasses`
-    // as:
-    //   IllegalStateException: Cannot load configuration class: <name>
-    //   Caused by: IllegalStateException
-    // SportMe hits this on `RedisHttpSessionConfiguration`.
+    // FIX(net-phase-e #2): this used to register an identity-bypass that
+    // returned the @Configuration class unchanged, disabling CGLIB @Bean
+    // interception (a silent-wrong-result stub: inter-@Bean-method calls
+    // returned fresh instances instead of the shared singleton).
     //
-    // Pragmatic workaround: return the original class unchanged so Spring
-    // skips enhancement.  Inter-@Bean-method calls won't be intercepted, but
-    // that is the same trade-off Spring makes for `@Configuration(proxyBeanMethods = false)`
-    // and lets the application advance past container bootstrap.
+    // The REAL CGLIB @Configuration enhancement is now implemented in
+    // `cglib_enhancer.rs` (`cce_enhance` / `register_cglib_enhancer`), which
+    // emits a genuine EnhancedConfiguration subclass and intercepts @Bean
+    // methods. That registration runs in `lib.rs::register_net_natives`
+    // AFTER `net_phase_e::register_phase_e_networking` and re-registers the
+    // identical method triple
+    //   org/springframework/context/annotation/ConfigurationClassEnhancer
+    //   .enhance(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/lang/Class;
+    // Registry semantics silently overwrite on duplicate triples
+    // (native-api registry), so this bypass was already DEAD CODE —
+    // unconditionally clobbered by the real enhancer. Removing it eliminates
+    // the misleading stub; the live behavior is unchanged (real path wins).
+    // Do not re-add a bypass here: if the real enhancer needs work, fix it in
+    // `cglib_enhancer.rs`.
     // -----------------------------------------------------------------------
-    r.register(
-        "org/springframework/context/annotation/ConfigurationClassEnhancer",
-        "enhance",
-        "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/lang/Class;",
-        |_ctx, args| {
-            // invokevirtual: args[0] = receiver (ConfigurationClassEnhancer), args[1] =
-            // config Class, args[2] = ClassLoader. Returning args.first() was the receiver
-            // mis-typed as Class → AbstractBeanDefinition.getBeanClassName CCE.
-            let cls = match args.get(1).cloned() {
-                Some(v) => v,
-                None => return Err(iae("ConfigurationClassEnhancer.enhance: missing class arg")),
-            };
-            // JNI / invoke bridges may pass the config Class as `Value::Long`;
-            // return a proper reference so the caller's `astore`/`if_acmpeq`
-            // sequence does not retain an unrooted jlong handle (Letsgo AV).
-            let cls = match cls {
-                cratonvm_types::Value::Long(bits) => {
-                    if let Some(p) =
-                        cratonvm_types::jlong_bits_as_aligned_object_ptr(bits as u64)
-                    {
-                        cratonvm_types::Value::Object(Some(unsafe {
-                            cratonvm_types::ObjectRef::from_raw(p as *mut u8)
-                        }))
-                    } else {
-                        cratonvm_types::Value::Object(None)
-                    }
-                }
-                other => other,
-            };
-            if spring_dbg_enabled() {
-                eprintln!("[CCE-DBG] ConfigurationClassEnhancer.enhance -> bypass (return original class)");
-            }
-            Ok(Some(cls))
-        },
-    );
 
     // -----------------------------------------------------------------------
     // (REMOVED) AbstractBeanDefinition.getResolvedAutowireMode() override.
@@ -3720,8 +3709,10 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // In real-JDK mode under CratonVM the `@Autowired` setter on
     // `RedisHttpSessionConfiguration.setRedisConnectionFactory(ObjectProvider,
     // ObjectProvider)` is not being invoked (multi-arg ObjectProvider setter
-    // injection on a @Configuration class whose CGLIB enhancement was bypassed
-    // — see `ConfigurationClassEnhancer.enhance` shim above).  The
+    // injection on a @Configuration class — the CGLIB enhancement is now
+    // performed by the real enhancer in `cglib_enhancer.rs`; the former
+    // identity-bypass shim here was removed, see the "(REMOVED)
+    // ConfigurationClassEnhancer.enhance" note above).  The
     // RedisOperationsSessionRepository @Bean factory method then ends up
     // calling `RedisTemplate.afterPropertiesSet()` with a null connection
     // factory and Spring throws `IllegalStateException:
@@ -6067,6 +6058,28 @@ mod tests {
         let raw = b"5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n";
         let body = http_decode_chunked(raw).unwrap();
         assert_eq!(body, b"helloworld");
+    }
+
+    // FIX(net-phase-e #1): a crafted chunk size must never panic — neither on
+    // numeric overflow of the hex parse nor on the `n + 2` / `&data[..n]`
+    // arithmetic. All malformed/oversize sizes must return a protocol error.
+    #[test]
+    fn re4_http_decode_chunked_overflow_is_error_not_panic() {
+        // Hex value that overflows usize (would have panicked `n + 2` / slice).
+        let huge = b"ffffffffffffffff\r\nx\r\n0\r\n\r\n";
+        assert!(http_decode_chunked(huge).is_err());
+
+        // In-range-but-absurd size beyond MAX_CHUNK cap -> protocol error,
+        // not an out-of-range slice panic.
+        let big = b"7fffffff\r\nx\r\n0\r\n\r\n"; // ~2 GiB declared, tiny body
+        assert!(http_decode_chunked(big).is_err());
+
+        // Non-hex / empty chunk size -> protocol error.
+        assert!(http_decode_chunked(b"zz\r\nx\r\n0\r\n\r\n").is_err());
+        assert!(http_decode_chunked(b"\r\nx\r\n0\r\n\r\n").is_err());
+
+        // A valid small chunk just over the available data is "truncated".
+        assert!(http_decode_chunked(b"5\r\nhi\r\n").is_err());
     }
 
     #[test]
