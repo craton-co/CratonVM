@@ -169,6 +169,18 @@ const SIG_SHA512_ECDSA: i32 = 11;
 const SIG_PSS_SHA256: i32 = 12;
 const SIG_PSS_SHA384: i32 = 13;
 const SIG_PSS_SHA512: i32 = 14;
+// Post-quantum ML-DSA (FIPS 204). CratonVM has no native lattice signature
+// crypto, so these are sign/verify-routed to the real JDK 25 SUN-provider SPI
+// (`sun.security.provider.ML_DSA_Impls$SIG{2,3,5}`) behind
+// `crate::route_pqc_to_real()` — the exact mirror of the SunEC ECDSA route, and
+// the companion to the ML-DSA *keygen*/keyfactory routing already in
+// `jca::key_factory` (`pqc_spi_classes`). `SIG_MLDSA` is the umbrella name
+// (`Signature.getInstance("ML-DSA")`), where the concrete parameter set is
+// resolved from the init key's `getAlgorithm()`.
+const SIG_MLDSA: i32 = 15;
+const SIG_MLDSA_44: i32 = 16;
+const SIG_MLDSA_65: i32 = 17;
+const SIG_MLDSA_87: i32 = 18;
 
 fn algo_idx(name: &str) -> i32 {
     let upper = name.to_ascii_uppercase();
@@ -191,6 +203,15 @@ fn algo_idx(name: &str) -> i32 {
         "SHA512WITHECDSA" | "SHA-512WITHECDSA" => SIG_SHA512_ECDSA,
         "ED25519" | "EDDSA" => SIG_ED25519,
         "SHA256WITHDSA" => SIG_SHA256_DSA,
+        // Post-quantum ML-DSA (FIPS 204). The umbrella "ML-DSA" name carries no
+        // parameter set; the concrete SPI suffix is resolved from the init key's
+        // `getAlgorithm()` (see `mldsa_spi_class`). The explicit param-set names
+        // (and their dotted OIDs, 2.16.840.1.101.3.4.3.{17,18,19}) pin the SPI
+        // directly.
+        "ML-DSA" => SIG_MLDSA,
+        "ML-DSA-44" | "2.16.840.1.101.3.4.3.17" => SIG_MLDSA_44,
+        "ML-DSA-65" | "2.16.840.1.101.3.4.3.18" => SIG_MLDSA_65,
+        "ML-DSA-87" | "2.16.840.1.101.3.4.3.19" => SIG_MLDSA_87,
         // Signature-algorithm OIDs. X.509 `cert.verify()` resolves
         // `Signature.getInstance(signatureAlgorithm.getId())` by OID, not the
         // friendly name (e.g. BC's `X509CertificateObject.verify()`); without
@@ -225,6 +246,10 @@ fn algo_name(idx: i32) -> &'static str {
         SIG_PSS_SHA256 => "SHA256withRSAandMGF1",
         SIG_PSS_SHA384 => "SHA384withRSAandMGF1",
         SIG_PSS_SHA512 => "SHA512withRSAandMGF1",
+        SIG_MLDSA => "ML-DSA",
+        SIG_MLDSA_44 => "ML-DSA-44",
+        SIG_MLDSA_65 => "ML-DSA-65",
+        SIG_MLDSA_87 => "ML-DSA-87",
         _ => "Unknown",
     }
 }
@@ -488,6 +513,154 @@ fn drive_real_ecdsa(
 }
 
 // ---------------------------------------------------------------------------
+// Post-quantum ML-DSA → real JDK SUN-provider SPI routing
+// (crate::route_pqc_to_real, default ON)
+// ---------------------------------------------------------------------------
+//
+// CratonVM has no native ML-DSA lattice signature crypto. JDK 25 ships a real
+// pure-Java implementation in the SUN provider: `sun.security.provider.
+// ML_DSA_Impls`, with one concrete `SignatureSpi` per NIST parameter set —
+// `$SIG2` (ML-DSA-44), `$SIG3` (ML-DSA-65), `$SIG5` (ML-DSA-87) — exactly the
+// `$KPG{n}`/`$KF{n}` naming the keygen route already drives
+// (`jca::key_factory::pqc_spi_classes`). We drive that SPI the same way
+// `drive_real_ecdsa` drives `sun.security.ec.ECDSASignature$*`: construct the
+// SPI, `engineInitSign/Verify(key)`, `engineUpdate(buffer)`, then
+// `engineSign()`/`engineVerify(sig)`. This is only correct because the native
+// `SHA3.keccak` override (lib.rs) gives the JDK SHAKE256 sponge real output —
+// the same precondition the ML-DSA keygen route documents.
+
+/// `true` once `route_pqc_to_real()` is on AND `alg` is an ML-DSA index. The
+/// umbrella `SIG_MLDSA` qualifies too: its concrete parameter set is resolved
+/// from the init key's algorithm at drive time.
+fn is_mldsa(alg: i32) -> bool {
+    crate::route_pqc_to_real()
+        && matches!(alg, SIG_MLDSA | SIG_MLDSA_44 | SIG_MLDSA_65 | SIG_MLDSA_87)
+}
+
+/// Real-SUN `ML_DSA_Impls$SIG{2,3,5}` class for an ML-DSA parameter-set name
+/// (e.g. "ML-DSA-65"), or `None` when the name is not a recognised ML-DSA set.
+/// The suffix mapping matches `jca::key_factory::pqc_spi_classes` (2/3/5 by NIST
+/// category), so the Signature SPI is the same provider that minted the key.
+fn mldsa_spi_class_for_name(name: &str) -> Option<&'static str> {
+    match name.to_ascii_uppercase().as_str() {
+        "ML-DSA-44" => Some("sun/security/provider/ML_DSA_Impls$SIG2"),
+        "ML-DSA-65" => Some("sun/security/provider/ML_DSA_Impls$SIG3"),
+        "ML-DSA-87" => Some("sun/security/provider/ML_DSA_Impls$SIG5"),
+        _ => None,
+    }
+}
+
+/// Resolve the concrete `ML_DSA_Impls$SIG*` SPI class for this Signature.
+///
+/// Precedence: a parameter-set-specific algo index (`SIG_MLDSA_{44,65,87}`,
+/// reached when the caller did `Signature.getInstance("ML-DSA-65")`) pins the
+/// SPI directly. For the umbrella `SIG_MLDSA` ("ML-DSA"), read the init key's
+/// `getAlgorithm()` — the real `ML_DSA_Impls` keys report their parameter set
+/// there — and map that. Returns `None` (→ fail-closed at the call site) when
+/// the set can't be determined, never a silently-wrong SPI.
+fn mldsa_spi_class(ctx: &mut dyn NativeContext, alg: i32, key: ObjectRef) -> Option<&'static str> {
+    match alg {
+        SIG_MLDSA_44 => mldsa_spi_class_for_name("ML-DSA-44"),
+        SIG_MLDSA_65 => mldsa_spi_class_for_name("ML-DSA-65"),
+        SIG_MLDSA_87 => mldsa_spi_class_for_name("ML-DSA-87"),
+        SIG_MLDSA => {
+            let pin = ctx.pin_native_root(key);
+            let k = ctx.read_native_pin(pin, key);
+            let name = match ctx.invoke_virtual(k, "getAlgorithm", "()Ljava/lang/String;", &[]) {
+                Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            ctx.unpin_native_roots(pin);
+            mldsa_spi_class_for_name(&name)
+        }
+        _ => None,
+    }
+}
+
+/// Drive the real SUN `ML_DSA_Impls$SIG*` SPI: `new` → `engineInitSign/Verify(key)`
+/// → `engineUpdate(buffer)` → `engineSign()`/`engineVerify(sig)`. `verify_sig`
+/// `None` → sign (returns the raw `byte[]` signature); `Some(sig)` → verify
+/// (returns `Int(0/1)`). The real ML-DSA key is read from `SIG_OFF_KEYOBJ`; the
+/// payload from the identity-hash-keyed side table via `take_data`. Structurally
+/// identical to `drive_real_ecdsa`.
+fn drive_real_mldsa(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    alg: i32,
+    verify_sig: Option<Vec<u8>>,
+) -> MethodCallResult {
+    let base = synthetic_base_offset(ctx, "java/security/Signature");
+    let key = match ctx.get_field(this, base + SIG_OFF_KEYOBJ) {
+        Value::Object(Some(o)) => o,
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "Signature not initialized (no ML-DSA key)".into(),
+            }
+            .into())
+        }
+    };
+    // Resolve the parameter-set SPI before consuming the payload, so a closed
+    // fail leaves nothing half-done. Fail closed (no synthetic stub) when the
+    // set can't be determined — never sign/verify with the wrong SPI.
+    let spi_class = match mldsa_spi_class(ctx, alg, key) {
+        Some(c) => c,
+        None => {
+            return Err(RuntimeError::NotImplemented {
+                feature: "ML-DSA parameter set could not be resolved for Signature".into(),
+            }
+            .into())
+        }
+    };
+    let data = take_data(ctx, this)?;
+    let verifying = verify_sig.is_some();
+    let key_pin = ctx.pin_native_root(key);
+    let result = (|| {
+        let spi = match ctx.new_object_initialized(spi_class, "()V", &[])? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                return Err(RuntimeError::NotImplemented {
+                    feature: spi_class.into(),
+                }
+                .into())
+            }
+        };
+        let spi_pin = ctx.pin_native_root(spi);
+        let key = ctx.read_native_pin(key_pin, key);
+        let (init_m, init_desc) = if verifying {
+            ("engineInitVerify", "(Ljava/security/PublicKey;)V")
+        } else {
+            ("engineInitSign", "(Ljava/security/PrivateKey;)V")
+        };
+        ctx.invoke_virtual(spi, init_m, init_desc, &[Value::Object(Some(key))])?;
+        let spi = ctx.read_native_pin(spi_pin, spi);
+        let arr = alloc_byte_array(ctx, &data);
+        let spi = ctx.read_native_pin(spi_pin, spi);
+        ctx.invoke_virtual(
+            spi,
+            "engineUpdate",
+            "([BII)V",
+            &[Value::Object(Some(arr)), Value::Int(0), Value::Int(data.len() as i32)],
+        )?;
+        let spi = ctx.read_native_pin(spi_pin, spi);
+        match verify_sig {
+            Some(sig_bytes) => {
+                let sigarr = alloc_byte_array(ctx, &sig_bytes);
+                let spi = ctx.read_native_pin(spi_pin, spi);
+                let ok =
+                    ctx.invoke_virtual(spi, "engineVerify", "([B)Z", &[Value::Object(Some(sigarr))])?;
+                Ok(match ok {
+                    Some(Value::Int(n)) => Some(Value::Int(if n != 0 { 1 } else { 0 })),
+                    _ => Some(Value::Int(0)),
+                })
+            }
+            None => ctx.invoke_virtual(spi, "engineSign", "()[B", &[]),
+        }
+    })();
+    ctx.unpin_native_roots(key_pin);
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Native methods
 // ---------------------------------------------------------------------------
 
@@ -641,6 +814,10 @@ fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(spi_class) = ecdsa_real_spi_class(alg) {
         return drive_real_ecdsa(ctx, this, spi_class, None);
     }
+    // ML-DSA: drive the real SUN ML_DSA_Impls$SIG* SPI (real lattice signature).
+    if is_mldsa(alg) {
+        return drive_real_mldsa(ctx, this, alg, None);
+    }
     let key_id = key_id_of(ctx, this);
     // C18: surface a missing payload as IllegalStateException rather than
     // silently signing/verifying `b""` (the pre-fix raw-pointer keying
@@ -705,6 +882,14 @@ fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             _ => Vec::new(),
         };
         return drive_real_ecdsa(ctx, this, spi_class, Some(provided));
+    }
+    // ML-DSA: drive the real SUN ML_DSA_Impls$SIG* SPI (real lattice verify).
+    if is_mldsa(alg) {
+        let provided = match args.get(1) {
+            Some(Value::Object(Some(arr))) => read_byte_array_full(ctx, *arr),
+            _ => Vec::new(),
+        };
+        return drive_real_mldsa(ctx, this, alg, Some(provided));
     }
     let key_id = key_id_of(ctx, this);
     // C18: surface a missing payload as IllegalStateException rather than
@@ -945,5 +1130,134 @@ mod tests {
         assert_eq!(algo_name(SIG_SHA256_ECDSA), "SHA256withECDSA");
         assert_eq!(algo_name(SIG_SHA384_ECDSA), "SHA384withECDSA");
         assert_eq!(algo_name(SIG_ED25519), "Ed25519");
+    }
+
+    // ---- ML-DSA post-quantum Signature routing ----
+
+    /// The umbrella name, the three parameter-set names, and their X.509 OIDs
+    /// all classify as ML-DSA so `Signature.getInstance` routes them to the real
+    /// SUN-provider SPI (FIPS 204 sig OIDs 2.16.840.1.101.3.4.3.{17,18,19}).
+    #[test]
+    fn algo_idx_recognizes_mldsa_names_and_oids() {
+        assert_eq!(algo_idx("ML-DSA"), SIG_MLDSA);
+        assert_eq!(algo_idx("ml-dsa-44"), SIG_MLDSA_44);
+        assert_eq!(algo_idx("ML-DSA-65"), SIG_MLDSA_65);
+        assert_eq!(algo_idx("ML-DSA-87"), SIG_MLDSA_87);
+        assert_eq!(algo_idx("2.16.840.1.101.3.4.3.17"), SIG_MLDSA_44);
+        assert_eq!(algo_idx("2.16.840.1.101.3.4.3.18"), SIG_MLDSA_65);
+        assert_eq!(algo_idx("2.16.840.1.101.3.4.3.19"), SIG_MLDSA_87);
+        assert_eq!(algo_name(SIG_MLDSA), "ML-DSA");
+        assert_eq!(algo_name(SIG_MLDSA_65), "ML-DSA-65");
+    }
+
+    /// Parameter-set → concrete SUN `ML_DSA_Impls$SIG{2,3,5}` SPI mapping
+    /// (matching `key_factory::pqc_spi_classes`' 2/3/5 NIST-category suffixes),
+    /// and a non-ML-DSA name rejects.
+    #[test]
+    fn mldsa_spi_class_for_name_maps_parameter_sets() {
+        assert_eq!(
+            mldsa_spi_class_for_name("ML-DSA-44"),
+            Some("sun/security/provider/ML_DSA_Impls$SIG2")
+        );
+        assert_eq!(
+            mldsa_spi_class_for_name("ml-dsa-65"),
+            Some("sun/security/provider/ML_DSA_Impls$SIG3")
+        );
+        assert_eq!(
+            mldsa_spi_class_for_name("ML-DSA-87"),
+            Some("sun/security/provider/ML_DSA_Impls$SIG5")
+        );
+        assert_eq!(mldsa_spi_class_for_name("EC"), None);
+        assert_eq!(mldsa_spi_class_for_name("ML-KEM-768"), None);
+    }
+
+    /// `is_mldsa` gates the real-SPI route on the ML-DSA indices only (umbrella
+    /// included), and not on the classical RSA/EC/Ed25519 indices.
+    #[test]
+    fn is_mldsa_gates_pqc_indices_only() {
+        // Default-on routing (CRATONVM_SYNTHETIC_PQC unset in the test env).
+        assert!(is_mldsa(SIG_MLDSA));
+        assert!(is_mldsa(SIG_MLDSA_44));
+        assert!(is_mldsa(SIG_MLDSA_65));
+        assert!(is_mldsa(SIG_MLDSA_87));
+        assert!(!is_mldsa(SIG_SHA256_RSA));
+        assert!(!is_mldsa(SIG_SHA256_ECDSA));
+        assert!(!is_mldsa(SIG_ED25519));
+    }
+
+    /// Build a `Signature` via `getInstance(alg)` and `initSign`/`initVerify` it
+    /// with `key` (mirrors the public API order). Returns the Signature ref.
+    fn make_inited_sig(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        alg: &str,
+        key: Option<ObjectRef>,
+        verifying: bool,
+    ) -> ObjectRef {
+        let name = ctx.create_string(alg);
+        let sig = match sig_get_instance(ctx, &[Value::Object(Some(name))])
+            .unwrap()
+            .unwrap()
+        {
+            Value::Object(Some(o)) => o,
+            other => panic!("getInstance returned {other:?}"),
+        };
+        let mut args = vec![Value::Object(Some(sig))];
+        args.push(Value::Object(key));
+        if verifying {
+            sig_init_verify(ctx, &args).unwrap();
+        } else {
+            sig_init_sign(ctx, &args).unwrap();
+        }
+        sig
+    }
+
+    /// Fail-closed: an ML-DSA `sign()` with no init key (no `SIG_OFF_KEYOBJ`
+    /// object) must raise rather than silently produce a signature over `b""`.
+    /// This is the no-synthetic-stubs contract — the synthetic `sign_dispatch`
+    /// path would have `unwrap_or_default()`-ed to an empty byte[] success.
+    #[test]
+    fn mldsa_sign_without_key_fails_closed() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        // initSign with a null key leaves SIG_OFF_KEYOBJ unset.
+        let sig = make_inited_sig(&mut ctx, "ML-DSA-65", None, false);
+        let err = sig_sign(&mut ctx, &[Value::Object(Some(sig))])
+            .expect_err("ML-DSA sign with no key must fail closed");
+        use cratonvm_types::error::{MethodCallFailed, VmError};
+        assert!(
+            matches!(
+                err,
+                MethodCallFailed::InternalError(VmError::Runtime(
+                    RuntimeError::IllegalStateException { .. }
+                ))
+            ),
+            "expected IllegalStateException (no ML-DSA key), got {err:?}"
+        );
+    }
+
+    /// Routing proof: an ML-DSA `sign()` WITH an init key is dispatched into the
+    /// real-SPI drive (`drive_real_mldsa`), NOT the synthetic `sign_dispatch`.
+    /// The mock SPI's `engineSign` yields no bytes, so the routed result is
+    /// `Ok(None)` — whereas the synthetic path would have returned
+    /// `Ok(Some(Object(byte[])))` (an empty-but-present false signature). The
+    /// `None` therefore distinguishes "took the real route" from "fell through
+    /// to the synthetic empty-sig stub".
+    #[test]
+    fn mldsa_sign_with_key_takes_real_spi_route() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        // A stand-in for a real `ML_DSA_Impls` private key whose getAlgorithm()
+        // the mock can't answer — we use the parameter-set-specific algorithm
+        // name so the SPI is pinned without needing getAlgorithm().
+        let key = match ctx.new_object("java/security/PrivateKey").unwrap().unwrap() {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected key object, got {other:?}"),
+        };
+        let sig = make_inited_sig(&mut ctx, "ML-DSA-65", Some(key), false);
+        let r = sig_sign(&mut ctx, &[Value::Object(Some(sig))])
+            .expect("routed ML-DSA sign should not error in the mock");
+        assert!(
+            r.is_none(),
+            "ML-DSA sign must route to the real SPI (Ok(None) from the mock SPI), \
+             not fall through to the synthetic empty-signature stub; got {r:?}"
+        );
     }
 }

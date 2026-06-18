@@ -2037,8 +2037,30 @@ impl JepComplianceMatrix {
         self.add(513, "Flexible Constructor Bodies", ComplianceStatus::Compliant, "Super() call relaxed");
         self.add(519, "Compact Object Headers", ComplianceStatus::Compliant, "Header compression enabled");
         self.add(484, "Class-File API", ComplianceStatus::Compliant, "Stable API, fully implemented");
-        self.add(496, "ML-KEM", ComplianceStatus::Compliant, "Post-quantum KEM implemented");
-        self.add(497, "ML-DSA", ComplianceStatus::Compliant, "Post-quantum DSA implemented");
+        // Honest PQC self-report (no false-pass): CratonVM has no native lattice
+        // crypto. ML-DSA keygen/keyfactory AND Signature sign/verify are routed to
+        // the real JDK SUN provider (`sun.security.provider.ML_DSA_Impls$KPG*/$KF*/
+        // $SIG*`) behind `route_pqc_to_real`, so ML-DSA round-trips — but it relies
+        // on the routed provider rather than a native impl, so it is Partial, not a
+        // self-contained Compliant. ML-KEM keygen/keyfactory route similarly, but
+        // the `javax.crypto.KEM` encaps/decaps SPI is not yet wired here.
+        self.add(
+            496,
+            "ML-KEM",
+            ComplianceStatus::Partial(
+                "Keygen/KeyFactory routed to real provider; KEM encaps/decaps SPI not yet wired"
+                    .to_string(),
+            ),
+            "Post-quantum KEM partial",
+        );
+        self.add(
+            497,
+            "ML-DSA",
+            ComplianceStatus::Partial(
+                "Keygen/KeyFactory + Signature sign/verify routed to real SUN provider".to_string(),
+            ),
+            "Post-quantum DSA routed (not native)",
+        );
     }
 }
 
