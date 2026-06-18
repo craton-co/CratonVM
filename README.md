@@ -190,6 +190,23 @@ cargo test --all
 RUST_MIN_STACK=8388608 cargo test --all -- --test-threads=4
 ```
 
+### Java regression suite
+
+A fast, deterministic suite of Java classes that exercise the VM's critical
+paths (JIT/GC, collections, strings, serialization, crypto, exceptions,
+reflection) and **diff CratonVM's output against HotSpot**. It runs in
+seconds and is the quick "is the VM still healthy?" check — complementary to
+the heavier real-app gauntlet in `test-infra/`.
+
+```bash
+# Build target/release/cratonvm first, then:
+bash regression-suite/run.sh        # → "REGRESSION SUITE: 8 passed, 0 failed"
+```
+
+It exits non-zero on any regression (CI-ready). See
+[`regression-suite/README.md`](regression-suite/README.md) for what each class
+covers, how to add one, and the list of known gaps it intentionally skips.
+
 ### Linting
 
 ```bash
