@@ -1,0 +1,27 @@
+== h2-testall-fast ==
+  cratonvm rc=0 PASS     3.9s  [2m2026-06-18T08:44:58.385913Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util
+  hotspot  rc=0 PASS     1.8s  00:00.078 total
+
+== hibernate-smoke ==
+  cratonvm rc=1 FAIL     13.0s  2026-06-18T08:45:16.438404Z  WARN cratonvm_vm::vm::vm_exec: NoSuchMethodError method="cratonvm/internal/ArrayListSubList
+  hotspot  (skipped — CratonVM did not PASS)
+
+== gpu-bench-cpu ==
+  cratonvm rc=0 PASS     4.0s  [cratonvm] System.exit(0) called — process terminating
+  hotspot  rc=0 PASS     1.0s  correctness=OK
+
+== pool:kafka-codec ==
+  cratonvm rc=0 PASS 3.94s  regression-pool: total=1 pass=1 regress=0 slow=0 no_base=0 no_stage=0 results: /c/craton/CratonVM/apps/probe/test-infra
+  hotspot  rc=1 REGRESS 0.64s
+
+== pool:spring-boot-run ==
+  cratonvm rc=0 PASS 7.58s  regression-pool: total=1 pass=1 regress=0 slow=0 no_base=0 no_stage=0 results: /c/craton/CratonVM/apps/probe/test-infra
+  hotspot  rc=1 REGRESS 0.43s
+
+== pool:tomcat-server-info ==
+  cratonvm rc=0 PASS 4.06s  regression-pool: total=1 pass=1 regress=0 slow=0 no_base=0 no_stage=0 results: /c/craton/CratonVM/apps/probe/test-infra
+  hotspot  rc=1 REGRESS 0.51s
+
+Wrote C:/craton/CratonVM/apps/APPS_SUITE_RESULTS.md
+TSV: C:/craton/CratonVM/test-infra/suite-results/apps-all-20260618-054448/results.tsv
+Done.

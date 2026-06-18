@@ -48,6 +48,15 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
+/// Gated NIO op tracing (CRATONVM_DBG_NIO=1) for diagnosing reactor flows.
+macro_rules! nio_trace {
+    ($($a:tt)*) => {
+        if std::env::var_os("CRATONVM_DBG_NIO").is_some() {
+            eprintln!($($a)*);
+        }
+    };
+}
+
 fn ipc_dbg_enabled() -> bool {
     std::env::var("CRATONVM_SUREFIRE_IPC_DBG")
         .map(|v| {
@@ -777,6 +786,7 @@ fn sc_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(this) = obj_or_none(args, 0) {
         if let Some(id) = read_reg_id(ctx, this) {
+            nio_trace!("[NIO] close id={id}");
             tcp_remove(id);
         }
         // Drop the synthetic state entirely: a later isOpen()/isConnected()
@@ -1103,6 +1113,7 @@ fn sc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
     let blocking = read_blocking_flag(ctx, this);
     let ok = sc_connect_inner(ctx, this, sa, blocking)?;
+    nio_trace!("[NIO] connect blocking={blocking} -> immediate={ok}");
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 
@@ -1138,6 +1149,7 @@ fn sc_finish_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(v) => v,
         None => return Ok(Some(Value::Int(0))),
     };
+    nio_trace!("[NIO] finishConnect id={id}");
 
     // Check the current state of the registry entry.
     let res_kind = {
@@ -1278,6 +1290,7 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         let written = buffer_write_bytes(ctx, bb, &buf[..n as usize]);
         buffer_advance(ctx, bb, written);
     }
+    nio_trace!("[NIO] read id={id} -> {n}");
     Ok(Some(Value::Int(n)))
 }
 
@@ -1313,6 +1326,7 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         crate::net::socket_capture('w', id, &data[..n as usize]);
         buffer_advance(ctx, bb, n);
     }
+    nio_trace!("[NIO] write id={id} len={} -> {n}", data.len());
     Ok(Some(Value::Int(n)))
 }
 
@@ -1573,14 +1587,54 @@ fn sc_get_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         },
         None => String::new(),
     };
-    if let Some(id) = read_reg_id(ctx, this) {
+    // `SocketChannel.getOption` is declared `<T> T getOption(SocketOption<T>)`,
+    // so the native MUST return a *boxed* object (Boolean/Integer), not a raw
+    // `Value::Int` — a primitive returned for an object-typed method coerces to
+    // null, and the `SocketAdaptor` getters then `((Boolean) ...).booleanValue()`
+    // → NPE. Box by the option's value type.
+    let raw = if let Some(id) = read_reg_id(ctx, this) {
         let map = tcp_registry().read();
-        if let Some(TcpHandle::Stream(s)) = map.get(&id) {
-            let v = read_option(s, &opt_name).unwrap_or(0);
-            return Ok(Some(Value::Int(v)));
+        match map.get(&id) {
+            Some(TcpHandle::Stream(s)) => read_option(s, &opt_name).unwrap_or(0),
+            _ => 0,
         }
+    } else {
+        0
+    };
+    box_socket_option(ctx, &opt_name, raw)
+}
+
+/// Box a socket-option value as the JDK type the `SocketOption<T>` declares:
+/// `Boolean` for the flag options, otherwise `Integer`.
+fn box_socket_option(
+    ctx: &mut dyn NativeContext,
+    opt_name: &str,
+    raw: i32,
+) -> MethodCallResult {
+    let is_bool = matches!(
+        opt_name,
+        "TCP_NODELAY"
+            | "SO_KEEPALIVE"
+            | "SO_REUSEADDR"
+            | "SO_REUSEPORT"
+            | "SO_BROADCAST"
+            | "SO_OOBINLINE"
+    );
+    if is_bool {
+        ctx.invoke(
+            "java/lang/Boolean",
+            "valueOf",
+            "(Z)Ljava/lang/Boolean;",
+            &[Value::Int(if raw != 0 { 1 } else { 0 })],
+        )
+    } else {
+        ctx.invoke(
+            "java/lang/Integer",
+            "valueOf",
+            "(I)Ljava/lang/Integer;",
+            &[Value::Int(raw)],
+        )
     }
-    Ok(Some(Value::Int(0)))
 }
 
 // ---------------------------------------------------------------------------

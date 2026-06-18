@@ -1645,6 +1645,9 @@ fn selector_select_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     refresh_selector_handles(ctx, id);
     let n = selector_select(id, timeout)?;
     apply_ready_ops(ctx, id);
+    if std::env::var_os("CRATONVM_DBG_NIO").is_some() {
+        eprintln!("[NIO] select id={id} timeout={timeout} -> ready={n}");
+    }
     Ok(Some(Value::Int(n)))
 }
 
@@ -1886,6 +1889,9 @@ fn channel_register_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         },
     );
 
+    if std::env::var_os("CRATONVM_DBG_NIO").is_some() {
+        eprintln!("[NIO] register sel={sel_id} net_fd={net_fd} ops={ops} has_handle={}", kind.is_some());
+    }
     selector_register(sel_id, net_fd, ops, Some(key_obj), key_hash, kind)?;
 
     Ok(Some(Value::Object(Some(key_obj))))

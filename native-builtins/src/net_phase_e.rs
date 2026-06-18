@@ -5656,6 +5656,16 @@ fn http_reject_and_close(stream: &mut TcpStream, status: i32) {
 }
 
 fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
+    // The accept loop sets the LISTENER non-blocking; on Windows the accepted
+    // stream inherits that mode, so a bare `read` returns WouldBlock the instant
+    // the peer hasn't sent yet — which `Err(_) => return None` below would treat
+    // as a dead connection and drop the socket. A well-behaved client that
+    // connects slightly before it writes its request (e.g. the Apache NIO
+    // reactor, which establishes the connection then writes on the next event
+    // loop turn) would then see an immediate EOF / "Connection is closed". Force
+    // the accepted stream BLOCKING so the read timeout below actually governs and
+    // we wait for the request.
+    stream.set_nonblocking(false).ok();
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 1024];
@@ -5991,11 +6001,19 @@ fn re10_dispatch_pending(
         use std::io::Write as _;
         let _ = write!(&mut resp, "HTTP/1.1 {status} {}\r\n", http_reason(status));
         let mut has_content_length = false;
+        let mut has_date = false;
         for (k, v) in &resp_headers {
             if k.eq_ignore_ascii_case("content-length") {
                 has_content_length = true;
             }
+            if k.eq_ignore_ascii_case("date") {
+                has_date = true;
+            }
             let _ = write!(&mut resp, "{k}: {v}\r\n");
+        }
+        // The real com.sun.net.httpserver auto-adds a Date header; match it.
+        if !has_date {
+            let _ = write!(&mut resp, "Date: {}\r\n", http_date_now());
         }
         if !has_content_length {
             let _ = write!(&mut resp, "Content-Length: {}\r\n", body_bytes.len());
@@ -6050,50 +6068,61 @@ const HS_THREAD_NUM_FIELDS: usize = 5;
 /// Build a daemon VM thread whose `run()` is `re10_serve_loop_run` for
 /// `server_id`, and start it via the VM's real thread machinery. The thread
 /// exits when the server's `running` flag clears (stop()).
+/// Number of VM dispatcher threads draining the request queue concurrently.
+/// More than one lets independent requests run their Java handlers in parallel
+/// (each request is popped by exactly one thread), which is what keeps a burst
+/// of hundreds of concurrent requests (ES testManyAsyncRequests) inside the
+/// client's timeout instead of serializing every handler on one thread.
+const HS_DISPATCHER_POOL: i32 = 4;
+
 fn re10_spawn_dispatcher(
     ctx: &mut dyn NativeContext,
     server_id: i32,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
-    let runner = alloc_concurrent_synthetic(ctx, HS_LOOP_CLASS, 1);
-    ctx.set_field(runner, 0, Value::Int(server_id));
+    let dbg = std::env::var_os("CRATONVM_DBG_HTTPSRV").is_some();
+    for idx in 0..HS_DISPATCHER_POOL {
+        let runner = alloc_concurrent_synthetic(ctx, HS_LOOP_CLASS, 1);
+        ctx.set_field(runner, 0, Value::Int(server_id));
 
-    let worker = alloc_concurrent_synthetic(ctx, "java/lang/Thread", HS_THREAD_NUM_FIELDS);
-    let name = ctx.create_string(&format!("cratonvm-httpserver-dispatch-{server_id}"));
-    // Populate the worker Thread via the registered
-    // `Thread.<init>(ThreadGroup, Runnable, String)` native. This stores the
-    // runnable the right way for BOTH layouts: slot 3 (`target`) on a synthetic
-    // <=8-field Thread, or `holder:FieldHolder.task` on a real-JDK Thread — which
-    // is what `Thread.run()` actually reads. Setting `target` by name on a
-    // real-JDK Thread does NOT work (no top-level `target` field; the runnable
-    // lives in the FieldHolder), which is why the loop never started before.
-    let _ = ctx.invoke(
-        "java/lang/Thread",
-        "<init>",
-        "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;)V",
-        &[
-            Value::Object(Some(worker)),
-            Value::Object(None),
-            Value::Object(Some(runner)),
-            Value::Object(Some(name)),
-        ],
-    );
-    // Daemon so a server left unstopped never wedges VM shutdown after main()
-    // returns (it normally exits on stop() when `running` clears).
-    let _ = ctx.invoke(
-        "java/lang/Thread",
-        "setDaemon",
-        "(Z)V",
-        &[Value::Object(Some(worker)), Value::Int(1)],
-    );
-    // Best-effort: if the VM has no thread registry (e.g. test mocks) the
-    // start is a no-op; start()/stop() still drain the queue as a fallback.
-    let res = ctx.thread_start(worker);
-    if std::env::var_os("CRATONVM_DBG_HTTPSRV").is_some() {
-        eprintln!(
-            "[HTTPSRV] spawn_dispatcher server={server_id} num_fields={} thread_start_ok={}",
-            ctx.object_num_fields(worker),
-            res.is_ok()
+        let worker = alloc_concurrent_synthetic(ctx, "java/lang/Thread", HS_THREAD_NUM_FIELDS);
+        let name = ctx.create_string(&format!("cratonvm-httpserver-dispatch-{server_id}-{idx}"));
+        // Populate the worker Thread via the registered
+        // `Thread.<init>(ThreadGroup, Runnable, String)` native. This stores the
+        // runnable the right way for BOTH layouts: slot 3 (`target`) on a
+        // synthetic <=8-field Thread, or `holder:FieldHolder.task` on a real-JDK
+        // Thread — which is what `Thread.run()` actually reads. Setting `target`
+        // by name on a real-JDK Thread does NOT work (no top-level `target`
+        // field; the runnable lives in the FieldHolder), which is why the loop
+        // never started before.
+        let _ = ctx.invoke(
+            "java/lang/Thread",
+            "<init>",
+            "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;)V",
+            &[
+                Value::Object(Some(worker)),
+                Value::Object(None),
+                Value::Object(Some(runner)),
+                Value::Object(Some(name)),
+            ],
         );
+        // Daemon so a server left unstopped never wedges VM shutdown after main()
+        // returns (it normally exits on stop() when `running` clears).
+        let _ = ctx.invoke(
+            "java/lang/Thread",
+            "setDaemon",
+            "(Z)V",
+            &[Value::Object(Some(worker)), Value::Int(1)],
+        );
+        // Best-effort: if the VM has no thread registry (e.g. test mocks) the
+        // start is a no-op; start()/stop() still drain the queue as a fallback.
+        let res = ctx.thread_start(worker);
+        if dbg {
+            eprintln!(
+                "[HTTPSRV] spawn_dispatcher server={server_id} idx={idx} num_fields={} thread_start_ok={}",
+                ctx.object_num_fields(worker),
+                res.is_ok()
+            );
+        }
     }
     Ok(())
 }
@@ -6142,6 +6171,43 @@ fn re10_serve_loop_run(
         }
     }
     Ok(None)
+}
+
+/// Current time as an RFC 1123 HTTP-date (e.g. "Thu, 18 Jun 2026 08:37:05 GMT").
+/// The real `com.sun.net.httpserver` adds a `Date` response header automatically;
+/// clients (and the ES `testHeaders` assertion) expect it.
+fn http_date_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format_http_date(secs)
+}
+
+/// Format epoch seconds as an RFC 1123 date in GMT (civil-from-days per
+/// Howard Hinnant's algorithm; no external date crate).
+fn format_http_date(epoch_secs: u64) -> String {
+    let days = (epoch_secs / 86400) as i64;
+    let rem = epoch_secs % 86400;
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // 1970-01-01 is a Thursday; Sun=0.
+    let dow = (((days % 7) + 4) % 7) as usize;
+    let dow_name = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][dow];
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+    let mon_name = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ][(m - 1) as usize];
+    format!("{dow_name}, {d:02} {mon_name} {year} {hh:02}:{mm:02}:{ss:02} GMT")
 }
 
 fn http_reason(code: i32) -> &'static str {
@@ -6198,13 +6264,25 @@ fn re10_start_server(server_id: i32) -> std::io::Result<()> {
             while state_cl.running.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _peer)) => {
-                        if let Some(pending) = parse_http_request(stream) {
-                            let mut q = request_queue().lock();
-                            q.entry(server_id).or_default().push(pending);
-                        }
+                        // Parse each connection on its own short-lived thread so a
+                        // slow (or merely not-yet-written) request never blocks the
+                        // accept loop. Serially parsing here let the OS listen
+                        // backlog overflow under burst load (hundreds of concurrent
+                        // Connection: close requests), failing requests — see ES
+                        // testManyAsyncRequests. Parse is pure socket work and needs
+                        // no VM context; the dispatcher thread(s) run the handler.
+                        let sid = server_id;
+                        let _ = std::thread::Builder::new()
+                            .name(format!("cratonvm-httpserver-parse-{sid}"))
+                            .spawn(move || {
+                                if let Some(pending) = parse_http_request(stream) {
+                                    let mut q = request_queue().lock();
+                                    q.entry(sid).or_default().push(pending);
+                                }
+                            });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(10));
+                        std::thread::sleep(Duration::from_millis(1));
                     }
                     Err(_) => break,
                 }

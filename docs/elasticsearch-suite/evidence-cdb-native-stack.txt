@@ -1,0 +1,186 @@
+ÿþ
+************* Preparing the environment for Debugger Extensions Gallery repositories **************
+   ExtensionRepository : Implicit
+   UseExperimentalFeatureForNugetShare : true
+   AllowNugetExeUpdate : true
+   NonInteractiveNuget : true
+   AllowNugetMSCredentialProviderInstall : true
+   AllowParallelInitializationOfLocalRepositories : true
+   EnableRedirectToChakraJsProvider : false
+
+   -- Configuring repositories
+      ----> Repository : LocalInstalled, Enabled: true
+      ----> Repository : UserExtensions, Enabled: true
+
+>>>>>>>>>>>>> Preparing the environment for Debugger Extensions Gallery repositories completed, duration 0.000 seconds
+
+************* Waiting for Debugger Extensions Gallery to Initialize **************
+
+>>>>>>>>>>>>> Waiting for Debugger Extensions Gallery to Initialize completed, duration 0.015 seconds
+   ----> Repository : UserExtensions, Enabled: true, Packages count: 0
+   ----> Repository : LocalInstalled, Enabled: true, Packages count: 30
+
+Microsoft (R) Windows Debugger Version 10.0.28000.2114 AMD64
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+*** wait with pending attach
+
+************* Path validation summary **************
+Response                         Time (ms)     Location
+Deferred                                       srv*
+Symbol search path is: srv*
+Executable search path is: 
+
++------------------------------------------------------------------------+
+| This target supports Hardware-enforced Stack Protection. A HW based    |
+| "Shadow Stack" may be available to assist in debugging and analysis.   |
+| See aka.ms/userhsp for more info.                                      |
+|                                                                        |
+| dps @ssp                                                               |
+|                                                                        |
++------------------------------------------------------------------------+
+
+ModLoad: 00007ff7`4d340000 00007ff7`4e5f1000   C:\craton\CratonVM-esrun\target\release\cratonvm.exe
+ModLoad: 00007ffd`89d60000 00007ffd`89fc7000   C:\WINDOWS\SYSTEM32\ntdll.dll
+ModLoad: 00007ffd`884d0000 00007ffd`88599000   C:\WINDOWS\System32\KERNEL32.DLL
+ModLoad: 00007ffd`871c0000 00007ffd`875af000   C:\WINDOWS\System32\KERNELBASE.dll
+ModLoad: 00007ffd`87760000 00007ffd`87805000   C:\WINDOWS\System32\bcryptprimitives.dll
+ModLoad: 00007ffd`87810000 00007ffd`87987000   C:\WINDOWS\System32\crypt32.dll
+ModLoad: 00007ffd`86f40000 00007ffd`8708b000   C:\WINDOWS\System32\ucrtbase.dll
+ModLoad: 00007ffd`882f0000 00007ffd`883a4000   C:\WINDOWS\System32\advapi32.dll
+ModLoad: 00007ffd`83b10000 00007ffd`83b1d000   C:\WINDOWS\SYSTEM32\secur32.dll
+ModLoad: 00007ffd`885c0000 00007ffd`88669000   C:\WINDOWS\System32\msvcrt.dll
+ModLoad: 00007ffd`883b0000 00007ffd`88456000   C:\WINDOWS\System32\sechost.dll
+ModLoad: 00007ffd`88060000 00007ffd`88178000   C:\WINDOWS\System32\RPCRT4.dll
+ModLoad: 00007ffd`88940000 00007ffd`889b4000   C:\WINDOWS\System32\ws2_32.dll
+ModLoad: 00007ffd`86da0000 00007ffd`86dca000   C:\WINDOWS\SYSTEM32\bcrypt.dll
+ModLoad: 00007ffd`79340000 00007ffd`79582000   C:\WINDOWS\SYSTEM32\dbghelp.dll
+ModLoad: 00007ffd`6cb40000 00007ffd`6cb5e000   C:\WINDOWS\SYSTEM32\VCRUNTIME140.dll
+ModLoad: 00007ffd`88c60000 00007ffd`88fe5000   C:\WINDOWS\System32\combase.dll
+ModLoad: 00007ffd`88670000 00007ffd`88746000   C:\WINDOWS\System32\OLEAUT32.dll
+ModLoad: 00007ffd`85f00000 00007ffd`85f49000   C:\WINDOWS\SYSTEM32\SSPICLI.DLL
+ModLoad: 00007ffd`876b0000 00007ffd`87753000   C:\WINDOWS\System32\msvcp_win.dll
+ModLoad: 00007ffd`864b0000 00007ffd`864bc000   C:\WINDOWS\SYSTEM32\CRYPTBASE.DLL
+ModLoad: 00007ffd`83f60000 00007ffd`83f81000   C:\Program Files\Common Files\Crypto Pro\AppCompat\cpcrypt.dll
+ModLoad: 00007ffd`861d0000 00007ffd`8623b000   C:\WINDOWS\system32\mswsock.dll
+ModLoad: 00007ffd`85270000 00007ffd`8539c000   C:\WINDOWS\SYSTEM32\DNSAPI.dll
+ModLoad: 00007ffd`85230000 00007ffd`85264000   C:\WINDOWS\SYSTEM32\IPHLPAPI.DLL
+ModLoad: 00007ffd`87b30000 00007ffd`87b3a000   C:\WINDOWS\System32\NSI.dll
+ModLoad: 00007ffd`78cc0000 00007ffd`78ccb000   C:\Windows\System32\rasadhlp.dll
+ModLoad: 00007ffd`79110000 00007ffd`79196000   C:\WINDOWS\System32\fwpuclnt.dll
+(a29c.7970): Break instruction exception - code 80000003 (first chance)
+ntdll!DbgBreakPoint:
+00007ffd`89e80c50 cc              int     3
+0:007> cdb: Reading initial command '~*k 50; qd'
+
+   0  Id: a29c.6a9c Suspend: 1 Teb: 00000000`002a1000 Unfrozen "main"
+Child-SP          RetAddr               Call Site
+00000000`013ffb58 00007ffd`871f76af     ntdll!NtWaitForSingleObject+0x14
+*** WARNING: Unable to verify checksum for C:\craton\CratonVM-esrun\target\release\cratonvm.exe
+00000000`013ffb60 00007ff7`4d3aee8b     KERNELBASE!WaitForSingleObjectEx+0xaf
+00000000`013ffc00 00007ff7`4d358e16     cratonvm!__ImageBase
+00000000`013ffe10 00007ff7`4d35468c     cratonvm!__ImageBase
+00000000`013ffe40 00007ff7`4df681ff     cratonvm!__ImageBase
+(Inline Function) --------`--------     cratonvm!std::rt::lang_start_internal::closure$0+0x99
+(Inline Function) --------`--------     cratonvm!std::panicking::catch_unwind::do_call+0x99
+(Inline Function) --------`--------     cratonvm!std::panicking::catch_unwind+0x99
+(Inline Function) --------`--------     cratonvm!std::panic::catch_unwind+0x99
+00000000`013ffe70 00007ff7`4d3b07ba     cratonvm!std::rt::lang_start_internal+0xaf
+00000000`013ffef0 00007ff7`4e130ebc     cratonvm!main+0x1a
+(Inline Function) --------`--------     cratonvm!invoke_main+0x22
+00000000`013fff20 00007ffd`884fe8d7     cratonvm!__scrt_common_main_seh+0x10c
+00000000`013fff60 00007ffd`89dec53c     KERNEL32!BaseThreadInitThunk+0x17
+00000000`013fff90 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   1  Id: a29c.cf1c Suspend: 1 Teb: 00000000`002a3000 Unfrozen
+Child-SP          RetAddr               Call Site
+00000000`0267fbf8 00007ffd`89dd5f3e     ntdll!NtWaitForWorkViaWorkerFactory+0x14
+00000000`0267fc00 00007ffd`884fe8d7     ntdll!TppWorkerThread+0x37e
+00000000`0267ff60 00007ffd`89dec53c     KERNEL32!BaseThreadInitThunk+0x17
+00000000`0267ff90 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   2  Id: a29c.4884 Suspend: 1 Teb: 00000000`002a5000 Unfrozen
+Child-SP          RetAddr               Call Site
+00000000`0367fbf8 00007ffd`89dd5f3e     ntdll!NtWaitForWorkViaWorkerFactory+0x14
+00000000`0367fc00 00007ffd`884fe8d7     ntdll!TppWorkerThread+0x37e
+00000000`0367ff60 00007ffd`89dec53c     KERNEL32!BaseThreadInitThunk+0x17
+00000000`0367ff90 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   3  Id: a29c.9140 Suspend: 1 Teb: 00000000`002a7000 Unfrozen
+Child-SP          RetAddr               Call Site
+00000000`0467fbf8 00007ffd`89dd5f3e     ntdll!NtWaitForWorkViaWorkerFactory+0x14
+00000000`0467fc00 00007ffd`884fe8d7     ntdll!TppWorkerThread+0x37e
+00000000`0467ff60 00007ffd`89dec53c     KERNEL32!BaseThreadInitThunk+0x17
+00000000`0467ff90 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   4  Id: a29c.6b94 Suspend: 1 Teb: 00000000`002a9000 Unfrozen "main-vm"
+Child-SP          RetAddr               Call Site
+00000000`4ca89510 00007ffd`8729f8b8     ntdll!RtlWaitOnAddress+0x1f7
+00000000`4ca89580 00007ff7`4ddd1f3f     KERNELBASE!WaitOnAddress+0x38
+00000000`4ca895c0 00007ff7`4db5fafd     cratonvm!core::ptr::drop_in_place<alloc::boxed::Box<dyn$<core::ops::function::FnOnce<tuple$<>,assoc$<Output,tuple$<> > >,core::marker::Send>,alloc::alloc::Global> >+0x83f
+00000000`4ca896c0 00007ff7`4d8a3706     cratonvm!core::net::socket_addr::impl$6::fmt+0x725efd
+00000000`4ca89880 00007ff7`4db88cc0     cratonvm!core::net::socket_addr::impl$6::fmt+0x469b06
+00000000`4ca898c0 00007ff7`4dc61446     cratonvm!core::net::socket_addr::impl$6::fmt+0x74f0c0
+00000000`4ca89bb0 00007ff7`4dc02cc0     cratonvm!core::net::socket_addr::impl$6::fmt+0x827846
+00000000`4ca8a040 00007ff7`4dc0a619     cratonvm!core::net::socket_addr::impl$6::fmt+0x7c90c0
+00000000`4ca8a4f0 00007ff7`4dbe110f     cratonvm!core::net::socket_addr::impl$6::fmt+0x7d0a19
+00000000`4ca8ae60 00007ff7`4db8eb60     cratonvm!core::net::socket_addr::impl$6::fmt+0x7a750f
+00000000`4ca8b600 00007ff7`4db76da0     cratonvm!core::net::socket_addr::impl$6::fmt+0x754f60
+00000000`4ca8bba0 00007ff7`4dd2c14f     cratonvm!core::net::socket_addr::impl$6::fmt+0x73d1a0
+00000000`4ca8c0c0 00007ff7`4d396805     cratonvm!jit_get_current_thread+0xa8e7f
+00000000`4ca8c190 00007ff7`4d354737     cratonvm!__ImageBase
+00000000`4ca8fdb0 00007ff7`4d35e7ea     cratonvm!__ImageBase
+00000000`4ca8fe00 00007ff7`4df6e150     cratonvm!__ImageBase
+00000000`4ca8feb0 00007ffd`884fe8d7     cratonvm!std::sys::thread::windows::impl$0::new::thread_start+0x210
+00000000`4ca8ff60 00007ffd`89dec53c     KERNEL32!BaseThreadInitThunk+0x17
+00000000`4ca8ff90 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   5  Id: a29c.cb70 Suspend: 1 Teb: 00000000`002ab000 Unfrozen "Thread-1"
+Child-SP          RetAddr               Call Site
+00000000`4d38be18 00007ffd`89dfc1c3     ntdll!NtWaitForAlertByThreadId+0x14
+00000000`4d38be20 00007ffd`8729f8b8     ntdll!RtlWaitOnAddress+0x213
+00000000`4d38be90 00007ff7`4ddd1f3f     KERNELBASE!WaitOnAddress+0x38
+00000000`4d38bed0 00007ff7`4dca6ef9     cratonvm!core::ptr::drop_in_place<alloc::boxed::Box<dyn$<core::ops::function::FnOnce<tuple$<>,assoc$<Output,tuple$<> > >,core::marker::Send>,alloc::alloc::Global> >+0x83f
+00000000`4d38bfd0 00007ff7`4d8de03c     cratonvm!jit_get_current_thread+0x23c29
+00000000`4d38c0b0 00007ff7`4db88cc0     cratonvm!core::net::socket_addr::impl$6::fmt+0x4a443c
+00000000`4d38c100 00007ff7`4dc8e3cc     cratonvm!core::net::socket_addr::impl$6::fmt+0x74f0c0
+00000000`4d38c3f0 00007ff7`4dbfc1a9     cratonvm!jit_get_current_thread+0xb0fc
+00000000`4d38c500 00007ff7`4dbe516b     cratonvm!core::net::socket_addr::impl$6::fmt+0x7c25a9
+00000000`4d38c980 00007ff7`4db8eb60     cratonvm!core::net::socket_addr::impl$6::fmt+0x7ab56b
+00000000`4d38d120 00007ff7`4db76da0     cratonvm!core::net::socket_addr::impl$6::fmt+0x754f60
+00000000`4d38d6c0 00007ff7`4dc5b7f2     cratonvm!core::net::socket_addr::impl$6::fmt+0x73d1a0
+00000000`4d38dbe0 00007ff7`4dbd2ea1     cratonvm!core::net::socket_addr::impl$6::fmt+0x821bf2
+00000000`4d38dcb0 00007ff7`4dc01cfd     cratonvm!core::net::socket_addr::impl$6::fmt+0x7992a1
+00000000`4d38e180 00007ff7`4dbe82e5     cratonvm!core::net::socket_addr::impl$6::fmt+0x7c80fd
+00000000`4d38e630 00007ff7`4db8eb60     cratonvm!core::net::socket_addr::impl$6::fmt+0x7ae6e5
+00000000`4d38edd0 00007ff7`4db76da0     cratonvm!core::net::socket_addr::impl$6::fmt+0x754f60
+00000000`4d38f370 00007ff7`4db721bb     cratonvm!core::net::socket_addr::impl$6::fmt+0x73d1a0
+00000000`4d38f890 00007ff7`4db71a86     cratonvm!core::net::socket_addr::impl$6::fmt+0x7385bb
+00000000`4d38fcf0 00007ff7`4df6e150     cratonvm!core::net::socket_addr::impl$6::fmt+0x737e86
+00000000`4d38feb0 00007ffd`884fe8d7     cratonvm!std::sys::thread::windows::impl$0::new::thread_start+0x210
+00000000`4d38ff60 00007ffd`89dec53c     KERNEL32!BaseThreadInitThunk+0x17
+00000000`4d38ff90 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   6  Id: a29c.a548 Suspend: 1 Teb: 00000000`002ad000 Unfrozen "Thread-2"
+Child-SP          RetAddr               Call Site
+00000000`4dee1fc8 00000000`4ed60567     cratonvm!core::net::socket_addr::impl$6::fmt+0x842f9c
+00000000`4dee2010 00000000`00000000     0x4ed60567
+
+#  7  Id: a29c.7970 Suspend: 1 Teb: 00000000`002af000 Unfrozen
+Child-SP          RetAddr               Call Site
+00000000`4fd8ff28 00007ffd`89e92d7e     ntdll!DbgBreakPoint
+00000000`4fd8ff30 00007ffd`884fe8d7     ntdll!DbgUiRemoteBreakin+0x4e
+00000000`4fd8ff60 00007ffd`89dec53c     KERNEL32!BaseThreadInitThunk+0x17
+00000000`4fd8ff90 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+quit:
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\atlmfc.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\concurrency.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\cpp_rest.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\ObjectiveC.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\stl.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Data.Json.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Geolocation.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Sensors.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Media.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\windows.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\winrt.natvis'

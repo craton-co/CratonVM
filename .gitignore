@@ -29,6 +29,7 @@ apps/**/*.tar.gz
 # app's library code (OpenWire round-trip, OSGi framework lifecycle,
 # jboss-modules class loader, etc.) — see docstring on run_smoke /
 # run_functional in scripts/orchestrator.sh.
+test-infra/
 !test-infra/probes/**/*.class
 # Spring Framework jars used by the springboot probe. Checked in so the
 # probe can compile + run without a network fetch at smoke time.
