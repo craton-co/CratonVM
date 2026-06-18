@@ -375,6 +375,26 @@ impl CompilerCore {
 /// supplied by the VM at startup; `tiered.rs` only owns the scheduling.
 pub type CompileFn = Box<dyn Fn(&CompilationTask) -> u64 + Send + 'static>;
 
+/// Whether a target tier should use the **optimized** (C2-equivalent) backend.
+///
+/// wire-tiered-manager increment 2 / Step 3: this is the policy half of the
+/// C1/C2 backend split. `C1`/`C1WithProfiling` map to the fast single-pass
+/// (no-opt) backend; `C2` (and the `FullProfile` collection tier, which only
+/// reaches codegen as a C2 promotion) map to the optimizing pipeline.
+///
+/// The *codegen* half lives VM-side (the `cratonvm-jit` crate cannot reference
+/// `SharedVm` or the interpreter's compile entry points), so the VM-supplied
+/// [`CompileFn`] consumes this hint to pick its compile strategy. The current
+/// VM backend (`jit::try_compile`) selects single-pass vs. optimized by
+/// process-global env flags rather than a per-call switch, so the C1 routing is
+/// presently a *stub* — both tiers funnel into the same entry point and this
+/// hint is advisory until a per-call no-opt toggle is threaded through
+/// `try_compile` (tracked as wire-tiered-manager Step 3 follow-up).
+#[inline]
+pub fn tier_uses_optimized_backend(tier: CompilationTier) -> bool {
+    matches!(tier, CompilationTier::C2 | CompilationTier::FullProfile)
+}
+
 /// Handle to the spawned background compile thread.
 ///
 /// Dropping the handle (or calling [`BackgroundCompiler::shutdown`]) signals the
@@ -833,10 +853,31 @@ impl TieredCompilationManager {
     }
 
     /// Body of the background compile thread.
+    ///
+    /// ## GC-STW-safety invariant (wire-tiered-manager increment 3)
+    ///
+    /// This loop runs on the unregistered, GC-neutral `cratonvm-jit-compiler`
+    /// daemon (see [`start_background_compiler`]). The queue wait MUST block on
+    /// `CompilerCore`'s OWN [`Condvar`] (`core.wake`) while holding ONLY this
+    /// crate's `core.queue` mutex — never any VM lock. `tiered.rs` is in the
+    /// `cratonvm-jit` crate and cannot even name `SharedVm`'s locks, so the wait
+    /// here is structurally VM-lock-free: `core.queue`/`core.wake`/`core.methods`
+    /// are jit-crate-private. `parking_lot::Condvar::wait` releases `q` while the
+    /// worker is parked and re-acquires it on wake.
+    ///
+    /// The VM-side codegen + publish runs in `compile_fn` with NO lock of any
+    /// kind held by this frame (`q` is dropped at the end of the inner scope
+    /// before `compile_fn` is called). The VM closure
+    /// ([`crate::...background_compile_task`]) is responsible for bounding its
+    /// own VM-lock scopes; this loop guarantees it is entered lock-free. The net
+    /// effect: while the worker idles on `core.wake`, it holds no lock a mutator
+    /// could need, so a mutator never stalls behind it and a concurrent STW
+    /// completes promptly.
     fn compiler_loop(core: &Arc<CompilerCore>, compile_fn: CompileFn) {
         loop {
-            // Pop one task while holding the queue lock; block on the condvar
-            // when empty so the worker idles instead of spinning.
+            // Pop one task while holding ONLY the jit-crate queue lock; block on
+            // the core's own condvar when empty so the worker idles instead of
+            // spinning. No VM lock is — or can be — held across this wait.
             let task = {
                 let mut q = core.queue.lock();
                 loop {
@@ -852,7 +893,9 @@ impl TieredCompilationManager {
                 }
             };
 
-            // Compile off the mutator thread, then publish completion.
+            // Compile off the mutator thread with NO lock held by this frame
+            // (`q` was dropped above), then publish completion. `compile_fn`
+            // bounds its own VM-lock scopes internally.
             let compile_time_ms = compile_fn(&task);
             core.complete_task(&task.method_key, task.target_tier, compile_time_ms);
         }
@@ -1672,6 +1715,232 @@ mod tests {
         }
 
         // Clean shutdown joins the worker thread.
+        drop(bg);
+        assert!(!mgr.compiler_active(), "worker stopped after shutdown");
+    }
+
+    // ── Tier → backend routing (Step 3) ──────────────────────────────────
+
+    #[test]
+    fn tier_routing_selects_optimized_backend_for_c2() {
+        // C1 tiers route to the fast single-pass (no-opt) backend; C2 (and the
+        // FullProfile collection tier, which only reaches codegen as a C2
+        // promotion) route to the optimizing pipeline.
+        assert!(!tier_uses_optimized_backend(CompilationTier::Interpreter));
+        assert!(!tier_uses_optimized_backend(CompilationTier::C1));
+        assert!(!tier_uses_optimized_backend(CompilationTier::C1WithProfiling));
+        assert!(tier_uses_optimized_backend(CompilationTier::FullProfile));
+        assert!(tier_uses_optimized_backend(CompilationTier::C2));
+    }
+
+    // ── Increment 2: flag-gated off-thread compile publishes the Jit target ──
+
+    /// wire-tiered-manager increment 2: with background compilation enabled, a
+    /// crossed threshold enqueues a task that the worker compiles OFF the
+    /// mutator thread; the worker then "publishes" the compiled entry (here a
+    /// shared `Jit`-target map standing in for `SharedVm::jit_cache`, which is
+    /// VM-crate-only) and the manager's tier is flipped to the compiled tier —
+    /// the jit-crate analogue of the invoke cache being updated to the `Jit`
+    /// target. Deterministic: blocks on an `mpsc` recv, never sleeps.
+    #[test]
+    fn flag_on_threshold_compiles_off_thread_and_publishes_jit_target() {
+        use std::sync::mpsc;
+
+        // A stand-in for the VM's `jit_cache`: the compile closure inserts the
+        // method key here to model "the Jit target is now installed/published".
+        let published: Arc<Mutex<Vec<MethodKey>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Low C2 threshold so a couple of invocations route STRAIGHT to C2
+        // (the optimized backend), exercising the Step-3 routing decision.
+        let policy = CompilationPolicy {
+            c1_threshold: u32::MAX, // skip the C1 step
+            c2_threshold: 2,
+            c2_min_invocations: 2,
+            osr_threshold: u32::MAX,
+            tiered_enabled: true,
+            c1_profiling: true,
+        };
+        let mgr = TieredCompilationManager::new(policy);
+        let key = test_key();
+
+        let mutator_thread = std::thread::current().id();
+        let (tx, rx) = mpsc::channel::<(CompilationTier, bool, std::thread::ThreadId)>();
+        let published_w = Arc::clone(&published);
+        let bg = mgr
+            .start_background_compiler(Box::new(move |task: &CompilationTask| -> u64 {
+                // Real compile_fn shape: pick the backend by tier (Step 3),
+                // "publish" the Jit target, and report back off-thread.
+                let optimized = tier_uses_optimized_backend(task.target_tier);
+                published_w.lock().push(task.method_key.clone());
+                tx.send((task.target_tier, optimized, std::thread::current().id()))
+                    .unwrap();
+                3
+            }))
+            .expect("worker should start");
+
+        // Drive invocations on the mutator thread until C2 is recommended.
+        assert!(
+            mgr.on_method_invocation(&key).is_none(),
+            "1st invocation: below threshold"
+        );
+        let rec = mgr.on_method_invocation(&key);
+        assert_eq!(
+            rec,
+            Some(CompilationTier::C2),
+            "threshold crossing enqueues a C2 task (straight-to-C2 path)"
+        );
+
+        // Worker drains + compiles off-thread; block on the channel (no sleep).
+        let (compiled_tier, optimized, worker_thread) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker must drain the task");
+        assert_eq!(compiled_tier, CompilationTier::C2);
+        assert!(
+            optimized,
+            "C2 must route to the optimized backend (Step 3 routing)"
+        );
+        assert_ne!(
+            worker_thread, mutator_thread,
+            "compilation must run OFF the mutator thread"
+        );
+
+        // After completion the worker publishes the tier (invoke-cache analogue)
+        // and clears the queue. Bounded spin on the completion counter.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while mgr.completed_compilations() == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(mgr.completed_compilations(), 1, "one task completed");
+        assert!(mgr.queue_empty(), "queue drained");
+        assert_eq!(
+            mgr.current_tier(&key),
+            CompilationTier::C2,
+            "Jit target (tier) published by the worker"
+        );
+        assert_eq!(
+            *published.lock(),
+            vec![key.clone()],
+            "the compiled method's Jit target was published off-thread"
+        );
+        assert_eq!(mgr.stats().c2_compilations.load(Ordering::Relaxed), 1);
+
+        drop(bg);
+        assert!(!mgr.compiler_active(), "worker stopped after shutdown");
+    }
+
+    // ── Increment 3: GC-STW-safety — no VM-equivalent lock held across waits ──
+
+    /// wire-tiered-manager increment 3 (GC-STW-safety): the background worker
+    /// must hold NO VM lock across (a) its queue wait and (b) an in-flight
+    /// compile's own blocking. This is the load-bearing invariant that keeps a
+    /// STW prompt: a mutator wanting an exclusive VM lock (modelled here by
+    /// `vm_lock`, standing in for `SharedVm::class_manager.write()`) must be
+    /// able to acquire it WHILE a compile task is in-flight, because the worker
+    /// only ever takes that lock for a bounded scope and drops it before doing
+    /// anything blocking.
+    ///
+    /// The test drives a compile task whose `compile_fn` mirrors the real
+    /// `background_compile_task` lock shape: briefly take `vm_lock` (read out
+    /// what it needs), DROP it, then block (here on a barrier standing in for
+    /// the long codegen / a `load_class_concurrent` condvar wait). While the
+    /// worker is blocked mid-compile, a competing "STW initiator" thread must
+    /// acquire `vm_lock` PROMPTLY. If the worker wrongly held a VM lock across
+    /// its blocking wait, this acquisition would deadlock and the bounded
+    /// `recv_timeout` would fire. Deterministic: every rendezvous is a channel
+    /// recv or a barrier, never a sleep.
+    #[test]
+    fn worker_holds_no_vm_lock_across_blocking_compile() {
+        use std::sync::mpsc;
+        use std::sync::{Arc as StdArc, Barrier};
+
+        // Stand-in for `SharedVm::class_manager` (the lock a class-defining
+        // mutator / STW path contends for). The worker takes it only briefly.
+        let vm_lock: StdArc<Mutex<u64>> = StdArc::new(Mutex::new(0));
+
+        let policy = CompilationPolicy {
+            c1_threshold: 1,
+            c2_threshold: u32::MAX,
+            c2_min_invocations: u32::MAX,
+            osr_threshold: u32::MAX,
+            tiered_enabled: true,
+            c1_profiling: true,
+        };
+        let mgr = TieredCompilationManager::new(policy);
+        let key = test_key();
+
+        // Rendezvous: worker -> test when it has ENTERED the compile and is
+        // about to block; a two-party barrier the worker waits on to model the
+        // long in-flight compile; and a channel the worker uses to report the
+        // VM-lock value it read during its bounded critical section.
+        let (entered_tx, entered_rx) = mpsc::channel::<u64>();
+        let release = StdArc::new(Barrier::new(2));
+
+        let vm_lock_w = StdArc::clone(&vm_lock);
+        let release_w = StdArc::clone(&release);
+        let bg = mgr
+            .start_background_compiler(Box::new(move |_task: &CompilationTask| -> u64 {
+                // (1) Bounded VM-lock scope: acquire, read, DROP — exactly the
+                // shape `try_jit_compile_callee_slow` uses for class_manager /
+                // jit_cache. The guard must NOT survive into the blocking wait.
+                let seen = {
+                    let g = vm_lock_w.lock();
+                    *g
+                }; // <-- guard dropped here, BEFORE blocking below.
+                entered_tx.send(seen).unwrap();
+                // (2) Blocking wait with NO VM lock held — models long codegen
+                // or a `load_class_concurrent` condvar wait. If a VM lock were
+                // still held here, the STW thread below would deadlock.
+                release_w.wait();
+                4
+            }))
+            .expect("worker should start");
+
+        // Enqueue one task (crossing c1_threshold=1 on the 1st invocation) ->
+        // worker picks it up.
+        assert_eq!(
+            mgr.on_method_invocation(&key),
+            Some(CompilationTier::C1),
+            "1st invocation crosses c1_threshold=1 and enqueues a C1 task"
+        );
+        // The worker has entered the compile and finished its bounded VM-lock
+        // critical section; block on the channel (no sleep).
+        let seen = entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker must enter compile and release the VM lock");
+        assert_eq!(seen, 0, "worker read the VM-lock-protected state");
+
+        // The worker is now blocked mid-compile (on `release`). A competing STW
+        // initiator MUST be able to grab the VM lock promptly — proving the
+        // worker holds no VM lock across its blocking wait. Do it on a separate
+        // thread with a bounded join so a regression deadlocks the test thread's
+        // timeout rather than hanging forever.
+        let vm_lock_stw = StdArc::clone(&vm_lock);
+        let (stw_tx, stw_rx) = mpsc::channel::<()>();
+        let stw = std::thread::spawn(move || {
+            let mut g = vm_lock_stw.lock();
+            *g += 1; // mutate while the worker is mid-compile
+            stw_tx.send(()).unwrap();
+        });
+        stw_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("STW initiator must acquire the VM lock while a compile is in-flight");
+        stw.join().unwrap();
+        assert_eq!(*vm_lock.lock(), 1, "STW path mutated the VM-locked state");
+
+        // The worker is also not holding its OWN queue lock while mid-compile:
+        // `queue_size()` takes `core.queue.lock()` and returns without blocking,
+        // confirming the worker dropped the queue lock before running compile_fn
+        // (the queue was drained when the task was dequeued).
+        assert_eq!(mgr.queue_size(), 0, "queue drained while compile in-flight");
+
+        // Let the in-flight compile finish.
+        release.wait();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while mgr.completed_compilations() == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(mgr.completed_compilations(), 1, "compile completed");
+
         drop(bg);
         assert!(!mgr.compiler_active(), "worker stopped after shutdown");
     }

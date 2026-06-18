@@ -28,6 +28,69 @@ per-framework native short-circuits by making the real container bytecode run.
 >   `tag`/`end` natives and the `post_clinit_fixup` carrier write are RETAINED —
 >   removing them would re-expose the nested-`<clinit>` NPE and abort Spring Boot.
 
+> **Increment 2 (Step 2, gated `CRATONVM_REAL_SPRING_STARTUP`) — LANDED.**
+> Scope: make the real `DefaultApplicationStartup.<clinit>` chain run behind a
+> default-OFF env gate, so the swallow + `post_clinit_fixup` backfill + no-op
+> startup-metrics natives are no longer needed when the gate is ON. The default
+> (gate unset) path is unchanged byte-for-byte.
+>
+> - **Concrete root cause.** Disassembling Spring Framework 5.3.31
+>   (`spring-core`, the Spring Boot 2.7.x line the shim targets) shows the entire
+>   `<clinit>` chain is *trivial* bytecode — no I/O, no reflection, no resource
+>   loading:
+>     - `ApplicationStartup.<clinit>`: `new DefaultApplicationStartup; dup;
+>       invokespecial <init>; putstatic DEFAULT`.
+>     - `DefaultApplicationStartup.<clinit>`: `new DefaultStartupStep; dup;
+>       invokespecial <init>; putstatic DEFAULT_STARTUP_STEP`.
+>     - `DefaultStartupStep.<init>`: `Object.<init>` then `new DefaultTags; dup;
+>       invokespecial <init>; putfield TAGS`.
+>     - `DefaultTags.<init>`: just `Object.<init>` (all nested classes are
+>       `static`, so there is no enclosing-instance `this$0` to bind).
+>   There is no genuine deep VM bug in *executing* this chain. The operative
+>   failure was that the chain was **never given the chance to run on the real
+>   path**: the no-op `getApplicationStartup()` native (registered in
+>   `spring_startup_bootstrap.rs` and force-routed by the `check_override` chain
+>   in `vm_exec.rs`) shadowed the real `getstatic ApplicationStartup.DEFAULT`
+>   getter, so the interface `<clinit>` → nested `DefaultApplicationStartup
+>   .<clinit>` chain was bypassed; and on the Spring Boot fat-jar path, where the
+>   nested inner classes are loaded from a nested JAR, the `<clinit>` that *did*
+>   run was swallowed by the lenient `<clinit>` path and `post_clinit_fixup`
+>   stamped a synthetic `DEFAULT`. So the "nested-`<clinit>` NPE" was really a
+>   shadow-and-swallow interaction, not an un-runnable bytecode chain. With the
+>   gate ON the real chain completes on its own.
+> - **The gate (`CRATONVM_REAL_SPRING_STARTUP`, default OFF).** Three coordinated
+>   suppressions, all no-ops when the var is unset:
+>     1. `native-builtins/src/spring_startup_bootstrap.rs::register` — the no-op
+>        `getApplicationStartup`/`start`/`tag`/`end`/`getName`/`getId`/
+>        `getParentId`/`getTags` natives are wrapped in `if !real_spring_startup()`
+>        (mirroring the `CRATONVM_REAL_AQS` registration gate). The
+>        environment/bean-factory/property-source natives in the same module cover
+>        *separate* gaps and remain registered.
+>     2. `vm/src/vm/vm_exec.rs` `check_override` chain — the `getApplicationStartup`
+>        arm and the `start|tag|end|getName|getTags` arm are guarded with
+>        `!real_spring_startup()` so the no-op natives are not force-shadowed over
+>        the real bytecode.
+>     3. `vm/src/vm/vm_util.rs` — `clinit_swallow_has_recovery` drops
+>        `ApplicationStartup`/`DefaultApplicationStartup` from the lenient swallow
+>        allowlist when the gate is ON (so a failed `<clinit>` propagates per JVMS
+>        §5.5 instead of being swallowed), and the `post_clinit_fixup`
+>        `ApplicationStartup` arm early-returns (so `DEFAULT` is never synthetically
+>        backfilled). The shared gate accessor is
+>        `crate::runtime::env_cache::real_spring_startup()`.
+> - **Test.** `vm/tests/nested_clinit_startup.rs` with a framework-independent
+>   fixture `vm/tests/resources/cratonvm/NestedClinitStartup.java` (real-JDK
+>   bytecode, JDK 25 / class major 69) whose `Startup`/`DefaultStartup`/
+>   `DefaultStep`/`DefaultTags` classes mirror Spring's `ApplicationStartup`/
+>   `DefaultApplicationStartup`/`DefaultStartupStep`/`DefaultTags` byte-for-byte in
+>   `<clinit>` shape. The flag-ON test (in-process) drives a single `getstatic
+>   Startup.DEFAULT` and asserts the whole nested chain completes (probe `true`)
+>   without the shim; the flag-OFF test (subprocess, env-isolated, skips if the
+>   binary is unbuilt) asserts the existing shim + swallow + fixup fallback still
+>   completes the probe.
+> - **Not yet done (deferred):** flipping the gate default to ON and deleting the
+>   startup-metrics natives + the `post_clinit_fixup` ApplicationStartup arm (Step
+>   3) — gated on validating the Spring Boot battery with the flag ON.
+
 ## Goal
 
 Run the **real** CDI / dependency-injection / service-container bytecode of

@@ -190,6 +190,63 @@ because it is the load-bearing piece a C host needs) — is implemented in a new
 Next: Layer 2 (the flat `cratonvm_*` opaque-handle C API + cbindgen header) and
 Layer 1 (the curated semver-stable `cratonvm-embed` Rust facade) build on this.
 
+## Increment 2 (Layer 2 flat C API) landed
+
+The flat **opaque-handle C API** (Layer 2 in the design above) is implemented
+alongside the Increment-1 Invocation-API entry points, in the same
+`libcratonvm` crate (`libcratonvm/src/lib.rs`). No Rust types cross the
+boundary — everything is handles + POD — and every entry point is
+`#[no_mangle] pub extern "C"` and `catch_unwind`-wrapped (a panic converts to
+an error code / null / `ERROR`-tagged value, never unwinds into C).
+
+- **Opaque VM handle.** `cratonvm_create(const JavaVMInitArgs*) -> *mut
+  CratonVm` builds a VM via the *same* `Vm::new` + `bootstrap` +
+  `set_jni_context_arc` path as `JNI_CreateJavaVM` (no duplicated bootstrap),
+  and hands back an owning `CratonVm*`. `cratonvm_destroy(vm)` drops it (null
+  is a no-op). Unlike the Invocation API, the flat handle's lifetime is
+  caller-controlled and it does **not** touch the `CREATED_VM`
+  one-VM-per-process registry — a flat-only host may create/destroy freely.
+- **Operations:** `cratonvm_load_class(vm, name, *out_class)` (out-pointer +
+  `JNI_OK`/`JNI_ERR` return, because `0` is a valid `ClassId`);
+  `cratonvm_invoke_static(vm, cls, method, sig, *args, n_args) -> CratonValue`;
+  `cratonvm_new_string(vm, utf8) -> CratonRef` (reuses the Layer-1 interning
+  constructor `vm::create_java_string`).
+- **Handle / value encoding.** `CratonRef` (`u64`) is `ObjectRef::as_ptr()`
+  with `0 == null` — identical to the JNIEnv side's `JObject = u64`, so handles
+  are interchangeable between the two surfaces. `CratonClass` (`u64`) is a
+  widened `ClassId`. `CratonValue` is a `#[repr(C)]` tag+`u64` POD covering
+  int/long/float/double/object/void/error. **Args are a typed `CratonValue`
+  array + count, not C varargs** — varargs across FFI are unsound for
+  non-`int`/`double` types and not ABI-portable; a varargs convenience shim is
+  noted as a next step.
+- **Thread-local last error / pending-throwable accessor.**
+  `cratonvm_last_error(vm) -> *const c_char` returns this thread's pending
+  message (or null); `cratonvm_clear_error(vm)` clears it. State is
+  thread-local, mirroring JNI's per-thread pending exception; each entry point
+  clears it on entry. A thrown Java exception is reported with its throwable
+  handle (reading the throwable's message/class needs heap-header access owned
+  by another work item, so it is surfaced as an inspectable handle rather than
+  decoded here).
+- **Header.** A hand-written, cbindgen-byte-compatible stub ships at
+  `libcratonvm/include/cratonvm.h` (the flat ABI is small/stable enough to
+  maintain by hand for now; wiring real cbindgen generation as a build step is
+  a next step).
+- **C harness:** `libcratonvm/examples/embed_flat.c` exercises create →
+  load_class → new_string → invoke_static → last_error (deliberate bad-class
+  path) → destroy. Not compiled by cargo; build commands are in the file
+  header.
+- **Rust smoke tests** (in `libcratonvm/src/lib.rs` `tests`): `CratonValue`
+  tag round-trip for every variant; null-handle → `JNI_ERR`/error-value/null
+  with the last error set (for `load_class`, `invoke_static`, `new_string`);
+  last-error set/clear round-trip; `cratonvm_destroy(null)` no-op. A full
+  live-VM round trip is gated behind `--cfg flat_api_live_vm` so the default
+  unit run stays fast and JDK-independent (the increment-1 convention of not
+  booting a VM in the default unit run).
+
+Next: a C varargs convenience overload of `invoke_static`; real cbindgen header
+generation; `cratonvm_invoke_virtual` + value/array read-back helpers; and the
+Layer-1 curated `cratonvm-embed` Rust facade.
+
 ## Effort
 
 L. Layer 1 (curate/document the existing Rust API) is S–M and immediately

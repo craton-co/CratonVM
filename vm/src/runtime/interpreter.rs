@@ -7023,10 +7023,44 @@ fn execute_instruction(
         | Instruction::Laload
         | Instruction::Daload => {
             let index = thread.frames[frame_idx].stack.pop_int()?;
-            let array_ref = pop_object_ref_ctx(
-                &mut thread.frames[frame_idx].stack,
-                Some("Cannot load from null array"),
-            )?;
+            // JEP 358 increment 2: `Cannot load from <T> array because
+            // "<expr>" is null`. Source bytecode stack is `[..., arrayref,
+            // index]` so the array is one slot below the top (depth 1). The
+            // element kind comes from the opcode itself.
+            let array_ref = if crate::runtime::env_cache::helpful_npe_opcodes() {
+                use crate::runtime::exceptions::helpful_npe::ArrayElemKind;
+                let elem = match instruction {
+                    Instruction::Iaload => ArrayElemKind::Int,
+                    Instruction::Laload => ArrayElemKind::Long,
+                    Instruction::Faload => ArrayElemKind::Float,
+                    Instruction::Daload => ArrayElemKind::Double,
+                    Instruction::Aaload => ArrayElemKind::Object,
+                    Instruction::Baload => ArrayElemKind::Byte,
+                    Instruction::Caload => ArrayElemKind::Char,
+                    _ => ArrayElemKind::Short, // Saload
+                };
+                let action = crate::runtime::exceptions::helpful_npe::action_array_load(elem);
+                let npe_code = Arc::clone(&thread.frames[frame_idx].code);
+                let npe_cid = thread.frames[frame_idx].class_id;
+                let npe_mname = thread.frames[frame_idx].method_name_arc();
+                let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
+                let npe_bci = thread.frames[frame_idx].last_instr_pc;
+                pop_object_ref_ctx_with(
+                    &mut thread.frames[frame_idx].stack,
+                    &shared.heap,
+                    || {
+                        helpful_npe_opcode_message_parts(
+                            shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci,
+                            &action, 1,
+                        )
+                    },
+                )?
+            } else {
+                pop_object_ref_ctx(
+                    &mut thread.frames[frame_idx].stack,
+                    Some("Cannot load from null array"),
+                )?
+            };
             let value = shared
                 .heap
                 .get_array_element(array_ref, index as usize) // Widening: index conversion
@@ -7086,7 +7120,27 @@ fn execute_instruction(
             let _diag_pc = thread.frames[frame_idx].pc;
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
-            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || format!("aastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
+            // JEP 358 increment 2: `Cannot store to object array because
+            // "<expr>" is null`. Source stack `[..., arrayref, index, value]`
+            // → array at depth 2.
+            let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
+            let npe_code = Arc::clone(&thread.frames[frame_idx].code);
+            let npe_cid = thread.frames[frame_idx].class_id;
+            let npe_mname = thread.frames[frame_idx].method_name_arc();
+            let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
+            let npe_bci = thread.frames[frame_idx].last_instr_pc;
+            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
+                if jep358 {
+                    let action = crate::runtime::exceptions::helpful_npe::action_array_store(
+                        crate::runtime::exceptions::helpful_npe::ArrayElemKind::Object,
+                    );
+                    helpful_npe_opcode_message_parts(
+                        shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 2,
+                    )
+                } else {
+                    format!("aastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)
+                }
+            })?;
             // JVMS §aastore covariance check: a reference store into an
             // Object[]-family array whose element's runtime type is NOT
             // assignment-compatible with the array's component type throws
@@ -7136,7 +7190,32 @@ fn execute_instruction(
             let _diag_pc = thread.frames[frame_idx].pc;
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
-            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || format!("Xastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
+            // JEP 358 increment 2: array at depth 2 (`[..., arrayref, index,
+            // value]`); element kind from the opcode.
+            let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
+            let npe_code = Arc::clone(&thread.frames[frame_idx].code);
+            let npe_cid = thread.frames[frame_idx].class_id;
+            let npe_mname = thread.frames[frame_idx].method_name_arc();
+            let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
+            let npe_bci = thread.frames[frame_idx].last_instr_pc;
+            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
+                if jep358 {
+                    use crate::runtime::exceptions::helpful_npe::ArrayElemKind;
+                    let elem = match instruction {
+                        Instruction::Iastore => ArrayElemKind::Int,
+                        Instruction::Fastore => ArrayElemKind::Float,
+                        Instruction::Bastore => ArrayElemKind::Byte,
+                        Instruction::Castore => ArrayElemKind::Char,
+                        _ => ArrayElemKind::Short, // Sastore
+                    };
+                    let action = crate::runtime::exceptions::helpful_npe::action_array_store(elem);
+                    helpful_npe_opcode_message_parts(
+                        shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 2,
+                    )
+                } else {
+                    format!("Xastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)
+                }
+            })?;
             // bc math-ec 0x4 smear hunt — see the Lastore twin below.
             if arrstore_enabled() {
                 arrstore_check(shared, thread, array_ref, index, "iastore");
@@ -7163,7 +7242,25 @@ fn execute_instruction(
             let _diag_pc = thread.frames[frame_idx].pc;
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
-            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || format!("lastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
+            // JEP 358 increment 2: long array store, array at depth 2.
+            let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
+            let npe_code = Arc::clone(&thread.frames[frame_idx].code);
+            let npe_cid = thread.frames[frame_idx].class_id;
+            let npe_mname = thread.frames[frame_idx].method_name_arc();
+            let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
+            let npe_bci = thread.frames[frame_idx].last_instr_pc;
+            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
+                if jep358 {
+                    let action = crate::runtime::exceptions::helpful_npe::action_array_store(
+                        crate::runtime::exceptions::helpful_npe::ArrayElemKind::Long,
+                    );
+                    helpful_npe_opcode_message_parts(
+                        shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 2,
+                    )
+                } else {
+                    format!("lastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)
+                }
+            })?;
             // bc math-ec 0x4 smear hunt (CRATONVM_DBG_ARRSTORE): validate the
             // receiver's header AT THE WRITE. A stale (GC-moved) long[] ref
             // points at reused memory whose "header" is garbage math data —
@@ -7186,7 +7283,25 @@ fn execute_instruction(
             let _diag_pc = thread.frames[frame_idx].pc;
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
-            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || format!("dastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
+            // JEP 358 increment 2: double array store, array at depth 2.
+            let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
+            let npe_code = Arc::clone(&thread.frames[frame_idx].code);
+            let npe_cid = thread.frames[frame_idx].class_id;
+            let npe_mname = thread.frames[frame_idx].method_name_arc();
+            let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
+            let npe_bci = thread.frames[frame_idx].last_instr_pc;
+            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
+                if jep358 {
+                    let action = crate::runtime::exceptions::helpful_npe::action_array_store(
+                        crate::runtime::exceptions::helpful_npe::ArrayElemKind::Double,
+                    );
+                    helpful_npe_opcode_message_parts(
+                        shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 2,
+                    )
+                } else {
+                    format!("dastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)
+                }
+            })?;
             shared
                 .heap
                 .set_array_element(array_ref, index as usize, Value::Double(d))
@@ -7983,15 +8098,45 @@ fn execute_instruction(
             // (rare) null-receiver NPE message and the (cached-off) debug
             // blocks below. Resolve it LAZILY in those paths instead of on
             // every getfield (the single most common opcode in OO bytecode).
+            // JEP 358 increment 2 (opt-in via CRATONVM_HELPFUL_NPE_OPCODES):
+            // emit the HotSpot shape `Cannot read field "x" because "<expr>"
+            // is null`. The getfield receiver is at the top of the operand
+            // stack (depth 0). Pre-extract the `thread`-independent frame
+            // parts so the closure (which holds a &mut borrow of the operand
+            // stack) can build the message without re-borrowing `thread`.
+            // Only clone the frame parts (Arc bumps) when the opt-in flag is
+            // set — keep the default getfield path (the hottest OO opcode)
+            // allocation-free.
+            let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
+            let npe_parts = if jep358 {
+                Some((
+                    Arc::clone(&thread.frames[frame_idx].code),
+                    thread.frames[frame_idx].method_name_arc(),
+                    thread.frames[frame_idx].method_descriptor_arc(),
+                    thread.frames[frame_idx].last_instr_pc,
+                ))
+            } else {
+                None
+            };
             let obj_ref = pop_object_ref_ctx_with(
                 &mut thread.frames[frame_idx].stack,
                 &shared.heap,
-                || format!(
-                    "Cannot read field '{}' because the object is null",
-                    resolve_field_name(shared, current_class_id, *index)
-                        .as_deref()
-                        .unwrap_or("?")
-                ),
+                || {
+                    let field_name = resolve_field_name(shared, current_class_id, *index);
+                    if let Some((code, mname, mdesc, bci)) = &npe_parts {
+                        let action = crate::runtime::exceptions::helpful_npe::action_read_field(
+                            field_name.as_deref().unwrap_or("?"),
+                        );
+                        helpful_npe_opcode_message_parts(
+                            shared, current_class_id, code, mname, mdesc, *bci, &action, 0,
+                        )
+                    } else {
+                        format!(
+                            "Cannot read field '{}' because the object is null",
+                            field_name.as_deref().unwrap_or("?")
+                        )
+                    }
+                },
             )?;
             let field = resolve_field_ref(shared, current_class_id, *index)?;
             // Perf: ALL of the per-getfield diagnostic blocks below are gated
@@ -8283,15 +8428,42 @@ fn execute_instruction(
             // Perf: resolve the field name LAZILY (it locks + allocates) — see
             // the matching Getfield comment. Only the rare null-NPE message and
             // cached-off debug blocks need it; putfield is a hot opcode.
+            // JEP 358 increment 2: `Cannot assign field "x" because "<expr>"
+            // is null`. In the source bytecode the putfield stack is
+            // `[..., objectref, value]`, so the receiver sits one slot below
+            // the top (the stored value) — depth 1. Clone the frame parts
+            // only when the opt-in flag is set (putfield is a hot opcode).
+            let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
+            let npe_parts = if jep358 {
+                Some((
+                    Arc::clone(&thread.frames[frame_idx].code),
+                    thread.frames[frame_idx].method_name_arc(),
+                    thread.frames[frame_idx].method_descriptor_arc(),
+                    thread.frames[frame_idx].last_instr_pc,
+                ))
+            } else {
+                None
+            };
             let obj_ref = pop_object_ref_ctx_with(
                 &mut thread.frames[frame_idx].stack,
                 &shared.heap,
-                || format!(
-                    "Cannot write field '{}' because the object is null",
-                    resolve_field_name(shared, current_class_id, *index)
-                        .as_deref()
-                        .unwrap_or("?")
-                ),
+                || {
+                    let field_name = resolve_field_name(shared, current_class_id, *index);
+                    if let Some((code, mname, mdesc, bci)) = &npe_parts {
+                        let action =
+                            crate::runtime::exceptions::helpful_npe::action_assign_field(
+                                field_name.as_deref().unwrap_or("?"),
+                            );
+                        helpful_npe_opcode_message_parts(
+                            shared, current_class_id, code, mname, mdesc, *bci, &action, 1,
+                        )
+                    } else {
+                        format!(
+                            "Cannot write field '{}' because the object is null",
+                            field_name.as_deref().unwrap_or("?")
+                        )
+                    }
+                },
             );
             // CRATONVM_DBG_NULLTHIS — dump the Java frame stack + current-frame
             // locals when a putfield pops a null receiver. Diagnoses the
@@ -8653,11 +8825,31 @@ fn execute_instruction(
             let current_class_name = thread.frames[frame_idx].class_name().to_string();
             let mname = thread.frames[frame_idx].method_name().to_string();
             let mdesc = thread.frames[frame_idx].method_descriptor().to_string();
+            // JEP 358 increment 2: `Cannot read the array length because
+            // "<expr>" is null`. The array ref is at the top of the operand
+            // stack (depth 0).
+            let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
+            let npe_code = Arc::clone(&thread.frames[frame_idx].code);
+            let npe_cid = thread.frames[frame_idx].class_id;
+            let npe_mname = thread.frames[frame_idx].method_name_arc();
+            let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
+            let npe_bci = thread.frames[frame_idx].last_instr_pc;
             // S111r14 diag: print full Java stack trace on arraylength failure
             let arr_ref = match pop_object_ref_ctx_with(
                 &mut thread.frames[frame_idx].stack,
                 &shared.heap,
-                || format!("arraylength null (in {current_class_name}.{mname}{mdesc} pc={pc})"),
+                || {
+                    if jep358 {
+                        let action =
+                            crate::runtime::exceptions::helpful_npe::action_array_length();
+                        helpful_npe_opcode_message_parts(
+                            shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci,
+                            &action, 0,
+                        )
+                    } else {
+                        format!("arraylength null (in {current_class_name}.{mname}{mdesc} pc={pc})")
+                    }
+                },
             ) {
                 Ok(r) => r,
                 Err(e) => {
@@ -8946,10 +9138,20 @@ fn execute_instruction(
                     return Err(MethodCallFailed::ExceptionThrown(obj_ref));
                 }
                 Value::Object(None) => {
-                    return Err(RuntimeError::NullPointerException {
-                        message: Some("cannot throw null".to_string()),
-                    }
-                    .into());
+                    // JEP 358 increment 2: `Cannot throw exception because
+                    // "<expr>" is null`. The thrown ref was at the top of the
+                    // operand stack (depth 0). Falls back to the legacy
+                    // `cannot throw null` text when the flag is off.
+                    let message = if crate::runtime::env_cache::helpful_npe_opcodes() {
+                        let action =
+                            crate::runtime::exceptions::helpful_npe::action_throw();
+                        Some(helpful_npe_opcode_message(
+                            shared, thread, frame_idx, &action, 0,
+                        ))
+                    } else {
+                        Some("cannot throw null".to_string())
+                    };
+                    return Err(RuntimeError::NullPointerException { message }.into());
                 }
                 _ => {
                     return Err(VmError::Internal {
@@ -9178,6 +9380,15 @@ fn execute_instruction(
         // `thread.frames[..]`-borrow-while-also-mut-borrowing-stack issue.
         Instruction::Monitorenter => {
             let pc_snap = thread.frames[frame_idx].pc;
+            // JEP 358 increment 2: `Cannot enter synchronized block because
+            // "<expr>" is null`. The monitor object is at the top of the
+            // operand stack (depth 0).
+            let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
+            let npe_code = Arc::clone(&thread.frames[frame_idx].code);
+            let npe_cid = thread.frames[frame_idx].class_id;
+            let npe_mname = thread.frames[frame_idx].method_name_arc();
+            let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
+            let npe_bci = thread.frames[frame_idx].last_instr_pc;
             let obj_ref = {
                 // Capture &str borrows of class/method into the closure
                 // without allocating Strings on the hot path. The frame
@@ -9193,12 +9404,21 @@ fn execute_instruction(
                 let mth_ptr = mth as *const str;
                 let stack = &mut thread.frames[frame_idx].stack;
                 pop_object_ref_ctx_with(stack, &shared.heap, || {
-                    // SAFETY: cls/mth originate from `frame_ref.inner`,
-                    // which is not mutated by stack ops; the pointers are
-                    // valid for the duration of the closure call.
-                    let cls = unsafe { &*cls_ptr };
-                    let mth = unsafe { &*mth_ptr };
-                    format!("monitorenter in {cls}.{mth} pc={pc_snap}")
+                    if jep358 {
+                        let action =
+                            crate::runtime::exceptions::helpful_npe::action_monitor();
+                        helpful_npe_opcode_message_parts(
+                            shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci,
+                            &action, 0,
+                        )
+                    } else {
+                        // SAFETY: cls/mth originate from `frame_ref.inner`,
+                        // which is not mutated by stack ops; the pointers are
+                        // valid for the duration of the closure call.
+                        let cls = unsafe { &*cls_ptr };
+                        let mth = unsafe { &*mth_ptr };
+                        format!("monitorenter in {cls}.{mth} pc={pc_snap}")
+                    }
                 })?
             };
             // Snapshot the JFR-enabled flag *before* the acquire so the
@@ -9259,17 +9479,33 @@ fn execute_instruction(
         }
         Instruction::Monitorexit => {
             let pc_snap = thread.frames[frame_idx].pc;
+            // JEP 358 increment 2: monitor object at top of stack (depth 0).
+            let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
+            let npe_code = Arc::clone(&thread.frames[frame_idx].code);
+            let npe_cid = thread.frames[frame_idx].class_id;
+            let npe_mname = thread.frames[frame_idx].method_name_arc();
+            let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
+            let npe_bci = thread.frames[frame_idx].last_instr_pc;
             let obj_ref = {
                 let frame_ref = &thread.frames[frame_idx];
                 let cls_ptr = frame_ref.class_name() as *const str;
                 let mth_ptr = frame_ref.method_name() as *const str;
                 let stack = &mut thread.frames[frame_idx].stack;
                 pop_object_ref_ctx_with(stack, &shared.heap, || {
-                    // SAFETY: see Monitorenter — frame metadata is stable
-                    // across the stack pop performed by `pop_object_ref_ctx_with`.
-                    let cls = unsafe { &*cls_ptr };
-                    let mth = unsafe { &*mth_ptr };
-                    format!("monitorexit in {cls}.{mth} pc={pc_snap}")
+                    if jep358 {
+                        let action =
+                            crate::runtime::exceptions::helpful_npe::action_monitor();
+                        helpful_npe_opcode_message_parts(
+                            shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci,
+                            &action, 0,
+                        )
+                    } else {
+                        // SAFETY: see Monitorenter — frame metadata is stable
+                        // across the stack pop performed by `pop_object_ref_ctx_with`.
+                        let cls = unsafe { &*cls_ptr };
+                        let mth = unsafe { &*mth_ptr };
+                        format!("monitorexit in {cls}.{mth} pc={pc_snap}")
+                    }
                 })?
             };
             // Round-9 JFR MED-6 fix (audit `round9-jfr.md`): the previous
@@ -10993,6 +11229,11 @@ fn execute_invoke(
 struct CpPoolResolver<'a> {
     shared: &'a SharedVm,
     class_id: ClassId,
+    /// Method identity needed to locate the `LocalVariableTable` for real
+    /// local-name resolution (increment 2). When these are empty the
+    /// resolver still works — `local_name` just falls back to `<localN>`.
+    method_name: &'a str,
+    method_descriptor: &'a str,
 }
 
 impl crate::runtime::exceptions::helpful_npe::CpResolver for CpPoolResolver<'_> {
@@ -11045,6 +11286,39 @@ impl crate::runtime::exceptions::helpful_npe::CpResolver for CpPoolResolver<'_> 
             descriptor: desc.to_string(),
         })
     }
+
+    /// JEP 358 step 4 — real `LocalVariableTable` name resolution. Look up
+    /// the source name of local slot `slot` live at byte-offset `bci` by
+    /// scanning the trapping method's `Code.LocalVariableTable` attribute
+    /// (`[start_pc, start_pc+length)` is the live range, JVMS §4.7.13). The
+    /// name is a Utf8 CP entry referenced by `name_index`. Returns `None`
+    /// when the method has no LVT (the common stripped-debug-info case),
+    /// which makes the analysis fall back to the synthetic `<localN>` /
+    /// `this` spelling.
+    fn local_name(&self, slot: u16, bci: usize) -> Option<String> {
+        use cratonvm_reader::attribute::Attribute;
+        let cm = self.shared.class_manager.read_recursive();
+        let class = cm.get_class(self.class_id)?;
+        let method = class.find_method(self.method_name, self.method_descriptor)?;
+        let code = method.code()?;
+        let bci_u16 = bci.min(u16::MAX as usize) as u16;
+        for attr in &code.attributes {
+            if let Attribute::LocalVariableTable(entries) = attr {
+                for e in entries {
+                    // Live range is `[start_pc, start_pc + length)`. A slot is
+                    // matched only when the trapping bci falls inside it, so a
+                    // re-used slot resolves to the correct variable name.
+                    let end = e.start_pc.saturating_add(e.length);
+                    if e.index == slot && bci_u16 >= e.start_pc && bci_u16 < end {
+                        if let Some(name) = class.constant_pool.get_utf8(e.name_index) {
+                            return Some(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 /// JEP 358 — synthesize the HotSpot-style extended message for a null-receiver
@@ -11069,13 +11343,77 @@ fn helpful_npe_invoke_message(
     // relies on for the interpreter path.
     let invoke_bci = frame.last_instr_pc;
     let code = Arc::clone(&frame.code);
+    let m_name = frame.method_name_arc();
+    let m_desc = frame.method_descriptor_arc();
     let resolver = CpPoolResolver {
         shared,
         class_id: frame.class_id,
+        method_name: &m_name,
+        method_descriptor: &m_desc,
     };
     let expr =
         helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, num_params, &resolver);
     helpful_npe::combine(&action, expr.as_deref())
+}
+
+/// JEP 358 increment 2 — synthesize the HotSpot-style extended message for a
+/// non-invoke null-deref opcode (`getfield`/`putfield`, `arraylength`, the
+/// array load/store family, `monitorenter`/`monitorexit`, `athrow`). The
+/// caller supplies the already-built action half (e.g.
+/// `Cannot read field "x"`) and the operand's depth below the top of the
+/// operand stack as it stood just before the trapping opcode. Appends
+/// `because "<expr>" is null` when the bounded backward analysis can name the
+/// null operand; otherwise emits the action half alone (HotSpot omits the
+/// `because` clause rather than fabricating one).
+///
+/// Gated by `env_cache::helpful_npe_opcodes()` at the call sites; the trapping
+/// bci is `last_instr_pc`, always known in the interpreter (deopt-independent).
+fn helpful_npe_opcode_message(
+    shared: &SharedVm,
+    thread: &JvmThread,
+    frame_idx: usize,
+    action: &str,
+    depth_below_top: usize,
+) -> String {
+    let frame = &thread.frames[frame_idx];
+    helpful_npe_opcode_message_parts(
+        shared,
+        frame.class_id,
+        &frame.code,
+        frame.method_name_arc_ref(),
+        frame.method_descriptor_arc_ref(),
+        frame.last_instr_pc,
+        action,
+        depth_below_top,
+    )
+}
+
+/// `thread`-free core of [`helpful_npe_opcode_message`]: builds the message
+/// from the trapping frame's already-extracted parts. Kept separate so the
+/// opcode call sites can invoke it from inside a `pop_object_ref_ctx_with`
+/// closure (which holds a `&mut` borrow of the frame's operand stack and so
+/// cannot also borrow `thread`). The bytecode analysis only reads `shared`
+/// (for CP / LVT lookups) and the supplied `code` slice, never `thread`.
+#[allow(clippy::too_many_arguments)]
+fn helpful_npe_opcode_message_parts(
+    shared: &SharedVm,
+    class_id: ClassId,
+    code: &[u8],
+    method_name: &str,
+    method_descriptor: &str,
+    trap_bci: usize,
+    action: &str,
+    depth_below_top: usize,
+) -> String {
+    use crate::runtime::exceptions::helpful_npe;
+    let resolver = CpPoolResolver {
+        shared,
+        class_id,
+        method_name,
+        method_descriptor,
+    };
+    let expr = helpful_npe::null_expr_at_depth(code, trap_bci, depth_below_top, &resolver);
+    helpful_npe::combine_opt(action, expr.as_deref())
 }
 
 /// Variant of `execute_invoke` that knows whether the source bytecode was
@@ -14476,39 +14814,62 @@ fn execute_invokestatic_cached(
                 cached.method_name.as_ref(),
                 cached.method_descriptor.as_ref(),
             );
-            // wire-tiered-manager increment 1: start the background compile
-            // thread once (idempotent) so enqueued tasks are drained OFF the
-            // mutator thread. `on_method_invocation` increments the per-method
-            // counter and, when the tiered thresholds are crossed, ENQUEUES a
-            // CompilationTask at the recommended tier (instead of the old code
-            // discarding the tier into `_`). The background worker consumes that
-            // queue. For this increment the worker uses a drain-only compile
-            // closure and the mutator keeps its existing inline upgrade below;
-            // moving compilation fully off-mutator is increment 2.
-            crate::jit::tiered::ensure_background_compiler(&shared.tiered_manager, || {
-                Box::new(|_task: &crate::jit::tiered::CompilationTask| -> u64 {
-                    // Increment-1 placeholder: real codegen wiring (which needs
-                    // VM-init / class-metadata access outside this item's
-                    // subsystem boundary) lands in a later increment. Draining
-                    // here proves tasks flow off-thread and clears the queued
-                    // flag via `complete_task`.
-                    0
-                })
-            });
+            // wire-tiered-manager increment 2: OFF-THREAD codegen, gated
+            // default-OFF behind `CRATONVM_BG_COMPILE`.
+            //
+            //  * Flag ON  — start the background compile thread once (idempotent)
+            //    with the REAL compile closure below, then ENQUEUE-ONLY: the
+            //    tiered manager's `on_method_invocation` pushes a CompilationTask
+            //    at the recommended tier and the worker compiles it off the
+            //    mutator (publishing into `shared.jit_cache`). The mutator does
+            //    NOT compile inline; it keeps interpreting until the worker
+            //    publishes, at which point the `jit_cache` fast-path at the top
+            //    of the `Bytecode` arm flips this call site to `Jit`.
+            //  * Flag OFF (default) — never start the worker; keep the existing
+            //    inline `try_jit_upgrade_with_gate` path EXACTLY as before so the
+            //    off-thread pipeline cannot regress steady-state behaviour until
+            //    proven. (`on_method_invocation` still enqueues, but with no
+            //    worker draining the queue this is the historical no-op.)
+            let bg_compile_on = crate::runtime::env_cache::bg_compile();
+            if bg_compile_on {
+                // Real off-thread compile closure. Captures a `Weak<SharedVm>`
+                // (the worker outlives no Arc of its own) and, per drained task,
+                // upgrades it and runs the same codegen entry point the inline
+                // path uses — `try_jit_compile_callee` does the by-name lookup +
+                // `jit::try_compile` + `shared.jit_cache` publish. Returns the
+                // wall-clock compile time in ms for the tiered stats.
+                let weak_vm: std::sync::Weak<SharedVm> = shared
+                    .self_arc
+                    .read()
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_default();
+                crate::jit::tiered::ensure_background_compiler(&shared.tiered_manager, || {
+                    Box::new(move |task: &crate::jit::tiered::CompilationTask| -> u64 {
+                        background_compile_task(&weak_vm, task)
+                    })
+                });
+            }
             let recommended_tier =
                 shared.tiered_manager.on_method_invocation(&tiered_key);
             if let Some(tier) = recommended_tier {
                 if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
                     eprintln!(
-                        "[cratonvm-jitc] tiered-enqueue {}.{}{} tier={:?} invoc_count={}",
+                        "[cratonvm-jitc] tiered-enqueue {}.{}{} tier={:?} invoc_count={} bg={}",
                         cached.class_name,
                         cached.method_name,
                         cached.method_descriptor,
                         tier,
-                        invoc_count
+                        invoc_count,
+                        bg_compile_on,
                     );
                 }
             }
+            // When background compilation is ON the mutator does NOT compile
+            // inline — the worker owns codegen. Skip straight to interpreted
+            // execution; a later call picks up the published JIT entry via the
+            // `jit_cache` fast-path above.
+            if !bg_compile_on {
             // WP2.4-F1: pass the bytecode entry's gate to inherit
             // the staleness binding — the JIT'd body executes the same
             // declaring class, so a future `redefine_class` must
@@ -14547,6 +14908,7 @@ fn execute_invokestatic_cached(
                     );
                 }
             }
+            } // end !bg_compile_on inline-upgrade path
             } // end invocation threshold check
 
             // Fallback: interpreted execution
@@ -16364,6 +16726,41 @@ pub fn try_jit_compile_callee(
 /// Sets `*cache_negative = false` when a `None` return is for a reason that
 /// may change soon (currently: receiver class not loaded yet), so the caller
 /// does not negative-cache it.
+///
+/// ## GC-STW-safety / VM-lock discipline (wire-tiered-manager increment 3)
+///
+/// This function runs both on the mutator (inline JIT-dispatch helpers) AND,
+/// when `CRATONVM_BG_COMPILE` is on, on the GC-neutral `cratonvm-jit-compiler`
+/// worker via [`background_compile_task`]. The worker is an unregistered
+/// `std::thread::Builder` daemon (the G1-MarkComplete precedent): the STW
+/// barrier never waits for it, so concurrent relocation is harmless to it
+/// PROVIDED it holds no VM lock across a blocking op. The fatal failure mode is
+/// indirect: a mutator wanting `class_manager.write()` (class definition) that
+/// blocks behind a read lock the worker is holding across a wait can no longer
+/// reach its safepoint, so a STW initiated by a third thread (whose `expected`
+/// count includes that blocked mutator) never completes.
+///
+/// Lock order and bounded scopes (each VM lock acquire -> read out what is
+/// needed -> DROP -> proceed; never two held simultaneously, never one held
+/// across a blocking call / nested VM-lock acquisition / managed allocation):
+///   1. `class_manager.read()` (`cm`) — bytecode/method metadata extraction
+///      only; explicitly `drop(cm)` BEFORE `jit::try_compile`. The constant-pool
+///      resolver closures handed to `try_compile` re-acquire `class_manager`
+///      read locks TRANSIENTLY, each scoped to a single CP lookup and dropped at
+///      closure return. The one resolver that can BLOCK or take
+///      `class_manager.write()` — `resolve_field_ref` -> `load_class_concurrent`
+///      (per-class-name condvar wait, write-lock class load with <clinit>/GC) —
+///      is invoked by `field_resolver`/`static_field_resolver` BEFORE those
+///      closures take their own `cm` read, so no VM read lock is alive across
+///      that blocking/allocating call.
+///   2. `flight_recorder.lock()` — held only for the single
+///      `emit_compilation_event_arc` call; description + timestamp built first.
+///   3. `jit_cache.write()` — held only for the publishing `put`; the key Arc
+///      is built first. This is the cross-thread publish: a mutator's
+///      `jit_cache` fast-path flips the call site to `Jit` on its next call.
+/// No two of {class_manager, flight_recorder, jit_cache} are ever held at once.
+/// GC itself takes none of these during STW (it scans deposited root snapshots),
+/// so the worker's transient holds only matter via the mutator-stall path above.
 fn try_jit_compile_callee_slow(
     shared: &SharedVm,
     class_name: &str,
@@ -16646,20 +17043,33 @@ fn try_jit_compile_callee_slow(
     let needs_ctx = compiled.needs_context();
     let compile_duration_ns = compile_start.elapsed().as_nanos() as u64; // Cast: duration to u64 nanoseconds
 
-    // Record JFR compilation event
+    // Record JFR compilation event.
+    //
+    // GC-STW-safety / lock-scope discipline (wire-tiered-manager increment 3):
+    // when this runs on the GC-neutral `cratonvm-jit-compiler` worker, the
+    // `shared.flight_recorder.lock()` must be held for the MINIMAL scope and
+    // NEVER across a blocking op or a nested VM-lock acquisition — a mutator
+    // wanting the recorder must not stall behind the worker (which would keep
+    // that mutator off its safepoint and stall a third-thread STW). The
+    // timestamp and the `Arc<str>` description (a Rust-heap alloc, not a managed
+    // GC allocation) are built BEFORE the lock so the guard's live region is
+    // exactly the `emit_compilation_event_arc` call and nothing else. No other
+    // VM lock (`class_manager` / `jit_cache`) is held here — `cm` was dropped at
+    // the `drop(cm)` above, and `jit_cache.write()` is taken AFTER this block.
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64; // Cast: duration to u64 nanoseconds
+    // Round-9 HIGH-5: build the Arc<str> once and hand ownership to the
+    // `_arc` variant instead of letting `emit_compilation_event` reallocate
+    // a fresh Arc from `&str` internally. Built before the lock so the alloc
+    // is outside the `flight_recorder` critical section.
+    let method_desc: Arc<str> = Arc::from(format!(
+        "{}::{}{}",
+        cached.class_name, cached.method_name, cached.method_descriptor
+    ));
     {
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64; // Cast: duration to u64 nanoseconds
         let mut jfr = shared.flight_recorder.lock();
-        // Round-9 HIGH-5: build the Arc<str> once and hand ownership to the
-        // `_arc` variant instead of letting `emit_compilation_event` reallocate
-        // a fresh Arc from `&str` internally.
-        let method_desc: Arc<str> = Arc::from(format!(
-            "{}::{}{}",
-            cached.class_name, cached.method_name, cached.method_descriptor
-        ));
         cratonvm_jfr::builtin::emit_compilation_event_arc(
             &mut jfr,
             method_desc,
@@ -16689,17 +17099,116 @@ fn try_jit_compile_callee_slow(
     // class hit; distinct subclasses recompile at most once each. The compiled
     // code is identical regardless of receiver (it is the resolved method's
     // body), so dispatching it for any receiver of that class is correct.
+    //
+    // GC-STW-safety / lock-scope discipline (wire-tiered-manager increment 3):
+    // this is the "publish" step — on the GC-neutral worker it is the moment a
+    // freshly compiled body becomes visible to mutators (their `jit_cache`
+    // fast-path flips the call site to `Jit` on the next invocation, the
+    // cross-thread analogue of flipping the invoke cache). The
+    // `shared.jit_cache.write()` is held for the MINIMAL scope: the receiver
+    // key `Arc` is built BEFORE the lock, the codegen + every resolver read of
+    // `class_manager` already completed above (no VM lock is live here), and the
+    // guard covers exactly the `put`. Holding nothing else means a mutator
+    // taking `jit_cache.read()` (or `class_manager.write()` to define a class)
+    // never blocks behind the worker, so it always reaches its safepoint and a
+    // concurrent STW completes promptly.
+    let receiver_key: std::sync::Arc<str> = std::sync::Arc::from(class_name);
+    let method_name_key = cached.method_name.clone();
+    let method_desc_key = cached.method_descriptor.clone();
     {
         let mut jit_cache = shared.jit_cache.write();
-        jit_cache.put(
-            std::sync::Arc::from(class_name),
-            cached.method_name.clone(),
-            cached.method_descriptor.clone(),
-            compiled,
-        );
+        jit_cache.put(receiver_key, method_name_key, method_desc_key, compiled);
     }
 
     Some((entry, needs_ctx))
+}
+
+/// wire-tiered-manager increment 2 — the REAL off-thread compile callback.
+///
+/// Invoked on the background compile thread (see
+/// `jit::tiered::start_background_compiler`) for each `CompilationTask` the
+/// tiered manager drained off the mutator. Gated by `CRATONVM_BG_COMPILE`
+/// (the closure is only installed when the flag is on).
+///
+/// It upgrades the captured `Weak<SharedVm>` (the worker holds no `Arc` of its
+/// own, so it cannot keep the VM alive past teardown) and runs the same codegen
+/// entry point the inline mutator path uses: [`try_jit_compile_callee`] does the
+/// by-name `(class, method, descriptor)` lookup, builds the constant-pool
+/// resolvers, calls `jit::try_compile`, and PUBLISHES the result into
+/// `shared.jit_cache`. Publishing into the shared cache is the cross-thread
+/// "flip the invoke cache" mechanism: the per-thread `invoke_cache` is
+/// thread-local and cannot be mutated from here, but the `Bytecode` arm's
+/// `jit_cache` fast-path (interpreter.rs ~14366) upgrades the call site to
+/// `Jit` on the next mutator invocation once the entry is present.
+///
+/// Step 3 (C1/C2 routing): the target tier selects the intended backend via
+/// [`crate::jit::tiered::tier_uses_optimized_backend`]. The VM's current
+/// `try_compile` chooses single-pass vs. optimized by process-global env flags
+/// rather than a per-call switch, so both tiers presently funnel into
+/// `try_jit_compile_callee` and the C1 (no-opt) routing is a documented STUB —
+/// the `optimized` hint is computed and logged but a per-call no-opt toggle
+/// through `try_compile` is follow-up work.
+///
+/// Returns the wall-clock compile time in milliseconds for the tiered stats.
+/// A compile miss / bail (native shadow, skip-listed, backend bail, or a dropped
+/// VM) simply returns `0` — the queued flag is still cleared by the worker's
+/// `complete_task`, and a later mutator invocation re-attempts.
+///
+/// ## GC-neutral daemon (wire-tiered-manager increment 3)
+///
+/// This closure body is the entire VM-side surface of the
+/// `cratonvm-jit-compiler` worker, which `jit::tiered::start_background_compiler`
+/// spawns as an UNREGISTERED `std::thread::Builder` daemon — exactly the
+/// G1-MarkComplete / JDWP class of VM-internal thread. It is deliberately NOT a
+/// mutator: it is never `register_with_daemon`'d, never polls a safepoint, never
+/// calls `arrive_and_wait`, and holds NO managed `ObjectRef` across any GC point.
+/// Therefore the STW barrier's `expected` count (driven by
+/// `thread_registry.alive_count()`) never includes it, and concurrent
+/// relocation during a STW is harmless to it. Registering it instead would
+/// WRONGLY add its native Rust stack to the GC root set and make STW wait on a
+/// thread that has no safepoint — neither is wanted.
+///
+/// It captures a `Weak<SharedVm>` (never an `Arc`, so it cannot keep the VM
+/// alive past teardown), upgrades it per task, and NO-OPS when the upgrade fails
+/// (VM dropped) — the same `self_arc.upgrade()` pattern JDWP uses. All VM-lock
+/// scopes it touches are bounded inside `try_jit_compile_callee[_slow]` (see that
+/// function's lock-order contract): nothing is held across the worker's queue
+/// wait (its own `CompilerCore::wake` condvar, no VM lock), across class loading,
+/// or across the JFR / jit_cache publish.
+fn background_compile_task(
+    weak_vm: &std::sync::Weak<SharedVm>,
+    task: &crate::jit::tiered::CompilationTask,
+) -> u64 {
+    let shared = match weak_vm.upgrade() {
+        Some(s) => s,
+        None => return 0, // VM dropped (teardown) — nothing to compile.
+    };
+    let optimized = crate::jit::tiered::tier_uses_optimized_backend(task.target_tier);
+    if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+        eprintln!(
+            "[cratonvm-jitc] bg-compile {}.{}{} tier={:?} optimized={}{}",
+            task.method_key.class_name,
+            task.method_key.method_name,
+            task.method_key.descriptor,
+            task.target_tier,
+            optimized,
+            task.osr_bci
+                .map(|b| format!(" osr_bci={b}"))
+                .unwrap_or_default(),
+        );
+    }
+    let start = std::time::Instant::now();
+    // Real codegen + publish into the shared JIT cache. `try_jit_compile_callee`
+    // is the by-name entry point shared with the JIT dispatch helpers; it stores
+    // the compiled body under `(class, method, descriptor)` so the mutator's
+    // `jit_cache` fast-path flips the call site to `Jit` on its next call.
+    let _ = try_jit_compile_callee(
+        &shared,
+        &task.method_key.class_name,
+        &task.method_key.method_name,
+        &task.method_key.descriptor,
+    );
+    start.elapsed().as_millis() as u64
 }
 
 /// Convert a JIT panic payload into a `MethodCallFailed`.

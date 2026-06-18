@@ -1,5 +1,45 @@
 # Wire the Tiered Compilation Manager
 
+> **Increment 2 (Step 2 done + Step 3, gated `CRATONVM_BG_COMPILE` default-off) landed.**
+> Builds on increment 1. The background worker now runs a **real** compile
+> callback and (when the flag is on) the mutator no longer compiles inline:
+> - **Real `compile_fn`.** `ensure_background_compiler` is now wired with a live
+>   closure (`vm/src/runtime/interpreter.rs` ~14495–14510) that captures a
+>   `Weak<SharedVm>` and, per drained `CompilationTask`, calls the new
+>   `background_compile_task` (`interpreter.rs` ~16755). That runs the SAME
+>   codegen entry point the inline path uses — `try_jit_compile_callee`
+>   (by-name lookup → `jit::try_compile` → publish into `shared.jit_cache`) —
+>   **off the mutator thread**. Publishing into the shared `jit_cache` IS the
+>   cross-thread "flip the invoke cache" mechanism: the per-thread `invoke_cache`
+>   is thread-local and can't be touched from the worker, but the `Bytecode`
+>   arm's `jit_cache` fast-path (`interpreter.rs` ~14366) upgrades the call site
+>   to `Jit` on the next mutator invocation once the entry is present.
+> - **Gated default-OFF behind `CRATONVM_BG_COMPILE`** (`runtime/env_cache.rs`,
+>   `bg_compile()`). Flag ON → start the worker once and switch the trigger
+>   (~14365) to **enqueue-only** (the inline `try_jit_upgrade_with_gate` stall is
+>   dropped; the method stays interpreted until the worker publishes). Flag OFF
+>   (default) → the worker is never started and the existing inline path runs
+>   **exactly as before**, so the off-thread pipeline cannot regress steady-state
+>   behaviour until proven on the gauntlet.
+> - **Step 3 (C1 tier routing) — partial.** `jit/src/tiered.rs` gained
+>   `tier_uses_optimized_backend(tier)`: `C1`/`C1WithProfiling` → single-pass
+>   (no-opt) backend, `C2`/`FullProfile` → optimizing pipeline. The compile
+>   closure computes/logs this hint per task. **STUB note:** the VM's
+>   `jit::try_compile` currently selects single-pass vs. optimized by
+>   process-global env flags, not a per-call switch, so both tiers presently
+>   funnel into `try_jit_compile_callee` and the C1 no-opt routing is advisory
+>   until a per-call backend toggle is threaded through `try_compile` (Step 3
+>   follow-up).
+> - Tests (`jit/src/tiered.rs`):
+>   `flag_on_threshold_compiles_off_thread_and_publishes_jit_target` (a crossed
+>   C2 threshold compiles off-thread on a different `ThreadId`, the worker
+>   publishes the Jit target, and `current_tier` flips to C2 — the jit-crate
+>   analogue of the invoke cache being updated) and
+>   `tier_routing_selects_optimized_backend_for_c2`.
+> - Still SKIPPED: Step 5 (precise OSR) — gated on `real-frame-deopt.md` state
+>   maps. `on_backedge` is implemented in the manager but not yet called from the
+>   interpreter back-edge sites (Step 5).
+>
 > **Increment 1 (tier recommendation wired + background compile thread) landed.**
 > Steps 1–2 of the ordered plan below are now real:
 > - The interpreter no longer discards the recommended tier

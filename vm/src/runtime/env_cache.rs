@@ -111,6 +111,29 @@ pub fn intrinsics_disabled() -> bool {
     })
 }
 
+/// `CRATONVM_HELPFUL_NPE_OPCODES` — JEP 358 increment 2 opt-in. When set,
+/// the non-invoke null-deref opcodes (`getfield`/`putfield`, `arraylength`,
+/// the array load/store family, `monitorenter`/`monitorexit`, `athrow`) emit
+/// the HotSpot-style `Cannot <action> because "<expr>" is null` message
+/// instead of their older ad-hoc null-NPE text.
+///
+/// DEFAULT-OFF: routing these opcodes through the JEP 358 helper changes the
+/// user-visible NPE message string for every one of them (the single most
+/// common is `getfield`), and some test suites assert the current ad-hoc
+/// wording. Keeping it behind an explicit opt-in means the default path is
+/// byte-for-byte unchanged and can't regress while the new shape is rolled
+/// out. The increment-1 invoke-site message is unconditionally on (it shipped
+/// already) and is unaffected by this flag. Semantics match `disable_jit()`:
+/// empty or `"0"` is off, anything else is on.
+#[inline]
+pub fn helpful_npe_opcodes() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("CRATONVM_HELPFUL_NPE_OPCODES") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    })
+}
+
 // Cache the per-native-call GC root snapshot's *frozen* lower frames and
 // re-scan only the churning top, keyed by per-frame `seq` + GC generation.
 // Correctness rests on the LIFO stack discipline (a frame still present at
@@ -206,6 +229,15 @@ cached_is_set!(jit_dispatch_dbg, "CRATONVM_DBG_JIT_DISPATCH");
 // Default-OFF until a `try_emit_inline_body` miscompile (Spring boot enum CCE)
 // is root-caused. See `try_jit_upgrade_with_gate`.
 cached_is_set!(jit_main_inline, "CRATONVM_JIT_MAIN_INLINE");
+// wire-tiered-manager increment 2: opt-in OFF-THREAD codegen. When set, the
+// interpreter's invocation tier-up trigger ENQUEUES a `CompilationTask` for the
+// background compile thread (which runs the real codegen via
+// `try_jit_compile_callee` and publishes into `shared.jit_cache`) and DOES NOT
+// compile inline on the mutator. Default-OFF: the mutator keeps its existing
+// inline `try_jit_upgrade_with_gate` path so the off-thread pipeline cannot
+// regress steady-state behaviour until proven on the gauntlet. See
+// `docs/feature-designs/wire-tiered-manager.md` (Increment 2).
+cached_is_set!(bg_compile, "CRATONVM_BG_COMPILE");
 // Invocation-count tier-up for INSTANCE methods (invokevirtual/invokeinterface).
 // DEFAULT-ON as of 2026-06-15 (bug-03 layer B). Previously default-OFF: only
 // static methods had an invocation counter (`execute_invokestatic_cached`), so
@@ -360,6 +392,37 @@ pub fn strict_swallows() -> bool {
         Ok(v) => v == "1",
         Err(_) => false,
     })
+}
+
+// ── `CRATONVM_REAL_SPRING_STARTUP` — Spring startup-metrics real-path gate ──
+
+/// `CRATONVM_REAL_SPRING_STARTUP` — opt-in gate (default OFF) that routes
+/// Spring's `org.springframework.core.metrics` startup-metrics subsystem to its
+/// **real** bytecode instead of the `spring_startup_bootstrap.rs` no-op shim.
+///
+/// real-cdi-bean-container increment 2 (Step 2). When this is set:
+///   * the no-op `getApplicationStartup` / `start` / `tag` / `end` / `getName` /
+///     `getTags` / `getId` / `getParentId` natives are NOT registered (see
+///     `native-builtins/src/lib.rs`), so the real `DefaultApplicationStartup` /
+///     `DefaultStartupStep` methods run;
+///   * the `check_override` force arms that shadowed those methods with the
+///     no-op natives are suppressed (see `vm_exec.rs`);
+///   * `org/springframework/core/metrics/ApplicationStartup` is **removed** from
+///     the lenient `<clinit>`-swallow allowlist and its `post_clinit_fixup` arm
+///     is skipped (see `vm_util.rs`), so the real `ApplicationStartup.<clinit>`
+///     → `new DefaultApplicationStartup` → `DefaultApplicationStartup.<clinit>`
+///     → `new DefaultStartupStep` → `new DefaultTags` chain runs and any failure
+///     surfaces per JVMS §5.5 instead of being backfilled with a synthetic
+///     `DEFAULT`.
+///
+/// **Default OFF**: when unset the existing swallow + `post_clinit_fixup`
+/// ApplicationStartup arm and the functional no-op natives remain the default
+/// behavior byte-for-byte, so the working Spring Boot path cannot regress.
+/// Cached once for the process lifetime.
+#[inline]
+pub fn real_spring_startup() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_REAL_SPRING_STARTUP").is_some())
 }
 
 // ── `CRATONVM_REAL` — synthetic-stub differential switch ─────────────────
