@@ -5064,7 +5064,25 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("jdk/internal/misc/VM", "getegid", "()J", |_ctx, _args| Ok(Some(Value::Long(0))));
 
     // --- java/lang/NullPointerException ---
-    registry.register("java/lang/NullPointerException", "getExtendedNPEMessage", "()Ljava/lang/String;", |_ctx, _args| Ok(Some(Value::Object(None))));
+    // JEP 358: return the synthesized HotSpot-style extended message. The VM
+    // computes the message eagerly at the throw site (interpreter null-deref
+    // path) and stores it in `Throwable.detailMessage`, so the extended-message
+    // accessor simply surfaces that String. When no message was synthesized
+    // (e.g. an NPE thrown by `new NullPointerException()` with no detail, or a
+    // path the analysis couldn't classify), `detailMessage` is null and we
+    // return null — matching `Throwable.getMessage()`/the JDK accessor shape.
+    registry.register(
+        "java/lang/NullPointerException",
+        "getExtendedNPEMessage",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            match ctx.get_field_by_name(this, "detailMessage") {
+                Value::Object(Some(s)) => Ok(Some(Value::Object(Some(s)))),
+                _ => Ok(Some(Value::Object(None))),
+            }
+        },
+    );
 
     // --- java/lang/StackTraceElement ---
     registry.register("java/lang/StackTraceElement", "initStackTraceElement", "(Ljava/lang/StackTraceElement;Ljava/lang/StackFrameInfo;)V", native_noop_with_this);
@@ -35416,15 +35434,53 @@ fn wrap_undeclared_throwable(
     ute
 }
 
+/// proxy-real-classfile increment 1 — gate for the real generated-`$ProxyN`
+/// classfile path. Defaults to **ON** (the real path is canonical). Set
+/// `CRATONVM_REAL_PROXY=0` (or `false` / `off` / `no`, case-insensitive) to
+/// force the legacy synthetic `Proxy$Instance` shim for soak/triage.
+///
+/// Design-doc step 5: promoting the real path from "best-effort fast path
+/// with a silent synthetic fallback" to the canonical path. The gate exists
+/// so the flip can be reverted per-process without a rebuild while the
+/// reflection suites soak; it is NOT a `#[cfg]` feature.
+pub fn real_proxy_enabled() -> bool {
+    match std::env::var("CRATONVM_REAL_PROXY") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !(v == "0" || v == "false" || v == "off" || v == "no")
+        }
+        // Unset (the default): the real generated-classfile path is canonical.
+        Err(_) => true,
+    }
+}
+
 /// WP2.5-B — define (or fetch from cache) a `$ProxyN` class for the
-/// given iface ClassId set under `loader_id`. Returns `None` on any
-/// failure so the caller can fall back to the legacy synthetic shim
-/// without raising an exception.
+/// given iface ClassId set under `loader_id`. Returns `None` so the caller
+/// falls back to the legacy synthetic shim ONLY when:
+///   * the real-classfile path is disabled via `CRATONVM_REAL_PROXY=0`, or
+///   * a concrete, enumerated failure occurs (spec-build, emit, or define).
+///
+/// proxy-real-classfile increment 1 — the prior contract returned `None`
+/// on *any* failure and degraded silently, which made the synthetic shim
+/// the de-facto canonical path. The real path is now canonical by default
+/// (`real_proxy_enabled()`); every remaining `None` is the
+/// classification of a concrete failure mode (logged under
+/// `CRATONVM_DBG_PROXY` for the audit) rather than an accepted outcome.
 fn define_or_get_proxy_class(
     ctx: &mut dyn NativeContext,
     loader_id: u32,
     iface_class_ids: &[cratonvm_types::ClassId],
 ) -> Option<cratonvm_types::ClassId> {
+    let dbg = std::env::var("CRATONVM_DBG_PROXY").is_ok();
+
+    // Gate-off path: explicit opt-out keeps the synthetic shim canonical.
+    if !real_proxy_enabled() {
+        if dbg {
+            eprintln!("[DBG_PROXY] CRATONVM_REAL_PROXY disabled — using synthetic shim");
+        }
+        return None;
+    }
+
     // Sort + dedup ClassIds for deterministic cache keying.
     let mut sorted: Vec<cratonvm_types::ClassId> = iface_class_ids.to_vec();
     sorted.sort_by_key(|c| c.as_u32());
@@ -35457,18 +35513,22 @@ fn define_or_get_proxy_class(
     // directly — so `$Proxy0` now generates a real proxy exactly like `$Proxy1+`.
     let _ = ctx.ensure_synthetic_class("java/lang/reflect/Proxy$Instance", 3);
 
-    let dbg = std::env::var("CRATONVM_DBG_PROXY").is_ok();
+    // Failure mode (1): spec build. `build_proxy_spec_for` returns `None`
+    // only when an interface ClassId fails to resolve to a name (a
+    // genuinely unloadable interface) — see its doc.
     let (gen_name, spec) = match build_proxy_spec_for(ctx, &sorted) {
         Some(v) => v,
         None => {
-            if dbg { eprintln!("[DBG_PROXY] build_proxy_spec_for returned None for ifaces={sorted:?}"); }
+            if dbg { eprintln!("[DBG_PROXY] FALLBACK(spec): build_proxy_spec_for returned None for ifaces={sorted:?}"); }
             return None;
         }
     };
+    // Failure mode (2): classfile emission. `emit_proxy_classfile` fails
+    // only on a malformed method descriptor (typed `ClassFileError`).
     let bytes = match cratonvm_classloading::proxy_gen::emit_proxy_classfile(&spec) {
         Ok(b) => b,
         Err(e) => {
-            if dbg { eprintln!("[DBG_PROXY] emit_proxy_classfile({gen_name}) failed: {e:?}"); }
+            if dbg { eprintln!("[DBG_PROXY] FALLBACK(emit): emit_proxy_classfile({gen_name}) failed: {e:?}"); }
             return None;
         }
     };
@@ -35485,16 +35545,25 @@ fn define_or_get_proxy_class(
         skip_verification: false,
         ..Default::default()
     };
+    // Failure mode (3): class definition through the normal loader
+    // (`define_class_full` → `ClassManager::define_class_with_options`).
+    // Concrete causes the verifier/loader can raise here:
+    //   * VerifyError on the generated bytecode (Pass 2/3),
+    //   * NoClassDefFoundError if the super/interface fails to load,
+    //   * IncompatibleClassChangeError on a duplicate define,
+    //   * SecurityException ("Prohibited package name") if a non-public
+    //     iface forced a `java/`/`sun/` package (build_proxy_spec_for
+    //     already steers away from this).
     match ctx.define_class_full(&gen_name, &bytes, loader_id, opts) {
         Ok(cid) => {
-            if dbg { eprintln!("[DBG_PROXY] define_class_full OK: {gen_name} -> {cid:?}"); }
+            if dbg { eprintln!("[DBG_PROXY] define_class_full OK (real $ProxyN canonical): {gen_name} -> {cid:?}"); }
             let mut guard = PROXY_CLASS_CACHE.write();
             let map = guard.get_or_insert_with(rustc_hash::FxHashMap::default);
             map.insert(cache_key, cid);
             Some(cid)
         }
         Err(e) => {
-            if dbg { eprintln!("[DBG_PROXY] define_class_full({gen_name}) failed: {e}"); }
+            if dbg { eprintln!("[DBG_PROXY] FALLBACK(define): define_class_full({gen_name}) failed: {e}"); }
             None
         }
     }

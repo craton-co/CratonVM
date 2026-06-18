@@ -27,8 +27,10 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use rustc_hash::FxHashMap;
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -280,6 +282,167 @@ impl CompilationQueue {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
+// CompilerCore — shared between the manager and the background compile thread
+// ───────────────────────────────────────────────────────────────────────────────
+
+/// State the background compile thread shares with the manager.
+///
+/// The compilation queue, its wake-up condvar, the "compiler is running" flag,
+/// and the shutdown flag all live here behind an [`Arc`] so the spawned worker
+/// can drain the queue off the mutator thread without a back-reference to the
+/// whole [`TieredCompilationManager`] (which is owned by `SharedVm` by value).
+struct CompilerCore {
+    /// Per-method compilation state.
+    /// T10.9.B: FxHashMap — MethodKey (internal class/name/desc) is trusted.
+    ///
+    /// Lives here (rather than on the manager) so the background compile thread,
+    /// which only holds an `Arc<CompilerCore>`, can update a method's tier /
+    /// queued flag on completion under the same lock the mutator-side API uses.
+    methods: Mutex<FxHashMap<MethodKey, MethodState>>,
+    /// Pending compilation tasks (three-priority).
+    queue: Mutex<CompilationQueue>,
+    /// Signalled whenever a task is enqueued or shutdown is requested.
+    wake: Condvar,
+    /// Whether a background worker is currently running.
+    active: AtomicBool,
+    /// Requests the worker to stop: it finishes any in-flight compile, then
+    /// exits at the next queue check (remaining queued tasks are abandoned —
+    /// acceptable at teardown).
+    shutdown: AtomicBool,
+    /// Number of tasks the worker has finished compiling (for tests/diagnostics).
+    completed: AtomicU64,
+    /// Aggregate compilation statistics (shared so the worker can update them).
+    stats: CompilationStats,
+}
+
+impl CompilerCore {
+    fn new() -> Self {
+        Self {
+            methods: Mutex::new(FxHashMap::default()),
+            queue: Mutex::new(CompilationQueue::new()),
+            wake: Condvar::new(),
+            active: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+            completed: AtomicU64::new(0),
+            stats: CompilationStats::default(),
+        }
+    }
+
+    /// Push a task and wake the worker (if any).
+    fn enqueue(&self, task: CompilationTask) {
+        self.queue.lock().enqueue(task);
+        self.wake.notify_one();
+    }
+
+    /// Pop the highest-priority task, or `None` if the queue is empty.
+    fn dequeue(&self) -> Option<CompilationTask> {
+        self.queue.lock().dequeue()
+    }
+
+    /// Record that `key` finished compiling at `tier`. Mirrors
+    /// [`TieredCompilationManager::compilation_complete`] but operates purely on
+    /// the shared core so the background worker needs no back-reference to the
+    /// (by-value, non-`Arc`) manager.
+    fn complete_task(&self, key: &MethodKey, tier: CompilationTier, compile_time_ms: u64) {
+        {
+            let mut methods = self.methods.lock();
+            if let Some(state) = methods.get_mut(key) {
+                state.current_tier = tier;
+                state.queued_for_compilation = false;
+                state.queued_tier = None;
+                state.last_compile_time_ms = compile_time_ms;
+            }
+        }
+        match tier {
+            CompilationTier::C1 | CompilationTier::C1WithProfiling => {
+                self.stats.c1_compilations.fetch_add(1, Ordering::Relaxed);
+            }
+            CompilationTier::C2 => {
+                self.stats.c2_compilations.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        self.stats
+            .total_compile_time_ms
+            .fetch_add(compile_time_ms, Ordering::Relaxed);
+        self.completed.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// A compile callback invoked on the background thread for each drained task.
+///
+/// Returns the wall-clock compile time in milliseconds. The actual codegen is
+/// supplied by the VM at startup; `tiered.rs` only owns the scheduling.
+pub type CompileFn = Box<dyn Fn(&CompilationTask) -> u64 + Send + 'static>;
+
+/// Handle to the spawned background compile thread.
+///
+/// Dropping the handle (or calling [`BackgroundCompiler::shutdown`]) signals the
+/// worker to finish and joins it, so no compile thread outlives the VM.
+pub struct BackgroundCompiler {
+    core: Arc<CompilerCore>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl BackgroundCompiler {
+    /// Request shutdown and join the worker thread.
+    pub fn shutdown(&mut self) {
+        self.core.shutdown.store(true, Ordering::Release);
+        self.core.wake.notify_all();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        self.core.active.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for BackgroundCompiler {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Process-global background compiler
+// ───────────────────────────────────────────────────────────────────────────────
+
+/// Holds the single process-wide [`BackgroundCompiler`] handle for its lifetime.
+///
+/// The interpreter's invocation hook runs on the mutator and only has a `&self`
+/// borrow of the by-value `SharedVm::tiered_manager`; it can't own the worker
+/// handle. We park the handle here so the worker keeps running (the handle is
+/// not dropped) and a single worker is started exactly once via [`Once`].
+static BACKGROUND_COMPILER: Mutex<Option<BackgroundCompiler>> = Mutex::new(None);
+static BACKGROUND_COMPILER_INIT: std::sync::Once = std::sync::Once::new();
+
+/// Idempotently start the background compile thread for `mgr`.
+///
+/// Safe to call on every interpreter invocation hook — the spawn happens at most
+/// once (guarded by [`Once`]). `compile_fn` performs the actual codegen for a
+/// drained task off the mutator thread; for increment 1 the VM passes a
+/// drain-only closure (real codegen wiring lands when the VM-init path can be
+/// touched). The worker handle is parked in a process-global so it lives for the
+/// VM's lifetime; the OS reclaims the thread at process exit.
+pub fn ensure_background_compiler<F>(mgr: &TieredCompilationManager, make_compile_fn: F)
+where
+    F: FnOnce() -> CompileFn,
+{
+    BACKGROUND_COMPILER_INIT.call_once(|| {
+        if let Some(handle) = mgr.start_background_compiler(make_compile_fn()) {
+            *BACKGROUND_COMPILER.lock() = Some(handle);
+        }
+    });
+}
+
+/// Stop the process-global background compiler (drains+joins). Mainly for tests
+/// and orderly shutdown; production relies on process exit.
+pub fn shutdown_background_compiler() {
+    if let Some(mut handle) = BACKGROUND_COMPILER.lock().take() {
+        handle.shutdown();
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
 // CompilationStats
 // ───────────────────────────────────────────────────────────────────────────────
 
@@ -300,17 +463,11 @@ pub struct CompilationStats {
 
 /// Central coordinator for tiered compilation decisions.
 pub struct TieredCompilationManager {
-    /// Per-method compilation state.
-    /// T10.9.B: FxHashMap — MethodKey (internal class/name/desc) is trusted.
-    methods: Mutex<FxHashMap<MethodKey, MethodState>>,
-    /// Compilation queue.
-    queue: Mutex<CompilationQueue>,
+    /// Per-method state + queue + stats + wake/shutdown flags, shared with the
+    /// background compile thread (which holds an `Arc<CompilerCore>`).
+    core: Arc<CompilerCore>,
     /// Compilation policy.
     policy: Mutex<CompilationPolicy>,
-    /// Whether the compilation thread is running.
-    compiler_active: AtomicBool,
-    /// Statistics.
-    stats: CompilationStats,
 }
 
 /// Maximum number of deoptimizations before bailing out of C2.
@@ -323,11 +480,8 @@ impl TieredCompilationManager {
     /// Create a new manager with the given policy.
     pub fn new(policy: CompilationPolicy) -> Self {
         Self {
-            methods: Mutex::new(FxHashMap::default()),
-            queue: Mutex::new(CompilationQueue::new()),
+            core: Arc::new(CompilerCore::new()),
             policy: Mutex::new(policy),
-            compiler_active: AtomicBool::new(false),
-            stats: CompilationStats::default(),
         }
     }
 
@@ -342,7 +496,7 @@ impl TieredCompilationManager {
     /// Increments the counter and checks if compilation should be triggered.
     /// Returns the target tier if compilation was enqueued.
     pub fn on_method_invocation(&self, key: &MethodKey) -> Option<CompilationTier> {
-        let mut methods = self.methods.lock();
+        let mut methods = self.core.methods.lock();
         let state = methods
             .entry(key.clone())
             .or_insert_with(|| MethodState::new(key.clone()));
@@ -364,7 +518,7 @@ impl TieredCompilationManager {
     /// Called on each back-edge (loop iteration) from the interpreter.
     /// May trigger OSR compilation.
     pub fn on_backedge(&self, key: &MethodKey, bci: u32) -> Option<CompilationTask> {
-        let mut methods = self.methods.lock();
+        let mut methods = self.core.methods.lock();
         let state = methods
             .entry(key.clone())
             .or_insert_with(|| MethodState::new(key.clone()));
@@ -397,8 +551,8 @@ impl TieredCompilationManager {
                 osr_bci: Some(bci),
             };
 
-            self.queue.lock().enqueue(task.clone());
-            self.stats.osr_compilations.fetch_add(1, Ordering::Relaxed);
+            self.core.enqueue(task.clone());
+            self.core.stats.osr_compilations.fetch_add(1, Ordering::Relaxed);
             return Some(task);
         }
         None
@@ -408,7 +562,7 @@ impl TieredCompilationManager {
 
     /// Record a branch outcome for profiling.
     pub fn record_branch(&self, key: &MethodKey, bci: u32, taken: bool) {
-        let mut methods = self.methods.lock();
+        let mut methods = self.core.methods.lock();
         let state = methods
             .entry(key.clone())
             .or_insert_with(|| MethodState::new(key.clone()));
@@ -422,7 +576,7 @@ impl TieredCompilationManager {
 
     /// Record a receiver type at a call site.
     pub fn record_receiver(&self, key: &MethodKey, bci: u32, class_id: u32) {
-        let mut methods = self.methods.lock();
+        let mut methods = self.core.methods.lock();
         let state = methods
             .entry(key.clone())
             .or_insert_with(|| MethodState::new(key.clone()));
@@ -446,7 +600,7 @@ impl TieredCompilationManager {
 
     /// Record a type check result (checkcast/instanceof).
     pub fn record_type_check(&self, key: &MethodKey, bci: u32, class_id: u32) {
-        let mut methods = self.methods.lock();
+        let mut methods = self.core.methods.lock();
         let state = methods
             .entry(key.clone())
             .or_insert_with(|| MethodState::new(key.clone()));
@@ -462,7 +616,7 @@ impl TieredCompilationManager {
 
     /// Record a null check result.
     pub fn record_null_check(&self, key: &MethodKey, bci: u32, was_null: bool) {
-        let mut methods = self.methods.lock();
+        let mut methods = self.core.methods.lock();
         let state = methods
             .entry(key.clone())
             .or_insert_with(|| MethodState::new(key.clone()));
@@ -478,18 +632,19 @@ impl TieredCompilationManager {
 
     /// Enqueue a compilation task.
     pub fn enqueue_compilation(&self, task: CompilationTask) {
-        let mut methods = self.methods.lock();
+        let mut methods = self.core.methods.lock();
         let state = methods
             .entry(task.method_key.clone())
             .or_insert_with(|| MethodState::new(task.method_key.clone()));
         state.queued_for_compilation = true;
         state.queued_tier = Some(task.target_tier);
-        self.queue.lock().enqueue(task);
+        drop(methods);
+        self.core.enqueue(task);
     }
 
     /// Dequeue the next compilation task (highest priority first).
     pub fn dequeue_compilation(&self) -> Option<CompilationTask> {
-        self.queue.lock().dequeue()
+        self.core.dequeue()
     }
 
     /// Notify that compilation completed.
@@ -499,7 +654,7 @@ impl TieredCompilationManager {
         tier: CompilationTier,
         compile_time_ms: u64,
     ) {
-        let mut methods = self.methods.lock();
+        let mut methods = self.core.methods.lock();
         if let Some(state) = methods.get_mut(key) {
             state.current_tier = tier;
             state.queued_for_compilation = false;
@@ -509,14 +664,14 @@ impl TieredCompilationManager {
 
         match tier {
             CompilationTier::C1 | CompilationTier::C1WithProfiling => {
-                self.stats.c1_compilations.fetch_add(1, Ordering::Relaxed);
+                self.core.stats.c1_compilations.fetch_add(1, Ordering::Relaxed);
             }
             CompilationTier::C2 => {
-                self.stats.c2_compilations.fetch_add(1, Ordering::Relaxed);
+                self.core.stats.c2_compilations.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
         }
-        self.stats
+        self.core.stats
             .total_compile_time_ms
             .fetch_add(compile_time_ms, Ordering::Relaxed);
     }
@@ -525,7 +680,7 @@ impl TieredCompilationManager {
 
     /// Notify that deoptimization occurred for the given method.
     pub fn on_deoptimization(&self, key: &MethodKey) {
-        let mut methods = self.methods.lock();
+        let mut methods = self.core.methods.lock();
         if let Some(state) = methods.get_mut(key) {
             state.deopt_count += 1;
             state.current_tier = CompilationTier::Interpreter;
@@ -534,28 +689,29 @@ impl TieredCompilationManager {
 
             if state.deopt_count >= MAX_DEOPTS_BEFORE_BAILOUT {
                 state.c2_bailout = true;
-                self.stats.c2_bailouts.fetch_add(1, Ordering::Relaxed);
+                self.core.stats.c2_bailouts.fetch_add(1, Ordering::Relaxed);
             }
         }
-        self.stats.deoptimizations.fetch_add(1, Ordering::Relaxed);
+        self.core.stats.deoptimizations.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Notify that C2 compilation bailed out (method too complex, etc.).
     pub fn on_c2_bailout(&self, key: &MethodKey) {
-        let mut methods = self.methods.lock();
+        let mut methods = self.core.methods.lock();
         if let Some(state) = methods.get_mut(key) {
             state.c2_bailout = true;
             state.queued_for_compilation = false;
             state.queued_tier = None;
         }
-        self.stats.c2_bailouts.fetch_add(1, Ordering::Relaxed);
+        self.core.stats.c2_bailouts.fetch_add(1, Ordering::Relaxed);
     }
 
     // ── Queries ──────────────────────────────────────────────────────────
 
     /// Get the current tier for a method.
     pub fn current_tier(&self, key: &MethodKey) -> CompilationTier {
-        self.methods
+        self.core
+            .methods
             .lock()
             .get(key)
             .map(|s| s.current_tier)
@@ -564,12 +720,12 @@ impl TieredCompilationManager {
 
     /// Get a clone of the profile data for a method.
     pub fn get_profile(&self, key: &MethodKey) -> Option<MethodProfile> {
-        self.methods.lock().get(key).map(|s| s.profile.clone())
+        self.core.methods.lock().get(key).map(|s| s.profile.clone())
     }
 
     /// Get compilation statistics.
     pub fn stats(&self) -> &CompilationStats {
-        &self.stats
+        &self.core.stats
     }
 
     /// Get a snapshot of the compilation policy.
@@ -592,17 +748,18 @@ impl TieredCompilationManager {
 
     /// Check if the compilation queue is empty.
     pub fn queue_empty(&self) -> bool {
-        self.queue.lock().is_empty()
+        self.core.queue.lock().is_empty()
     }
 
     /// Get the number of tasks in the compilation queue.
     pub fn queue_size(&self) -> usize {
-        self.queue.lock().len()
+        self.core.queue.lock().len()
     }
 
     /// Get all method states: (key, current_tier, invocation_count).
     pub fn method_states(&self) -> Vec<(MethodKey, CompilationTier, u64)> {
-        self.methods
+        self.core
+            .methods
             .lock()
             .values()
             .map(|s| (s.method_key.clone(), s.current_tier, s.invocation_count))
@@ -611,12 +768,94 @@ impl TieredCompilationManager {
 
     /// Whether the background compiler is active.
     pub fn compiler_active(&self) -> bool {
-        self.compiler_active.load(Ordering::Relaxed)
+        self.core.active.load(Ordering::Relaxed)
     }
 
     /// Set whether the background compiler is active.
+    ///
+    /// Retained for compatibility / tests that only assert the flag. The real
+    /// worker is started via [`start_background_compiler`] and flips this flag
+    /// itself.
     pub fn set_compiler_active(&self, active: bool) {
-        self.compiler_active.store(active, Ordering::Relaxed);
+        self.core.active.store(active, Ordering::Relaxed);
+    }
+
+    /// Number of tasks the background worker has finished compiling.
+    pub fn completed_compilations(&self) -> u64 {
+        self.core.completed.load(Ordering::Relaxed)
+    }
+
+    /// Spawn the background compile thread (idempotent).
+    ///
+    /// The worker loops: block on the queue's condvar until a task is available
+    /// (or shutdown is requested), drain the highest-priority task, run
+    /// `compile_fn` for it **off the mutator thread**, then record completion on
+    /// the shared core. The returned [`BackgroundCompiler`] owns the join handle;
+    /// dropping it (e.g. at VM teardown) signals shutdown and joins, so no
+    /// compile thread outlives the VM.
+    ///
+    /// Takes `&self` (not `Arc<Self>`): the worker only needs the
+    /// `Arc<CompilerCore>`, so this works even though `SharedVm` owns the
+    /// manager by value.
+    ///
+    /// Returns `None` if a worker is already active.
+    pub fn start_background_compiler(&self, compile_fn: CompileFn) -> Option<BackgroundCompiler> {
+        // Atomically claim the single-worker slot.
+        if self
+            .core
+            .active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+        self.core.shutdown.store(false, Ordering::Release);
+
+        let core = Arc::clone(&self.core);
+        let handle = std::thread::Builder::new()
+            .name("cratonvm-jit-compiler".to_string())
+            .spawn(move || {
+                Self::compiler_loop(&core, compile_fn);
+            })
+            .ok();
+
+        match handle {
+            Some(handle) => Some(BackgroundCompiler {
+                core: Arc::clone(&self.core),
+                handle: Some(handle),
+            }),
+            None => {
+                // Spawn failed — release the slot so a retry can succeed.
+                self.core.active.store(false, Ordering::Release);
+                None
+            }
+        }
+    }
+
+    /// Body of the background compile thread.
+    fn compiler_loop(core: &Arc<CompilerCore>, compile_fn: CompileFn) {
+        loop {
+            // Pop one task while holding the queue lock; block on the condvar
+            // when empty so the worker idles instead of spinning.
+            let task = {
+                let mut q = core.queue.lock();
+                loop {
+                    if core.shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if let Some(task) = q.dequeue() {
+                        break task;
+                    }
+                    // `parking_lot::Condvar::wait` releases `q` while parked and
+                    // re-acquires on wake; spurious wakeups re-check the loop.
+                    core.wake.wait(&mut q);
+                }
+            };
+
+            // Compile off the mutator thread, then publish completion.
+            let compile_time_ms = compile_fn(&task);
+            core.complete_task(&task.method_key, task.target_tier, compile_time_ms);
+        }
     }
 
     // ── Internal ─────────────────────────────────────────────────────────
@@ -646,7 +885,9 @@ impl TieredCompilationManager {
             osr_bci: None,
         };
 
-        self.queue.lock().enqueue(task);
+        // `self.core.enqueue` takes the queue lock (distinct from `methods`,
+        // which the caller still holds) and wakes the background worker.
+        self.core.enqueue(task);
         Some(target)
     }
 
@@ -979,7 +1220,7 @@ mod tests {
             mgr.on_deoptimization(&key);
         }
         // After 3 deopts, c2_bailout should be set.
-        let methods = mgr.methods.lock();
+        let methods = mgr.core.methods.lock();
         assert!(methods[&key].c2_bailout);
     }
 
@@ -1324,7 +1565,7 @@ mod tests {
         });
         mgr.on_deoptimization(&key);
 
-        let methods = mgr.methods.lock();
+        let methods = mgr.core.methods.lock();
         let state = &methods[&key];
         assert!(!state.queued_for_compilation);
         assert!(state.queued_tier.is_none());
@@ -1353,5 +1594,85 @@ mod tests {
         let mgr = TieredCompilationManager::new(policy);
         let key = test_key();
         assert!(mgr.on_backedge(&key, 0).is_none());
+    }
+
+    // ── Background worker drains an enqueued task off-thread ──────────────
+
+    /// wire-tiered-manager increment 1: crossing the C1 threshold via
+    /// `on_method_invocation` enqueues a task, and the background compile thread
+    /// dequeues + "compiles" it on a *different* thread, then publishes the tier.
+    ///
+    /// Deterministic: the test blocks on an `mpsc` recv (a synchronization
+    /// handle) rather than sleeping, so it never races on timing.
+    #[test]
+    fn background_worker_drains_enqueued_task_off_thread() {
+        use std::sync::mpsc;
+
+        // Low C1 threshold so a couple of invocations cross it. Disable the
+        // straight-to-C2 path by keeping c2 thresholds high.
+        let policy = CompilationPolicy {
+            c1_threshold: 2,
+            c2_threshold: u32::MAX,
+            c2_min_invocations: u32::MAX,
+            osr_threshold: u32::MAX,
+            tiered_enabled: true,
+            c1_profiling: true,
+        };
+        let mgr = TieredCompilationManager::new(policy);
+        let key = test_key();
+
+        // The compile closure reports (task tier, the thread it ran on) back to
+        // the test thread, proving the work happened off the "mutator".
+        let (tx, rx) = mpsc::channel::<(CompilationTier, std::thread::ThreadId)>();
+        let bg = mgr
+            .start_background_compiler(Box::new(move |task: &CompilationTask| -> u64 {
+                tx.send((task.target_tier, std::thread::current().id())).unwrap();
+                7 // pretend the compile took 7ms
+            }))
+            .expect("worker should start");
+
+        let mutator_thread = std::thread::current().id();
+
+        // Drive invocations on *this* (mutator) thread until the threshold
+        // crossing enqueues a C1 task.
+        assert!(mgr.on_method_invocation(&key).is_none(), "1st invocation: below threshold");
+        let rec = mgr.on_method_invocation(&key);
+        assert_eq!(rec, Some(CompilationTier::C1), "threshold crossing enqueues C1");
+
+        // The worker should pick it up off-thread. Block on the channel (no sleep).
+        let (compiled_tier, worker_thread) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker must drain the task");
+        assert_eq!(compiled_tier, CompilationTier::C1);
+        assert_ne!(
+            worker_thread, mutator_thread,
+            "compilation must run OFF the mutator thread"
+        );
+
+        // After completion the worker must publish the tier and clear the queue.
+        // Spin briefly on the completion counter (bounded, no fixed sleep).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while mgr.completed_compilations() == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(mgr.completed_compilations(), 1, "one task completed");
+        assert!(mgr.queue_empty(), "queue drained");
+        assert_eq!(
+            mgr.current_tier(&key),
+            CompilationTier::C1,
+            "tier published by worker"
+        );
+        {
+            let methods = mgr.core.methods.lock();
+            assert!(
+                !methods[&key].queued_for_compilation,
+                "queued flag cleared on completion"
+            );
+            assert_eq!(methods[&key].last_compile_time_ms, 7);
+        }
+
+        // Clean shutdown joins the worker thread.
+        drop(bg);
+        assert!(!mgr.compiler_active(), "worker stopped after shutdown");
     }
 }

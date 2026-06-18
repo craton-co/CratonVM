@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2024-2026 Craton Software Company
+
+[package]
+name = "libcratonvm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "C-ABI shared library for embedding CratonVM (JNI Invocation API + flat C API)"
+
+[lib]
+# The whole point of this crate: produce a `libcratonvm.so` / `cratonvm.dll`
+# (cdylib) that a C host can dlopen/link as a `libjvm` substitute, plus a
+# `.a`/`.lib` (staticlib) for static linking, plus an `rlib` so Rust tests and
+# downstream Rust crates can depend on it normally.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+cratonvm-vm = { path = "../vm", version = "0.3.0" }
+
+[lints]
+workspace = true
