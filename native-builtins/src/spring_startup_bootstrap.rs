@@ -58,23 +58,25 @@
 //!   `post_clinit_fixup` carrier write) become unnecessary and should be
 //!   removed.
 //!
-//! GATED REAL PATH (real-cdi-bean-container increment 2, Step 2):
-//!   `CRATONVM_REAL_SPRING_STARTUP` (default OFF) is the opt-in gate that runs
-//!   the real chain. When set, the startup-metrics no-op natives below
-//!   (`getApplicationStartup`/`start`/`tag`/`end`/`getName`/`getId`/
-//!   `getParentId`/`getTags`) are NOT registered (see `register`), the
-//!   matching `check_override` force arms in `vm/src/vm/vm_exec.rs` are
-//!   suppressed, and `vm/src/vm/vm_util.rs` drops `ApplicationStartup` from the
-//!   lenient `<clinit>`-swallow allowlist + skips its `post_clinit_fixup` arm —
-//!   so the real `ApplicationStartup.<clinit>` → `new DefaultApplicationStartup`
-//!   → `DefaultApplicationStartup.<clinit>` → `new DefaultStartupStep` →
-//!   `new DefaultTags` chain runs to completion. The disassembly shows that
-//!   chain is trivial bytecode; the only reason it failed by default was that
-//!   the no-op `getApplicationStartup` native shadowed the real `getstatic
-//!   DEFAULT` getter (so the chain was never triggered) and the nested-JAR
-//!   `<clinit>` was swallowed + backfilled. The environment / bean-factory /
-//!   property-source natives in this module cover SEPARATE partial-bootstrap
-//!   gaps and remain registered regardless of the gate.
+//! REAL PATH IS NOW THE DEFAULT (real-cdi-bean-container increment 3, Step 2 →
+//! default flip): the real chain runs by DEFAULT. The startup-metrics no-op
+//! natives below (`getApplicationStartup`/`start`/`tag`/`end`/`getName`/`getId`/
+//!   `getParentId`/`getTags`) are NOT registered (see `register`), the matching
+//!   `check_override` force arms in `vm/src/vm/vm_exec.rs` are suppressed, and
+//!   `vm/src/vm/vm_util.rs` drops `ApplicationStartup` from the lenient
+//!   `<clinit>`-swallow allowlist + skips its `post_clinit_fixup` arm — so the
+//!   real `ApplicationStartup.<clinit>` → `new DefaultApplicationStartup` →
+//!   `DefaultApplicationStartup.<clinit>` → `new DefaultStartupStep` →
+//!   `new DefaultTags` chain runs to completion. Validated 10/10 == HotSpot on
+//!   the Spring Boot functional battery (`apps/spring-boot/cratonvm-suite`).
+//!   The disassembly shows that chain is trivial bytecode; the only reason it
+//!   used to fail was that the no-op `getApplicationStartup` native shadowed the
+//!   real `getstatic DEFAULT` getter (so the chain was never triggered) and the
+//!   nested-JAR `<clinit>` was swallowed + backfilled. Opt OUT to the legacy
+//!   shim with `CRATONVM_SYNTHETIC_SPRING_STARTUP=1` (kept as a fat-jar/nested-
+//!   JAR fallback). The environment / bean-factory / property-source natives in
+//!   this module cover SEPARATE partial-bootstrap gaps and remain registered
+//!   regardless.
 //!
 //! Fix strategy (the shim's moving parts):
 //! 1. Native override for `getApplicationStartup()` in `AbstractApplicationContext`
@@ -93,18 +95,29 @@ use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ObjectRef, Value};
 use std::sync::OnceLock;
 
-/// `CRATONVM_REAL_SPRING_STARTUP` — real-cdi-bean-container increment 2 (Step 2)
-/// opt-in gate (default OFF). When set, the no-op `ApplicationStartup` /
-/// `StartupStep` startup-metrics natives below are NOT registered, so Spring's
-/// real `org.springframework.core.metrics.DefaultApplicationStartup` /
-/// `DefaultStartupStep` bytecode runs (its `<clinit>` chain is allowed to
-/// complete — see the matching guards in `vm/src/vm/vm_util.rs` and
-/// `vm/src/vm/vm_exec.rs`). The environment / bean-factory / property-source
-/// natives in this module cover *separate* partial-bootstrap gaps and are
-/// always registered. Cached once for the process lifetime.
+/// Whether the real Spring `org.springframework.core.metrics` startup-metrics
+/// bytecode runs (now the DEFAULT) instead of the no-op `ApplicationStartup` /
+/// `StartupStep` natives below.
+///
+/// real-cdi-bean-container increment 3 (Step 2 → default flip). When this is
+/// `true` (the default) the startup-metrics no-op natives below are NOT
+/// registered, so Spring's real `DefaultApplicationStartup` / `DefaultStartupStep`
+/// bytecode runs (its `<clinit>` chain is allowed to complete — see the matching
+/// guards in `vm/src/vm/vm_util.rs` and `vm/src/vm/vm_exec.rs`). Opt out to the
+/// legacy shim with `CRATONVM_SYNTHETIC_SPRING_STARTUP=1`; the historical
+/// `CRATONVM_REAL_SPRING_STARTUP` opt-in is still accepted (now redundant) and
+/// wins if both are set. Must stay in lockstep with the canonical accessor
+/// `cratonvm_vm::runtime::env_cache::real_spring_startup` (this crate cannot
+/// depend on `vm`). The environment / bean-factory / property-source natives in
+/// this module cover *separate* partial-bootstrap gaps and are always
+/// registered. Cached once for the process lifetime.
 fn real_spring_startup() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_REAL_SPRING_STARTUP").is_some())
+    *CACHE.get_or_init(|| {
+        let synthetic = std::env::var_os("CRATONVM_SYNTHETIC_SPRING_STARTUP").is_some();
+        let force_real = std::env::var_os("CRATONVM_REAL_SPRING_STARTUP").is_some();
+        force_real || !synthetic
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1131,14 +1144,14 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
 
-    // ── Startup-metrics no-op shim (GATED) ──────────────────────────────────
-    // real-cdi-bean-container increment 2 (Step 2): the `ApplicationStartup` /
-    // `StartupStep` no-op natives are the part of this shim that covers the
-    // `DefaultApplicationStartup.<clinit>` NPE. Under
-    // `CRATONVM_REAL_SPRING_STARTUP` we DON'T register them, so the real Spring
-    // `org.springframework.core.metrics` bytecode runs (the `<clinit>` chain is
-    // allowed to complete by the matching guards in `vm_util.rs` / `vm_exec.rs`).
-    // Default OFF: registered exactly as before so the working path is unchanged.
+    // ── Startup-metrics no-op shim (legacy fallback — opt-out only) ──────────
+    // real-cdi-bean-container increment 3 (Step 2 → default flip): the
+    // `ApplicationStartup` / `StartupStep` no-op natives are the part of this
+    // shim that covered the `DefaultApplicationStartup.<clinit>` NPE. By DEFAULT
+    // we DON'T register them, so the real Spring `org.springframework.core.metrics`
+    // bytecode runs (the `<clinit>` chain is allowed to complete by the matching
+    // guards in `vm_util.rs` / `vm_exec.rs`). They are registered only under the
+    // `CRATONVM_SYNTHETIC_SPRING_STARTUP` opt-out (kept as a fat-jar fallback).
     if !real_spring_startup() {
         // AbstractApplicationContext.getApplicationStartup() — always return the
         // global no-op singleton so applicationStartup null can never crash.

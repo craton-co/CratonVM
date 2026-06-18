@@ -9418,10 +9418,11 @@ fn invoke_on_class_shared_inner(
                         // null when ApplicationStartup.DEFAULT fails to initialize (nested-JAR
                         // classloading). Force the native that returns a no-op synthetic object.
                         //
-                        // real-cdi-bean-container increment 2 (Step 2, gated): under
-                        // `CRATONVM_REAL_SPRING_STARTUP` the no-op natives are not
-                        // registered and the real `ApplicationStartup.DEFAULT`
-                        // `<clinit>` runs, so do NOT force-shadow the real getter.
+                        // real-cdi-bean-container increment 3 (Step 2 → default flip):
+                        // by DEFAULT the no-op natives are not registered and the real
+                        // `ApplicationStartup.DEFAULT` `<clinit>` runs, so do NOT
+                        // force-shadow the real getter. Only the
+                        // `CRATONVM_SYNTHETIC_SPRING_STARTUP` opt-out re-enables this arm.
                         || (!crate::runtime::env_cache::real_spring_startup()
                             && matches!(
                                 class_name,
@@ -9460,11 +9461,12 @@ fn invoke_on_class_shared_inner(
                         // and StartupStep.tag/end. The real bytecode requires DefaultApplicationStartup
                         // which may not be loadable from nested JARs.
                         //
-                        // real-cdi-bean-container increment 2 (Step 2, gated): under
-                        // `CRATONVM_REAL_SPRING_STARTUP` the no-op startup-metrics
-                        // natives are not registered and the real
-                        // `DefaultApplicationStartup` / `DefaultStartupStep` bytecode
-                        // runs, so do NOT force-shadow those methods.
+                        // real-cdi-bean-container increment 3 (Step 2 → default flip):
+                        // by DEFAULT the no-op startup-metrics natives are not
+                        // registered and the real `DefaultApplicationStartup` /
+                        // `DefaultStartupStep` bytecode runs, so do NOT force-shadow
+                        // those methods. Only the `CRATONVM_SYNTHETIC_SPRING_STARTUP`
+                        // opt-out re-enables this arm.
                         || (!crate::runtime::env_cache::real_spring_startup()
                             && matches!(
                                 class_name,

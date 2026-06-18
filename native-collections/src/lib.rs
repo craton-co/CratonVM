@@ -30936,9 +30936,13 @@ mod tests {
 
     #[test]
     fn hashmap_node_field_layout_valid() {
-        assert_eq!(NODE_FIELD_KEY, 0);
-        assert_eq!(NODE_FIELD_VALUE, 1);
-        assert_eq!(NODE_FIELD_HASH, 2);
+        // Node slot layout matches the `NODE_FIELD_*` consts the overlay
+        // actually uses: hash@0, key@1, value@2, next@3. The previous
+        // assertions asserted key@0/hash@2 — a layout the code never used; they
+        // had failed since the initial commit.
+        assert_eq!(NODE_FIELD_HASH, 0);
+        assert_eq!(NODE_FIELD_KEY, 1);
+        assert_eq!(NODE_FIELD_VALUE, 2);
         assert_eq!(NODE_FIELD_NEXT, 3);
         assert_eq!(NODE_NUM_FIELDS, 4);
         // All indices must be within NUM_FIELDS
@@ -31133,13 +31137,23 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn concurrent_skip_list_map_registered() {
+    fn concurrent_skip_list_map_not_intercepted() {
+        // ConcurrentSkipListMap interception is intentionally DISABLED — the
+        // native "sorted-array" overlay hardcoded natural ordering and ignored
+        // the (Comparator) ctor, silently dropping puts for non-Comparable keys
+        // (broke the Gradle test worker's serializer registry). We now run the
+        // real java.util.concurrent.ConcurrentSkipListMap bytecode instead (see
+        // the `let _ = register_concurrent_skip_list_map_natives;` no-op call
+        // site). This test guards that the natives stay unregistered so the real
+        // class is not shadowed again. (Previously asserted the opposite and had
+        // failed since the natives were disabled.)
         let r = build_registry();
         let c = "java/util/concurrent/ConcurrentSkipListMap";
-        assert!(r.find(c, "<init>", "()V").is_some(), "CSLM <init>");
-        assert!(r.find(c, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;").is_some(), "CSLM put");
-        assert!(r.find(c, "get", "(Ljava/lang/Object;)Ljava/lang/Object;").is_some(), "CSLM get");
-        assert!(r.find(c, "size", "()I").is_some(), "CSLM size");
+        assert!(r.find(c, "<init>", "()V").is_none(), "CSLM <init> must NOT be intercepted");
+        assert!(
+            r.find(c, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;").is_none(),
+            "CSLM put must NOT be intercepted"
+        );
     }
 
     // ===================================================================
