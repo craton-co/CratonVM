@@ -109,6 +109,19 @@ The history below predates the fix.
 | **B** | JUnit `@Timeout` interceptor chain `proceed()` invoked twice (cross-thread invocation / `MethodHandle` re-entry on the timeout worker). **Not GC-related.** Clears a broad band of Spring tests. | 🔴 **OPEN** | [spring-bug-04-junit-timeout-interceptor-double-proceed.md](spring-bug-04-junit-timeout-interceptor-double-proceed.md) |
 | **C** | Deep JIT→JIT recursion overruns the **native** stack (ANTLR `closure()`); the overflow path faults instead of throwing a catchable `StackOverflowError`. Only arises with an *unmerged* cold-path-throughput experiment; needs stack-banging + a fault-recovery handler. | ⚪ **LATENT** (not a current blocker) | [springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md) §6–7 |
 
+## Standalone — bug-06 assertion-mismatch family (Spring suite reflection/annotation tail)
+
+The bug-06 census (`spring-suite/crash-reports-2026-06-16/bug-06-assertion-mismatch-families.md`)
+clustered ~529 genuine assertion mismatches into 6 families. Families 1–4 are fixed
+(field-updaters `fe52db3a`; `HttpClient.executor`; synthetic-`Object` superclass `40b6d94a`;
+`findLoadedClass` no-load `4b923e86`, all on `dev`). The two open families are reflection/annotation
+**native-return-value** correctness, not GC/JIT:
+
+| # | Bug | Status | Doc |
+|---|---|---|---|
+| **F5** | Reflection native returns `null` where HotSpot returns a `Class`/`Method` (`getDeclaredMethod on null` ×28). Common paths **verified clean** (`Refl5` == HotSpot); the failing narrow generic/proxy path is not yet attributed to a test. **Do not** touch `synthetic_class_mirror` slot 0 (refuted hypothesis). | 🔴 **OPEN** — needs per-test attribution | [bug06-fam5-reflection-getdeclaredmethod-null.md](bug06-fam5-reflection-getdeclaredmethod-null.md) |
+| **F6** | Spring annotation **synthesis** (`@AliasFor`/`MergedAnnotation`/`MirrorSets`) value mismatches + `AnnotationUtilsTests` aborts with a fixed ~2 GB alloc (reproduces on the pre-fix binary → pre-existing, a wrong size computation, not the `findLoadedClass` fix). | 🔴 **OPEN** — `[[spring-bug-01]]` umbrella | [bug06-fam6-annotation-synthesis-mergedannotation.md](bug06-fam6-annotation-synthesis-mergedannotation.md) |
+
 ## The springrepos handoff (mostly fixed)
 
 [springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md)
