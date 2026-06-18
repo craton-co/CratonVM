@@ -11460,6 +11460,67 @@ fn inflate_bounded<R: std::io::Read>(
     Ok(out)
 }
 
+/// Drain a Java `InputStream` fully into a host `Vec<u8>`.
+///
+/// PERF: the GZIP/Zip `<init>` natives previously slurped the underlying stream
+/// ONE BYTE AT A TIME via `read()I`, paying a full virtual-dispatch + `Value`
+/// box per byte (catastrophic for multi-MB archives). This reads in 64 KiB
+/// chunks through the bulk `read([B,I,I)I` virtual instead, copying each chunk
+/// out with the `read_byte_array_into` memcpy intrinsic. A single reusable Java
+/// `byte[]` buffer is allocated for the whole drain.
+///
+/// Behavior is identical to the old per-byte loop ("read until EOF"): if the
+/// bulk read is unsupported (errors / returns a non-int) or returns 0 with a
+/// non-zero request length (a misbehaving stream that would otherwise spin), we
+/// fall back to the per-byte `read()I` loop for the remainder, so no input is
+/// ever lost.
+fn drain_input_stream_bulk(ctx: &mut dyn NativeContext, is_ref: ObjectRef) -> Vec<u8> {
+    const CHUNK: usize = 64 * 1024;
+    let mut out: Vec<u8> = Vec::new();
+    let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, CHUNK);
+    // Heap-allocated scratch (not a 64 KiB stack array) to keep native-call
+    // frames shallow; reused across every chunk.
+    let mut scratch = vec![0u8; CHUNK];
+    loop {
+        let res = ctx.invoke_virtual(
+            is_ref,
+            "read",
+            "([BII)I",
+            &[Value::Object(Some(buf)), Value::Int(0), Value::Int(CHUNK as i32)],
+        );
+        match res {
+            Ok(Some(Value::Int(n))) if n > 0 => {
+                let n = n as usize;
+                let copied = ctx.read_byte_array_into(buf, 0, &mut scratch[..n]);
+                out.extend_from_slice(&scratch[..copied]);
+                if copied < n {
+                    // Defensive: array shorter than reported — stop to avoid a
+                    // bogus read; matches the old loop's "break on anomaly".
+                    break;
+                }
+            }
+            Ok(Some(Value::Int(n))) if n < 0 => break, // EOF
+            // n == 0 (shouldn't happen for len>0) or bulk read unsupported:
+            // finish the drain via the per-byte path so nothing is dropped.
+            _ => {
+                drain_input_stream_per_byte(ctx, is_ref, &mut out);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Per-byte drain fallback (the original `read()I` loop). Appends to `out`.
+fn drain_input_stream_per_byte(ctx: &mut dyn NativeContext, is_ref: ObjectRef, out: &mut Vec<u8>) {
+    loop {
+        match ctx.invoke_virtual(is_ref, "read", "()I", &[]) {
+            Ok(Some(Value::Int(b))) if b >= 0 => out.push(b as u8),
+            _ => break,
+        }
+    }
+}
+
 pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -11517,17 +11578,12 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 3, Value::Int(-1)); // before first entry
         ctx.set_field(this, 4, Value::Int(0));
 
-        // Eagerly read all bytes from the underlying InputStream
-        let mut all_bytes = Vec::new();
-        if let Some(Value::Object(Some(is_ref))) = args.get(1) {
-            loop {
-                let result = ctx.invoke_virtual(*is_ref, "read", "()I", &[]);
-                match result {
-                    Ok(Some(Value::Int(b))) if b >= 0 => all_bytes.push(b as u8),
-                    _ => break,
-                }
-            }
-        }
+        // Eagerly read all bytes from the underlying InputStream.
+        // PERF: bulk-drain via read([B,I,I)I instead of a per-byte read()I loop.
+        let all_bytes = match args.get(1) {
+            Some(Value::Object(Some(is_ref))) => drain_input_stream_bulk(ctx, *is_ref),
+            _ => Vec::new(),
+        };
 
         // Parse with zip crate
         if !all_bytes.is_empty() {
@@ -11563,9 +11619,9 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
                             *rem = rem.saturating_sub(entry_bytes.len() as u64);
                         }
                         let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, entry_bytes.len());
-                        for (j, &b) in entry_bytes.iter().enumerate() {
-                            ctx.set_array_element(byte_arr, j, Value::Int(b as i8 as i32));
-                        }
+                        // PERF: bulk memcpy the inflated entry instead of a
+                        // per-element set_array_element loop.
+                        ctx.write_byte_array_from(byte_arr, 0, &entry_bytes);
                         ctx.set_array_element(data_arr, i, Value::Object(Some(byte_arr)));
                     }
                 }
@@ -11848,17 +11904,12 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
 fn p58_gzip_in_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let input_stream = args.get(1).copied().unwrap_or(Value::Object(None));
-    // Read all bytes from underlying stream eagerly
-    let mut compressed = Vec::new();
-    if let Value::Object(Some(is)) = input_stream {
-        loop {
-            let b = ctx.invoke_virtual(is, "read", "()I", &[])?;
-            match b {
-                Some(Value::Int(v)) if v >= 0 => compressed.push(v as u8),
-                _ => break,
-            }
-        }
-    }
+    // Read all bytes from underlying stream eagerly.
+    // PERF: bulk-drain via read([B,I,I)I instead of a per-byte read()I loop.
+    let compressed = match input_stream {
+        Value::Object(Some(is)) => drain_input_stream_bulk(ctx, is),
+        _ => Vec::new(),
+    };
     // Decompress with flate2 GzDecoder, bounded by the inflated-size cap so a
     // gzip bomb throws an IOException instead of exhausting the heap (finding 3).
     let decompressed = if !compressed.is_empty() {
@@ -11882,9 +11933,8 @@ fn p58_gzip_in_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Vec::new()
     };
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, decompressed.len());
-    for (i, &b) in decompressed.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-    }
+    // PERF: bulk memcpy the decompressed payload instead of a per-element loop.
+    ctx.write_byte_array_from(arr, 0, &decompressed);
     ctx.set_field(this, 0, Value::Object(Some(arr))); // decompressed data
     ctx.set_field(this, 1, Value::Int(0)); // position
     Ok(None)
@@ -28560,70 +28610,71 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     r.register(mac, "doFinal", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let id = ctx.identity_hash_code(this);
-        let (algo, key, data, ready) = {
-            let t = mac_state_table().lock().unwrap();
-            match t.get(&id) {
-                Some(st) => (
-                    st.algo.clone(),
-                    st.key.clone(),
-                    st.data.clone(),
-                    st.initialized || !st.key.is_empty(),
-                ),
-                None => (String::new(), Vec::new(), Vec::new(), false),
+        // PERF: single lock acquisition, no full-state clones. Previously this
+        // cloned algo (String) + key (Vec) + the entire accumulated data (Vec)
+        // out of the mutex, then re-locked to clear `data`. Instead, take the
+        // lock once, MOVE `data` out via `mem::take` (which both gives us owned
+        // bytes without a copy AND performs the JDK "reset buffer, keep Mac
+        // initialized" semantics in one step), and compute the HMAC borrowing
+        // algo/key in place. Same correctness; eliminates two Vec clones + a
+        // second lock round-trip per call in the hot ScramFormatter loop.
+        let hmac_result = {
+            let mut t = mac_state_table().lock().unwrap();
+            let st = match t.get_mut(&id) {
+                Some(st) => st,
+                None => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "MAC not initialized".into(),
+                    }
+                    .into());
+                }
+            };
+            if !(st.initialized || !st.key.is_empty()) {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "MAC not initialized".into(),
+                }
+                .into());
             }
+            // mem::take resets the accumulator (keeps Mac initialized for reuse).
+            let data = std::mem::take(&mut st.data);
+            mac_compute_hmac(&st.algo, &st.key, &data)
         };
-        if !ready {
-            return Err(RuntimeError::IllegalStateException {
-                message: "MAC not initialized".into(),
-            }
-            .into());
-        }
-        let hmac_result = mac_compute_hmac(&algo, &key, &data);
-        // JDK doFinal resets the buffer but keeps the Mac initialized for reuse.
-        if let Some(st) = mac_state_table().lock().unwrap().get_mut(&id) {
-            st.data.clear();
-        }
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, hmac_result.len());
-        for (i, &b) in hmac_result.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-        }
+        ctx.write_byte_array_from(arr, 0, &hmac_result);
         Ok(Some(Value::Object(Some(arr))))
     });
     // doFinal([B)[B — update with input bytes, then compute HMAC
     r.register(mac, "doFinal", "([B)[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let id = ctx.identity_hash_code(this);
-        // Append the input bytes first (read via ctx before taking the lock).
-        if let Some(Value::Object(Some(input_arr))) = args.get(1) {
-            let bytes = mac_read_byte_array(ctx, *input_arr);
-            mac_state_table().lock().unwrap().entry(id).or_default().data.extend_from_slice(&bytes);
-        }
-        let (algo, key, data, ready) = {
-            let t = mac_state_table().lock().unwrap();
-            match t.get(&id) {
-                Some(st) => (
-                    st.algo.clone(),
-                    st.key.clone(),
-                    st.data.clone(),
-                    st.initialized || !st.key.is_empty(),
-                ),
-                None => (String::new(), Vec::new(), Vec::new(), false),
-            }
+        // Read the input bytes via ctx BEFORE taking the lock (ctx access must
+        // not happen while the state mutex is held).
+        let input = match args.get(1) {
+            Some(Value::Object(Some(input_arr))) => Some(mac_read_byte_array(ctx, *input_arr)),
+            _ => None,
         };
-        if !ready {
-            return Err(RuntimeError::IllegalStateException {
-                message: "MAC not initialized".into(),
+        // PERF: same single-lock / move-out optimization as doFinal()[B above —
+        // append the input, compute the HMAC, and reset the accumulator under a
+        // single lock with no full-state clones (was: append-lock, clone-lock,
+        // clear-lock = three acquisitions plus algo/key/data clones per call).
+        let hmac_result = {
+            let mut t = mac_state_table().lock().unwrap();
+            let st = t.entry(id).or_default();
+            if let Some(bytes) = input.as_ref() {
+                st.data.extend_from_slice(bytes);
             }
-            .into());
-        }
-        let hmac_result = mac_compute_hmac(&algo, &key, &data);
-        if let Some(st) = mac_state_table().lock().unwrap().get_mut(&id) {
-            st.data.clear();
-        }
+            if !(st.initialized || !st.key.is_empty()) {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "MAC not initialized".into(),
+                }
+                .into());
+            }
+            // mem::take resets the accumulator (keeps Mac initialized for reuse).
+            let data = std::mem::take(&mut st.data);
+            mac_compute_hmac(&st.algo, &st.key, &data)
+        };
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, hmac_result.len());
-        for (i, &b) in hmac_result.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-        }
+        ctx.write_byte_array_from(arr, 0, &hmac_result);
         Ok(Some(Value::Object(Some(arr))))
     });
     // reset()V — clear the accumulator

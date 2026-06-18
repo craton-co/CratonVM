@@ -360,6 +360,157 @@ fn native_collections_ncopies(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 // Note: Locale and Charset natives are already registered in earlier phases
 
 // ===========================================================================
+// [PERF nb-phases-early-perf] java.util.Properties key->index lookup cache.
+//
+// The array-backed `Properties.getProperty`/`setProperty`/`containsKey`
+// natives registered in `register_core_stdlib_extras` store entries as an
+// interleaved key/value reference array (data[2i]=key, data[2i+1]=value) on
+// field 0 of the Properties object, with the pair count on field 1. Their
+// original lookup was a FULL LINEAR SCAN that called `ctx.read_string(k_ref)`
+// — a heap read + UTF-8 decode + String allocation — on EVERY stored key per
+// call, i.e. O(n) String allocations per `getProperty`. A typical app loads N
+// properties once and then reads them thousands of times, so this is O(n) per
+// read for the entire run.
+//
+// This cache is a PURE ACCELERATOR: the interleaved array remains the single
+// source of truth (every other Properties native — `size`, `stringPropertyNames`,
+// and the side-table-backed `put`/`load`/`entrySet`/… — is untouched). The
+// cache maps each decoded key string to its FIRST pair index, exactly mirroring
+// the linear scan's "first match wins, null key slots skipped" semantics. It is
+// validated on every use against a GC-stable token `(array identity hash, size)`:
+// if the backing array was reallocated (setProperty growth) or the size changed
+// by any path, the entry is rebuilt with a single scan (same cost as the old
+// code's worst case). The array identity hash — not the raw pointer — is the
+// validity token because it is stable across a moving-GC relocation, avoiding
+// the ABA hazard documented in properties_sidetable.rs::key_for.
+//
+// Behavior is byte-for-byte identical to the linear scan; only the per-lookup
+// cost changes from O(n) decode+alloc to O(1) hash probe on the hot read path.
+// ===========================================================================
+mod props_index_cache {
+    use super::*;
+    use parking_lot::Mutex;
+    use rustc_hash::FxHashMap;
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    /// One cached key->first-index map plus the validity token it was built
+    /// against. `arr_token` is the backing array's identity hash (GC-stable);
+    /// `size` is the pair count (field 1). The entry is valid iff BOTH still
+    /// match the live object, otherwise it is rebuilt.
+    struct Entry {
+        arr_token: i32,
+        size: usize,
+        map: HashMap<String, usize>,
+    }
+
+    /// Per-Properties-object cache, keyed by the object's GC-stable identity
+    /// hash so two distinct Properties never share an entry even if a moving
+    /// GC reuses a raw address. A stale generation is simply overwritten on
+    /// rebuild; the map is bounded by the same per-object property cap the
+    /// side-table enforces (a Properties cannot hold unbounded keys), so this
+    /// cannot grow without bound for a given object.
+    fn cache() -> &'static Mutex<FxHashMap<i32, Entry>> {
+        static C: OnceLock<Mutex<FxHashMap<i32, Entry>>> = OnceLock::new();
+        C.get_or_init(|| Mutex::new(FxHashMap::default()))
+    }
+
+    /// Rebuild a fresh key->first-index map from the interleaved array,
+    /// mirroring the linear scan exactly: ascending order, first occurrence of
+    /// a decoded key wins (`or_insert`), null key slots skipped.
+    fn build_map(
+        ctx: &dyn NativeContext,
+        data: ObjectRef,
+        size: usize,
+    ) -> HashMap<String, usize> {
+        let mut map: HashMap<String, usize> = HashMap::with_capacity(size);
+        for i in 0..size {
+            if let Value::Object(Some(k_ref)) = ctx.get_array_element(data, i * 2) {
+                if let Some(k) = ctx.read_string(k_ref) {
+                    map.entry(k).or_insert(i);
+                }
+            }
+        }
+        map
+    }
+
+    /// Look up `key`'s pair index in O(1), (re)building the cache if its
+    /// validity token no longer matches the live `(data, size)`. Returns the
+    /// pair index `i` (the value lives at `data[i*2+1]`) or `None` if absent —
+    /// identical to what the old linear scan would have found.
+    pub(super) fn lookup_index(
+        ctx: &dyn NativeContext,
+        this: ObjectRef,
+        data: ObjectRef,
+        size: usize,
+        key: &str,
+    ) -> Option<usize> {
+        let obj_token = ctx.identity_hash_code(this);
+        let arr_token = ctx.identity_hash_code(data);
+        let mut c = cache().lock();
+        let needs_rebuild = match c.get(&obj_token) {
+            Some(e) => e.arr_token != arr_token || e.size != size,
+            None => true,
+        };
+        if needs_rebuild {
+            let map = build_map(ctx, data, size);
+            c.insert(obj_token, Entry { arr_token, size, map });
+        }
+        // SAFETY of unwrap: just inserted-or-validated above.
+        c.get(&obj_token).and_then(|e| e.map.get(key).copied())
+    }
+
+    /// After `setProperty` APPENDS a new pair at index `new_index` (so size is
+    /// now `new_index + 1`) into `data`, fold that single key into the cached
+    /// map without a full rebuild — keeping the amortized cost of a load+many
+    /// reads at O(1) per op. The caller has already validated/populated the
+    /// entry via a preceding `lookup_index`, so the cache entry exists; if the
+    /// backing array was just grown, `data`/`arr_token` are the NEW array and
+    /// we refresh the token.
+    ///
+    /// The indexed key is decoded from the stored array slot `data[new_index*2]`
+    /// (NOT the caller's key string) so the cache always mirrors exactly what a
+    /// full `build_map` rebuild would produce: a null key slot is skipped (the
+    /// linear scan never matched it), and first-occurrence semantics are kept
+    /// with `or_insert`. If the slot decode disagrees with the cache shape we
+    /// simply drop the entry and let the next lookup rebuild — correct either
+    /// way.
+    pub(super) fn note_append(
+        ctx: &dyn NativeContext,
+        this: ObjectRef,
+        data: ObjectRef,
+        new_index: usize,
+    ) {
+        let obj_token = ctx.identity_hash_code(this);
+        let arr_token = ctx.identity_hash_code(data);
+        let new_size = new_index + 1;
+        let mut c = cache().lock();
+        match c.get_mut(&obj_token) {
+            // Fast path: cache is contiguous with this append (it was built
+            // for the pre-append size against the same backing array).
+            Some(e) if e.size == new_index => {
+                // Index the key exactly as build_map would: decode the stored
+                // slot, skip a null key (unmatched by the old scan).
+                if let Value::Object(Some(k_ref)) = ctx.get_array_element(data, new_index * 2) {
+                    if let Some(k) = ctx.read_string(k_ref) {
+                        e.map.entry(k).or_insert(new_index);
+                    }
+                }
+                e.size = new_size;
+                // Refresh the array token in case setProperty grew (copied)
+                // the array — the contents are identical so the indices still
+                // hold, only the array identity changed.
+                e.arr_token = arr_token;
+            }
+            // Otherwise drop the entry; the next lookup rebuilds from scratch.
+            _ => {
+                c.remove(&obj_token);
+            }
+        }
+    }
+}
+
+// ===========================================================================
 // Core stdlib utility methods (Collections.emptyList, Arrays.asList, Optional)
 // ===========================================================================
 
@@ -1799,21 +1950,19 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(k))) => ctx.read_string(*k).unwrap_or_default(),
             _ => return Ok(Some(Value::Object(None))),
         };
-        // Linear scan of stored key-value pairs (stored as interleaved key, value)
+        // Stored as interleaved key/value pairs (data[2i]=key, data[2i+1]=value).
         let data = match ctx.get_field(this, 0) {
             Value::Object(Some(d)) => d,
             _ => return Ok(Some(Value::Object(None))),
         };
         let size = match ctx.get_field(this, 1) { Value::Int(s) => s as usize, _ => 0 };
-        for i in 0..size {
-            let k = ctx.get_array_element(data, i * 2);
-            if let Value::Object(Some(k_ref)) = k {
-                if ctx.read_string(k_ref).as_deref() == Some(&key) {
-                    return Ok(Some(ctx.get_array_element(data, i * 2 + 1)));
-                }
-            }
+        // [PERF] O(1) cached key->index lookup instead of an O(n) scan that
+        // decoded every stored key. Returns the first-match value, exactly as
+        // the old linear scan did; falls through to null on a miss.
+        match props_index_cache::lookup_index(ctx, this, data, size, &key) {
+            Some(i) => Ok(Some(ctx.get_array_element(data, i * 2 + 1))),
+            None => Ok(Some(Value::Object(None))),
         }
-        Ok(Some(Value::Object(None)))
     });
     r.register(props, "getProperty", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -1826,15 +1975,12 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             _ => return Ok(args.get(2).copied()),
         };
         let size = match ctx.get_field(this, 1) { Value::Int(s) => s as usize, _ => 0 };
-        for i in 0..size {
-            let k = ctx.get_array_element(data, i * 2);
-            if let Value::Object(Some(k_ref)) = k {
-                if ctx.read_string(k_ref).as_deref() == Some(&key) {
-                    return Ok(Some(ctx.get_array_element(data, i * 2 + 1)));
-                }
-            }
+        // [PERF] O(1) cached lookup; on a miss return the supplied default,
+        // exactly as the old linear scan did.
+        match props_index_cache::lookup_index(ctx, this, data, size, &key) {
+            Some(i) => Ok(Some(ctx.get_array_element(data, i * 2 + 1))),
+            None => Ok(args.get(2).copied()),
         }
-        Ok(args.get(2).copied())
     });
     r.register(props, "setProperty", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -1850,15 +1996,15 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(k))) => ctx.read_string(*k).unwrap_or_default(),
             _ => String::new(),
         };
-        for i in 0..size {
-            let k = ctx.get_array_element(data, i * 2);
-            if let Value::Object(Some(k_ref)) = k {
-                if ctx.read_string(k_ref).as_deref() == Some(&key_str) {
-                    let old = ctx.get_array_element(data, i * 2 + 1);
-                    ctx.set_array_element(data, i * 2 + 1, val);
-                    return Ok(Some(old));
-                }
-            }
+        // [PERF] O(1) cached lookup for the existing-key (overwrite) case
+        // instead of an O(n) decode-every-key scan. On an in-place overwrite
+        // the key/index/size are unchanged, so the cache stays valid (no
+        // rebuild). Identical result: the FIRST matching pair's old value is
+        // returned and its value slot is replaced.
+        if let Some(i) = props_index_cache::lookup_index(ctx, this, data, size, &key_str) {
+            let old = ctx.get_array_element(data, i * 2 + 1);
+            ctx.set_array_element(data, i * 2 + 1, val);
+            return Ok(Some(old));
         }
         // Add new pair.
         //
@@ -1890,6 +2036,15 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         ctx.set_array_element(data, size * 2, key);
         ctx.set_array_element(data, size * 2 + 1, val);
         ctx.set_field(this, 1, Value::Int((size + 1) as i32));
+        // [PERF] Fold the just-appended key into the lookup cache so a
+        // load-then-many-reads pattern stays O(1) per op (the `lookup_index`
+        // above already (re)built the cache for the pre-append size, so this
+        // is an incremental update, not a full rebuild). `note_append` passes
+        // the NEW backing array `data` so a growth-copy refreshes the array
+        // validity token without invalidating the indices (contents copied
+        // 1:1). On any inconsistency it drops the entry and the next lookup
+        // rebuilds — behavior stays correct either way.
+        props_index_cache::note_append(ctx, this, data, size);
         Ok(Some(Value::Object(None)))
     });
     r.register(props, "size", "()I", |ctx, args| {
@@ -1907,14 +2062,9 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Int(0))),
         };
         let size = match ctx.get_field(this, 1) { Value::Int(s) => s as usize, _ => 0 };
-        for i in 0..size {
-            if let Value::Object(Some(k_ref)) = ctx.get_array_element(data, i * 2) {
-                if ctx.read_string(k_ref).as_deref() == Some(&key) {
-                    return Ok(Some(Value::Int(1)));
-                }
-            }
-        }
-        Ok(Some(Value::Int(0)))
+        // [PERF] O(1) cached membership test instead of an O(n) decode scan.
+        let found = props_index_cache::lookup_index(ctx, this, data, size, &key).is_some();
+        Ok(Some(Value::Int(found as i32)))
     });
     r.register(props, "stringPropertyNames", "()Ljava/util/Set;", |ctx, args| {
         // S111r11+: collect the keys we need to expose, then return a HashSet

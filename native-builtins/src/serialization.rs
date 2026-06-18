@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_native_api::{MethodMetadata, NativeContext, NativeMethodRegistry};
@@ -170,19 +171,75 @@ fn ois_filter_state() -> &'static Mutex<HashMap<usize, ObjectInputFilterState>> 
     INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// PERF: count of currently-installed per-stream filter states.
+///
+/// The hot deserialization path (`ois_buf_read` → `filter_account_bytes`,
+/// plus `filter_enter_depth` / `filter_exit_depth` / `filter_account_ref`
+/// in `ois_read_value`) consults `ois_filter_state` on EVERY byte/ref/depth
+/// op. Acquiring the process-wide `ois_filter_state` mutex and hashing the
+/// stream address per op is pure overhead for the overwhelmingly common case
+/// where the stream installed no JEP-290 filter at all (no `setObjectInput-
+/// Filter`, no `parse_serial_filter`, and no class ever rejected). This
+/// atomic mirrors `ois_filter_state().len()` exactly so those accessors can
+/// short-circuit to their "unbounded / proceed" answer with a single relaxed
+/// load — no lock, no hash — when the map is empty.
+///
+/// CORRECTNESS: the counter must move in lock-step with map membership. We
+/// keep it consistent by funnelling every insert through `filter_state_set`
+/// and every removal/clear through `filter_state_remove` / `filter_state_-
+/// clear_all`, each of which updates the count while holding the map lock so
+/// the count is never observed to under-report a live entry. A short-circuit
+/// only fires when the count reads zero, which (because increments happen
+/// before/with the insert under the lock) can only mean no entry exists for
+/// ANY address — strictly the same outcome the locked lookup would have
+/// produced (`None` → proceed). When the count is non-zero we always take the
+/// original locked path, so behaviour for streams that DO have a filter is
+/// byte-for-byte unchanged.
+fn ois_filter_state_count() -> &'static AtomicUsize {
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    &COUNT
+}
+
+/// Insert/replace a filter-state entry, keeping `ois_filter_state_count` in
+/// sync with map membership (increment only when a brand-new key is added).
+fn filter_state_set(addr: usize, state: ObjectInputFilterState) {
+    let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
+    if map.insert(addr, state).is_none() {
+        ois_filter_state_count().fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Remove a filter-state entry, keeping the count in sync (decrement only
+/// when an entry was actually present).
+fn filter_state_remove(addr: usize) {
+    let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
+    if map.remove(&addr).is_some() {
+        ois_filter_state_count().fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Drop every filter-state entry and reset the count (process reset / tests).
+fn filter_state_clear_all() {
+    let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
+    map.clear();
+    ois_filter_state_count().store(0, Ordering::Relaxed);
+}
+
 /// Install (or replace) the filter state for a stream. Returning a
 /// fresh `unbounded()` is also the natural lazy-init in `ois_buf_read`
 /// when no explicit state was set yet — that path keeps existing
 /// callers that don't care about JEP-290 limits working unchanged.
 pub(crate) fn ois_set_filter_state(addr: usize, state: ObjectInputFilterState) {
-    let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
-    map.insert(addr, state);
+    // PERF: funnel through `filter_state_set` so `ois_filter_state_count`
+    // stays in lock-step with map membership (enables the no-lock fast path
+    // in the per-op `filter_*` accessors).
+    filter_state_set(addr, state);
 }
 
 /// Drop the per-stream filter state — called from `ObjectInputStream.close()`.
 fn ois_clear_filter_state(addr: usize) {
-    let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
-    map.remove(&addr);
+    // PERF: funnel through `filter_state_remove` to keep the count in sync.
+    filter_state_remove(addr);
 }
 
 /// Read-only snapshot of the filter state for tests / introspection.
@@ -199,6 +256,12 @@ fn ois_get_filter_state(addr: usize) -> Option<ObjectInputFilterState> {
 /// zero-padding so we don't need a hard failure path here, just the
 /// sticky flag for `readObject` to surface as `IOException`).
 fn filter_account_bytes(addr: usize, n: usize) -> bool {
+    // PERF fast path: no filter installed for ANY stream → no byte cap to
+    // enforce. Skip the process-wide lock + per-call hash entirely. Identical
+    // result to the locked `get_mut` returning `None` (→ `true`, "unbounded").
+    if ois_filter_state_count().load(Ordering::Relaxed) == 0 {
+        return true;
+    }
     let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
     let st = match map.get_mut(&addr) {
         Some(s) => s,
@@ -223,6 +286,13 @@ fn filter_account_bytes(addr: usize, n: usize) -> bool {
 /// exceeded; the caller should stop recursing and surface
 /// `IOException` once control returns to `readObject`.
 fn filter_enter_depth(addr: usize) -> bool {
+    // PERF fast path: no filter installed → no depth cap. Same result as the
+    // locked `get_mut` returning `None` (→ `true`, "unbounded"). Because no
+    // state exists, there is nothing to increment; the matching
+    // `filter_exit_depth` is likewise a no-op for this stream.
+    if ois_filter_state_count().load(Ordering::Relaxed) == 0 {
+        return true;
+    }
     let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
     let st = match map.get_mut(&addr) {
         Some(s) => s,
@@ -245,6 +315,13 @@ fn filter_enter_depth(addr: usize) -> bool {
 
 /// Pop recursion depth on the way out of `ois_read_value`.
 fn filter_exit_depth(addr: usize) {
+    // PERF fast path: no filter installed → nothing to decrement. Same result
+    // as the locked `get_mut` returning `None` (no-op). `saturating_sub`
+    // already floors `depth` at 0, so even if a filter is installed mid-graph
+    // (between an enter and its exit) this can never underflow.
+    if ois_filter_state_count().load(Ordering::Relaxed) == 0 {
+        return;
+    }
     let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(st) = map.get_mut(&addr) {
         st.depth = st.depth.saturating_sub(1);
@@ -253,6 +330,11 @@ fn filter_exit_depth(addr: usize) {
 
 /// Account one back-reference and check `max_refs`.
 fn filter_account_ref(addr: usize) -> bool {
+    // PERF fast path: no filter installed → no ref cap. Same result as the
+    // locked `get_mut` returning `None` (→ `true`, "unbounded").
+    if ois_filter_state_count().load(Ordering::Relaxed) == 0 {
+        return true;
+    }
     let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
     let st = match map.get_mut(&addr) {
         Some(s) => s,
@@ -276,6 +358,11 @@ fn filter_account_ref(addr: usize) -> bool {
 /// Check an array allocation against `max_array`. Returns `false` if
 /// `length > max_array` (trips the reject flag too).
 fn filter_check_array(addr: usize, length: usize) -> bool {
+    // PERF fast path: no filter installed → no array-length cap. Same result
+    // as the locked `get_mut` returning `None` (→ `true`, "unbounded").
+    if ois_filter_state_count().load(Ordering::Relaxed) == 0 {
+        return true;
+    }
     let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
     let st = match map.get_mut(&addr) {
         Some(s) => s,
@@ -297,6 +384,11 @@ fn filter_check_array(addr: usize, length: usize) -> bool {
 
 /// Poll the sticky reject flag.
 fn filter_is_rejected(addr: usize) -> Option<String> {
+    // PERF fast path: no filter installed for any stream → nothing could have
+    // been rejected. Same result as the locked `get` returning `None`.
+    if ois_filter_state_count().load(Ordering::Relaxed) == 0 {
+        return None;
+    }
     let map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
     map.get(&addr).filter(|s| s.rejected).map(|s| s.reason.clone())
 }
@@ -317,7 +409,15 @@ fn filter_is_rejected(addr: usize) -> Option<String> {
 /// even when only a pattern-based filter (no `=N` clauses) is in force.
 fn filter_reject_class(addr: usize, class_name: &str) {
     let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
+    // PERF/CORRECTNESS: `or_insert_with` can create a brand-new entry here
+    // (lazy `unbounded()` when only a pattern filter, or none, was installed).
+    // Whenever it does, bump `ois_filter_state_count` so the no-lock fast path
+    // in the per-op accessors never under-reports this now-live entry.
+    let existed = map.contains_key(&addr);
     let st = map.entry(addr).or_insert_with(ObjectInputFilterState::unbounded);
+    if !existed {
+        ois_filter_state_count().fetch_add(1, Ordering::Relaxed);
+    }
     if !st.rejected {
         st.rejected = true;
         st.reason = format!(
@@ -790,7 +890,8 @@ pub(crate) fn reset_serialization_globals() {
     oos_buffers().lock().unwrap_or_else(|e| e.into_inner()).clear();
     ois_buffers().lock().unwrap_or_else(|e| e.into_inner()).clear();
     handle_registry().lock().unwrap_or_else(|e| e.into_inner()).clear();
-    ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    // PERF: clear via the helper so `ois_filter_state_count` is reset too.
+    filter_state_clear_all();
 }
 
 // ---------------------------------------------------------------------------
@@ -4876,7 +4977,7 @@ mod serialization_tests {
         // limits. Before the fix the patterns were discarded and every class
         // was UNDECIDED (silently allowed).
         let addr = 0x4A45_5070_usize;
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
 
         ois_set_filter_state(addr, parse_serial_filter("!com.evil.**;java.util.*;maxdepth=10"));
@@ -4898,7 +4999,7 @@ mod serialization_tests {
             FilterStatus::Undecided
         );
 
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
     }
 
     #[test]
@@ -4936,7 +5037,7 @@ mod serialization_tests {
     fn jep290_maxbytes_trips_reject_flag() {
         // Acceptance test 5(b): maxbytes=64 rejects a 100-byte payload.
         let addr = 0x4A45_5000_usize;
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         ois_buf_load(addr, vec![0u8; 100]);
         ois_set_filter_state(addr, parse_serial_filter("maxbytes=64"));
 
@@ -4960,7 +5061,7 @@ mod serialization_tests {
     #[test]
     fn jep290_maxbytes_not_tripped_when_under_limit() {
         let addr = 0x4A45_5001_usize;
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         ois_buf_load(addr, vec![0u8; 100]);
         ois_set_filter_state(addr, parse_serial_filter("maxbytes=200"));
         for _ in 0..100 {
@@ -4975,7 +5076,7 @@ mod serialization_tests {
     fn jep290_maxrefs_trips_reject_flag() {
         // Acceptance test 5(c): maxrefs=1 rejects a 2-back-reference graph.
         let addr = 0x4A45_5002_usize;
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         ois_set_filter_state(addr, parse_serial_filter("maxrefs=1"));
 
         // Two back-references — the second one must trip the cap.
@@ -4998,7 +5099,7 @@ mod serialization_tests {
         // in the wp02_tests module's neighbours; here we just confirm
         // the counter behaves correctly.
         let addr = 0x4A45_5003_usize;
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         ois_set_filter_state(addr, parse_serial_filter("maxdepth=2"));
 
         assert!(filter_enter_depth(addr), "depth 1");
@@ -5022,7 +5123,7 @@ mod serialization_tests {
         // Verifies `filter_check_array` returns false (and trips
         // `rejected`) when the on-wire array length exceeds maxarray.
         let addr = 0x4A45_5004_usize;
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         ois_set_filter_state(addr, parse_serial_filter("maxarray=10"));
 
         assert!(filter_check_array(addr, 5), "len 5 <= max 10 must pass");
@@ -5041,7 +5142,7 @@ mod serialization_tests {
         // same stream must NOT be rejected. This is the gate `ois_read_object`
         // / `ois_read_array` / `TC_ENUM` now call before instantiating a class.
         let addr = 0x4A45_5100_usize;
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
 
         // Reject anything under `evil.**`, allow everything else.
@@ -5078,7 +5179,7 @@ mod serialization_tests {
         // read; the result must be capped (no multi-exabyte allocation) and
         // the checked `pos + n` arithmetic must not wrap.
         let addr = 0x4A45_5101_usize;
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         ois_buf_load(addr, vec![1u8, 2, 3, 4]);
 
         // Consume the 4 real bytes, then over-read.
@@ -5092,7 +5193,7 @@ mod serialization_tests {
 
         // The TC_LONGSTRING clamp itself: a wire length far beyond remaining
         // must clamp to remaining (here 0 once exhausted, small otherwise).
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         ois_buf_load(addr, b"hello".to_vec());
         let remaining = ois_buf_remaining(addr) as u64;
         let clamped =
@@ -5106,7 +5207,7 @@ mod serialization_tests {
         // Acceptance test 6: with no `=N` clauses present every check
         // returns ok regardless of magnitude.
         let addr = 0x4A45_5005_usize;
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         ois_set_filter_state(addr, parse_serial_filter("java.util.*;!evil.*"));
         for _ in 0..1000 {
             assert!(filter_account_ref(addr));
@@ -5123,7 +5224,7 @@ mod serialization_tests {
         // Acceptance test 5(d): single filter with several `=N` clauses
         // — each dimension is enforced on its own counter.
         let addr = 0x4A45_5006_usize;
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         ois_set_filter_state(
             addr,
             parse_serial_filter("maxdepth=4;maxrefs=2;maxbytes=32;maxarray=8"),
@@ -5137,7 +5238,7 @@ mod serialization_tests {
             filter_exit_depth(addr);
         }
         // Reset for isolated dimension check.
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         ois_set_filter_state(
             addr,
             parse_serial_filter("maxdepth=4;maxrefs=2;maxbytes=32;maxarray=8"),
@@ -5172,7 +5273,7 @@ mod serialization_tests {
         ctx.set_field(ois, 2, Value::Int(0)); // objects_read
 
         let addr = ois.as_ptr() as usize;
-        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         // Pre-install a tripped filter so the readObject path
         // immediately observes the sticky flag.
         let mut tripped = parse_serial_filter("maxdepth=1");

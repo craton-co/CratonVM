@@ -2371,7 +2371,41 @@ new_prim_array!(jni_new_float_array, ArrayElementType::Float); // 181
 new_prim_array!(jni_new_double_array, ArrayElementType::Double); // 182
 
 // ---- Indices 183-190: Get<Type>ArrayElements ----
-// Returns a pointer to the raw array data. For simplicity, we allocate a copy.
+// Returns a pointer to the raw array data.
+//
+// PERF (jni-arrayelems-perf): the previous implementation ALWAYS materialised a
+// full per-element copy (a `get_array_element` + `match` loop over the whole
+// array) and reported `is_copy = JNI_TRUE` — an O(n) copy on every call, even
+// for ordinary contiguous primitive arrays whose in-heap layout is already a
+// flat native-endian block. The heap stores primitives exactly as the C side
+// expects them: `write_prim_element`/`read_prim_element` use native-endian
+// widths (boolean/byte=1, char/short=2, int/float=4, long/double=8) that match
+// the `JBoolean/JByte/JChar/JShort/JInt/JLong/JFloat/JDouble` typedefs
+// one-for-one, so a `*mut $rust_type` view over the array body is bit-identical
+// to the copy the old loop produced.
+//
+// We therefore hand out a DIRECT pointer into the (pinned, non-moving) array
+// body with `is_copy = JNI_FALSE` whenever the array is contiguous, avoiding the
+// copy entirely. This mirrors the long-established `GetPrimitiveArrayCritical`
+// fast path (see `jni_get_primitive_array_critical`), which already returns the
+// same `array_data_ptr` directly: ordinary arrays live in the non-moving
+// generational heap / a single G1 region and are not relocated across a GC while
+// native code holds the pointer (the codebase's "our heap doesn't move objects
+// between GC" contract, cf. `GetStringCritical`).
+//
+// GC SAFETY / Release semantics: a direct pointer is deliberately NOT recorded
+// in `JNI_ARRAY_ELEM_BUFFERS`. `Release<Type>ArrayElements` looks the pointer up
+// and, finding no entry, treats it as a no-op — which is exactly right: native
+// writes already landed in the live array body (nothing to copy back) and there
+// is no separate buffer to free. Consistent with the JNI spec, when
+// `is_copy == JNI_FALSE` the `JNI_ABORT` release mode cannot undo in-place
+// writes, identical to the critical-section direct path.
+//
+// The COPY path is preserved verbatim for the one case that genuinely requires
+// it: a G1 *humongous* array, whose payload spans non-contiguous regions and so
+// has no flat data pointer (`array_data_ptr` returns `None`). There we still
+// build a contiguous buffer, register it, and report `is_copy = JNI_TRUE` so
+// Release copies any mutations back and frees it.
 macro_rules! get_array_elements {
     ($name:ident, $rust_type:ty, $value_variant:ident, $default:expr) => {
         extern "C" fn $name(
@@ -2382,8 +2416,22 @@ macro_rules! get_array_elements {
             if array == 0 {
                 return std::ptr::null_mut();
             }
+            // `(ptr, is_copy_flag)` — `is_copy_flag` is JNI_FALSE for the direct
+            // (no-copy) pointer and JNI_TRUE for the humongous copy buffer.
             let result = with_shared_vm(|shared| {
                 let oref = jobject_to_obj(array)?;
+                // FAST PATH: ordinary contiguous array → hand out the live body
+                // pointer, no copy. `array_data_ptr` returns `None` only for a
+                // G1 humongous array (non-contiguous payload), which falls
+                // through to the copy path below.
+                if let Some(base) = shared.heap.array_data_ptr(oref) {
+                    // The data region is a native-endian block of `$rust_type`
+                    // (see `write_prim_element`), so this reinterpretation is the
+                    // same bit pattern the per-element copy loop would have built.
+                    return Some((base as *mut $rust_type, JNI_FALSE));
+                }
+                // SLOW PATH (G1 humongous): materialise a contiguous copy via the
+                // region-safe per-element accessor, register it for Release.
                 let len = shared.heap.array_length(oref);
                 let mut buf: Vec<$rust_type> = Vec::with_capacity(len);
                 for i in 0..len {
@@ -2412,14 +2460,14 @@ macro_rules! get_array_elements {
                     c.borrow_mut().insert(ptr as usize, (buf_len, buf_cap));
                 });
                 std::mem::forget(buf); // OWNERSHIP: buffer transferred to native caller, freed by Release<Type>ArrayElements via Vec::from_raw_parts
-                Some(ptr)
+                Some((ptr, JNI_TRUE))
             })
             .flatten();
             match result {
-                Some(ptr) => {
+                Some((ptr, copy_flag)) => {
                     if !is_copy.is_null() {
                         unsafe {
-                            *is_copy = JNI_TRUE;
+                            *is_copy = copy_flag;
                         }
                     }
                     ptr

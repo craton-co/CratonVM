@@ -3146,25 +3146,37 @@ fn extract_this_class_name(bytes: &[u8]) -> Option<String> {
     if cp_count == 0 {
         return None;
     }
-    // Scan the constant pool to collect each entry's byte offset and
-    // record Utf8 strings and Class entries so we can resolve
-    // `this_class` (an index into the pool) to a UTF-8 name.
+    // PERF: we only need the single `this_class` name, not the whole pool.
+    // The previous implementation allocated two HashMaps and a heap
+    // `String` for *every* Utf8 entry on each defineClass-family call —
+    // very hot for cglib/ByteBuddy-heavy apps that define many proxies.
+    //
+    // Instead we do one cheap linear scan that records only each constant
+    // pool entry's *start byte offset* into a flat `Vec<u32>` (one slot
+    // per pool index — no per-entry hashing, no per-Utf8 String alloc).
+    // After the pool we read `this_class`, follow it to the CONSTANT_Class
+    // entry's `name_index`, and decode exactly one Utf8 string. Behavior
+    // (including all `None`/out-of-range failure cases) is identical to
+    // the old HashMap version; only the one resolved name is allocated.
+    //
+    // offsets[i] = byte offset of constant pool entry `i` (the tag byte).
+    // Index 0 is unused (the pool is 1-based); long/double entries leave
+    // their second slot at the sentinel `u32::MAX` (unusable index).
+    let mut offsets: Vec<u32> = vec![u32::MAX; cp_count];
     let mut pos = 10usize;
-    let mut utf8_strings: std::collections::HashMap<u16, String> =
-        std::collections::HashMap::new();
-    let mut class_name_indices: std::collections::HashMap<u16, u16> =
-        std::collections::HashMap::new();
-
-    let mut idx: u16 = 1;
-    while (idx as usize) < cp_count {
+    let mut idx: usize = 1;
+    while idx < cp_count {
         if pos >= bytes.len() {
             return None;
         }
+        offsets[idx] = pos as u32;
         let tag = bytes[pos];
         pos += 1;
         match tag {
             1 => {
-                // CONSTANT_Utf8 — u2 length, [u1]* bytes
+                // CONSTANT_Utf8 — u2 length, [u1]* bytes. We deliberately
+                // do NOT decode the bytes here (the old code decoded every
+                // Utf8); we only need to skip past it.
                 if pos + 2 > bytes.len() {
                     return None;
                 }
@@ -3173,14 +3185,6 @@ fn extract_this_class_name(bytes: &[u8]) -> Option<String> {
                 if pos + len > bytes.len() {
                     return None;
                 }
-                // Lenient UTF-8: the JVM uses Modified UTF-8, but for
-                // the subset used in internal class names (ASCII-safe
-                // `foo/Bar$Inner`) the modified and standard forms
-                // agree. Non-conforming names decode via
-                // `from_utf8_lossy`, which is harmless for the
-                // mangling step.
-                let s = String::from_utf8_lossy(&bytes[pos..pos + len]).into_owned();
-                utf8_strings.insert(idx, s);
                 pos += len;
                 idx += 1;
             }
@@ -3199,8 +3203,6 @@ fn extract_this_class_name(bytes: &[u8]) -> Option<String> {
                 if pos + 2 > bytes.len() {
                     return None;
                 }
-                let name_idx = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
-                class_name_indices.insert(idx, name_idx);
                 pos += 2;
                 idx += 1;
             }
@@ -3236,9 +3238,43 @@ fn extract_this_class_name(bytes: &[u8]) -> Option<String> {
     if pos + 4 > bytes.len() {
         return None;
     }
-    let this_class_idx = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]);
-    let name_idx = class_name_indices.get(&this_class_idx)?;
-    utf8_strings.get(name_idx).cloned()
+    let this_class_idx = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
+
+    // Resolve `this_class` (a CONSTANT_Class) → its `name_index` Utf8.
+    // Bounds-check the index and verify the tag matches, mirroring the
+    // old code which returned `None` for a missing/mismatched entry.
+    let class_off = *offsets.get(this_class_idx)? as usize;
+    if class_off == u32::MAX as usize || class_off + 3 > bytes.len() {
+        return None;
+    }
+    if bytes[class_off] != 7 {
+        // `this_class` did not point at a CONSTANT_Class. The old code
+        // returned `None` here (the name-index HashMap had no entry).
+        return None;
+    }
+    let name_idx = u16::from_be_bytes([bytes[class_off + 1], bytes[class_off + 2]]) as usize;
+
+    let name_off = *offsets.get(name_idx)? as usize;
+    if name_off == u32::MAX as usize || name_off + 3 > bytes.len() {
+        return None;
+    }
+    if bytes[name_off] != 1 {
+        // name_index did not point at a CONSTANT_Utf8. The old code
+        // returned `None` (the utf8 HashMap had no entry for it).
+        return None;
+    }
+    let len = u16::from_be_bytes([bytes[name_off + 1], bytes[name_off + 2]]) as usize;
+    let start = name_off + 3;
+    let end = start.checked_add(len)?;
+    if end > bytes.len() {
+        return None;
+    }
+    // Lenient UTF-8: the JVM uses Modified UTF-8, but for the subset used
+    // in internal class names (ASCII-safe `foo/Bar$Inner`) the modified
+    // and standard forms agree. Non-conforming names decode via
+    // `from_utf8_lossy`, which is harmless for the mangling step. Only
+    // this one string is allocated (the old code allocated every Utf8).
+    Some(String::from_utf8_lossy(&bytes[start..end]).into_owned())
 }
 
 fn lk_define_hidden_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

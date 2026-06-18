@@ -5483,14 +5483,33 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 1024];
+    // PERF [nb-net-phase-e]: scan only the newly-appended bytes for the
+    // "\r\n\r\n" header terminator instead of re-running `buf.windows(4)` over
+    // the whole accumulated buffer on every ~1 KiB read. Re-scanning from 0 each
+    // read is O(n^2) in header size. `scanned` records how many leading bytes
+    // have already been checked; each read we restart the window scan 3 bytes
+    // before that point so a terminator straddling the previous/new boundary is
+    // still detected, then capture its absolute position so the post-loop step
+    // need not re-scan either. The detection result is identical to the original
+    // full-buffer `windows(4).position(...)`.
+    let mut scanned = 0usize;
+    let mut sep: Option<usize> = None;
     loop {
         match stream.read(&mut tmp) {
             Ok(0) => break,
             Ok(n) => {
                 buf.extend_from_slice(&tmp[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                // Restart 3 bytes before the previously-scanned end so a
+                // terminator split across the boundary is not missed (saturating
+                // so the first read starts at 0).
+                let start = scanned.saturating_sub(3);
+                if let Some(rel) = buf[start..].windows(4).position(|w| w == b"\r\n\r\n") {
+                    sep = Some(start + rel);
                     break;
                 }
+                // Everything except the trailing 3 bytes (which may begin a
+                // boundary-straddling terminator) is now fully checked.
+                scanned = buf.len().saturating_sub(3);
                 if buf.len() > 1 << 20 {
                     return None;
                 }
@@ -5498,7 +5517,7 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
             Err(_) => return None,
         }
     }
-    let sep = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let sep = sep?;
     let head = std::str::from_utf8(&buf[..sep]).ok()?;
     let mut lines = head.split("\r\n");
     let req_line = lines.next()?;

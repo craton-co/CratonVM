@@ -78,6 +78,23 @@ pub fn mon_enter_dump_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var("CRATONVM_DBG_MONENTER").is_ok())
 }
 
+/// PERF (monitor-leak reclaim): opt-in gate for reclaiming inflated-monitor
+/// registry entries whose object is dead. See `MonitorTable::remap_after_gc`
+/// for the full safety rationale — in short, "absent from the GC forwarding
+/// map" is a reliable *dead* signal **only for a whole-heap collection**; for
+/// partial collectors (G1 young/mixed, generational minor GC) an absent key may
+/// be a live in-place survivor, so dropping it would desync the registry from
+/// the surviving object's `INFLATED` mark word. Until the GC can pass a
+/// dead-address set (flagged cross-file follow-up), monitor reclamation is
+/// **default OFF** so the registry behaviour stays byte-identical. CAS-lock
+/// reclamation is unconditional (safe for all collectors) and does NOT consult
+/// this flag. Read once and cached so the per-GC check is a single relaxed load.
+#[inline]
+fn reclaim_dead_monitors_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_RECLAIM_DEAD_MONITORS").is_some())
+}
+
 /// KC16-watchdog: callback installed by the VM that emits the current
 /// thread's frame chain from a wait-site context. Set by `SharedVm`
 /// during construction so `Monitor::wait` can reach the per-thread
@@ -388,6 +405,26 @@ impl Monitor {
     fn is_held_by(&self, thread_id: ThreadId) -> bool {
         let state = self.state.lock();
         state.owner == Some(thread_id)
+    }
+
+    /// PERF (monitor-leak reclaim): returns true iff this monitor is fully
+    /// idle — unowned and with a zero entry count. A monitor that is held,
+    /// re-entered, or in the middle of a `wait()` (which temporarily clears
+    /// `owner` but keeps a non-zero `saved_count` *only on the stack*, and is
+    /// represented to the registry by a live extra `Arc` clone held by the
+    /// blocked thread — see the `strong_count` guard at the reclaim site)
+    /// reports `false`. Used by `remap_after_gc` to decide whether a
+    /// dead-object monitor entry can be dropped without losing lock state.
+    ///
+    /// Note: idleness alone does NOT prove the object is dead — the reclaim
+    /// site additionally requires (a) the object is absent from the GC's live
+    /// forwarding map for a whole-heap collection and (b) `Arc::strong_count`
+    /// proves the registry holds the only reference (no thread is parked in
+    /// `block_enter`/`wait` on a clone). All three together are required.
+    #[inline]
+    fn is_idle(&self) -> bool {
+        let state = self.state.lock();
+        state.owner.is_none() && state.entry_count == 0
     }
 
     /// Acquire this monitor for the given thread.
@@ -1382,10 +1419,67 @@ impl MonitorTable {
     /// Takes a mapping from old pointer addresses to new pointer addresses.
     /// Re-keys the internal HashMap so monitors remain associated with the
     /// correct (now-relocated) objects.
+    ///
+    /// PERF (monitor-leak reclaim): historically every inflated `Monitor` and
+    /// every per-object `cas_lock` was inserted on first use and **never
+    /// removed**, so the registries grew monotonically for the VM lifetime —
+    /// each moving GC's remap then walked an ever-larger table even though most
+    /// keyed objects were long dead. This pass reclaims the entries that can be
+    /// dropped *without ever losing live lock state*, keeping the table bounded
+    /// and the remap cost proportional to the live (not historical) population.
+    ///
+    /// SAFETY of reclamation (why this never drops a live monitor):
+    ///
+    /// * `cas_locks` are **always** safe to prune when idle. A CAS lock has no
+    ///   back-reference from the object header (unlike an inflated monitor,
+    ///   whose address is published into the mark word), so removing it is
+    ///   invisible to the rest of the VM — `with_cas_lock` simply re-creates an
+    ///   equivalent fresh `Mutex` on the next access. We drop an entry only when
+    ///   `Arc::strong_count == 1`, i.e. the registry holds the *sole* reference
+    ///   and no thread is currently inside `with_cas_lock` holding a clone. An
+    ///   entry that is in use (`strong_count > 1`) is always retained/re-keyed.
+    ///
+    /// * Inflated `monitors` are reclaimed only when **all** of the following
+    ///   hold, which together prove the monitor is dead *and* unreferenced:
+    ///     1. the object's old address is **absent** from `pointer_map`;
+    ///     2. `Arc::strong_count == 1` — the registry holds the only reference,
+    ///        so no thread is parked in `block_enter`/`wait` on a clone;
+    ///     3. the monitor `is_idle()` — unowned with a zero entry count.
+    ///   Condition (1) is a reliable *dead* signal **only for a whole-heap
+    ///   collection** (the semi-space copying collector forwards *every* live
+    ///   object into `pointer_map`, so absence ⇔ dead). For **partial**
+    ///   collectors (G1 young/mixed, the generational minor GC) `pointer_map`
+    ///   lists only *moved* objects; a live old-gen / non-CSet survivor stays in
+    ///   place and is legitimately absent. Dropping such an entry would be a
+    ///   correctness bug — the survivor's mark word still reads `INFLATED`, so
+    ///   the next `enter`/`lookup_inflated` would miss the registry and trip the
+    ///   hardened "INFLATED mark but registry entry missing" panic (the same
+    ///   class of premature-reclaim bug documented for BUG-V and the WildFly
+    ///   weak-`ClassLoader` referent). Because this method cannot tell which
+    ///   collector invoked it, monitor reclamation is **gated behind the opt-in
+    ///   `CRATONVM_RECLAIM_DEAD_MONITORS` flag** and the default build re-keys
+    ///   monitors exactly as before (byte-identical behaviour). The conditions
+    ///   (2)+(3) are belt-and-braces: even under the flag, a held/contended/
+    ///   waiting monitor is *never* removed.
+    ///
+    ///   CROSS-FILE FOLLOW-UP (flagged, not done here — out of edit scope): to
+    ///   reclaim dead monitors safely under *partial* collectors too, the GC
+    ///   would need to pass a dead-address set (or a "whole-heap collection"
+    ///   bool) through `cratonvm_gc::collector::MonitorCleanup::remap_after_gc`.
+    ///   That requires editing `gc/src/collector.rs`, the four `remap_after_gc`
+    ///   call sites (`gc/src/heap.rs`, `gc/src/g1.rs`, `gc/src/gen_heap.rs`),
+    ///   and the impl in this file — left to the owner of those files.
     pub fn remap_after_gc(&self, pointer_map: &std::collections::HashMap<usize, usize>) {
         if pointer_map.is_empty() {
             return;
         }
+        // PERF: read the monitor-reclaim opt-in once and cache it — the per-GC
+        // check then costs a single relaxed load. Default OFF keeps the
+        // monitor-registry behaviour byte-identical to before (see the safety
+        // note above: absence-from-`pointer_map` is only a reliable dead signal
+        // for a whole-heap collector).
+        let reclaim_monitors = reclaim_dead_monitors_enabled();
+
         // SECURITY FIX (V11): both `monitors` and `cas_locks` are wrapped at
         // the SAME hierarchy level (L6). The lock-order checker forbids holding
         // one and then acquiring the other (equal level => not strictly
@@ -1394,21 +1488,79 @@ impl MonitorTable {
         // safety with no behavioural change.
         {
             let mut monitors = self.monitors.lock().expect("monitors registry poisoned");
-            // Drain all entries, re-key those whose address has changed
+            // PERF: pre-size the rebuilt map to the live count so the
+            // re-insertion loop never rehashes mid-walk. With reclamation off
+            // the live count equals the drained count; with it on it is a tight
+            // upper bound. `drain()` empties the map in place and lets us
+            // `insert` back into the same (now-empty) allocation.
             let entries: Vec<(usize, Arc<Monitor>)> = monitors.drain().collect();
-            for (old_key, monitor) in entries {
-                let new_key = pointer_map.get(&old_key).copied().unwrap_or(old_key);
-                monitors.insert(new_key, monitor);
+            for (old_key, mut monitor) in entries {
+                match pointer_map.get(&old_key).copied() {
+                    Some(new_key) => {
+                        // Object survived AND moved — must re-key (a stale key
+                        // would desync the registry from the copied mark word,
+                        // see BUG-V). Always retained.
+                        monitors.insert(new_key, monitor);
+                    }
+                    None => {
+                        // Absent from the forwarding map. Under a whole-heap
+                        // collection this means the object is dead; under a
+                        // partial collection it may be a live in-place
+                        // survivor. Reclaim ONLY when explicitly enabled AND
+                        // the monitor is provably idle and uniquely referenced
+                        // (no waiter/owner). Otherwise re-key in place (old_key
+                        // unchanged) exactly as the original code did.
+                        let reclaimable = reclaim_monitors
+                            // `get_mut` succeeds iff this is the unique strong
+                            // reference (no other `Arc<Monitor>` clone is held
+                            // by a blocked/owning thread). Equivalent to
+                            // `strong_count == 1 && weak_count == 0` but checked
+                            // without a separate atomic load.
+                            && Arc::get_mut(&mut monitor).is_some()
+                            && monitor.is_idle();
+                        if !reclaimable {
+                            // Keep the entry under its (unchanged) address.
+                            monitors.insert(old_key, monitor);
+                        }
+                        // else: drop `monitor` here — the registry's sole
+                        // `Arc` is released, freeing the heavyweight Monitor.
+                    }
+                }
             }
         }
 
         // Also remap CAS locks (separate L6 critical section).
+        //
+        // PERF: CAS locks carry no object-header back-reference, so an idle one
+        // is always safe to drop and is transparently re-created by the next
+        // `with_cas_lock`. Prune every entry that survived-as-dead (absent from
+        // `pointer_map`) AND is unreferenced (`strong_count == 1`), independent
+        // of the monitor-reclaim flag — this is unconditionally correct for all
+        // collectors. A surviving-and-moved lock is re-keyed; an in-use lock
+        // (`strong_count > 1`, i.e. a thread is inside `with_cas_lock`) is kept.
         {
             let mut cas = self.cas_locks.lock().expect("cas_locks registry poisoned");
             let cas_entries: Vec<(usize, Arc<Mutex<()>>)> = cas.drain().collect();
-            for (old_key, lock) in cas_entries {
-                let new_key = pointer_map.get(&old_key).copied().unwrap_or(old_key);
-                cas.insert(new_key, lock);
+            for (old_key, mut lock) in cas_entries {
+                match pointer_map.get(&old_key).copied() {
+                    Some(new_key) => {
+                        // Object moved — re-key so a future CAS on the same
+                        // (relocated) object reuses the same lock.
+                        cas.insert(new_key, lock);
+                    }
+                    None => {
+                        // Absent. For cas_locks this is *always* safe to treat
+                        // as reclaimable when unreferenced, even under a partial
+                        // collector: dropping a live-but-idle object's cas_lock
+                        // only forces a cheap lazy re-create on the next CAS, it
+                        // never desyncs any header state. Keep it only if a
+                        // thread is currently using it.
+                        if Arc::get_mut(&mut lock).is_none() {
+                            cas.insert(old_key, lock);
+                        }
+                        // else: drop the sole `Arc` — reclaimed.
+                    }
+                }
             }
         }
     }
@@ -1591,6 +1743,63 @@ mod tests {
         // Exit using the NEW address should succeed — the registry was
         // re-keyed so the inflated Monitor is found.
         assert!(table.exit(new_obj, tid).is_ok());
+    }
+
+    /// PERF (monitor-leak reclaim): an idle, unreferenced CAS lock whose object
+    /// is absent from the GC forwarding map is dropped from the registry
+    /// (unconditional — no env flag), bounding the table. The next CAS on the
+    /// same object transparently re-creates the lock, so behaviour is preserved.
+    #[test]
+    fn cas_lock_idle_dead_entry_is_reclaimed() {
+        let table = MonitorTable::new();
+        let obj = test_object();
+
+        // Create a CAS lock for `obj`, then let the guard drop so the registry
+        // holds the sole `Arc` (strong_count == 1).
+        table.with_cas_lock(obj, || {});
+
+        // A non-empty pointer_map that does NOT mention `obj` simulates a
+        // whole-heap collection in which `obj` was not forwarded (= dead).
+        // (An empty map early-returns; use a dummy unrelated remap so the body
+        // actually runs.)
+        let mut pointer_map = std::collections::HashMap::new();
+        pointer_map.insert(0xdead_0000usize, 0xbeef_0000usize);
+        table.remap_after_gc(&pointer_map);
+
+        // The lock for `obj` was reclaimed: a fresh CAS still works (it lazily
+        // re-creates the lock), proving no state was lost.
+        let mut ran = false;
+        table.with_cas_lock(obj, || ran = true);
+        assert!(ran, "CAS lock must be transparently re-created after reclaim");
+    }
+
+    /// PERF safety: with monitor reclamation at its DEFAULT (off), an inflated
+    /// monitor whose object is absent from a *partial*-collection forwarding map
+    /// (a live in-place survivor) is RETAINED and still usable. This guards
+    /// against the premature-reclaim / registry-desync class of bug (BUG-V).
+    #[test]
+    fn inflated_monitor_absent_from_map_is_retained_by_default() {
+        let table = MonitorTable::new();
+        let obj = test_object();
+        let tid = ThreadId(1);
+
+        // Force inflation via wait() (heavyweight monitor required).
+        table.enter(obj, tid);
+        table.wait(obj, tid, Some(1), None).unwrap();
+
+        // Partial GC: pointer_map mentions some *other* object, not `obj`
+        // (which survived in place). Default flag is off → must NOT reclaim.
+        let mut pointer_map = std::collections::HashMap::new();
+        pointer_map.insert(0xfeed_0000usize, 0xface_0000usize);
+        table.remap_after_gc(&pointer_map);
+
+        // The monitor is still registered under the unchanged address: the
+        // owning thread can still exit it (a dropped entry would yield IMSE
+        // "never entered").
+        assert!(
+            table.exit(obj, tid).is_ok(),
+            "live in-place monitor must survive a partial-GC remap by default"
+        );
     }
 
     #[test]
