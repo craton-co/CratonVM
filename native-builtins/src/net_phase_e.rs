@@ -1132,6 +1132,39 @@ fn uri_split(s: &str) -> (Option<String>, Option<String>, String, Option<String>
     (scheme, authority, path, query, fragment)
 }
 
+/// Split a URI authority (`[userinfo "@"] host [":" port]`, RFC 3986 §3.2) into
+/// `(userInfo, host, port)`. `port` is -1 when absent or unparsable. Host of an
+/// IPv6 literal keeps its brackets (`[::1]`), matching `java.net.URI.getHost()`.
+pub(crate) fn uri_parse_authority(authority: &str) -> (Option<String>, Option<String>, i32) {
+    // userinfo ends at the last '@' (host cannot contain '@').
+    let (userinfo, hostport) = match authority.rfind('@') {
+        Some(i) => (Some(authority[..i].to_string()), &authority[i + 1..]),
+        None => (None, authority),
+    };
+    let (host, port_str) = if hostport.starts_with('[') {
+        // IPv6 literal: host is "[...]", optional ":port" after the ']'.
+        match hostport.find(']') {
+            Some(j) => {
+                let h = hostport[..=j].to_string();
+                let p = hostport[j + 1..].strip_prefix(':').map(|x| x.to_string());
+                (h, p)
+            }
+            None => (hostport.to_string(), None),
+        }
+    } else {
+        // Reg-name: port (if any) follows the last ':'.
+        match hostport.rfind(':') {
+            Some(j) => (hostport[..j].to_string(), Some(hostport[j + 1..].to_string())),
+            None => (hostport.to_string(), None),
+        }
+    };
+    let port = port_str
+        .and_then(|p| if p.is_empty() { None } else { p.parse::<i32>().ok() })
+        .unwrap_or(-1);
+    let host = if host.is_empty() { None } else { Some(host) };
+    (userinfo, host, port)
+}
+
 /// RFC 3986 §5.2 — resolve a reference against a base URI string.
 fn uri_resolve_ref(base: &str, reference: &str) -> String {
     if reference.is_empty() {
@@ -1362,7 +1395,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(ctx.create_string(&raw_path)))))
     });
 
-    // getHost() → host field (1) or parsed from raw
+    // getHost() → host field (1) or parsed from the raw authority.
     r.register(uri, "getHost", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(s)) = ctx.get_field(this, 1) {
@@ -1372,13 +1405,51 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
                 }
             }
         }
+        // Fallback (like getScheme/getPath/getQuery): parse the host out of the
+        // raw authority. `URI.create("http://proxy1:8080")` never populated the
+        // host slot, so getHost() returned null and getPort() returned 0 —
+        // keycloak ProxyMappings.valueOf -> new HttpHost(null,...) "Host name may
+        // not be null" (all 16 ProxyMappingsTest cases).
+        let raw = uri_raw_string(ctx, this);
+        if let (_, Some(auth), _, _, _) = uri_split(&raw) {
+            if let (_, Some(host), _) = uri_parse_authority(&auth) {
+                return Ok(Some(Value::Object(Some(ctx.create_string(&host)))));
+            }
+        }
         Ok(Some(Value::Object(None)))
     });
 
-    // getPort() → port field (2)
+    // getPort() → port field (2) when a real port was stored, else parse the raw
+    // authority. Absent port is -1 (java.net.URI contract), not the int-default 0.
     r.register(uri, "getPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 2)))
+        if let Value::Int(p) = ctx.get_field(this, 2) {
+            if p > 0 {
+                return Ok(Some(Value::Int(p)));
+            }
+        }
+        let raw = uri_raw_string(ctx, this);
+        if let (_, Some(auth), _, _, _) = uri_split(&raw) {
+            let (_, _, port) = uri_parse_authority(&auth);
+            return Ok(Some(Value::Int(port)));
+        }
+        Ok(Some(Value::Int(-1)))
+    });
+
+    // getUserInfo() → decoded user-information from the raw authority. Was
+    // unregistered (real bytecode read an unpopulated field → null), so
+    // `URI.create("http://user:pass@host:88").getUserInfo()` returned null
+    // (keycloak ProxyMappings proxy-authentication case).
+    r.register(uri, "getUserInfo", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let raw = uri_raw_string(ctx, this);
+        if let (_, Some(auth), _, _, _) = uri_split(&raw) {
+            if let (Some(ui), _, _) = uri_parse_authority(&auth) {
+                let decoded = uri_percent_decode(&ui);
+                return Ok(Some(Value::Object(Some(ctx.create_string(&decoded)))));
+            }
+        }
+        Ok(Some(Value::Object(None)))
     });
 
     // getQuery() → `query` field by name (slot-order safe), else parse the
