@@ -6853,6 +6853,88 @@ fn route_jit_exception_through_method(
     Ok(CachedCallResult::FramePushed)
 }
 
+/// real-frame-deopt: `true` (default OFF) when an IR-path deopt should resume
+/// the interpreter at the trapping bci from the reconstructed frame, instead of
+/// re-running the method from entry. Gated by `CRATONVM_IR_DEOPT_RESUME` while
+/// it soaks — the precise resume is unvalidated against the full VM suite, and
+/// no production IR method emits a deopt guard yet, so default OFF is inert.
+fn ir_deopt_resume_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_IR_DEOPT_RESUME").is_some())
+}
+
+/// Map a reconstructed frame's locals/stack `FrameValue`s to interpreter
+/// `Value`s. Conservative first cut: only integer slots are mapped (the IR
+/// path's deopt-eligible methods are integer-only). Any other variant —
+/// `Object`/`Float`/`VirtualObject`, or an unresolved `Register`/`StackSlot`
+/// (which should never reach here) — returns `None`, signalling the caller to
+/// fall back to the safe re-run path rather than materialise a mistyped slot.
+///
+/// LIMITATION: a long/double resolves to `FrameValue::Int(bits)` and would be
+/// truncated by `Value::Int`; until per-slot width tags exist, methods with
+/// category-2 locals must not precise-resume. The all-`Int` requirement plus
+/// the default-OFF gate keep that case off the live path.
+fn ir_deopt_frame_values(vals: &[cratonvm_jit::deopt::FrameValue]) -> Option<Vec<Value>> {
+    use cratonvm_jit::deopt::FrameValue;
+    vals.iter()
+        .map(|v| match v {
+            FrameValue::Int(i) => Some(Value::Int(*i as i32)),
+            FrameValue::Undefined => Some(Value::Int(0)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Resume interpretation from an IR-path deopt: build a frame for the deopting
+/// method (`cached`) with the reconstructed locals/operand-stack and resume at
+/// the reconstructed bci. Returns `Some(FramePushed)` on success, or `None` to
+/// fall back to the re-run path (unmappable values, inlined caller chain, or
+/// held monitors — none handled in this first cut). Mirrors the frame-push
+/// ordering of `route_jit_exception_through_method` (refill pools, build via
+/// `Frame::new_pooled`, push, set pc) so GC-root and pool handling match.
+fn resume_from_ir_deopt(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    cached: &Arc<CachedBytecodeMethod>,
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+) -> Option<CachedCallResult> {
+    // Phase-A scope: single non-inlined frame, no held monitors.
+    if !rframe.caller_frames.is_empty() || !rframe.monitors.is_empty() {
+        return None;
+    }
+    let locals = ir_deopt_frame_values(&rframe.locals)?;
+    let stack_vals = ir_deopt_frame_values(&rframe.stack)?;
+
+    thread.refill_pools_from_shared(
+        &shared.operand_stack_pool,
+        &shared.tag_pool,
+        cached.max_locals as usize,
+        (cached.max_stack as usize).max(16) + 8,
+    );
+    let frame = crate::runtime::frame::Frame::new_pooled(
+        cached.declaring_class_id,
+        cached.class_name.clone(),
+        cached.method_name.clone(),
+        cached.method_descriptor.clone(),
+        cached.source_file.clone(),
+        cached.code.clone(),
+        cached.exception_table.clone(),
+        cached.max_stack,
+        cached.max_locals,
+        &locals,
+        &mut thread.locals_pool,
+        &mut thread.stacks_pool,
+    );
+    push_frame_and_fire_entry(thread, frame);
+    let idx = thread.frames.len() - 1;
+    for v in stack_vals {
+        thread.frames[idx].stack.push(v).ok()?;
+    }
+    thread.frames[idx].pc = rframe.bci as usize;
+    Some(CachedCallResult::FramePushed)
+}
+
 // ---------------------------------------------------------------------------
 // Instruction dispatch
 // ---------------------------------------------------------------------------
@@ -17138,6 +17220,35 @@ fn execute_jit_call(
         }
     }
 
+    // real-frame-deopt: IR-path deopt detection. The IR lowerer's trampoline
+    // (`ir_deopt_entry`) stashes a reconstructed frame in `LAST_DEOPT` and
+    // returns `i64::MIN` WITHOUT setting `JIT_DEOPT_PENDING` (it lives in the
+    // jit crate, with no access to the VM flag), so an IR-path deopt is
+    // invisible to `deopt_signaled` and would otherwise be mistaken for a real
+    // `i64::MIN` return. Consume the stashed frame here (clearing it so it can
+    // never leak to the next JIT call): precise-resume at the trapping bci when
+    // enabled + mappable, else re-run the method from entry (`CacheMiss`),
+    // restoring the popped args first exactly like the `i64::MIN` arm below.
+    // Gated by the cached flag first, so the default-OFF path adds no
+    // thread-local access to the hot JIT-return path (no production IR method
+    // emits a deopt guard yet, so `LAST_DEOPT` is always empty regardless).
+    if ir_deopt_resume_enabled() {
+        if let Some(rframe) = cratonvm_jit::deopt::take_last_deopt() {
+            if let Some(r) = resume_from_ir_deopt(shared, thread, cached, &rframe) {
+                return Ok(r);
+            }
+            for i in 0..np {
+                let (cv, is_long) = saved_args[i];
+                if is_long {
+                    thread.frames[frame_idx].stack.push_compact_long(cv);
+                } else {
+                    thread.frames[frame_idx].stack.push_compact(cv);
+                }
+            }
+            return Ok(CachedCallResult::CacheMiss);
+        }
+    }
+
     // Deopt sentinel: i64::MIN means the method was deoptimized — fall through
     // to the interpreter slow path to re-execute. MEDIUM fix: only when the
     // out-of-band `deopt_signaled` flag confirms the JIT actually took the
@@ -17414,6 +17525,17 @@ fn execute_jit_call_decoded(
             }
             Err(other) => return Err(other),
         }
+    }
+
+    // real-frame-deopt: IR-path deopt detection (see the matching block at the
+    // fast sink). `ir_deopt_entry` stashes `LAST_DEOPT` and returns `i64::MIN`
+    // without setting `JIT_DEOPT_PENDING`, so consume the stashed frame here too
+    // (clearing it) and re-run the method from entry. Precise mid-bci resume is
+    // wired at the fast sink; this slow path falls back to re-run, which is
+    // correct for the side-effect-free methods that deopt today. Gated first so
+    // the default-OFF path adds nothing to the hot JIT-return path.
+    if ir_deopt_resume_enabled() && cratonvm_jit::deopt::take_last_deopt().is_some() {
+        return Ok(None);
     }
 
     // Deopt sentinel → interpreter fallback. The operand stack was never
