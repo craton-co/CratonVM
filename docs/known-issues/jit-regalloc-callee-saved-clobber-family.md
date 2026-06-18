@@ -132,6 +132,37 @@ what remains open is the **general** clobber.
   around the method's calls), fix the specific `emit_invoke_virtual`/`patch_self_calls`/
   `emit_inline_tlab_new`/`regalloc.rs` site, add a `bench/*` regression witness, then lift that ban.
 
+## Root-cause progress log
+
+### 2026-06-18 — a distinct JIT→JIT-reentry borrow-suspend gap (candidate fix on a WIP branch)
+
+While hunting the kafka-bug-C (`WeakHashMap` stream) hang, a scratch reproducer (`Dx4`: a field-
+post-increment `while (idx<hi || cur!=null)` loop driving `Consumer.accept` via **invokeinterface**
+to a JIT'd lambda) surfaced a **separate, deterministic** JIT soundness bug — and it is worth
+fixing in its own right:
+
+- **Symptom:** debug-build panic at `vm/src/jit/helpers.rs jit_thread_mut`: *"aliasing &mut
+  JvmThread borrow detected … sibling fabrication"*. Trigger needs BOTH the field-post-inc loop AND
+  invokeinterface-to-a-JIT'd-lambda (`invokevirtual` to a concrete class does NOT trip it — it
+  inlines and avoids the nested dispatch).
+- **Root cause:** `jit_invoke_virtual_mic`'s MIC-hit fast path (`helpers.rs` ~3506) re-enters the
+  compiled callee via `try_call_compiled_entry` while still holding this frame's `_jit_thread_guard`
+  borrow — **without** the `set_jit_thread` suspend the interpreter/bail path uses
+  (`interpreter.rs:3458/14908/16902/17237`). The nested invokeinterface dispatch's `jit_thread_mut`
+  is a legit child reborrow, but the tracker wasn't told → debug assert (and in **release**, where
+  the assert is compiled out, two un-suspended `&mut JvmThread` = aliasing UB). The 3 sibling fast-
+  path sites in `jit_invoke_dispatch` (2987/3036/3080) likely share the gap.
+- **Candidate fix:** branch `wip/jit-reentry-borrow-suspend` (NOT merged) wraps the re-entry in
+  `set_jit_thread`/`restore_jit_thread`. The panic goes away and normal `invokevirtual` dispatch
+  still works — **but** `Dx4` then *hangs in BOTH JIT and interpreter* (so `Dx4` is a *compound*
+  repro carrying a second, non-JIT bug, and is NOT a clean kafka-bug-C repro, which is JIT-only).
+  The `WeakHashMap` hang is unchanged. So this fix removes a real (masking) debug false-positive but
+  does not close the user-facing hang.
+- **Not merged because:** it is a HOT-PATH change (every MIC-hit dispatch), not yet regression-
+  verified, and doesn't fix the target hang. Next: regression-test it + extend to the 3
+  `jit_invoke_dispatch` sites; and build a JIT-*only* `WeakHashMap`-style repro (drop whatever makes
+  `Dx4` hang in the interpreter) to chase the actual clobber.
+
 ## Related
 
 - [kafka-bug-C-weakhashmap-stream-infinite-hang.md](kafka-bug-C-weakhashmap-stream-infinite-hang.md)
