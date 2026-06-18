@@ -839,6 +839,47 @@ fn al_slots(ctx: &dyn NativeContext) -> (usize, usize, usize) {
     }
 }
 
+/// Receiver-aware slot resolution for the shared ArrayList-backed list natives.
+///
+/// `java.util.Vector` (and its subclass `java.util.Stack`) are registered against
+/// the same `native_al_*` implementations, but Vector is **not** an ArrayList and
+/// has a different field layout: `elementData` + `elementCount` (NOT `size`) +
+/// `capacityIncrement`. Using ArrayList's `(elementData, size)` slots on a Vector
+/// reads/writes the wrong fields (and the layout guard rejects it), so every
+/// Vector/Stack mutation silently no-ops (DF08: `Vector.add`/`Stack.push` lost
+/// the element → Xerces external-DTD entity stack empty → "Premature end of
+/// file"). Resolve against the receiver's actual class instead.
+fn al_slots_for(ctx: &dyn NativeContext, this: ObjectRef) -> (usize, usize, usize) {
+    let cid = ctx.class_id_of_object(this);
+    if let Some(vec_id) = ctx.class_id_by_name("java/util/Vector") {
+        if cid == vec_id || ctx.is_subclass(cid, vec_id) {
+            if let (Some(d), Some(s)) = (
+                ctx.resolve_field_index("java/util/Vector", "elementData"),
+                ctx.resolve_field_index("java/util/Vector", "elementCount"),
+            ) {
+                return (d, s, std::cmp::max(d, s) + 1);
+            }
+        }
+    }
+    al_slots(ctx)
+}
+
+/// `true` iff `obj` has a list layout the `native_al_*` natives can read at the
+/// receiver-aware slots — ArrayList (or subclass) **or** Vector (or subclass,
+/// e.g. Stack). See [`al_is_arraylist_layout`] for the foreign-receiver rationale.
+fn al_is_list_layout(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    if al_is_arraylist_layout(ctx, obj) {
+        return true;
+    }
+    let cid = ctx.class_id_of_object(obj);
+    if let Some(vec_id) = ctx.class_id_by_name("java/util/Vector") {
+        if cid == vec_id || ctx.is_subclass(cid, vec_id) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Allocate an ArrayList instance, sized to fit whichever field layout the
 /// runtime is using. Initializes elementData and size to (buf, init_size).
 fn alloc_arraylist_with(
@@ -893,7 +934,7 @@ fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
     // throw, so callers reaching `al_state` are read-only. Mirrors the same
     // unwrap that `map_state` already performs for unmodifiable maps.
     let this = unwrap_unmod(ctx, this);
-    let (data_slot, size_slot, _) = al_slots(ctx);
+    let (data_slot, size_slot, _) = al_slots_for(ctx, this);
     // Receiver-layout guard. `al_state` is reached through `Collection`-
     // and `List`-interface natives (`size`, `forEach`, `stream`, …) whose
     // bytecode dispatcher can target *any* object — including non-list
@@ -922,7 +963,7 @@ fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
     // ArrayList slots when the receiver actually has ArrayList layout; otherwise
     // return the empty sentinel so the caller falls back to the receiver's own
     // `iterator()` (equals) / virtual dispatch.
-    if !al_is_arraylist_layout(ctx, this) {
+    if !al_is_list_layout(ctx, this) {
         return (None, 0);
     }
     let data = match ctx.get_field(this, data_slot) {
@@ -974,7 +1015,7 @@ fn collection_elements_generic(
 
 #[inline]
 fn al_set_data(ctx: &mut dyn NativeContext, this: ObjectRef, buf: ObjectRef) {
-    let (data_slot, _, _) = al_slots(ctx);
+    let (data_slot, _, _) = al_slots_for(ctx, this);
     // Receiver-layout guard — see `al_state` for rationale. Skip the write
     // entirely on a wrong-class receiver to avoid the out-of-bounds GC guard
     // warning that pairs with the read-side fix above.
@@ -986,7 +1027,7 @@ fn al_set_data(ctx: &mut dyn NativeContext, this: ObjectRef, buf: ObjectRef) {
 
 #[inline]
 fn al_set_size(ctx: &mut dyn NativeContext, this: ObjectRef, size: i32) {
-    let (_, size_slot, _) = al_slots(ctx);
+    let (_, size_slot, _) = al_slots_for(ctx, this);
     if size_slot >= ctx.object_num_fields(this) {
         return;
     }
@@ -7419,11 +7460,12 @@ fn native_al_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Int(0))),
     };
 
-    let data = match ctx.get_field(this, al_slots(ctx).0) {
+    let (al_data_slot, al_size_slot, _) = al_slots_for(ctx, this);
+    let data = match ctx.get_field(this, al_data_slot) {
         Value::Object(Some(arr)) => arr,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let size = match ctx.get_field(this, al_slots(ctx).1) {
+    let size = match ctx.get_field(this, al_size_slot) {
         Value::Int(s) => s as usize,
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -7477,11 +7519,12 @@ fn native_al_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(None),
     };
 
-    let data = match ctx.get_field(this, al_slots(ctx).0) {
+    let (al_data_slot, al_size_slot, _) = al_slots_for(ctx, this);
+    let data = match ctx.get_field(this, al_data_slot) {
         Value::Object(Some(arr)) => arr,
         _ => return Ok(None),
     };
-    let size = match ctx.get_field(this, al_slots(ctx).1) {
+    let size = match ctx.get_field(this, al_size_slot) {
         Value::Int(s) => s as usize,
         _ => return Ok(None),
     };
