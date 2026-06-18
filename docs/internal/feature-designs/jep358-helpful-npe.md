@@ -1,5 +1,15 @@
 # JEP 358 — Helpful NullPointerException Messages
 
+> **Increment 1 landed (2026-06-18).** Steps 1–5 implemented (step 6 JIT parity
+> skipped, deopt-gated). The interpreter null-receiver invoke site now emits the
+> HotSpot shape `Cannot invoke "Owner.name(params)" because "<expr>" is null`
+> via a bounded backward bytecode analysis (new `helpful_npe` module in
+> `vm/src/runtime/exceptions.rs`; producers: aload local/param incl.
+> `this`, getfield, getstatic, aaload, aconst_null). `getExtendedNPEMessage` is
+> un-stubbed (`native-builtins/src/lib.rs`) to surface the eagerly-stored
+> `detailMessage`. Tests: `exceptions.rs::helpful_npe_tests`. See the
+> public-docs copy of this file for the full per-step breakdown.
+
 Status: design / not started (foundation partially present). M. Synthesize
 HotSpot-style "Cannot invoke `String.length()` because `<expr>` is null"
 messages by analyzing the bytecode at the NPE throw site.

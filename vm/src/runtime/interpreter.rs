@@ -10984,6 +10984,100 @@ fn execute_invoke(
     execute_invoke_kind(shared, thread, frame_idx, cp_index, is_special, false)
 }
 
+/// JEP 358 — a [`CpResolver`] backed by the live constant pool of
+/// `current_class_id`. Acquires `class_manager.read_recursive()` per query; the
+/// whole helpful-NPE analysis runs once per thrown NPE (cold path), so the
+/// per-call lock cost is irrelevant.
+///
+/// [`CpResolver`]: crate::runtime::exceptions::helpful_npe::CpResolver
+struct CpPoolResolver<'a> {
+    shared: &'a SharedVm,
+    class_id: ClassId,
+}
+
+impl crate::runtime::exceptions::helpful_npe::CpResolver for CpPoolResolver<'_> {
+    fn field_ref(
+        &self,
+        cp_index: u16,
+    ) -> Option<crate::runtime::exceptions::helpful_npe::CpRef> {
+        use crate::runtime::exceptions::helpful_npe::CpRef;
+        let cm = self.shared.class_manager.read_recursive();
+        let class = cm.get_class(self.class_id)?;
+        if let Some(ConstantPoolEntry::FieldReference {
+            class_index,
+            name_and_type_index,
+        }) = class.constant_pool.get(cp_index)
+        {
+            let owner = class.constant_pool.get_class_name(*class_index)?.to_string();
+            let (name, _) = class.constant_pool.get_name_and_type(*name_and_type_index)?;
+            Some(CpRef::Field {
+                owner_internal: owner,
+                name: name.to_string(),
+            })
+        } else {
+            None
+        }
+    }
+
+    fn method_ref(
+        &self,
+        cp_index: u16,
+    ) -> Option<crate::runtime::exceptions::helpful_npe::CpRef> {
+        use crate::runtime::exceptions::helpful_npe::CpRef;
+        let cm = self.shared.class_manager.read_recursive();
+        let class = cm.get_class(self.class_id)?;
+        let (class_index, nat_index) = match class.constant_pool.get(cp_index) {
+            Some(ConstantPoolEntry::MethodReference {
+                class_index,
+                name_and_type_index,
+            })
+            | Some(ConstantPoolEntry::InterfaceMethodReference {
+                class_index,
+                name_and_type_index,
+            }) => (*class_index, *name_and_type_index),
+            _ => return None,
+        };
+        let owner = class.constant_pool.get_class_name(class_index)?.to_string();
+        let (name, desc) = class.constant_pool.get_name_and_type(nat_index)?;
+        Some(CpRef::Method {
+            owner_internal: owner,
+            name: name.to_string(),
+            descriptor: desc.to_string(),
+        })
+    }
+}
+
+/// JEP 358 — synthesize the HotSpot-style extended message for a null-receiver
+/// `invoke*` at the current bci. Always returns at least the action half
+/// (`Cannot invoke "Owner.name(params)"`); appends `because "<expr>" is null`
+/// when the bounded backward analysis can name the null expression.
+fn helpful_npe_invoke_message(
+    shared: &SharedVm,
+    thread: &JvmThread,
+    frame_idx: usize,
+    owner_internal: &str,
+    method_name: &str,
+    method_descriptor: &str,
+    num_params: usize,
+) -> String {
+    use crate::runtime::exceptions::helpful_npe;
+    let action = helpful_npe::action_invoke(owner_internal, method_name, method_descriptor);
+    let frame = &thread.frames[frame_idx];
+    // `last_instr_pc` is set by the dispatch loop to the bci of the opcode
+    // currently executing (here, the trapping invoke) — `pc` may already be
+    // advanced. This is the deopt-independent trapping bci the design doc
+    // relies on for the interpreter path.
+    let invoke_bci = frame.last_instr_pc;
+    let code = Arc::clone(&frame.code);
+    let resolver = CpPoolResolver {
+        shared,
+        class_id: frame.class_id,
+    };
+    let expr =
+        helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, num_params, &resolver);
+    helpful_npe::combine(&action, expr.as_deref())
+}
+
 /// Variant of `execute_invoke` that knows whether the source bytecode was
 /// `invokeinterface`. Only invokeinterface call sites pass `is_interface=true`;
 /// invokevirtual / invokespecial pass `false`. The flag gates γ's CP-resolved-
@@ -11696,8 +11790,25 @@ fn execute_invoke_kind(
                             eprintln!("  [{i}] {}.{}{} pc={}", cn, f.method_name(), f.method_descriptor(), f.pc);
                         }
                     }
+                    // JEP 358: build the HotSpot-style extended NPE message —
+                    // `Cannot invoke "Owner.name(params)" because "<expr>" is
+                    // null`. The action half is always present; the `because`
+                    // clause is added when the bounded backward bytecode
+                    // analysis can name the null receiver expression
+                    // (aload local/param, getfield, getstatic, aaload). The
+                    // trapping bci is `last_instr_pc`, always known here in the
+                    // interpreter, so this is deopt-independent.
+                    let npe_msg = helpful_npe_invoke_message(
+                        shared,
+                        thread,
+                        frame_idx,
+                        &method_class_name,
+                        &method_name,
+                        &method_descriptor,
+                        num_params,
+                    );
                     return Err(RuntimeError::NullPointerException {
-                        message: Some(format!("Cannot invoke {method_name} on null")),
+                        message: Some(npe_msg),
                     }
                     .into());
                 }
