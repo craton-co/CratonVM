@@ -94,12 +94,19 @@ the idle Cleaner daemon is dumpable; the work thread is stuck in a native
 `WaitForSingleObjectEx`) — the documented JTA / synthetic-socket-loopback Layer-2
 hang, which the class-loading storm had been masking.
 
-## Follow-ups (not this fix)
+## Follow-ups
 
-- The `ClassId(0)`-with-fields path still does `format!("…AnonymousObject${n}")` +
-  a `class_manager.write()` lock + two hash probes on **every** allocation. With
-  the scan gone these dominate the residual ~5× gap vs HotSpot. A per-`num_fields`
-  cached `ClassId` in `vm_exec::alloc_object` would make it truly O(1).
+- ✅ **DONE** — the `ClassId(0)`-with-fields path no longer does
+  `format!("…AnonymousObject${n}")` + a `class_manager.write()` lock + a
+  `class_manager.read()` clamp + an env-var lookup on **every** allocation.
+  `SharedVm.anon_class_cache` (a lock-free `[AtomicU32; 256]` indexed by field
+  count) caches the resolved synthetic ClassId; the first allocation per field
+  count resolves and stores it, every later one does a single relaxed atomic load
+  and allocates directly (the stub declares exactly `num_fields` fields, so the
+  clamp is a provable no-op). The bigger win is removing the **global
+  class-manager write-lock from the allocation hot path** (multi-thread
+  scalability), beyond the single-thread micro (~12–20%: 200k-node loop big-cp
+  1,553 ms → 1,360 ms). `vm/src/vm/vm_exec.rs`, `vm/src/vm/vm_init.rs`.
 - The deeper JAXB-test hang is the JTA/XA + synthetic-socket-loopback cluster
   (separate handoff).
 

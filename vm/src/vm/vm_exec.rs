@@ -2520,8 +2520,29 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         let class_id = if class_id == ClassId::new(0) && num_fields > 0 {
             // One synthetic class per distinct field count, shared across
             // all callers — keeps the class store from growing unbounded.
+            //
+            // Hot path (every HashMap/LinkedHashMap node, view backing, …):
+            // the resolved `AnonymousObject$N` ClassId is cached lock-free in
+            // `shared.anon_class_cache`, so repeat allocations skip the name
+            // `format!`, the `class_manager` write-lock, and the synthetic-class
+            // hash probe. The stub declares exactly `num_fields` fields, so the
+            // slot-count clamp below is provably a no-op and is skipped too —
+            // we allocate directly. Env verdict is read once (OnceLock); when
+            // `CRATONVM_DBG_ANONALLOC` is set we force the slow path so the
+            // per-allocation stack dump still fires every time.
+            let dbg = {
+                static DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *DBG.get_or_init(|| std::env::var("CRATONVM_DBG_ANONALLOC").is_ok())
+            };
+            if !dbg && num_fields < crate::vm::ANON_CLASS_CACHE_LEN {
+                let cached = self.shared.anon_class_cache[num_fields]
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if cached != 0 {
+                    return self.shared.heap.alloc_object(ClassId::new(cached), num_fields);
+                }
+            }
             let name = format!("cratonvm/synthetic/AnonymousObject${num_fields}");
-            if std::env::var("CRATONVM_DBG_ANONALLOC").is_ok() {
+            if dbg {
                 let stack: Vec<String> = self
                     .thread
                     .frames
@@ -2542,10 +2563,19 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     stack.join("\n")
                 );
             }
-            self.shared
+            let cid = self
+                .shared
                 .class_manager
                 .write()
-                .ensure_synthetic_class(&name, num_fields)
+                .ensure_synthetic_class(&name, num_fields);
+            // Cache for the lock-free fast path above. Races are benign:
+            // `ensure_synthetic_class` is idempotent, so any racing thread
+            // stores the same id.
+            if num_fields < crate::vm::ANON_CLASS_CACHE_LEN {
+                self.shared.anon_class_cache[num_fields]
+                    .store(cid.as_u32(), std::sync::atomic::Ordering::Relaxed);
+            }
+            cid
         } else {
             class_id
         };

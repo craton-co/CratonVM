@@ -227,6 +227,14 @@ fn derive_locale() -> (String, String) {
 /// Multiple threads can hold `&SharedVm` simultaneously. Mutable access to
 /// individual subsystems is provided via `RwLock` (class_manager, statics,
 /// resolution_cache) or atomic operations (heap).
+/// Length of [`SharedVm::anon_class_cache`]. Indexed by instance-field count,
+/// so it bounds the largest field count served by the lock-free fast path;
+/// allocations with more fields than this fall back to the slow (locked) path.
+/// 256 comfortably covers every native synthetic allocation
+/// (`HashMap`/`LinkedHashMap` nodes, view backings, …), which use a handful of
+/// small field counts.
+pub const ANON_CLASS_CACHE_LEN: usize = 256;
+
 pub struct SharedVm {
     /// VM configuration (immutable after construction).
     pub config: VmConfig,
@@ -250,6 +258,22 @@ pub struct SharedVm {
 
     /// Object/array heap — generational GC with young + old gen.
     pub heap: VmHeap,
+
+    /// Lock-free cache of the shared `cratonvm/synthetic/AnonymousObject$N`
+    /// ClassId, indexed by field count `N` (slot 0 is unused — `num_fields > 0`
+    /// always on this path). `0` means "not yet resolved" — a valid sentinel
+    /// because these synthetic classes are minted with non-zero ClassIds
+    /// (`ClassId(0)` is `java/lang/Object`).
+    ///
+    /// `vm_exec::alloc_object` rewrites every `ClassId(0)`-with-fields
+    /// allocation (e.g. a `HashMap` node) to one of these synthetic classes.
+    /// The first allocation for a given `N` resolves it through
+    /// `ClassManager::ensure_synthetic_class` (a write-lock + name `format!` +
+    /// hash probe) and stores the id here; every later allocation reads the id
+    /// with a single relaxed atomic load and skips the class-manager locks
+    /// entirely. The synthetic stub declares exactly `N` fields, so the
+    /// field-count clamp is a provable no-op and is skipped on the fast path.
+    pub anon_class_cache: [std::sync::atomic::AtomicU32; ANON_CLASS_CACHE_LEN],
 
     /// Native method registry (immutable after construction).
     pub native_methods: NativeMethodRegistry,
@@ -2180,6 +2204,7 @@ impl SharedVm {
             offload_registry,
             class_manager: RwLock::new(class_manager),
             heap,
+            anon_class_cache: std::array::from_fn(|_| AtomicU32::new(0)),
             native_methods,
             native_method_cache: parking_lot::RwLock::new(crate::runtime::fx_collections::fx_hashmap()),
             statics: RwLock::new(FxHashMap::default()),
