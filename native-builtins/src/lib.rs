@@ -18714,6 +18714,24 @@ const CB_FIELD_BROKEN: usize = 2;
 /// SECONDS.toMillis(Long.MAX_VALUE)`; a wrapped negative value made every fresh
 /// sensor report `hasExpired() == true`, so `Sensor.add(...)` silently dropped
 /// every metric and `metrics.metric(name)` returned null.
+/// Read a `java.util.concurrent.TimeUnit`'s ordinal robustly.
+///
+/// The real `TimeUnit` is a JDK enum: its ordinal lives in the `Enum` base field
+/// `ordinal`, while object slot 0 holds the enum `name` (a `String`). Several
+/// timed natives historically read slot 0 for the ordinal — which works in their
+/// unit tests (they build a synthetic 1-field TimeUnit with the ordinal at slot
+/// 0) but is WRONG for the real enum the JDK passes: `await(N, SECONDS)` then
+/// read the `name` String, fell back to MILLISECONDS, and waited `N` ms instead
+/// of `N` seconds — so `CountDownLatch.await(10, SECONDS)` returned `false`
+/// almost immediately (ES `RestClient*IntegTests` async assertions). Prefer the
+/// named `ordinal` field; fall back to slot 0 for the synthetic test object.
+fn time_unit_ordinal(ctx: &dyn NativeContext, u: ObjectRef) -> i32 {
+    match ctx.get_field_by_name(u, "ordinal") {
+        Value::Int(o) => o,
+        _ => ctx.get_field(u, 0).as_int().unwrap_or(2),
+    }
+}
+
 fn convert_time_unit_to_millis(value: i64, ordinal: i32) -> i64 {
     // Saturating multiply mirroring TimeUnit.x: clamp to i64::MAX / i64::MIN
     // when the magnitude would overflow.
@@ -22509,7 +22527,7 @@ fn native_cdl_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => 0,
     };
     let unit_ordinal = match args.get(2) {
-        Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+        Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
         _ => 2, // MILLISECONDS
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);

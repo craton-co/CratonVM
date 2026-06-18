@@ -1748,8 +1748,8 @@ fn sk_table() -> &'static parking_lot::RwLock<FxHashMap<i32, SkState>> {
 /// stale ObjectRef values for any entry whose underlying objects moved;
 /// see the SkState doc-block for the residual behaviour.
 #[allow(dead_code)]
-pub fn sk_table_update_after_gc(
-    pointer_map: &FxHashMap<usize, usize>,
+pub fn sk_table_update_after_gc<S: std::hash::BuildHasher>(
+    pointer_map: &std::collections::HashMap<usize, usize, S>,
 ) {
     if pointer_map.is_empty() {
         return;
