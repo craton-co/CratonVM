@@ -5685,6 +5685,17 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
             Ok(0) => break,
             Ok(n) => {
                 buf.extend_from_slice(&tmp[..n]);
+                // Fast-reject non-HTTP traffic: every HTTP request line starts
+                // with an uppercase-ASCII method token (GET/POST/PUT/...). A TLS
+                // ClientHello (0x16 ...) or other binary garbage never will, so
+                // bail immediately instead of blocking the (now-blocking) read
+                // until the timeout. Without this, an HTTPS client against the
+                // plaintext synthetic server (com.sun.net.httpserver.HttpsServer
+                // is not TLS-capable here) would hang the whole suite waiting for
+                // a ServerHello that never comes — RestClientBuilderIntegTests.
+                if !buf.is_empty() && !buf[0].is_ascii_uppercase() {
+                    return None;
+                }
                 // Restart 3 bytes before the previously-scanned end so a
                 // terminator split across the boundary is not missed (saturating
                 // so the first read starts at 0).
@@ -6031,7 +6042,10 @@ fn re10_dispatch_pending(
         let _ = len_hint;
         let is_head = req.method.eq_ignore_ascii_case("HEAD");
         if !is_head {
-            let _ = write!(&mut resp, "Content-Length: {}\r\n", body_bytes.len());
+            // Casing matters: the real com.sun.net.httpserver emits "Content-length"
+            // (lowercase 'l') and ES assertHeaders compares header names
+            // case-sensitively against that exact spelling.
+            let _ = write!(&mut resp, "Content-length: {}\r\n", body_bytes.len());
         }
         resp.extend_from_slice(b"Connection: close\r\n\r\n");
         if !is_head {
@@ -6276,6 +6290,15 @@ fn re10_start_server(server_id: i32) -> std::io::Result<()> {
             while state_cl.running.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _peer)) => {
+                        // If the server was stopped between accept() returning and
+                        // now, close the connection instead of queueing a request no
+                        // dispatcher will serve — a stopped host must fail fast (so
+                        // the RestClient retries another node) rather than hang the
+                        // request. See ES MultipleHosts stopRandomHost.
+                        if !state_cl.running.load(Ordering::SeqCst) {
+                            drop(stream);
+                            break;
+                        }
                         // Parse each connection on its own short-lived thread so a
                         // slow (or merely not-yet-written) request never blocks the
                         // accept loop. Serially parsing here let the OS listen
@@ -6299,6 +6322,9 @@ fn re10_start_server(server_id: i32) -> std::io::Result<()> {
                     Err(_) => break,
                 }
             }
+            // Drop our listener clone promptly so the OS socket can close and a
+            // stopped host starts refusing connections.
+            drop(listener);
         })?;
     Ok(())
 }
@@ -6400,6 +6426,35 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(hctx))))
         },
     );
+
+    // removeContext(String path) — drop the handler registered for that exact
+    // path (ES MultipleHosts resetWaitHandlers swaps the "/wait" handler).
+    r.register(hs, "removeContext", "(Ljava/lang/String;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let path = value_or_string(ctx, args.get(1).copied().unwrap_or(Value::Object(None)), "");
+        let id = ctx.get_field(this, HS_SERVER_ID).as_int().unwrap_or(-1);
+        if id >= 0 {
+            if let Some(state) = server_registry().lock().get(&id) {
+                state.handlers.lock().retain(|e| e.path_prefix != path);
+            }
+        }
+        Ok(None)
+    });
+    // removeContext(HttpContext ctx) — same, resolving the path from the context's
+    // slot 0 (set by createContext).
+    r.register(hs, "removeContext", "(Lcom/sun/net/httpserver/HttpContext;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let id = ctx.get_field(this, HS_SERVER_ID).as_int().unwrap_or(-1);
+        if let Some(Value::Object(Some(hctx))) = args.get(1).copied() {
+            let path = value_or_string(ctx, ctx.get_field(hctx, 0), "");
+            if id >= 0 {
+                if let Some(state) = server_registry().lock().get(&id) {
+                    state.handlers.lock().retain(|e| e.path_prefix != path);
+                }
+            }
+        }
+        Ok(None)
+    });
 
     r.register(
         hs,

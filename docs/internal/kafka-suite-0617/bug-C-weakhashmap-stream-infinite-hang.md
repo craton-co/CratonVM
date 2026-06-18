@@ -6,8 +6,39 @@
 | **Kind** | Hang / infinite loop (TIMEOUT @ 600s) |
 | **Surfaced by** | The whole `org.apache.kafka.clients.consumer.internals.*` TIMEOUT cluster (13+ classes), starting with the trivial `ConsumerRecordsTest` |
 | **CratonVM** | TIMEOUT · **HotSpot** OK |
-| **Status** | OPEN — root-caused with 3-line repro |
-| **Recommendation** | **Fix** — small, well-scoped (WeakHashMap stream/spliterator path); unblocks a large hang cluster |
+| **Status** | **FIXED** (CratonVM-subfix) — root-caused to a JIT field-write miscompile; fixed via JIT skip-list |
+| **Recommendation** | Fixed; underlying JIT field-write codegen defect tracked for a general fix |
+
+## FIX (2026-06-17)
+
+Confirmed a **JIT miscompile**, not a stream/weakref-semantics bug:
+
+- `--nojit` → `WS_count` prints `count=5 / DONE`, rc=0. Default (JIT on) → hangs (rc=124).
+- `CRATONVM_JIT_VIRTUAL_TIERUP=0` still hangs (so it's not the instance-method invocation
+  tier-up path).
+- Keep-only bisection (`CRATONVM_JIT_BISECT_SKIP`) pinpointed the culprit to a **single
+  method**: `java/util/WeakHashMap$ValueSpliterator.tryAdvance`. Skipping just that → rc=0;
+  skipping `forEachRemaining` or `expungeStaleEntries` alone does **not** help.
+
+`tryAdvance`'s loop advances purely through the spliterator **instance fields** `index`
+(`current = tab[index++]`) and `current` (`current = current.next`). The JIT'd body never
+persists those field writes, so `index` stays 0 and the loop spins forever — re-calling
+`getFence()→size()→expungeStaleEntries()→ReferenceQueue.poll()` every iteration (exactly the
+`--stack-dump-on-timeout` trace). This is the same field-write miscompile family as the
+already-banned `HashMap$HashIterator` / `WeakHashMap$HashIterator` methods.
+
+**Fix:** added `WeakHashMap$ValueSpliterator.tryAdvance` (plus the structurally identical
+`KeySpliterator`/`EntrySpliterator.tryAdvance`, pre-emptively, for `keySet()`/`entrySet()`
+streams) to the JIT skip-list (`vm/src/jit/skip_list.rs::is_known_miscompile`) — the
+codebase's sanctioned mechanism for a known-miscompiled library method. `tryAdvance` is a
+tiny method, so forcing interpreter dispatch has negligible perf cost. Regression assertions
+added to `tier1_skip_list_targeted_entries_are_only_known_miscompiles`.
+
+The underlying JIT instance-field-write codegen defect remains for a general fix (shared with
+the HashIterator family).
+
+---
+_Original investigation notes below (pre-fix)._
 
 ## Symptom
 
