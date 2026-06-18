@@ -2411,9 +2411,25 @@ impl<'a> X509Cert<'a> {
     /// * ECDSA / DSA links surface as [`TrustError::NotImplemented`]
     ///   (no EC point arithmetic reachable — see module docs).  This
     ///   keeps the chain fail-closed.
-    /// * The synthetic [`OID_STUB_SIG`] path is retained for the
-    ///   in-process test fixtures only.
+    /// * The synthetic [`OID_STUB_SIG`] acceptance path exists ONLY under
+    ///   `cfg(test)` (it is a test backdoor — see the security note in the
+    ///   body).  In a production build it is compiled out, so an
+    ///   `OID_STUB_SIG` cert is an unknown algorithm and surfaces as
+    ///   [`TrustError::NotImplemented`] (fail-closed).
     pub fn link_signature_ok(&self, parent: &X509Cert) -> Result<(), TrustError> {
+        // SECURITY (cert-chain signature bypass): the synthetic
+        // [`OID_STUB_SIG`] acceptance path is an in-process TEST backdoor —
+        // it accepts a link on `signature == SHA-256(tbs || parent.subject_dn)`
+        // with NO real-crypto verification and NO trust-store consultation.
+        // `sig_alg_oid` is an attacker-controllable certificate field, so in a
+        // production build this branch would let a forged chain validate.  It
+        // is therefore compiled out of non-test builds entirely: a real binary
+        // never contains this code.  Under `cfg(test)` it remains available for
+        // the in-crate X.509-shaped fixtures (see the `tests` module).  In
+        // production an `OID_STUB_SIG` cert is an unknown algorithm and falls
+        // through to `verify_signature_with_spki`, which returns `Unsupported`
+        // → `NotImplemented` (fail-closed).
+        #[cfg(test)]
         if self.sig_alg_oid == OID_STUB_SIG {
             // Test-only computation: SHA-256(tbs_der || parent.subject_dn).
             let mut buf = Vec::with_capacity(self.tbs_der.len() + parent.subject_dn.len());
@@ -2701,6 +2717,31 @@ fn check_ca_ext_facts(facts: &CertExtFacts, ca_certs_below: usize) -> Result<(),
     Ok(())
 }
 
+/// SECURITY (cert-chain signature bypass): is `cert` a synthetic
+/// [`OID_STUB_SIG`] test fixture whose dummy validity dates / missing
+/// extensions should be skipped?
+///
+/// In a **production** build this is hard-wired to `false` so the
+/// `OID_STUB_SIG` skip-branches in [`verify_chain`] (which would otherwise
+/// bypass `cert_dates_ok` and the RFC 5280 extension checks on the strength
+/// of the attacker-controllable `signatureAlgorithm` OID) can never be
+/// taken — date and extension validation always apply.  The stub recognition
+/// only exists under `cfg(test)` for the in-crate fixtures.
+#[cfg(test)]
+#[inline]
+fn is_stub_sig_fixture(cert: &X509Cert) -> bool {
+    cert.sig_alg_oid == OID_STUB_SIG
+}
+
+/// Production stub: `OID_STUB_SIG` fixtures do not exist outside tests, so
+/// every cert is treated as a real cert and gets full date / extension
+/// validation.  See the `cfg(test)` variant above for the rationale.
+#[cfg(not(test))]
+#[inline]
+fn is_stub_sig_fixture(_cert: &X509Cert) -> bool {
+    false
+}
+
 /// Walk `leaf` → `intermediates` → `trust_store` building a chain.
 ///
 /// At each step the current cert's `issuer` DN is looked up first
@@ -2730,14 +2771,16 @@ pub fn verify_chain<'a>(
 
     // Leaf validity window must include "now" (skip for the synthetic
     // stub-sig fixtures, whose dummy validity dates aren't real times).
-    if leaf.sig_alg_oid != OID_STUB_SIG && !cert_dates_ok(leaf) {
+    if !is_stub_sig_fixture(leaf) && !cert_dates_ok(leaf) {
         return Err(TrustError::Expired);
     }
 
     // FEAT(jar-signer): RFC 5280 leaf extension checks (KeyUsage /
     // ExtendedKeyUsage / unknown-critical).  Skipped for stub-sig
-    // fixtures (which carry no extensions and aren't real certs).
-    if leaf.sig_alg_oid != OID_STUB_SIG {
+    // fixtures (which carry no extensions and aren't real certs) —
+    // `is_stub_sig_fixture` is hard-`false` in production builds, so the
+    // checks always run there.
+    if !is_stub_sig_fixture(leaf) {
         let facts = extract_ext_facts(leaf.full_der)?;
         check_leaf_ext_facts(&facts)?;
     }
@@ -2749,12 +2792,12 @@ pub fn verify_chain<'a>(
     for _step in 0..MAX_CHAIN_LEN {
         if let Some(anchor) = trust_store.find_anchor_by_subject(current.issuer_dn) {
             let parent = X509Cert::parse(&anchor.der).map_err(|_| TrustError::Malformed)?;
-            if parent.sig_alg_oid != OID_STUB_SIG && !cert_dates_ok(&parent) {
+            if !is_stub_sig_fixture(&parent) && !cert_dates_ok(&parent) {
                 return Err(TrustError::Expired);
             }
             // FEAT(jar-signer): the anchor certifies `current`, so it acts
             // as a CA — enforce BasicConstraints / KeyUsage on it.
-            if parent.sig_alg_oid != OID_STUB_SIG {
+            if !is_stub_sig_fixture(&parent) {
                 let facts = extract_ext_facts(parent.full_der)?;
                 check_ca_ext_facts(&facts, ca_certs_below)?;
             }
@@ -2770,13 +2813,13 @@ pub fn verify_chain<'a>(
                 if visited.iter().any(|v| v.as_slice() == parent.subject_dn) {
                     return Err(TrustError::Cyclic);
                 }
-                if parent.sig_alg_oid != OID_STUB_SIG && !cert_dates_ok(parent) {
+                if !is_stub_sig_fixture(parent) && !cert_dates_ok(parent) {
                     return Err(TrustError::Expired);
                 }
                 // FEAT(jar-signer): `parent` is an intermediate CA that
                 // certifies `current` — enforce CA constraints, counting
                 // the non-self-issued CAs already below it.
-                if parent.sig_alg_oid != OID_STUB_SIG {
+                if !is_stub_sig_fixture(parent) {
                     let facts = extract_ext_facts(parent.full_der)?;
                     check_ca_ext_facts(&facts, ca_certs_below)?;
                 }

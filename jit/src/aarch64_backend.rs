@@ -277,6 +277,30 @@ pub enum Arm64Instruction {
         rn: Arm64Register,
         offset: i32,
     },
+    /// Pre-index STP with writeback: `STP rt1, rt2, [rn, #offset]!`.
+    ///
+    /// Bug-fix (ARM64 BUG #2): the AAPCS64-idiomatic prologue store. The base
+    /// register `rn` is updated to `rn + offset` as part of the instruction,
+    /// which both saves the pair AND allocates the (first 16 bytes of the)
+    /// stack frame atomically. `offset` uses the small fixed −16, always inside
+    /// the imm7 range, so it is robust for arbitrarily large frames (unlike a
+    /// signed-offset STP at `frame_size-16`).
+    StpPre {
+        rt1: Arm64Register,
+        rt2: Arm64Register,
+        rn: Arm64Register,
+        offset: i32,
+    },
+    /// Post-index LDP with writeback: `LDP rt1, rt2, [rn], #offset`.
+    ///
+    /// Bug-fix (ARM64 BUG #2): the matching epilogue restore. Loads the pair
+    /// from `[rn]` then updates `rn = rn + offset`, mirroring [`StpPre`].
+    LdpPost {
+        rt1: Arm64Register,
+        rt2: Arm64Register,
+        rn: Arm64Register,
+        offset: i32,
+    },
     LdrLiteral {
         rt: Arm64Register,
         label: u32,
@@ -957,28 +981,54 @@ impl Arm64Backend {
         };
         let frame_size = frame.frame_size;
 
-        // Save FP and LR.
-        self.buffer.emit(Arm64Instruction::Stp {
+        // Bug-fix (ARM64 BUG #2, broken prologue SP/frame geometry):
+        //
+        // The previous prologue emitted a *signed-offset* (non-writeback) STP
+        // `[SP,#-16]`, which does NOT decrement SP, then `MOV FP,SP`, then
+        // `SUB SP,SP,#(frame-16)` under the false assumption that "16 was
+        // already consumed by STP". Because the STP never moved SP, the frame
+        // ended up 16 bytes too small at the bottom and, for a minimal frame,
+        // SP could sit *above* the saved FP/LR slots — corrupting the frame.
+        //
+        // New scheme (AAPCS64-idiomatic, FP at top of frame, all callee-save /
+        // spill offsets remain NEGATIVE from FP exactly as `Arm64FrameLayout`
+        // computes them — no layout change required):
+        //
+        //   1. STP FP, LR, [SP, #-16]!   (writeback) — saves the caller's
+        //      FP/LR and moves SP to old_SP-16. Small fixed offset, always in
+        //      imm7 range, so it is robust for arbitrarily large frames.
+        //   2. SUB SP, SP, #(frame-16)   — allocate the rest of the frame;
+        //      SP now = old_SP - frame_size (the bottom).
+        //   3. ADD FP, SP, #frame        — FP = old_SP (the top). The saved
+        //      caller FP/LR therefore live at [FP-16], matching
+        //      `callee_save_offset = -16 - callee_save_bytes` and the spill
+        //      slots below it.
+        //
+        // The matching epilogue reverses this exactly (see `emit_epilogue`).
+        self.buffer.emit(Arm64Instruction::StpPre {
             rt1: Arm64Register::FP,
             rt2: Arm64Register::LR,
             rn: Arm64Register::SP,
             offset: -16,
         });
 
-        // Set up frame pointer.
-        self.buffer.emit(Arm64Instruction::Mov {
-            rd: Arm64Register::FP,
-            rm: Arm64Register::SP,
-        });
-
-        // Allocate stack space.
+        // Allocate the remainder of the frame (the writeback STP already
+        // consumed the first 16 bytes).
         if frame_size > 16 {
             self.buffer.emit(Arm64Instruction::SubImm {
                 rd: Arm64Register::SP,
                 rn: Arm64Register::SP,
-                imm: frame_size - 16, // 16 already consumed by STP above
+                imm: frame_size - 16,
             });
         }
+
+        // Point FP at the top of the frame (old_SP). After this, the saved
+        // FP/LR pair from step 1 sits at [FP-16].
+        self.buffer.emit(Arm64Instruction::AddImm {
+            rd: Arm64Register::FP,
+            rn: Arm64Register::SP,
+            imm: frame_size,
+        });
 
         // Save callee-saved registers used for locals (in pairs).
         let saved = &frame.saved_regs.clone();
@@ -1039,16 +1089,24 @@ impl Arm64Backend {
             });
         }
 
-        // Restore SP from FP, then restore FP/LR.
-        self.buffer.emit(Arm64Instruction::Mov {
+        // Bug-fix (ARM64 BUG #2): reverse the writeback prologue exactly.
+        //
+        // The caller's FP/LR were saved at [FP-16] (see `emit_prologue`).
+        //   1. SUB SP, FP, #16          — SP = old_SP-16, the address the
+        //      post-index LDP loads from (mirror of the prologue's
+        //      `STP ...,[SP,#-16]!`).
+        //   2. LDP FP, LR, [SP], #16    — restore the caller's FP/LR, then
+        //      SP = old_SP (caller's stack pointer fully restored).
+        self.buffer.emit(Arm64Instruction::SubImm {
             rd: Arm64Register::SP,
-            rm: Arm64Register::FP,
+            rn: Arm64Register::FP,
+            imm: 16,
         });
-        self.buffer.emit(Arm64Instruction::Ldp {
+        self.buffer.emit(Arm64Instruction::LdpPost {
             rt1: Arm64Register::FP,
             rt2: Arm64Register::LR,
             rn: Arm64Register::SP,
-            offset: 0,
+            offset: 16,
         });
         self.buffer.emit(Arm64Instruction::Ret);
     }
@@ -2539,16 +2597,36 @@ impl Arm64Backend {
             }
         }
 
-        // Emit an indirect call placeholder (real target patched later).
-        let call_label = self.buffer.new_label();
-        self.buffer.emit(Arm64Instruction::Bl { label: call_label });
+        // Bug-fix (ARM64 BUG #3, infinite self-call): the previous code created
+        // a fresh `call_label`, emitted `Bl { label: call_label }`, and never
+        // bound it. The branch-patch loop in `emit_machine_code` leaves an
+        // unbound label as a "branch to self" (`BL .`), which at runtime is an
+        // infinite self-call / stack overflow. There is no resolved target
+        // address available at emit time here, so the only safe action is to
+        // bail to the interpreter for this method (AArch64 is the secondary
+        // backend; correctness and a safe fallback take priority over feature
+        // completeness). We set `self.failed`, which forces
+        // `Arm64CompileResult.success = false`, and emit a `Brk` trap so that
+        // any code path which mistakenly ignores `failed` still traps loudly
+        // rather than executing a broken self-call.
+        //
+        // (If a concrete call target ever becomes available at emit time, the
+        // correct lowering is `mov_imm64 IP0, <target>; BLR IP0` — the
+        // range-unlimited indirect form — followed by capturing the X0 result.
+        // Until then we must NOT emit any call.)
+        self.failed = true;
+        self.buffer.emit(Arm64Instruction::Comment(format!(
+            "ARM64 BUG #3: unresolved invoke ({} args) — bailing to interpreter",
+            num_args
+        )));
+        self.buffer.emit(Arm64Instruction::Brk { imm: 0 });
 
-        // Result in X0; push onto operand stack.
+        // Keep the operand stack shape consistent for the remainder of the
+        // (now-doomed) compilation pass: a call leaves one result value on the
+        // stack. We push a scratch placeholder so later pops do not underflow
+        // and mask the real failure cause. The emitted code is discarded
+        // because `success` is false.
         let dst = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::Mov {
-            rd: dst,
-            rm: Arm64Register::X0,
-        });
         self.push_operand(dst);
     }
 
@@ -3484,6 +3562,31 @@ fn to_cond(c: &Arm64Condition) -> crate::aarch64::Cond {
     }
 }
 
+/// Materialize the effective address `base + offset` into IP0 (X16).
+///
+/// Bug-fix (ARM64 BUG #1): used by the `Ldr`/`Str` lowering when `offset`
+/// falls outside the 9-bit signed range that LDUR/STUR can encode. We load the
+/// (possibly large, possibly negative) byte offset into IP0 with `mov_imm64`
+/// (sign-extended via the MOVN path for negatives) and add the base, so the
+/// subsequent zero-offset access never touches the base register's value. IP0
+/// (X16) is the AAPCS64 intra-procedure-call scratch register and is never a
+/// regalloc output, so clobbering it here is safe.
+fn emit_addr_into_ip0(
+    emitter: &mut crate::aarch64::Aarch64Emitter,
+    base: crate::aarch64::Reg,
+    offset: i32,
+) {
+    // IP0 = (i64)offset  (mov_imm64 picks MOVN for negative values, giving a
+    // correct two's-complement 64-bit value).
+    emitter.mov_imm64(crate::aarch64::Reg::X16, offset as i64 as u64);
+    // IP0 = base + IP0
+    emitter.add(
+        crate::aarch64::Reg::X16,
+        base,
+        crate::aarch64::Reg::X16,
+    );
+}
+
 /// Emit machine code bytes from the ARM64 pseudo-instruction sequence.
 /// Uses `Aarch64Emitter` from `aarch64.rs` to encode each instruction.
 pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
@@ -3593,18 +3696,39 @@ pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
             }
 
             // -- Load / Store --
+            //
+            // Bug-fix (ARM64 BUG #1, frame-slot corruption): plain
+            // `[base + #offset]` access must NEVER use the pre-index
+            // writeback form (`ldr_pre`/`str_pre`), which mutates the base
+            // register `base = base + offset` as a side effect. Every frame
+            // slot is addressed at a NEGATIVE offset from FP, so the old code
+            // corrupted FP on every spill/reload. Routing:
+            //   * offset >= 0 and 8-aligned and in scaled range → scaled
+            //     unsigned-offset LDR/STR (`ldr_imm`/`str_imm`);
+            //   * offset in the signed imm9 range (−256..=255) → unscaled
+            //     non-writeback LDUR/STUR (`ldur`/`stur`);
+            //   * otherwise → materialize the effective address into a scratch
+            //     (IP0/X16) and use a zero-offset access.
             Arm64Instruction::Ldr { rt, rn, offset } => {
-                if *offset >= 0 && *offset % 8 == 0 {
+                if *offset >= 0 && *offset % 8 == 0 && *offset <= 32760 {
                     emitter.ldr_imm(r(*rt), r(*rn), *offset as u16);
+                } else if (-256..=255).contains(offset) {
+                    emitter.ldur(r(*rt), r(*rn), *offset as i16);
                 } else {
-                    emitter.ldr_pre(r(*rt), r(*rn), *offset as i16);
+                    // Out of imm9 range: IP0 = base + offset, then LDR [IP0, #0].
+                    emit_addr_into_ip0(&mut emitter, r(*rn), *offset);
+                    emitter.ldur(r(*rt), crate::aarch64::Reg::X16, 0);
                 }
             }
             Arm64Instruction::Str { rt, rn, offset } => {
-                if *offset >= 0 && *offset % 8 == 0 {
+                if *offset >= 0 && *offset % 8 == 0 && *offset <= 32760 {
                     emitter.str_imm(r(*rt), r(*rn), *offset as u16);
+                } else if (-256..=255).contains(offset) {
+                    emitter.stur(r(*rt), r(*rn), *offset as i16);
                 } else {
-                    emitter.str_pre(r(*rt), r(*rn), *offset as i16);
+                    // Out of imm9 range: IP0 = base + offset, then STR [IP0, #0].
+                    emit_addr_into_ip0(&mut emitter, r(*rn), *offset);
+                    emitter.stur(r(*rt), crate::aarch64::Reg::X16, 0);
                 }
             }
             Arm64Instruction::Ldp {
@@ -3622,6 +3746,23 @@ pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
                 offset,
             } => {
                 emitter.stp(r(*rt1), r(*rt2), r(*rn), *offset as i16);
+            }
+            // Bug-fix (ARM64 BUG #2): writeback prologue/epilogue pair ops.
+            Arm64Instruction::StpPre {
+                rt1,
+                rt2,
+                rn,
+                offset,
+            } => {
+                emitter.stp_pre(r(*rt1), r(*rt2), r(*rn), *offset as i16);
+            }
+            Arm64Instruction::LdpPost {
+                rt1,
+                rt2,
+                rn,
+                offset,
+            } => {
+                emitter.ldp_post(r(*rt1), r(*rt2), r(*rn), *offset as i16);
             }
             Arm64Instruction::LdrLiteral { rt, label } => {
                 // Emit a real LDR (literal) instruction. The offset to the
@@ -4231,23 +4372,32 @@ mod tests {
     #[test]
     fn backend_prologue_emits_stp_fp_lr() {
         let result = make_backend_with_method(0, 0, &[0xb1]); // return void
+        // Bug-fix (ARM64 BUG #2): the prologue now uses the writeback
+        // `STP FP, LR, [SP, #-16]!` form (StpPre) so SP is decremented as part
+        // of the save, instead of the old non-writeback `Stp` with an unsound
+        // "16 already consumed" SUB fudge.
         let has_stp_fp_lr = result.instructions.iter().any(|inst| {
             matches!(
                 inst,
-                Arm64Instruction::Stp { rt1, rt2, .. }
+                Arm64Instruction::StpPre { rt1, rt2, offset: -16, .. }
                     if *rt1 == Arm64Register::FP && *rt2 == Arm64Register::LR
             )
         });
-        assert!(has_stp_fp_lr, "prologue must save FP/LR with STP");
+        assert!(
+            has_stp_fp_lr,
+            "prologue must save FP/LR with writeback STP (StpPre, #-16)"
+        );
     }
 
     #[test]
     fn backend_epilogue_emits_ldp_fp_lr_and_ret() {
         let result = make_backend_with_method(0, 0, &[0xb1]);
+        // Bug-fix (ARM64 BUG #2): the epilogue now restores FP/LR with the
+        // matching post-index `LDP FP, LR, [SP], #16` (LdpPost).
         let has_ldp = result.instructions.iter().any(|inst| {
             matches!(
                 inst,
-                Arm64Instruction::Ldp { rt1, rt2, .. }
+                Arm64Instruction::LdpPost { rt1, rt2, offset: 16, .. }
                     if *rt1 == Arm64Register::FP && *rt2 == Arm64Register::LR
             )
         });
@@ -4255,7 +4405,7 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| matches!(inst, Arm64Instruction::Ret));
-        assert!(has_ldp, "epilogue must restore FP/LR with LDP");
+        assert!(has_ldp, "epilogue must restore FP/LR with post-index LDP (LdpPost, #16)");
         assert!(has_ret, "epilogue must emit RET");
     }
 

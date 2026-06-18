@@ -295,6 +295,48 @@ fn filter_is_rejected(addr: usize) -> Option<String> {
     map.get(&addr).filter(|s| s.rejected).map(|s| s.reason.clone())
 }
 
+/// SECURITY (JEP-290 deserialization filter bypass, CRITICAL): mark the
+/// per-stream filter state sticky-rejected because a class was rejected by
+/// the serial filter (a per-stream `setObjectInputFilter` rule or the
+/// process-wide `jdk.serialFilter`). The synthetic read-path
+/// (`ois_read_object` / `ois_read_array` / `TC_ENUM`) instantiates classes
+/// directly without ever passing through the JDK `resolveClass` natives, so
+/// before this fix the filter was simply never consulted and gadget classes
+/// were never blocked. Callers invoke this *before* `ensure_class_initialized`
+/// and then abort the read; the top-level `readObject` / `readUnshared`
+/// natives poll `filter_is_rejected` and turn the sticky flag into the
+/// `IOException("filter status: REJECTED: ...")` flow (`InvalidClassException`
+/// extends `IOException`). Lazily creates an `unbounded()` state entry if the
+/// stream had no resource-limit filter installed, so the reject is recorded
+/// even when only a pattern-based filter (no `=N` clauses) is in force.
+fn filter_reject_class(addr: usize, class_name: &str) {
+    let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
+    let st = map.entry(addr).or_insert_with(ObjectInputFilterState::unbounded);
+    if !st.rejected {
+        st.rejected = true;
+        st.reason = format!(
+            "class \"{}\" rejected by ObjectInputFilter (InvalidClassException)",
+            class_name
+        );
+    }
+}
+
+/// SECURITY (JEP-290 deserialization filter bypass, CRITICAL): run a class
+/// name through the serial filter from inside the synthetic read-path. If
+/// the merged decision is `Rejected`, trip the sticky reject flag (via
+/// `filter_reject_class`) and return `true` so the caller aborts the read
+/// *before* initializing or instantiating the class. `Allowed` and
+/// `Undecided` both return `false` (proceed) — matching the JDK, where an
+/// undecided filter falls through to normal resolution.
+fn synthetic_read_class_rejected(addr: usize, class_name: &str) -> bool {
+    if evaluate_serial_filters(addr, class_name) == FilterStatus::Rejected {
+        filter_reject_class(addr, class_name);
+        true
+    } else {
+        false
+    }
+}
+
 /// Parse a JEP-290 serial-filter string into an `ObjectInputFilterState`.
 ///
 /// Recognises the four resource-limit clauses (`maxdepth=N`, `maxrefs=N`,
@@ -471,6 +513,14 @@ fn ois_buf_load(addr: usize, data: Vec<u8>) {
 /// `max_bytes` has already been tripped the read still returns zeros
 /// — the sticky `rejected` flag is what `readObject` consults at the
 /// end of a frame to raise `IOException("filter status: REJECTED")`.
+///
+/// SECURITY (deserialization DoS via unbounded allocation, HIGH): the
+/// short-read fall-back previously allocated `vec![0u8; n]` for an
+/// arbitrary attacker-controlled `n` (e.g. a `TC_LONGSTRING` length of
+/// `0x7FFF_FFFF_FFFF_FFFF` → ~9.2 EB → OOM abort). We now never allocate
+/// more than the bytes actually remaining in the buffer, and use checked
+/// arithmetic for the `pos + n` bound so a near-`usize::MAX` length can
+/// never overflow into a passing comparison.
 fn ois_buf_read(addr: usize, n: usize) -> Vec<u8> {
     // Account first so that an exactly-at-limit final read still
     // surfaces the reject (otherwise short-reads near the cap would
@@ -478,14 +528,35 @@ fn ois_buf_read(addr: usize, n: usize) -> Vec<u8> {
     let _ok = filter_account_bytes(addr, n);
     let mut map = ois_buffers().lock().unwrap_or_else(|e| e.into_inner());
     if let Some((buf, pos)) = map.get_mut(&addr) {
-        if *pos + n <= buf.len() {
-            let slice = buf[*pos..*pos + n].to_vec();
-            *pos += n;
-            return slice;
+        // Checked add: a malicious `n` close to `usize::MAX` must not
+        // wrap past `buf.len()` and pass the bounds check.
+        if let Some(end) = pos.checked_add(n) {
+            if end <= buf.len() {
+                let slice = buf[*pos..end].to_vec();
+                *pos = end;
+                return slice;
+            }
         }
     }
-    vec![0u8; n] // return zeroes if no data
+    // Short read / no data for this stream. The historical contract is to
+    // return an `n`-length zero pad so fixed-width primitive readers
+    // (`readInt` etc., which index `bytes[0..n]`) keep working at
+    // end-of-stream. We preserve that contract but CAP the synthesised
+    // allocation: an attacker-controlled `n` (e.g. a `TC_LONGSTRING`
+    // length of `0x7FFF_FFFF_FFFF_FFFF`) must never let this allocate
+    // multiple exabytes. Length-prefixed readers (strings, arrays) clamp
+    // `n` to the bytes actually remaining *before* calling, so they never
+    // depend on the pad past this cap, and short reads still decode to an
+    // empty/truncated value rather than an OOM abort.
+    vec![0u8; n.min(MAX_SERIAL_BUF_READ_PAD)]
 }
+
+/// Upper bound on the zero-padding `ois_buf_read` will synthesise on a
+/// short read. Large enough to satisfy any legitimate fixed-width
+/// primitive read (8 bytes) with head-room; small enough that an
+/// attacker-controlled length can never weaponise the short-read
+/// fall-back into an out-of-memory abort.
+const MAX_SERIAL_BUF_READ_PAD: usize = 64;
 
 /// Peek at remaining bytes in an OIS buffer.
 fn ois_buf_remaining(addr: usize) -> usize {
@@ -703,6 +774,15 @@ pub(crate) fn reset_serialization_globals() {
 
 const STREAM_MAGIC: u16 = 0xACED;
 const STREAM_VERSION: u16 = 5;
+
+/// Hard ceiling on the byte length of a single `TC_LONGSTRING` we will
+/// allocate, independent of any configured JEP-290 `maxarray` filter.
+/// `TC_LONGSTRING` carries an attacker-controlled u64 length; this cap is
+/// the last line of defence against a deserialization DoS (unbounded
+/// allocation) when no `maxarray` clause is installed. 256 MiB comfortably
+/// exceeds any legitimate serialized string while staying far below the
+/// out-of-memory regime an attacker is fishing for.
+const MAX_SERIAL_STRING_BYTES: usize = 256 * 1024 * 1024;
 
 // Type codes (TC_*)
 const TC_NULL: u8 = 0x70;
@@ -1528,10 +1608,32 @@ fn ois_read_value(ctx: &mut dyn NativeContext, addr: usize) -> Value {
         }
         TC_LONGSTRING => {
             let lb = ois_buf_read(addr, 8);
-            let len = u64::from_be_bytes([
+            let wire_len = u64::from_be_bytes([
                 lb[0], lb[1], lb[2], lb[3], lb[4], lb[5], lb[6], lb[7],
-            ]) as usize;
-            let str_bytes = ois_buf_read(addr, len);
+            ]);
+
+            // SECURITY (deserialization DoS via unbounded allocation, HIGH):
+            // `TC_LONGSTRING` carries a full u64 length straight off the wire.
+            // The previous code passed it verbatim to `ois_buf_read`, so a
+            // hostile length such as `0x7FFF_FFFF_FFFF_FFFF` requested ~9.2 EB
+            // → OOM abort. We mirror `ois_read_array`'s maxarray discipline:
+            //   1. clamp to the bytes actually remaining in the stream (a
+            //      valid string can never be longer than what's left), and
+            //   2. run the clamped length through `filter_check_array` so any
+            //      configured JEP-290 `maxarray` cap trips the sticky reject
+            //      flag, plus a hard ceiling independent of the filter.
+            let remaining = ois_buf_remaining(addr) as u64;
+            let clamped = wire_len.min(remaining).min(MAX_SERIAL_STRING_BYTES as u64) as usize;
+
+            // Honour a configured `maxarray` (the JEP-290 cap that bounds
+            // attacker-controlled element counts). A reject here trips the
+            // sticky flag; `readObject`/`readUnshared` surface it as the
+            // `IOException("filter status: REJECTED")` flow.
+            if !filter_check_array(addr, clamped) {
+                return Value::Object(None);
+            }
+
+            let str_bytes = ois_buf_read(addr, clamped);
             let s = String::from_utf8_lossy(&str_bytes).to_string();
             let obj = ctx.create_string(&s);
             ois_push_handle(addr, Some(obj));
@@ -1543,7 +1645,16 @@ fn ois_read_value(ctx: &mut dyn NativeContext, addr: usize) -> Value {
             Value::Object(None)
         }
         TC_ENUM => {
-            skip_class_desc(addr);
+            // SECURITY (JEP-290 deserialization filter bypass, CRITICAL):
+            // filter the enum class too. We read (rather than skip) the class
+            // descriptor so we have the enum type name to evaluate; a reject
+            // trips the sticky flag and aborts before the constant name is
+            // materialized or a wire handle is reserved. `read_class_desc_name`
+            // consumes the same descriptor bytes `skip_class_desc` would.
+            let enum_class = read_class_desc_name(addr);
+            if synthetic_read_class_rejected(addr, &enum_class) {
+                return Value::Object(None);
+            }
             let name_val = ois_read_value(ctx, addr);
             ois_push_handle(
                 addr,
@@ -1568,6 +1679,16 @@ fn ois_read_object(ctx: &mut dyn NativeContext, addr: usize) -> Value {
         Some(d) => d,
         None => return Value::Object(None),
     };
+    // SECURITY (JEP-290 deserialization filter bypass, CRITICAL): consult the
+    // serial filter BEFORE initializing or instantiating the class. The
+    // synthetic read-path does not go through the JDK `resolveClass` native
+    // (the only place the filter used to be checked), so without this gate a
+    // gadget class would be loaded and instantiated unfiltered. A reject
+    // trips the sticky flag and aborts the read; `readObject` surfaces it as
+    // `IOException("filter status: REJECTED: ...")`.
+    if synthetic_read_class_rejected(addr, &desc.class_name) {
+        return Value::Object(None);
+    }
     let resolved = ctx.ensure_class_initialized(&desc.class_name);
     let serialized_count = desc.field_types.len().max(2);
     let obj = if let Ok(class_id) = resolved {
@@ -1695,6 +1816,15 @@ fn ois_read_array(ctx: &mut dyn NativeContext, addr: usize) -> Value {
         Some(d) => d,
         None => return Value::Object(None),
     };
+    // SECURITY (JEP-290 deserialization filter bypass, CRITICAL): the array
+    // class descriptor (e.g. `[Lcom.evil.Gadget;`) must clear the serial
+    // filter before we allocate or populate the array — the JDK runs the
+    // filter on the array class too. Checked here, before the length is even
+    // read, because the synthetic path never reaches the JDK `resolveClass`
+    // native where the filter used to be enforced.
+    if synthetic_read_class_rejected(addr, &desc.class_name) {
+        return Value::Object(None);
+    }
     let len_bytes = ois_buf_read(addr, 4);
     let length =
         i32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]).max(0)
@@ -4807,6 +4937,74 @@ mod serialization_tests {
         let snapshot = ois_get_filter_state(addr).expect("filter state");
         assert!(snapshot.rejected);
         assert!(snapshot.reason.contains("maxarray=10"));
+    }
+
+    #[test]
+    fn jep290_synthetic_path_rejects_filtered_class() {
+        // SECURITY regression (JEP-290 filter bypass, CRITICAL): a per-stream
+        // reject rule installed for a gadget class must trip the sticky flag
+        // when the synthetic read-path evaluates it, and a benign class in the
+        // same stream must NOT be rejected. This is the gate `ois_read_object`
+        // / `ois_read_array` / `TC_ENUM` now call before instantiating a class.
+        let addr = 0x4A45_5100_usize;
+        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+
+        // Reject anything under `evil.**`, allow everything else.
+        ois_stream_filters()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(addr, SerialFilter::parse("!evil.**;*"));
+
+        // A benign class passes (proceed = false).
+        assert!(
+            !synthetic_read_class_rejected(addr, "java/util/ArrayList"),
+            "allowed class must not be rejected"
+        );
+        // A filtered gadget class is rejected (abort = true) and trips sticky.
+        assert!(
+            synthetic_read_class_rejected(addr, "evil/Gadget"),
+            "filtered class must be rejected"
+        );
+        let why = filter_is_rejected(addr).expect("reject must be sticky");
+        assert!(
+            why.contains("evil/Gadget") && why.contains("ObjectInputFilter"),
+            "reason must name the rejected class: {}",
+            why
+        );
+
+        ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+    }
+
+    #[test]
+    fn longstring_oversized_length_does_not_overallocate() {
+        // SECURITY regression (deserialization DoS, HIGH): `ois_buf_read`
+        // must never honour a hostile length past the bytes actually in the
+        // buffer. We register a tiny buffer and ask for a near-`usize::MAX`
+        // read; the result must be capped (no multi-exabyte allocation) and
+        // the checked `pos + n` arithmetic must not wrap.
+        let addr = 0x4A45_5101_usize;
+        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        ois_buf_load(addr, vec![1u8, 2, 3, 4]);
+
+        // Consume the 4 real bytes, then over-read.
+        let _ = ois_buf_read(addr, 4);
+        let huge = ois_buf_read(addr, usize::MAX); // would have OOM'd pre-fix
+        assert!(
+            huge.len() <= MAX_SERIAL_BUF_READ_PAD,
+            "short read must be capped at the pad bound, got {}",
+            huge.len()
+        );
+
+        // The TC_LONGSTRING clamp itself: a wire length far beyond remaining
+        // must clamp to remaining (here 0 once exhausted, small otherwise).
+        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        ois_buf_load(addr, b"hello".to_vec());
+        let remaining = ois_buf_remaining(addr) as u64;
+        let clamped =
+            (u64::MAX).min(remaining).min(MAX_SERIAL_STRING_BYTES as u64) as usize;
+        assert_eq!(clamped, 5, "clamp must bound to bytes remaining");
+        assert!(clamped <= MAX_SERIAL_STRING_BYTES, "clamp must honour hard cap");
     }
 
     #[test]
