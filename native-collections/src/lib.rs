@@ -14199,6 +14199,26 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     // structure, isEmpty()/remove(0) read the overlay → permutation lost).
     registry.register(c, "add", "(ILjava/lang/Object;)V", native_ll_add_at);
     registry.register(c, "remove", "(I)Ljava/lang/Object;", native_ll_remove_at);
+    // remove-by-VALUE (and the Deque occurrence removers) MUST also hit the
+    // overlay — the real-JDK `remove(Object)` bytecode walks `first`/`last`
+    // (which our synthetic `<init>` never populates) and silently no-ops, so the
+    // overlay never shrinks. This desynced the Apache httpcore-nio pool's
+    // `available.remove(entry)` (entries accumulated, eventually a null → NPE at
+    // `AbstractNIOConnPool.shutdown`) once keep-alive made the client pool
+    // connections (ES-HANG-02 residual 2).
+    registry.register(c, "remove", "(Ljava/lang/Object;)Z", native_ll_remove_object);
+    registry.register(
+        c,
+        "removeFirstOccurrence",
+        "(Ljava/lang/Object;)Z",
+        native_ll_remove_object,
+    );
+    registry.register(
+        c,
+        "removeLastOccurrence",
+        "(Ljava/lang/Object;)Z",
+        native_ll_remove_last_occurrence,
+    );
     registry.register(c, "addFirst", "(Ljava/lang/Object;)V", native_ll_add_first);
     registry.register(c, "addLast", "(Ljava/lang/Object;)V", native_ll_add_last);
     registry.register(c, "get", "(I)Ljava/lang/Object;", native_ll_get);
@@ -15012,6 +15032,68 @@ fn native_ll_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             return Ok(Some(Value::Int(1)));
         }
         cur_opt = match ctx.get_field(cur, LL_NODE_NEXT) {
+            Value::Object(Some(r)) => Some(r),
+            _ => None,
+        };
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+/// `LinkedList.remove(Object)` / `removeFirstOccurrence(Object)` — remove the
+/// FIRST node whose element equals the argument (null matches a null element),
+/// returning true iff one was removed. Without this overlay native the real-JDK
+/// `remove(Object)` bytecode walks the never-populated `first`/`last` fields,
+/// finds nothing, and silently no-ops — so the overlay list never shrinks. The
+/// Apache httpcore-nio connection pool's `available.remove(entry)` then left
+/// stale (and eventually null) entries in the pool's `available` LinkedList,
+/// NPEing at `AbstractNIOConnPool.shutdown` (`PoolEntry.close()` on a null
+/// receiver) — ES RestClient keep-alive (ES-HANG-02 residual 2).
+fn native_ll_remove_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mut cur_opt = match ll_get(ctx, this, "head") {
+        Value::Object(Some(r)) => Some(r),
+        _ => None,
+    };
+    while let Some(cur) = cur_opt {
+        let elem = ctx.get_field(cur, LL_NODE_ELEM);
+        if list_element_matches(ctx, &elem, &target) {
+            ll_unlink_node(ctx, this, cur);
+            return Ok(Some(Value::Int(1)));
+        }
+        cur_opt = match ctx.get_field(cur, LL_NODE_NEXT) {
+            Value::Object(Some(r)) => Some(r),
+            _ => None,
+        };
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+/// `LinkedList.removeLastOccurrence(Object)` — as above but walks from the tail
+/// and removes the LAST matching node. Same overlay-desync rationale.
+fn native_ll_remove_last_occurrence(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mut cur_opt = match ll_get(ctx, this, "tail") {
+        Value::Object(Some(r)) => Some(r),
+        _ => None,
+    };
+    while let Some(cur) = cur_opt {
+        let elem = ctx.get_field(cur, LL_NODE_ELEM);
+        if list_element_matches(ctx, &elem, &target) {
+            ll_unlink_node(ctx, this, cur);
+            return Ok(Some(Value::Int(1)));
+        }
+        cur_opt = match ctx.get_field(cur, LL_NODE_PREV) {
             Value::Object(Some(r)) => Some(r),
             _ => None,
         };
@@ -30397,9 +30479,13 @@ mod tests {
         assert_eq!(LL_FIELD_HEAD, 0);
         assert_eq!(LL_FIELD_TAIL, 1);
         assert_eq!(LL_FIELD_SIZE, 2);
-        assert_eq!(LL_NODE_PREV, 0);
+        // Node slot layout (matches the `LL_NODE_*` consts the overlay actually
+        // uses): element@0, next@1, prev@2. The previous assertions here had the
+        // element/prev indices swapped vs the real constants and had been failing
+        // since the initial commit; corrected to the layout the overlay uses.
+        assert_eq!(LL_NODE_ELEM, 0);
         assert_eq!(LL_NODE_NEXT, 1);
-        assert_eq!(LL_NODE_ELEM, 2);
+        assert_eq!(LL_NODE_PREV, 2);
     }
 
     #[test]
