@@ -143,6 +143,53 @@ a JVM via the standard Invocation API can load `libcratonvm` as its `libjvm`:
   3 to the subset real embedders use (`CreateJavaVM`, find/call static & virtual,
   string/array marshalling, exception check) before chasing 100% of the table.
 
+## Increment 1 (Layer 1 C-ABI) landed
+
+The JNI **Invocation API** bootstrap layer — the `libjvm`-substitute entry
+points that were the real gap (Layer 3 in the design above, shipped first
+because it is the load-bearing piece a C host needs) — is implemented in a new
+`libcratonvm` crate:
+
+- **New crate `libcratonvm/`** with `crate-type = ["cdylib", "staticlib",
+  "rlib"]`, registered in the workspace-root `Cargo.toml` `members`. Produces
+  `libcratonvm.{so,dll,a}` / `cratonvm.dll` / `cratonvm.lib`.
+- **Three exported entry points** (`#[no_mangle] pub extern "C"`):
+  - `JNI_CreateJavaVM(JavaVM**, void** penv, void* args)` — parses
+    `JavaVMInitArgs` (`-Xmx`, `-cp`/`-classpath`, `-D<k>=<v>`) into a
+    `VmConfig`, calls `Vm::new`, runs the bootstrap init sequence
+    (`System.initPhase1` best-effort + advance init level to 4, mirroring
+    `vm-cli/src/main.rs`), sets the calling thread's JNI TLS context via the
+    existing `set_jni_context_arc`, and hands back the **process-global**
+    `JavaVM*` (`get_java_vm()`) and `JNIEnv*` (`get_jni_env()`) from
+    `vm/src/native/jni.rs`.
+  - `JNI_GetDefaultJavaVMInitArgs(void* args)` — writes the supported version
+    (`JNI_VERSION_1_8`) into `JavaVMInitArgs.version`.
+  - `JNI_GetCreatedJavaVMs(JavaVM**, jsize, jsize*)` — reports the at-most-one
+    VM held in the process-global registry.
+- **Reuse, not re-implementation:** the per-`Vm` `extern "C"` function tables
+  in `jni.rs` are used verbatim. `jni.rs` itself was **not modified** — the
+  invocation table (`DestroyJavaVM`/`AttachCurrentThread`/`DetachCurrentThread`/
+  `GetEnv`/`AttachCurrentThreadAsDaemon`, slots 3–7) and the 234-slot `JNIEnv`
+  table were already complete; the bootstrap/registry was the only gap, and it
+  lives entirely in the new crate via the public `get_java_vm` / `get_jni_env`
+  / `set_jni_context_arc` re-exports.
+- **One-VM-per-process** is enforced (HotSpot semantics): a second
+  `JNI_CreateJavaVM` returns `JNI_EEXIST`.
+- **Panic safety:** every entry point wraps its body in `catch_unwind` and
+  converts a caught panic to `JNI_ERR` (never unwinds across the C boundary).
+- **Acceptance harness:** `libcratonvm/examples/embed_smoke.c` is a C program
+  that does `GetDefaultInitArgs` → `CreateJavaVM` → `GetCreatedJavaVMs` →
+  `FindClass`/`GetStaticMethodID`/`CallStaticVoidMethodA(System.gc)` through the
+  `JNIEnv` table. It is not compiled by cargo; the orchestrator builds it
+  against the produced library (build commands are in the file header).
+- **Rust smoke tests** in `libcratonvm/src/lib.rs`:
+  `JNI_GetDefaultJavaVMInitArgs` populates `version`; null-arg returns
+  `JNI_ERR`; `JNI_GetCreatedJavaVMs` reports a valid count; `-Xmx`/classpath
+  option parsing.
+
+Next: Layer 2 (the flat `cratonvm_*` opaque-handle C API + cbindgen header) and
+Layer 1 (the curated semver-stable `cratonvm-embed` Rust facade) build on this.
+
 ## Effort
 
 L. Layer 1 (curate/document the existing Rust API) is S–M and immediately
