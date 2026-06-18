@@ -37,6 +37,25 @@ pub fn optimize(graph: &mut Graph) {
             break;
         }
     }
+    // SCEV-driven loop-invariant code motion. Default-OFF behind
+    // `CRATONVM_JIT_LICM` while it soaks (Increment 2 of activate-ir-optimizer).
+    // Runs once *after* the fixed-point cleanup so it sees already-folded /
+    // GVN'd invariant expressions, then a final lightweight cleanup re-runs
+    // GVN + DCE to dedup any anchor edges it rewrote.
+    if licm_enabled() && licm(graph) {
+        gvn(graph);
+        eliminate_dead_nodes(graph);
+    }
+}
+
+/// `true` when `CRATONVM_JIT_LICM` is set (cached). Enables the SCEV-driven
+/// loop-invariant code-motion pass. Default-OFF: the pass is the experimental
+/// Increment-2 slice and must soak against the differential gauntlet before
+/// the default flips.
+pub fn licm_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_JIT_LICM").is_some())
 }
 
 /// `true` when `CRATONVM_JIT_REASSOC` is set (cached). Enables the affine
@@ -632,6 +651,396 @@ fn gvn_hash(op: &Op, ty: IrType, inputs: &[NodeId]) -> u64 {
     hasher.finish()
 }
 
+// ── SCEV-driven Loop-Invariant Code Motion (LICM) ────────────────────
+//
+// Hoists provably loop-invariant *pure* computations and *invariant loads*
+// out of a loop into its pre-header.  Increment 2 of activate-ir-optimizer.
+//
+// RELATIONSHIP TO `scev` / `loop_analysis`:
+//
+//   `scev::analyze_induction_variables` / `InductionVar::trip_count` and
+//   `loop_analysis::detect_loops` / `find_invariant_loads` are *bytecode*
+//   analyses — they consume the raw `&[u8]` method body and return
+//   bytecode-PC keyed facts (induction-variable locals, trip counts,
+//   getfield/getstatic invariant-load sites).  They are not threaded through
+//   `optimize(&mut Graph)` (which only sees the post-build SSA graph, no
+//   bytecode), and their PC keys do not map onto SSA `NodeId`s, so they
+//   cannot *drive* node-level hoisting directly.  This pass therefore makes
+//   its hoisting decisions *structurally on the SSA graph* — the only sound
+//   basis available here — and uses the SCEV/loop-analysis vocabulary
+//   (loop header = `Op::Region`, induction variable = the loop-carried
+//   `Op::Phi` anchored at that Region, trip-count-bounded body) to reason
+//   about invariance.  `licm_scev_corroborates` bridges back to
+//   `scev`/`loop_analysis` for graphs that retain `bytecode_pc` annotations,
+//   keeping those modules exercised and giving a future bytecode-threaded
+//   caller a ready hook.
+//
+// LOOP MODEL (Sea-of-Nodes):
+//
+//   A loop header is an `Op::Region` node whose inputs are
+//   `[ctrl_entry, ctrl_backedge, …]` (see `ir.rs` `activate_loop_header`).
+//   The *loop body* is the set of control nodes reachable from the Region
+//   along control edges without leaving through the Region again, up to and
+//   including the node that closes the back-edge (input slot >= 1 of the
+//   Region).  A value is *loop-variant* if it is a `Phi` anchored at this
+//   Region (the loop-carried / induction values) or transitively depends on
+//   one; everything else (params, constants, and pure expressions over
+//   non-variant inputs) is *loop-invariant*.
+//
+// SOUNDNESS MODEL (deliberately conservative — a hoist that changes
+// observable behaviour is a miscompile):
+//
+//   * We hoist only:
+//       (a) PURE nodes (`Op::is_pure()`), which carry no control / memory
+//           edge.  In Sea-of-Nodes these already float, so "hoisting" is a
+//           no-op on placement; the value of this pass is the *gated
+//           invariant-load* case (b) plus making the invariance explicit so
+//           GVN can dedup loop-entry vs loop-body copies.
+//       (b) `Op::Load` whose base AND address operands are loop-invariant
+//           AND that is provably not clobbered by any `Store` / `Call` /
+//           barrier inside the loop body (a real reordering across the loop
+//           back-edge).
+//   * Loop-invariance of an operand is decided by `is_loop_invariant`, which
+//     bails (returns false → conservative) on:
+//       - any node inside the loop body,
+//       - any `Phi` anchored at the loop Region,
+//       - any node it cannot resolve (out-of-range id, `Dead`).
+//   * A load is hoist-eligible only if NO node in the loop body is a
+//     `Store` of a possibly-aliasing `MemKind`, a `Call`, a `New`/`NewArray`
+//     (constructor side effects), or any other non-pure non-load barrier.
+//     We do not run an alias oracle: ANY store / call in the body
+//     disqualifies ALL loads (give up — conservative).  This still fires on
+//     the common read-only invariant-load loop.
+//   * Hoisting never moves a node past an exception edge that should observe
+//     the pre-loop value: pure nodes raise nothing, and a load is only
+//     hoisted when the body contains no barrier (so no observable ordering
+//     relative to a side effect exists to violate).
+//   * Irreducible / multi-entry loops are excluded: we only treat a `Region`
+//     with at least 2 control inputs (one entry, one back-edge) as a loop,
+//     and we require the entry predecessor (`inputs[0]`) to be outside the
+//     body (the hoist target / pre-header anchor).
+//
+// This pass is monotone in observable behaviour (it only re-anchors invariant
+// pure nodes — already-floating — and rewrites a hoisted load's control /
+// memory inputs to the pre-header) and is idempotent, so re-running it finds
+// no new work.
+
+/// Identify the `Op::Region` (loop-header) nodes in the graph.
+fn loop_regions(graph: &Graph) -> Vec<NodeId> {
+    graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.op == Op::Region && n.inputs.len() >= 2)
+        .map(|(i, _)| i as NodeId)
+        .collect()
+}
+
+/// Compute the set of nodes that belong to the loop whose header is `region`.
+///
+/// Membership = control-reachable from `region` along control / projection
+/// edges, plus the data / memory nodes pinned to those control nodes, without
+/// passing back *out* through `region`'s entry predecessor.  We approximate
+/// the body with a forward control walk seeded at `region` and at the control
+/// projections of `If` nodes inside it, stopping at the graph exit and at any
+/// control edge that leaves to a node dominating `region`.  Because the IR is
+/// reducible (the builder only creates a Region for a genuine back-edge), this
+/// forward-from-header reachability over-approximates the body safely: an
+/// over-large body only *loses* hoisting opportunities (more nodes look
+/// variant), never produces an unsound hoist.
+fn loop_body(graph: &Graph, region: NodeId) -> FxHashSet<NodeId> {
+    // Control nodes whose nearest enclosing loop header is `region`. We seed
+    // with `region` itself and walk *users* (forward control flow) — but the
+    // arena stores inputs, not users, so build a users map once.
+    let mut users: Vec<Vec<NodeId>> = vec![Vec::new(); graph.nodes.len()];
+    for (id, node) in graph.nodes.iter().enumerate() {
+        for &inp in &node.inputs {
+            if (inp as usize) < users.len() {
+                users[inp as usize].push(id as NodeId);
+            }
+        }
+    }
+
+    // Back-edge control node(s): the region's predecessors other than the
+    // entry edge (`inputs[0]`). For a reducible loop these are the control
+    // nodes that close the loop.
+    let entry_pred = graph.nodes[region as usize].inputs.first().copied().unwrap_or(NO_NODE);
+    let back_ctrls: Vec<NodeId> = graph.nodes[region as usize]
+        .inputs
+        .iter()
+        .skip(1)
+        .copied()
+        .filter(|&c| c != NO_NODE)
+        .collect();
+
+    // (1) Forward control set: control nodes reachable from `region` along
+    // control / projection successor edges, without leaving through the entry
+    // predecessor or a *different* loop header.
+    let mut forward: FxHashSet<NodeId> = FxHashSet::default();
+    forward.insert(region);
+    let mut work = vec![region];
+    while let Some(cur) = work.pop() {
+        for &u in &users[cur as usize] {
+            if u == entry_pred || forward.contains(&u) {
+                continue;
+            }
+            let op = &graph.nodes[u as usize].op;
+            if matches!(op, Op::Region) && u != region {
+                continue; // don't recurse into another loop header
+            }
+            if op.is_control() && !matches!(op, Op::Return) {
+                if forward.insert(u) {
+                    work.push(u);
+                }
+            }
+        }
+    }
+
+    // (2) "Can reach a back-edge" set: control nodes from which control flows
+    // back to `region` (i.e. that reach one of the back-edge control nodes by
+    // following input → producer edges backward from each back-edge ctrl,
+    // staying within the forward set). The natural-loop body is the
+    // intersection: forward-reachable AND on a path back to the header. This
+    // precisely excludes the loop-exit projection and all post-loop code.
+    let mut body: FxHashSet<NodeId> = FxHashSet::default();
+    body.insert(region);
+    let mut back: Vec<NodeId> = back_ctrls.clone();
+    while let Some(cur) = back.pop() {
+        if cur == NO_NODE || cur == region || body.contains(&cur) {
+            continue;
+        }
+        if !forward.contains(&cur) {
+            // A back-edge control outside the forward set (irreducible / odd
+            // shape): skip it conservatively rather than pulling in foreign
+            // control.
+            continue;
+        }
+        body.insert(cur);
+        // Walk backward through this control node's control inputs.
+        for &inp in &graph.nodes[cur as usize].inputs {
+            if inp != region && forward.contains(&inp) {
+                back.push(inp);
+            }
+        }
+    }
+
+    // Pinned-node sweep: any non-pure data / memory node whose control or
+    // memory input is a body control node, or which is a Phi anchored at the
+    // region, belongs to the body. Pure nodes are intentionally *not* pinned
+    // (they float); their invariance is decided per use in `is_loop_invariant`.
+    for (id, node) in graph.nodes.iter().enumerate() {
+        if node.op == Op::Dead || node.op.is_pure() {
+            continue;
+        }
+        if node.op == Op::Phi {
+            // Loop-carried phi: anchored at the region (input slot 0).
+            if node.inputs.first().copied() == Some(region) {
+                body.insert(id as NodeId);
+            }
+            continue;
+        }
+        // Loads / stores / calls / allocations: pinned to a control/mem input.
+        if node
+            .inputs
+            .iter()
+            .any(|&inp| body.contains(&inp))
+        {
+            body.insert(id as NodeId);
+        }
+    }
+    body
+}
+
+/// True if `id` produces a value that is constant across all iterations of the
+/// loop with header `region` and body `body`. Conservative: any uncertainty
+/// (out-of-range, Dead, a loop-carried phi, or membership in the body)
+/// returns false. `depth` bounds the recursion so a cyclic phi (e.g. from a
+/// *different* loop nest) cannot cause unbounded recursion — exceeding the
+/// bound is treated conservatively as variant.
+fn is_loop_invariant(
+    graph: &Graph,
+    id: NodeId,
+    region: NodeId,
+    body: &FxHashSet<NodeId>,
+) -> bool {
+    is_loop_invariant_d(graph, id, region, body, 0)
+}
+
+fn is_loop_invariant_d(
+    graph: &Graph,
+    id: NodeId,
+    region: NodeId,
+    body: &FxHashSet<NodeId>,
+    depth: u32,
+) -> bool {
+    if id == NO_NODE || (id as usize) >= graph.nodes.len() {
+        return false;
+    }
+    if depth > 64 {
+        // Recursion bound hit (possible phi cycle in another loop nest):
+        // give up conservatively.
+        return false;
+    }
+    let node = &graph.nodes[id as usize];
+    match node.op {
+        Op::Dead => false,
+        // Constants / params are defined at Start — always invariant.
+        Op::Const(_) | Op::ConstF(_) | Op::Param(_) => true,
+        // Any phi is a merge value. A phi anchored at *this* loop's region is
+        // the induction / loop-carried value: variant by construction. A phi
+        // anchored elsewhere is treated as variant too (conservative — we do
+        // not prove cross-merge invariance here).
+        Op::Phi => false,
+        _ => {
+            // Anything physically in the loop body is variant.
+            if body.contains(&id) {
+                return false;
+            }
+            // Otherwise invariant iff every data input is invariant. We skip
+            // control (ctrl/mem) inputs for pure nodes (they have none) and,
+            // for impure nodes, defer to the caller's barrier check.
+            node.inputs.iter().all(|&inp| {
+                inp == NO_NODE || is_loop_invariant_d(graph, inp, region, body, depth + 1)
+            })
+        }
+    }
+}
+
+/// True if the loop body contains any memory barrier (store, call, allocation,
+/// guard, monitor) that could clobber a hoisted load. Conservative: a single
+/// barrier disqualifies all load hoisting for this loop.
+fn loop_has_memory_barrier(graph: &Graph, body: &FxHashSet<NodeId>) -> bool {
+    body.iter().any(|&id| {
+        let op = &graph.nodes[id as usize].op;
+        !op.is_pure()
+            && !op.is_control()
+            && !matches!(op, Op::Load(_) | Op::Phi | Op::Dead)
+    })
+}
+
+/// Run loop-invariant code motion. Returns `true` if it changed the graph.
+///
+/// See the module-level soundness model. Hoists invariant loads out of each
+/// natural loop (`Op::Region` header) into the loop pre-header (the region's
+/// entry-predecessor control), provided the loop body has no memory barrier
+/// that could clobber the load. Pure invariant nodes already float in
+/// Sea-of-Nodes, so no placement change is needed for them — but recognising
+/// them lets the trailing GVN pass dedup loop-entry vs loop-body copies.
+fn licm(graph: &mut Graph) -> bool {
+    let regions = loop_regions(graph);
+    if regions.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+
+    for region in regions {
+        // Re-validate: the region may have been killed by an earlier hoist's
+        // cleanup in this same loop set (defensive).
+        if graph.nodes[region as usize].op != Op::Region {
+            continue;
+        }
+        let body = loop_body(graph, region);
+        // The pre-header is the control feeding the region's entry edge.
+        let preheader = graph.nodes[region as usize].inputs.first().copied().unwrap_or(NO_NODE);
+        if preheader == NO_NODE || body.contains(&preheader) {
+            // No identifiable pre-header outside the loop → cannot hoist.
+            continue;
+        }
+
+        // Load hoisting requires a clobber-free body.
+        if loop_has_memory_barrier(graph, &body) {
+            continue;
+        }
+
+        // Collect hoistable loads: in the body, with invariant base/address,
+        // typed as a real Load. We snapshot ids first (we mutate inputs after).
+        let load_ids: Vec<NodeId> = body
+            .iter()
+            .copied()
+            .filter(|&id| matches!(graph.nodes[id as usize].op, Op::Load(_)))
+            .collect();
+
+        // The memory token to use at the pre-header: the region's *entry*
+        // memory phi input if a memory phi exists, else any invariant memory.
+        // For loads in the EA-bridge/hand-built compact form (`[base]` or
+        // `[base, index]`) there is no control/mem operand to repoint, so the
+        // hoist is purely a re-anchor that GVN/scheduling already honour; we
+        // still record `changed` so the trailing cleanup runs.
+        for load in load_ids {
+            let inputs = graph.nodes[load as usize].inputs.clone();
+            // Identify base / address operands across both layouts:
+            //   compact:  [base] | [base, index]
+            //   full:     [ctrl, mem, base, index?]
+            let (base, addr) = match inputs.len() {
+                1 => (inputs[0], NO_NODE),
+                2 => {
+                    // Disambiguate compact [base, index] from a 2-input full
+                    // form by the type of slot 0: a Memory-typed slot 0 means
+                    // the full form is malformed here (we only see compact),
+                    // so treat slot 0 as base.
+                    (inputs[0], inputs[1])
+                }
+                3 => (inputs[2], NO_NODE),           // [ctrl, mem, base]
+                n if n >= 4 => (inputs[2], inputs[3]), // [ctrl, mem, base, index]
+                _ => (NO_NODE, NO_NODE),
+            };
+            if !is_loop_invariant(graph, base, region, &body) {
+                continue;
+            }
+            if addr != NO_NODE && !is_loop_invariant(graph, addr, region, &body) {
+                continue;
+            }
+            // The load is invariant and the body is barrier-free → it is safe
+            // to compute once at the pre-header. Remove it from the body by
+            // repointing its control input (slot 0 of the full form) to the
+            // pre-header so scheduling/lowering place it before the loop. For
+            // the compact form there is no control slot, so invariance alone
+            // (already established) makes it loop-entry schedulable.
+            if inputs.len() >= 3 {
+                // Full form: repoint ctrl (slot 0) to the pre-header control.
+                if graph.nodes[load as usize].inputs[0] != preheader {
+                    graph.nodes[load as usize].inputs[0] = preheader;
+                    changed = true;
+                }
+            } else {
+                // Compact form: nothing to repoint, but mark changed so the
+                // trailing GVN dedups identical hoisted loads to one.
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// Bridge to the bytecode-level `scev` / `loop_analysis` passes: given the
+/// method bytecode, corroborate that a loop with the given `(header_pc,
+/// back_edge_pc)` is a recognised counted loop with at least one invariant
+/// load site. Returns `true` when SCEV agrees there is a counted induction
+/// variable OR `loop_analysis` finds an invariant getfield/getstatic in the
+/// body — i.e. when bytecode-level analysis independently supports hoisting.
+///
+/// Not currently called from `optimize()` (which has no bytecode in scope);
+/// it is the hook a future bytecode-threaded caller uses to gate the
+/// graph-structural `licm()` against the bytecode analyses, and it keeps
+/// `scev` / `loop_analysis` exercised from this module.
+#[allow(dead_code)]
+pub fn licm_scev_corroborates(code: &[u8], code_len: usize) -> bool {
+    let loops = crate::loop_analysis::detect_loops(code, code_len);
+    if loops.is_empty() {
+        return false;
+    }
+    let pairs: Vec<(usize, usize)> = loops
+        .iter()
+        .filter_map(|li| li.back_edges.iter().copied().max().map(|be| (li.header_pc, be)))
+        .collect();
+    let ivs = crate::scev::analyze_induction_variables(code, code_len, &pairs);
+    let has_counted_iv = ivs.iter().any(|iv| iv.stride != 0);
+    let has_invariant_load = loops
+        .iter()
+        .any(|li| !crate::loop_analysis::find_invariant_loads(li, code).is_empty());
+    has_counted_iv || has_invariant_load
+}
+
 // ── Dead Store Elimination (DSE) ─────────────────────────────────────
 //
 // `eliminate_dead_nodes` (below) is a *value* DCE: it removes nodes whose
@@ -680,6 +1089,40 @@ fn gvn_hash(op: &Op, ty: IrType, inputs: &[NodeId]) -> u64 {
 //     base ids are the same object; differing `MemKind`/idx are different
 //     slots and never matched.
 //
+// WIDENED CASE — WRITE-ONLY, NEVER-READ (Increment 2):
+//
+//   The straight-line "overwritten before any read" phase above only fires
+//   inside one barrier-free region.  The second phase catches the
+//   complementary shape: a store to a local `New`/`NewArray` allocation that
+//   is *never read on any path* and *never escapes*, so every store into it
+//   is dead regardless of control flow.
+//
+//   SOUNDNESS: a store to allocation `A` is write-only-dead iff
+//     (1) `A` is a fresh local `New`/`NewArray` (same provenance guard), AND
+//     (2) NO `Load` node anywhere in the graph reads from `A`
+//         (`load_base(load) == A`), AND
+//     (3) `A` does not escape — it never flows, *other than as the base of a
+//         Store*, into any node that could publish or read it: a `Call` arg,
+//         a `Return`, a `Store` *value* slot (storing the ref into another
+//         object), an `ArrayLength`, or any base we cannot classify.  A
+//         `Phi`/`Proj` use is treated as escaping (conservative — we do not
+//         chase the ref through merges here, the increment-1 EA does).
+//   When all three hold, *every* Store whose base is `A` is observably inert
+//   (nothing ever loads what was written, and no external code sees `A`), so
+//   each such Store is removed.  This is path-insensitive and needs no
+//   ordering relation, because the predicate "no load of A exists" is a whole-
+//   graph property.
+//
+//   This deliberately does NOT extend the location key to array-element
+//   stores for the *overwrite* phase: the production bytecode→IR builder
+//   (`ir.rs`) never emits `Op::Store`/`Op::NewArray` at all (it bails on those
+//   opcodes), so the only array stores that exist are EA-bridge / hand-built
+//   compact-form `[base, value]` nodes with no distinct element index operand
+//   to key on.  Until a real array `Store` operand layout with a resolvable
+//   element index lands, array-element overwrite matching is left out; the
+//   write-only phase above is layout-agnostic (it keys on the base only) and
+//   so already covers write-only dead array stores.
+//
 // This pass is monotone (only ever marks nodes `Dead`) and idempotent, so it
 // composes safely inside the `optimize()` fixed-point loop.
 
@@ -715,6 +1158,25 @@ fn store_operands(graph: &Graph, store_id: NodeId) -> Option<(NodeId, NodeId, No
         4 => Some((inputs[2], NO_NODE, inputs[3])),
         // Full store with index/offset: [ctrl, mem, base, index, value]
         n if n >= 5 => Some((inputs[2], inputs[3], inputs[4])),
+        _ => None,
+    }
+}
+
+/// Read the base reference a `Load` node addresses, tolerating both the
+/// compact (`[base]` / `[base, index]`) and full (`[ctrl, mem, base, index?]`)
+/// layouts — mirrors `store_operands`. Returns `None` for an uninterpretable
+/// layout (caller treats it conservatively as a potential reader of anything).
+fn load_base(graph: &Graph, load_id: NodeId) -> Option<NodeId> {
+    let n = &graph.nodes[load_id as usize];
+    debug_assert!(matches!(n.op, Op::Load(_)));
+    let inputs = &n.inputs;
+    match inputs.len() {
+        // Compact: [base] or [base, index] — slot 0 is the base.
+        1 | 2 => Some(inputs[0]),
+        // Full with no index: [ctrl, mem, base].
+        3 => Some(inputs[2]),
+        // Full with index: [ctrl, mem, base, index].
+        n if n >= 4 => Some(inputs[2]),
         _ => None,
     }
 }
@@ -806,6 +1268,113 @@ fn eliminate_dead_stores(graph: &mut Graph) {
         }
     }
 
+    for id in to_kill {
+        graph.kill(id);
+    }
+
+    // ── Phase 2: write-only, never-read local allocations ──────────────
+    // Path-insensitive: a store to a local alloc that is never loaded and
+    // never escapes is dead regardless of control flow. See the module-level
+    // "WIDENED CASE" note for the soundness argument.
+    eliminate_write_only_stores(graph);
+}
+
+/// Remove every `Store` into a local `New`/`NewArray` allocation that is never
+/// read (no `Load` addresses it) and never escapes the method. Path-
+/// insensitive whole-graph analysis; see the DSE module note.
+fn eliminate_write_only_stores(graph: &mut Graph) {
+    use std::collections::hash_map::Entry;
+
+    // 1. Candidate allocations: every fresh local alloc node.
+    let mut candidate: FxHashMap<NodeId, bool> = FxHashMap::default();
+    for (id, node) in graph.nodes.iter().enumerate() {
+        if matches!(node.op, Op::New { .. } | Op::NewArray { .. }) {
+            candidate.insert(id as NodeId, true); // true = still write-only
+        }
+    }
+    if candidate.is_empty() {
+        return;
+    }
+
+    // 2. Disqualify any allocation that is read or escapes. We scan every use
+    //    of every candidate. A use disqualifies the candidate unless it is the
+    //    *base* slot of a Store (the only inert use of a write-only alloc).
+    for (id, node) in graph.nodes.iter().enumerate() {
+        let id = id as NodeId;
+        match &node.op {
+            Op::Dead => continue,
+            Op::Load(_) => {
+                // Reading any candidate disqualifies it.
+                if let Some(base) = load_base(graph, id) {
+                    if let Entry::Occupied(mut e) = candidate.entry(base) {
+                        *e.get_mut() = false;
+                    }
+                } else {
+                    // Unreadable load layout: conservatively disqualify every
+                    // candidate it could touch (all of them).
+                    for v in candidate.values_mut() {
+                        *v = false;
+                    }
+                }
+            }
+            Op::Store(_) => {
+                // The base slot is the inert use; the *value* slot escaping the
+                // ref (storing a candidate ref into another object) disqualifies
+                // it. `idx` operand referencing a candidate would be nonsensical
+                // for an alloc ref but is treated as escaping if it occurs.
+                if let Some((base, idx, val)) = store_operands(graph, id) {
+                    // value or index referencing a candidate ⇒ escapes.
+                    for &slot in &[val, idx] {
+                        if slot != NO_NODE {
+                            if let Entry::Occupied(mut e) = candidate.entry(slot) {
+                                *e.get_mut() = false;
+                            }
+                        }
+                    }
+                    // base is the inert use — does not disqualify.
+                    let _ = base;
+                } else {
+                    // Unreadable store layout: disqualify everything it touches.
+                    for &inp in &node.inputs {
+                        if let Entry::Occupied(mut e) = candidate.entry(inp) {
+                            *e.get_mut() = false;
+                        }
+                    }
+                }
+            }
+            // Any OTHER node (Call arg, Return value, ArrayLength, Phi, Proj,
+            // a second New's input, Guard, …) that references a candidate
+            // publishes or observes the ref ⇒ escapes / read ⇒ disqualify.
+            _ => {
+                for &inp in &node.inputs {
+                    if let Entry::Occupied(mut e) = candidate.entry(inp) {
+                        *e.get_mut() = false;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Kill every Store whose base is a surviving write-only candidate AND
+    //    whose own node is not consumed as an input elsewhere. A Store
+    //    referenced by another node (a memory-token chain, a Return, …) is
+    //    being kept alive as an observed effect; we only remove the store when
+    //    nothing depends on the store node itself, so this never severs a
+    //    memory/effect edge a consumer relies on.
+    let uses = graph.use_counts();
+    let mut to_kill: Vec<NodeId> = Vec::new();
+    for (id, node) in graph.nodes.iter().enumerate() {
+        if let Op::Store(_) = node.op {
+            if uses[id] != 0 {
+                continue; // store node is depended upon — keep it
+            }
+            if let Some((base, _, _)) = store_operands(graph, id as NodeId) {
+                if candidate.get(&base).copied() == Some(true) {
+                    to_kill.push(id as NodeId);
+                }
+            }
+        }
+    }
     for id in to_kill {
         graph.kill(id);
     }
@@ -1295,7 +1864,10 @@ mod tests {
     #[test]
     fn test_dse_distinct_fields_not_matched() {
         // Two stores to *different* fields of the same object: neither
-        // overwrites the other, so both survive.
+        // overwrites the other, so the overwrite phase must not match them.
+        // A trailing load of the object makes it *read* (so the widened
+        // write-only phase does not apply here) — this test isolates the
+        // distinct-field non-conflation property of the overwrite phase.
         let mut g = probe_graph();
         let alloc = g.add(Op::New { class_id: 1, num_fields: 2 }, IrType::Ref, vec![g.entry], None);
         let c1 = g.add(Op::Const(1), IrType::Int, vec![], None);
@@ -1303,12 +1875,219 @@ mod tests {
         // Different MemKind → different location key (Int vs Long slot).
         let s1 = g.add(Op::Store(MemKind::Int), IrType::Void, vec![alloc, c1], None);
         let s2 = g.add(Op::Store(MemKind::Long), IrType::Void, vec![alloc, c2], None);
-        let ret = g.add(Op::Return, IrType::Void, vec![g.entry, s2], None);
+        // Read the object back so it is observed (write-only phase off).
+        let load = g.add(Op::Load(MemKind::Int), IrType::Int, vec![alloc], None);
+        let ret = g.add(Op::Return, IrType::Void, vec![g.entry, load], None);
         g.exit = ret;
 
         eliminate_dead_stores(&mut g);
 
         assert_eq!(g.nodes[s1 as usize].op, Op::Store(MemKind::Int));
         assert_eq!(g.nodes[s2 as usize].op, Op::Store(MemKind::Long));
+    }
+
+    // ── Widened DSE: write-only, never-read local allocation ────────
+
+    #[test]
+    fn test_dse_removes_write_only_never_read_store() {
+        // A local object whose field is written once and never read, with
+        // nothing depending on the store, and the object never escaping:
+        // the store is observably inert and must be removed. (Distinct from
+        // the overwrite case: there is only ONE store, so the straight-line
+        // overwrite phase cannot fire — only the write-only phase can.)
+        let mut g = probe_graph();
+        let alloc = g.add(Op::New { class_id: 1, num_fields: 1 }, IrType::Ref, vec![g.entry], None);
+        let c1 = g.add(Op::Const(7), IrType::Int, vec![], None);
+        let store = g.add(Op::Store(MemKind::Int), IrType::Void, vec![alloc, c1], None);
+        // The method returns void; the alloc never escapes and is never read.
+        let ret = g.add(Op::Return, IrType::Void, vec![g.entry], None);
+        g.exit = ret;
+
+        eliminate_dead_stores(&mut g);
+
+        assert_eq!(
+            g.nodes[store as usize].op,
+            Op::Dead,
+            "a write-only, never-read store to a local alloc must be removed"
+        );
+    }
+
+    #[test]
+    fn test_dse_keeps_write_only_store_when_alloc_escapes() {
+        // Same write-only shape, but the allocation escapes (returned to the
+        // caller). The caller may read the field, so the store is observable
+        // and must be kept — guards the kafka bug-25-class escape hole.
+        let mut g = probe_graph();
+        let alloc = g.add(Op::New { class_id: 1, num_fields: 1 }, IrType::Ref, vec![g.entry], None);
+        let c1 = g.add(Op::Const(7), IrType::Int, vec![], None);
+        let store = g.add(Op::Store(MemKind::Int), IrType::Void, vec![alloc, c1], None);
+        // The allocation is RETURNED → escapes.
+        let ret = g.add(Op::Return, IrType::Void, vec![g.entry, alloc], None);
+        g.exit = ret;
+
+        eliminate_dead_stores(&mut g);
+
+        assert_eq!(
+            g.nodes[store as usize].op,
+            Op::Store(MemKind::Int),
+            "a store into an escaping allocation may be observed externally and must be kept"
+        );
+    }
+
+    // ── SCEV-driven LICM ────────────────────────────────────────────
+
+    /// Hand-build a minimal counted-loop graph and return
+    /// `(graph, region, preheader, iv_phi)`:
+    ///
+    /// ```text
+    ///   start ─ c0(Proj0) ─ m0(Proj1)
+    ///   region = Region[c0, back_ctrl]          (loop header)
+    ///   iv     = Phi[region, init=Const0, back] (induction var, variant)
+    ///   if     = If[region, cond]               (loop spine)
+    ///   t/f    = Proj0/Proj1[if]
+    ///   back_ctrl = Proj0 (loops to region)     (the back-edge control)
+    /// ```
+    ///
+    /// The caller adds the node under test (an invariant or variant load)
+    /// pinned into the body via a control input, then runs `licm`.
+    fn loop_probe() -> (Graph, NodeId, NodeId, NodeId) {
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: 0,
+            safepoints: Vec::new(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        g.entry = start;
+        let c0 = g.add(Op::Proj(0), IrType::Control, vec![start], None); // preheader ctrl
+        let _m0 = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        // Region: [entry_pred=c0, back_edge_ctrl] — fill back-edge below.
+        let region = g.add(Op::Region, IrType::Control, vec![c0], None);
+        let init = g.add(Op::Const(0), IrType::Int, vec![], None);
+        // Induction phi (loop-carried): [region, init, back_val]. back_val
+        // filled after the increment exists.
+        let iv = g.add(Op::Phi, IrType::Int, vec![region, init], None);
+        let one = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let iv_next = g.add(Op::Add, IrType::Int, vec![iv, one], None);
+        // Close the phi's back-edge value.
+        g.nodes[iv as usize].inputs.push(iv_next);
+        // Loop spine: If on a cond, with a back-edge Proj re-entering region.
+        let bound = g.add(Op::Const(10), IrType::Int, vec![], None);
+        let cond = g.add(Op::Cmp(CmpOp::Lt), IrType::Int, vec![iv, bound], None);
+        let if_node = g.add(Op::If, IrType::Control, vec![region, cond], None);
+        let back_ctrl = g.add(Op::Proj(0), IrType::Control, vec![if_node], None);
+        let _exit_ctrl = g.add(Op::Proj(1), IrType::Control, vec![if_node], None);
+        // Wire the back-edge control into the region.
+        g.nodes[region as usize].inputs.push(back_ctrl);
+        (g, region, c0, iv)
+    }
+
+    #[test]
+    fn test_licm_hoists_invariant_load() {
+        // An invariant load (base + address defined OUTSIDE the loop) pinned
+        // into a barrier-free loop body must be re-anchored to the pre-header.
+        let (mut g, region, preheader, _iv) = loop_probe();
+        // Memory token and base are defined outside the loop (invariant).
+        let mem = 2; // _m0 = Proj(1) of Start
+        let base = g.add(Op::Param(0), IrType::Ref, vec![g.entry], None);
+        let off = g.add(Op::Const(4), IrType::Int, vec![], None);
+        // Full-form load pinned into the body: ctrl = region (loop control).
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![region, mem, base, off],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![region, load], None);
+        g.exit = ret;
+
+        let changed = licm(&mut g);
+
+        assert!(changed, "an invariant load in a barrier-free loop must hoist");
+        assert_eq!(
+            g.nodes[load as usize].inputs[0], preheader,
+            "the hoisted load's control input must be re-anchored to the pre-header"
+        );
+    }
+
+    #[test]
+    fn test_licm_does_not_hoist_variant_load() {
+        // A load whose base is the loop-carried induction phi is loop-VARIANT
+        // and must NOT be hoisted (its control input stays at the region).
+        let (mut g, region, _preheader, iv) = loop_probe();
+        let mem = 2;
+        // Use the induction variable itself as the address — variant.
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![region, mem, iv, NO_NODE],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![region, load], None);
+        g.exit = ret;
+
+        let _ = licm(&mut g);
+
+        assert_eq!(
+            g.nodes[load as usize].inputs[0], region,
+            "a loop-variant load must NOT be hoisted (control stays in the loop)"
+        );
+    }
+
+    #[test]
+    fn test_licm_bails_on_barrier_in_loop() {
+        // A store inside the loop body is a memory barrier: even an otherwise
+        // invariant load must NOT be hoisted (we have no alias oracle).
+        let (mut g, region, _preheader, _iv) = loop_probe();
+        let mem = 2;
+        let base = g.add(Op::Param(0), IrType::Ref, vec![g.entry], None);
+        let off = g.add(Op::Const(4), IrType::Int, vec![], None);
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![region, mem, base, off],
+            None,
+        );
+        // A store pinned into the body (ctrl = region) is the barrier. Its
+        // base is a *different* local alloc so DSE-style reasoning is moot;
+        // for LICM any in-body store disqualifies hoisting.
+        let other = g.add(Op::New { class_id: 9, num_fields: 1 }, IrType::Ref, vec![region], None);
+        let cval = g.add(Op::Const(5), IrType::Int, vec![], None);
+        let _st = g.add(Op::Store(MemKind::Int), IrType::Void, vec![region, mem, other, cval], None);
+        let ret = g.add(Op::Return, IrType::Void, vec![region, load], None);
+        g.exit = ret;
+
+        let changed = licm(&mut g);
+
+        assert!(
+            !changed,
+            "a memory barrier in the loop body must block all load hoisting"
+        );
+        assert_eq!(
+            g.nodes[load as usize].inputs[0], region,
+            "the load must stay in the loop when the body has a barrier"
+        );
+    }
+
+    #[test]
+    fn test_licm_scev_corroborates_counted_loop() {
+        // Bridge sanity: the bytecode-level SCEV/loop-analysis corroboration
+        // recognises a simple counted loop (`for i in 0..10`).
+        // iconst_0; istore_1; [h:] iload_1; bipush 10; if_icmpge exit;
+        // iinc 1,1; goto h; [exit:] return
+        let code: Vec<u8> = vec![
+            0x03, // 0: iconst_0
+            0x3c, // 1: istore_1
+            0x1b, // 2: iload_1            (header)
+            0x10, 0x0a, // 3: bipush 10
+            0xa2, 0x00, 0x08, // 5: if_icmpge +8 → 13
+            0x84, 0x01, 0x01, // 8: iinc 1, 1
+            0xa7, 0xff, 0xf7, // 11: goto -9 → 2
+            0xb1, // 14: return
+        ];
+        assert!(
+            licm_scev_corroborates(&code, code.len()),
+            "SCEV must corroborate a simple counted loop"
+        );
     }
 }

@@ -172,6 +172,89 @@ methods).
 **Not yet done** (still Fronts 2/3 follow-ups): SCEV-driven LICM/unroll, and
 guard-surviving scalar replacement (gated on `real-frame-deopt.md`).
 
+## Increment 2 (LICM + widened DSE)
+
+Status: **landed** on `rm/activate-ir-optimizer`. The second landable slice of
+Front 2 — the LICM half of Front 2.2 and the write-only widening of DSE
+(Front 2.1).
+
+**What landed**
+
+1. **SCEV-driven LICM (`jit/src/ir_optimize.rs`, `licm` + helpers)** — a new
+   loop-invariant code-motion pass, gated **default-OFF** behind
+   `CRATONVM_JIT_LICM` (`licm_enabled`) while it soaks, and run once *after*
+   the fixed-point cleanup in `optimize()` (followed by a final GVN + DCE when
+   it changed anything). It hoists provably loop-invariant **loads** out of a
+   natural loop into the loop pre-header:
+   - **Loop model is structural on the SSA graph**: a loop header is an
+     `Op::Region` (`[ctrl_entry, ctrl_backedge, …]`); the induction / loop-
+     carried value is the `Op::Phi` anchored at that Region. `loop_body`
+     computes the natural-loop body precisely as *forward-reachable-from-header
+     ∩ can-reach-a-back-edge*, which excludes the loop-exit projection and all
+     post-loop code (a reducible-loop body).
+   - **Why structural, not bytecode-SCEV-driven**: `scev::analyze_induction_
+     variables` / `trip_count` and `loop_analysis::detect_loops` /
+     `find_invariant_loads` are *bytecode* analyses keyed by bytecode PC; they
+     are not threaded through `optimize(&mut Graph)` (which has no bytecode in
+     scope) and their PC keys do not map onto SSA `NodeId`s, so they cannot
+     drive node-level hoisting directly. The pass therefore reasons on the
+     graph and exposes `licm_scev_corroborates(code, code_len)` — a bridge that
+     calls `loop_analysis::detect_loops` + `scev::analyze_induction_variables` +
+     `loop_analysis::find_invariant_loads` to corroborate a counted/invariant-
+     load loop from bytecode. It is the ready hook for a future bytecode-
+     threaded caller and keeps both modules exercised from this module.
+   - **Soundness guards**: hoist only a `Load` whose base AND address operands
+     are loop-invariant (`is_loop_invariant`, conservative — *any* `Phi`, any
+     in-body node, any unresolved id ⇒ variant) AND only when the loop body has
+     **no memory barrier** (`loop_has_memory_barrier`: any in-body store /
+     call / allocation / guard ⇒ bail). No alias oracle: one barrier
+     disqualifies all loads. Pure invariant nodes already float in Sea-of-
+     Nodes, so the pass does not move them (it relies on scheduling + the
+     trailing GVN to dedup loop-entry vs loop-body copies).
+   - **Pre-header**: the region's entry-edge control (`inputs[0]`); a hoisted
+     full-form load's control input is repointed there. Compact-form loads
+     (no control slot) are left to scheduling, with `changed` set so the
+     trailing cleanup runs.
+
+2. **Widened DSE — write-only, never-read (`eliminate_write_only_stores`)** —
+   the existing straight-line overwrite phase only fires inside one barrier-
+   free region. The new second phase is a path-insensitive whole-graph pass:
+   a `Store` into a local `New`/`NewArray` allocation is removed iff (a) the
+   allocation is **never read** (no `Load` addresses it), (b) it **never
+   escapes** (it flows nowhere except as the *base* of a Store — any use as a
+   Call arg, `Return` value, Store *value*, `ArrayLength`, `Phi`/`Proj`, etc.
+   disqualifies it, closing the kafka bug-25-class escape hole), and (c) the
+   store node itself has **no consumers** (use-count 0), so removing it never
+   severs a memory/effect edge a consumer relies on.
+   - **Array-element stores deliberately left out of the *overwrite* key**:
+     the production bytecode→IR builder (`ir.rs`) never emits
+     `Op::Store`/`Op::NewArray`/`Op::Load` (it bails on those opcodes), so the
+     only stores that exist are EA-bridge / hand-built **compact-form**
+     `[base, value]` nodes — there is no distinct, resolvable array-element
+     index operand to extend the overwrite location key with. Until a real
+     array `Store` operand layout lands, array-element *overwrite* matching is
+     omitted; the write-only phase is layout-agnostic (keys on the base only)
+     and already removes write-only dead array stores.
+
+**Tests added** (run from the worktree):
+- `cargo test -p cratonvm-jit licm` — LICM: hoists an invariant load out of a
+  barrier-free loop; does NOT hoist a load whose base is the induction phi
+  (loop-variant); bails when the body has a store barrier; and the SCEV/loop-
+  analysis bridge corroborates a counted loop.
+- `cargo test -p cratonvm-jit dse` — adds `test_dse_removes_write_only_never_
+  read_store` (single write-only store removed) and
+  `test_dse_keeps_write_only_store_when_alloc_escapes` (escaping alloc's store
+  kept); existing overwrite-phase tests retained (one adjusted to read its
+  allocation so it isolates the overwrite property from the new write-only
+  phase).
+
+**Not yet done** (still Fronts 2/3 follow-ups): SCEV-driven *unrolling* with a
+real trip-count gate, threading bytecode into `optimize()` so LICM can consult
+`licm_scev_corroborates` as a gate, a real alias oracle so LICM can hoist
+loads past non-aliasing in-loop stores, the array `Store` operand layout for
+array-element overwrite DSE, and guard-surviving scalar replacement (gated on
+`real-frame-deopt.md`). LICM default flip is gated on the soak.
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.
