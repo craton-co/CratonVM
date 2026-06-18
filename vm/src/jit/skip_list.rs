@@ -1483,6 +1483,27 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("java/util/WeakHashMap$Entry", "<init>")
         | ("java/util/WeakHashMap", "getTable")
         | ("java/util/WeakHashMap", "expungeStaleEntries")
+        // Kafka Bug C (docs/kafka-suite-0617) — `WeakHashMap.values()/keySet()/
+        // entrySet().stream()` (any terminal, e.g. `.count()`) hangs in JIT mode
+        // but completes with `CRATONVM_DISABLE_JIT=1`. WeakHashMap is the only Map
+        // whose views are NOT natively shadowed (HashMap/TreeMap/LHM/CHM return
+        // synthetic snapshot collections), so its stream runs the real-JDK
+        // `WeakHashMap$WeakHashMapSpliterator` traversal. The stream pipeline drives
+        // the spliterator via `tryAdvance`, whose loop advances purely through the
+        // instance fields `index` (`current = tab[index++]`) and `current`
+        // (`current = current.next`); the JIT'd body never persists those field
+        // writes, so `index` stays 0 and the loop spins forever — re-calling
+        // `getFence()->size()->expungeStaleEntries()->ReferenceQueue.poll()` each
+        // iteration (confirmed by `--stack-dump-on-timeout`). Same field-write
+        // miscompile family as the HashIterator bans above. Pinpointed by
+        // keep-only bisection: `CRATONVM_JIT_BISECT_SKIP=java/util/WeakHashMap`
+        // `$ValueSpliterator.tryAdvance` alone fixes it (rc=0), while skipping
+        // `forEachRemaining`/`expungeStaleEntries` alone does not. The sibling
+        // Key/Entry spliterators share identical `tryAdvance` structure and are
+        // banned pre-emptively so `keySet()`/`entrySet()` streams don't regress.
+        | ("java/util/WeakHashMap$ValueSpliterator", "tryAdvance")
+        | ("java/util/WeakHashMap$KeySpliterator", "tryAdvance")
+        | ("java/util/WeakHashMap$EntrySpliterator", "tryAdvance")
         // Tomcat Bug D (apps/tomcat suite) — `org.apache.catalina.filters.
         // TestRemoteCIDRFilter` SIGSEGVs in JIT mode but completes cleanly with
         // `CRATONVM_DISABLE_JIT=1`. Root cause (CRATONVM_BUGS/BUG-D-*): a JIT
@@ -2429,8 +2450,26 @@ mod tests {
         assert!(is_known_miscompile("java/util/HashMap", "get"));
         assert!(is_known_miscompile("java/util/HashMap", "resize"));
         assert!(is_known_miscompile("cratonvm/TckLang", "exc_hierarchy"));
+        // Kafka Bug C — WeakHashMap spliterator tryAdvance field-write miscompile.
+        assert!(is_known_miscompile(
+            "java/util/WeakHashMap$ValueSpliterator",
+            "tryAdvance"
+        ));
+        assert!(is_known_miscompile(
+            "java/util/WeakHashMap$KeySpliterator",
+            "tryAdvance"
+        ));
+        assert!(is_known_miscompile(
+            "java/util/WeakHashMap$EntrySpliterator",
+            "tryAdvance"
+        ));
         // Everything else must NOT be in the list.
         assert!(!is_known_miscompile("java/util/HashMap", "size"));
+        // Sibling spliterator methods that are NOT the miscompiling one stay eligible.
+        assert!(!is_known_miscompile(
+            "java/util/WeakHashMap$ValueSpliterator",
+            "forEachRemaining"
+        ));
         assert!(!is_known_miscompile("java/util/ArrayList", "add"));
         assert!(!is_known_miscompile("cratonvm/TckLang", "str_length"));
         assert!(!is_known_miscompile("com/example/Foo", "bar"));
