@@ -133,6 +133,19 @@ items are **its "defect #2" (= family A3 above)** and **bug C** (the cold-path
 deep-recursion overflow). It is kept for that context and the deep-recursion
 stack-guard design.
 
+## Standalone — Hibernate JAXB class-load storm (✅ FIXED)
+
+[hibernate-jaxb-classload-synthetic-stub-rescan-storm.md](hibernate-jaxb-classload-synthetic-stub-rescan-storm.md)
+— HIB-DEV-03. The **dominant** layer of the JAXB-XML-mapping hang. **Not** GC/JIT,
+**not** `retainAll`. Every `HashMap`/`LinkedHashMap` node insert allocates a
+`cratonvm/synthetic/AnonymousObject$N` whose synthetic-stub "upgrade" re-ran a
+**full classpath scan** (`find_class_bytes_delegated`) — O(num_jars) — on *every
+allocation*; with the ~250-JAR Hibernate classpath, map-heavy JAXB model building
+crawled to a `rc=124` timeout. ✅ **FIXED** (`fix/hib-dev-03-jaxb-classload`):
+memoize the known-absent result in `ClassManager`, re-armed on classpath
+extension. A/B: 20 000-node put loop 20 120 ms → 132 ms (now classpath-independent
+≈ HotSpot's allocation scaling). Unmasks the deeper JTA/socket cluster below.
+
 ## Standalone — Hibernate JTA cluster (Narayana XA + socket loopback)
 
 [hibernate-jta-narayana-xa-completion-and-socket-loopback.md](hibernate-jta-narayana-xa-completion-and-socket-loopback.md)
