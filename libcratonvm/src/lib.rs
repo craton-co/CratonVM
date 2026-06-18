@@ -912,6 +912,83 @@ pub extern "C" fn cratonvm_new_string(vm: *mut CratonVm, utf8: *const c_char) ->
     })
 }
 
+// --- string_utf8 read-back -------------------------------------------------
+
+/// `char *cratonvm_string_utf8(CratonVm *vm, CratonRef str)`
+///
+/// Read a `java.lang.String` handle (e.g. an `OBJECT` result from
+/// [`cratonvm_invoke_static`]) into a freshly-allocated, NUL-terminated UTF-8 C
+/// string — the read-back companion to [`cratonvm_new_string`]. Returns null
+/// (and sets the thread's last error) on a bad VM/handle or when `str` is not a
+/// `String`. The returned buffer is owned by the CALLER and must be released
+/// with [`cratonvm_free_string`] — it is NOT the thread-local last-error buffer.
+///
+/// # Safety
+/// `vm` is a handle from [`cratonvm_create`]; `str` is a [`CratonRef`] the VM
+/// previously handed out (or `0`).
+#[no_mangle]
+pub extern "C" fn cratonvm_string_utf8(vm: *mut CratonVm, str: CratonRef) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        clear_last_error();
+        // SAFETY: `vm` per caller contract.
+        unsafe {
+            with_vm(vm, std::ptr::null_mut(), |h| {
+                let oref = match ref_from_handle(str) {
+                    Some(r) => r,
+                    None => {
+                        set_last_error("cratonvm_string_utf8: null string handle");
+                        return std::ptr::null_mut();
+                    }
+                };
+                // Reuse the VM's String reader (`vm::read_java_string`), the same
+                // primitive the JNIEnv `GetStringUTFChars` slot uses.
+                match cratonvm_vm::vm::read_java_string(&h.vm.shared.heap, oref) {
+                    Some(s) => {
+                        // Strip interior NULs so `CString::new` cannot fail; the
+                        // buffer is caller-owned (freed via cratonvm_free_string).
+                        let mut bytes = s.into_bytes();
+                        bytes.retain(|&b| b != 0);
+                        match CString::new(bytes) {
+                            Ok(c) => c.into_raw(),
+                            Err(_) => std::ptr::null_mut(),
+                        }
+                    }
+                    None => {
+                        set_last_error(
+                            "cratonvm_string_utf8: handle is not a java.lang.String",
+                        );
+                        std::ptr::null_mut()
+                    }
+                }
+            })
+        }
+    }))
+    .unwrap_or_else(|_| {
+        set_last_error("cratonvm_string_utf8: panic");
+        std::ptr::null_mut()
+    })
+}
+
+/// `void cratonvm_free_string(char *s)`
+///
+/// Release a buffer returned by [`cratonvm_string_utf8`]. Passing null is a
+/// no-op; must not be called on any other pointer.
+///
+/// # Safety
+/// `s` is null or a pointer returned by [`cratonvm_string_utf8`] that has not
+/// already been freed.
+#[no_mangle]
+pub extern "C" fn cratonvm_free_string(s: *mut c_char) {
+    if s.is_null() {
+        return;
+    }
+    // SAFETY: caller contract — `s` came from cratonvm_string_utf8
+    // (`CString::into_raw`) and is freed exactly once.
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+        drop(CString::from_raw(s));
+    }));
+}
+
 // --- last_error ------------------------------------------------------------
 
 /// `const char *cratonvm_last_error(CratonVm *vm)`
@@ -1099,6 +1176,20 @@ mod tests {
     }
 
     #[test]
+    fn string_utf8_null_handle_returns_null_and_sets_error() {
+        clear_last_error();
+        let p = cratonvm_string_utf8(std::ptr::null_mut(), 0);
+        assert!(p.is_null());
+        assert!(last_error_string().is_some());
+    }
+
+    #[test]
+    fn free_string_null_is_noop() {
+        // Must not panic / segfault.
+        cratonvm_free_string(std::ptr::null_mut());
+    }
+
+    #[test]
     fn last_error_clear_round_trip() {
         set_last_error("boom");
         assert_eq!(last_error_string().as_deref(), Some("boom"));
@@ -1135,6 +1226,14 @@ mod tests {
         let text = CString::new("embed").unwrap();
         let s = cratonvm_new_string(vm, text.as_ptr());
         assert_ne!(s, 0, "new_string failed: {:?}", last_error_string());
+
+        // read the string handle back to UTF-8 and confirm the round trip.
+        let back = cratonvm_string_utf8(vm, s);
+        assert!(!back.is_null(), "string_utf8 failed: {:?}", last_error_string());
+        // SAFETY: `back` is a live caller-owned C string from cratonvm_string_utf8.
+        let back_str = unsafe { CStr::from_ptr(back) }.to_string_lossy().into_owned();
+        assert_eq!(back_str, "embed");
+        cratonvm_free_string(back);
 
         // invoke a void static (System.gc) with no args.
         let m = CString::new("gc").unwrap();

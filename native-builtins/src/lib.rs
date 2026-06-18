@@ -483,6 +483,8 @@ pub mod lookup_define;
 pub mod system_bootstrap;
 pub mod boot_loader;
 pub mod zip_real;
+/// Third-party compression JNI shims (snappy-java + zstd-jni) for Kafka codecs.
+pub mod compression_native;
 /// `java.util.zip.CRC32C` native overrides (Castagnoli CRC-32C).
 pub mod zip_crc32c;
 pub mod security_manager;
@@ -1752,6 +1754,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // unconditionally; in synthetic-jdk mode the phase71 overrides run after
     // register_synthetic_overrides and supersede these.
     zip_real::register_zip_real_natives(registry);
+
+    // Kafka third-party compression codecs: snappy-java block natives + zstd-jni
+    // streaming natives (see compression_native.rs). Registered in the same
+    // Bridge category as the zip_real natives above.
+    compression_native::register_compression_natives(registry);
 
     // java.util.zip.CRC32C — Java-method overrides for the Castagnoli CRC-32C.
     // CRC32C has NO native methods in JDK 25 (pure-Java, Unsafe-backed hot
@@ -35213,9 +35220,8 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(loader_obj))) => ctx.identity_hash_code(*loader_obj) as u32,
         _ => 0,
     };
-    let proxy_cid = define_or_get_proxy_class(ctx, loader_namespace, &iface_cids);
-    let proxy = match proxy_cid {
-        Some(cid) => {
+    let proxy = match define_or_get_proxy_class(ctx, loader_namespace, &iface_cids) {
+        ProxyClassOutcome::Real(cid) => {
             // The generated class extends `Proxy$Instance` (3 slots:
             // handler / interfaces / identity-hash). Use whichever is
             // larger of the declared field count or 3 — `class_num_total_fields`
@@ -35224,7 +35230,19 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             let n = ctx.class_num_total_fields(cid).max(3);
             ctx.alloc_object(cid, n)
         }
-        None => alloc_concurrent_synthetic(ctx, "java/lang/reflect/Proxy$Instance", 3),
+        ProxyClassOutcome::Degrade => {
+            alloc_concurrent_synthetic(ctx, "java/lang/reflect/Proxy$Instance", 3)
+        }
+        ProxyClassOutcome::Failed(stage) => {
+            // increment 3 (§3): STRICT mode surfaces the real failure as the JDK
+            // does (IllegalArgumentException); the default (non-strict) path keeps
+            // the synthetic shim so existing apps keep running while the real
+            // generated-classfile path soaks.
+            if real_proxy_strict() {
+                return Err(throw_proxy_failure(ctx, stage));
+            }
+            alloc_concurrent_synthetic(ctx, "java/lang/reflect/Proxy$Instance", 3)
+        }
     };
     ctx.set_field(proxy, 0, handler);
     ctx.set_field(proxy, 1, interfaces);
@@ -35483,11 +35501,79 @@ pub fn real_proxy_enabled() -> bool {
     }
 }
 
+/// proxy-real-classfile increment 3 (design §3) — STRICT mode. Default **OFF**.
+/// When ON (and the real path is enabled), a *genuine* proxy-class generation
+/// failure (spec-build / emit / define) surfaces as the real JDK exception
+/// (`IllegalArgumentException`), exactly as `Proxy.newProxyInstance` does —
+/// instead of silently degrading to the synthetic `Proxy$Instance` shim.
+///
+/// Gated default-off because the silent degrade is currently a *safety net* on
+/// the default (gate-on) path: removing it changes default behaviour, so the
+/// flip waits on the reflection-suite soak. Set `CRATONVM_REAL_PROXY_STRICT=1`
+/// (or `true`/`on`/`yes`) to opt in. Step 5 (deleting the shim outright) is the
+/// follow-up once this soaks clean.
+pub fn real_proxy_strict() -> bool {
+    matches!(std::env::var("CRATONVM_REAL_PROXY_STRICT"), Ok(v) if {
+        let v = v.trim().to_ascii_lowercase();
+        v == "1" || v == "true" || v == "on" || v == "yes"
+    })
+}
+
+/// Outcome of [`define_or_get_proxy_class`]. Distinguishes the *intended*
+/// gate-off degrade (use the synthetic shim) from a *genuine* generation
+/// failure, so STRICT mode ([`real_proxy_strict`]) can surface the latter as a
+/// real JDK exception rather than masking it with the shim.
+enum ProxyClassOutcome {
+    /// The real generated `$ProxyN` class (canonical path).
+    Real(cratonvm_types::ClassId),
+    /// `CRATONVM_REAL_PROXY=0` — the synthetic shim is the intended path.
+    Degrade,
+    /// A concrete spec/emit/define failure. `&'static str` is the stage, for
+    /// the exception message + the `CRATONVM_DBG_PROXY` audit.
+    Failed(&'static str),
+}
+
+/// Build + throw (as `Err(ExceptionThrown)`) the real JDK exception for a proxy
+/// generation failure under STRICT mode. Mirrors `Proxy.newProxyInstance`,
+/// which raises `IllegalArgumentException` when it cannot define the class.
+fn throw_proxy_failure(ctx: &mut dyn NativeContext, stage: &str) -> MethodCallFailed {
+    let msg = format!("Could not generate proxy class (stage: {stage})");
+    let cid = match ctx.ensure_class_initialized("java/lang/IllegalArgumentException") {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let n = ctx.class_num_total_fields(cid).max(4);
+    let exc = ctx.alloc_object(cid, n);
+    let msg_ref = ctx.create_string(&msg);
+    let _ = ctx.invoke(
+        "java/lang/IllegalArgumentException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(exc)), Value::Object(Some(msg_ref))],
+    );
+    MethodCallFailed::ExceptionThrown(exc)
+}
+
+#[cfg(test)]
+mod proxy_strict_gate_tests {
+    /// increment 3 (§3): STRICT proxy mode is opt-in and OFF by default, so the
+    /// silent-degrade safety net remains the default behaviour until the soak
+    /// flips it. (The throw path itself requires a live VM and is exercised by
+    /// the reflection suites under `CRATONVM_REAL_PROXY_STRICT=1`.)
+    #[test]
+    fn real_proxy_strict_defaults_off() {
+        assert!(!super::real_proxy_strict());
+    }
+}
+
 /// WP2.5-B — define (or fetch from cache) a `$ProxyN` class for the
-/// given iface ClassId set under `loader_id`. Returns `None` so the caller
-/// falls back to the legacy synthetic shim ONLY when:
-///   * the real-classfile path is disabled via `CRATONVM_REAL_PROXY=0`, or
-///   * a concrete, enumerated failure occurs (spec-build, emit, or define).
+/// given iface ClassId set under `loader_id`. Returns a [`ProxyClassOutcome`]:
+///   * `Degrade` — the real-classfile path is disabled via `CRATONVM_REAL_PROXY=0`;
+///     the caller uses the synthetic shim (intended).
+///   * `Failed(stage)` — a concrete spec-build / emit / define failure; the caller
+///     degrades to the shim by default, or throws the real JDK exception under
+///     STRICT mode ([`real_proxy_strict`]).
+///   * `Real(cid)` — the canonical generated `$ProxyN`.
 ///
 /// proxy-real-classfile increment 1 — the prior contract returned `None`
 /// on *any* failure and degraded silently, which made the synthetic shim
@@ -35499,7 +35585,7 @@ fn define_or_get_proxy_class(
     ctx: &mut dyn NativeContext,
     loader_id: u32,
     iface_class_ids: &[cratonvm_types::ClassId],
-) -> Option<cratonvm_types::ClassId> {
+) -> ProxyClassOutcome {
     let dbg = std::env::var("CRATONVM_DBG_PROXY").is_ok();
 
     // Gate-off path: explicit opt-out keeps the synthetic shim canonical.
@@ -35507,7 +35593,7 @@ fn define_or_get_proxy_class(
         if dbg {
             eprintln!("[DBG_PROXY] CRATONVM_REAL_PROXY disabled — using synthetic shim");
         }
-        return None;
+        return ProxyClassOutcome::Degrade;
     }
 
     // Sort + dedup ClassIds for deterministic cache keying.
@@ -35520,7 +35606,7 @@ fn define_or_get_proxy_class(
         let guard = PROXY_CLASS_CACHE.read();
         if let Some(map) = guard.as_ref() {
             if let Some(&cid) = map.get(&cache_key) {
-                return Some(cid);
+                return ProxyClassOutcome::Real(cid);
             }
         }
     }
@@ -35549,7 +35635,7 @@ fn define_or_get_proxy_class(
         Some(v) => v,
         None => {
             if dbg { eprintln!("[DBG_PROXY] FALLBACK(spec): build_proxy_spec_for returned None for ifaces={sorted:?}"); }
-            return None;
+            return ProxyClassOutcome::Failed("spec");
         }
     };
     // Failure mode (2): classfile emission. `emit_proxy_classfile` fails
@@ -35558,7 +35644,7 @@ fn define_or_get_proxy_class(
         Ok(b) => b,
         Err(e) => {
             if dbg { eprintln!("[DBG_PROXY] FALLBACK(emit): emit_proxy_classfile({gen_name}) failed: {e:?}"); }
-            return None;
+            return ProxyClassOutcome::Failed("emit");
         }
     };
     let opts = cratonvm_native_api::DefineClassFull {
@@ -35589,11 +35675,11 @@ fn define_or_get_proxy_class(
             let mut guard = PROXY_CLASS_CACHE.write();
             let map = guard.get_or_insert_with(rustc_hash::FxHashMap::default);
             map.insert(cache_key, cid);
-            Some(cid)
+            ProxyClassOutcome::Real(cid)
         }
         Err(e) => {
             if dbg { eprintln!("[DBG_PROXY] FALLBACK(define): define_class_full({gen_name}) failed: {e}"); }
-            None
+            ProxyClassOutcome::Failed("define")
         }
     }
 }

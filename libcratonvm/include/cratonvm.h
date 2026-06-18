@@ -112,6 +112,15 @@ CratonValue cratonvm_invoke_static(CratonVm *vm, const char *cls,
  * handle, or 0 on failure (last error set). */
 CratonRef cratonvm_new_string(CratonVm *vm, const char *utf8);
 
+/* Read a java.lang.String handle (e.g. an OBJECT result from
+ * cratonvm_invoke_static) into a freshly-allocated NUL-terminated UTF-8 C
+ * string. Returns NULL on failure (bad handle / not a String; last error set).
+ * The buffer is CALLER-owned and must be released with cratonvm_free_string. */
+char *cratonvm_string_utf8(CratonVm *vm, CratonRef str);
+
+/* Release a buffer returned by cratonvm_string_utf8. NULL is a no-op. */
+void cratonvm_free_string(char *s);
+
 /* ---- error access (thread-local) -------------------------------------- */
 
 /* Return this thread's pending error message, or NULL if none. The pointer is
