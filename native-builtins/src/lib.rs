@@ -1691,6 +1691,53 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/io/Console", "istty", "()Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
+
+    // nontty-console: companion to `Console.istty()` for the modern
+    // (JDK 22+) console path. In JDK 25 the only two natives across the
+    // entire `System.console()` chain are:
+    //   1. `java/io/Console.istty()Z`                       (above)
+    //   2. `jdk/internal/io/JdkConsoleImpl.echo(Z)Z`        (here)
+    //
+    // `Console.instantiateConsole()` reads the `istty` field (seeded by the
+    // native above): when it is `false` — our default for every redirected /
+    // piped / daemon stdout — the `if (istty && cons == null)` arm that would
+    // `new JdkConsoleImpl(...)` is SKIPPED, so `System.console()` returns
+    // `null` exactly like HotSpot on a non-TTY. That is the common path and it
+    // works with `istty()` alone.
+    //
+    // `echo(boolean)` is only reached when a `JdkConsoleImpl` actually exists
+    // (i.e. `istty == true`) and the program calls `readLine`/`readPassword`,
+    // which toggle terminal echo around the read. If `istty()` ever reports
+    // `true` for an embedding (an interactive launch, or a future change that
+    // wires real TTY detection) WITHOUT this native, the `echo()` call hits the
+    // missing-native path in `vm_exec` mid-read — an `UnsatisfiedLinkError`
+    // raised deep inside `JdkConsoleImpl.readline()` that is NOT at a
+    // <clinit>/swallow boundary, manifesting as the picocli/JLine/Boot-logger
+    // "probe System.console() then crash/hang" symptom (the daemon-gating bug).
+    //
+    // The OpenJDK Windows/Unix native flips the OS echo flag via a console
+    // ioctl and returns the PREVIOUS echo state. CratonVM has no JNI binding
+    // and must never block on a controlling-terminal ioctl, so we model a
+    // non-interactive terminal: echo is treated as already in the requested
+    // state, the call is a pure no-op, and we return the requested flag (`on`).
+    // This is non-blocking, never throws (the `throws IOException` is unused),
+    // and keeps `readLine`/`readPassword` from faulting if a Console is ever
+    // instantiated. Args: [0] = boolean `on` (this is a STATIC native, so there
+    // is no receiver in args).
+    registry.register(
+        "jdk/internal/io/JdkConsoleImpl", "echo", "(Z)Z",
+        |_ctx, args| {
+            let on = match args.first() {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            // Return the requested state (== "previous state was already this"):
+            // a faithful no-op for a non-interactive terminal that never
+            // touches a real tty ioctl.
+            Ok(Some(Value::Int(on)))
+        },
+    );
+
     registry.register(
         "java/lang/String", "toString", "()Ljava/lang/String;",
         |_ctx, args| {

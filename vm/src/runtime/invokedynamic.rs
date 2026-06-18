@@ -169,11 +169,20 @@ pub fn execute_invokedynamic(
             String::new()
         };
 
+        // The `\u0002` (TAG_CONST) entries in the recipe consume these trailing
+        // bootstrap static arguments in order. Per `java.lang.invoke.
+        // StringConcatFactory`, a constant may be *any* loadable constant
+        // (String, but also int/long/float/double or a Class), and is folded in
+        // via its `String.valueOf` form — NOT only `String`/`Utf8`. The previous
+        // `resolve_string_constant` returned `None` (→ empty) for every numeric
+        // constant, silently dropping it. `resolve_concat_constant` converts each
+        // loadable-constant kind to its HotSpot-identical text (reusing
+        // `format_float`/`format_double` so e.g. `1.0f` → "1.0", not "1").
         let constant_args: Vec<String> = bsm
             .bootstrap_arguments
             .iter()
             .skip(1) // skip recipe
-            .map(|&idx| resolve_string_constant(&class.constant_pool, idx).unwrap_or_default())
+            .map(|&idx| resolve_concat_constant(&class.constant_pool, idx).unwrap_or_default())
             .collect();
 
         let bootstrap_arg_indices = bsm.bootstrap_arguments.clone();
@@ -736,6 +745,46 @@ pub(crate) fn resolve_string_constant(cp: &ConstantPool, index: u16) -> Option<S
             cp.get_utf8(*string_index).map(|s| s.to_string())
         }
         ConstantPoolEntry::Utf8(s) => Some(s.to_string()),
+        _ => None,
+    }
+}
+
+/// Resolve a `makeConcatWithConstants` static constant argument (a `\u0002` /
+/// TAG_CONST recipe slot) to its `String.valueOf` text.
+///
+/// Unlike [`resolve_string_constant`] (which only understands `String`/`Utf8`
+/// and is shared with other call sites where that is the contract), the recipe
+/// constants of `StringConcatFactory.makeConcatWithConstants` may be *any*
+/// loadable constant. javac most often emits a folded `String` here, but the
+/// spec permits `int`/`long`/`float`/`double` and `Class` constants, and a
+/// faithful implementation must convert each exactly as `String.valueOf` /
+/// `String.valueOf((Object) c)` would:
+///   - `String`/`Utf8`           → the text verbatim
+///   - `int`                     → decimal (also covers folded boolean/char as int)
+///   - `long`                    → decimal
+///   - `float`/`double`          → Java float/double text (`format_float`/`format_double`)
+///   - `Class` (`ClassReference`) → the binary class name `String.valueOf` of a
+///                                   `Class` is its `toString()`, but for the
+///                                   common `String` literal case this never
+///                                   applies; we render the dotted name as a
+///                                   best effort rather than dropping it.
+///
+/// Returning `None` (→ empty string at the call site, preserving the prior
+/// fail-soft behaviour) only for kinds that cannot legally appear as a recipe
+/// constant.
+fn resolve_concat_constant(cp: &ConstantPool, index: u16) -> Option<String> {
+    match cp.get(index)? {
+        ConstantPoolEntry::StringReference { string_index } => {
+            cp.get_utf8(*string_index).map(|s| s.to_string())
+        }
+        ConstantPoolEntry::Utf8(s) => Some(s.to_string()),
+        ConstantPoolEntry::Integer(v) => Some(v.to_string()),
+        ConstantPoolEntry::Long(v) => Some(v.to_string()),
+        ConstantPoolEntry::Float(v) => Some(format_float(*v)),
+        ConstantPoolEntry::Double(v) => Some(format_double(*v)),
+        ConstantPoolEntry::ClassReference { name_index } => cp
+            .get_utf8(*name_index)
+            .map(|s| format!("class {}", s.replace('/', "."))),
         _ => None,
     }
 }
@@ -2016,6 +2065,36 @@ mod tests {
     fn parse_descriptor_args_all_primitives() {
         let args = parse_descriptor_args("(BCDFIJSZ)V");
         assert_eq!(args, vec!['B', 'C', 'D', 'F', 'I', 'J', 'S', 'Z']);
+    }
+
+    /// `makeConcatWithConstants` recipe constants (the `\u0002` slots) may be any
+    /// loadable constant, not just `String`. Verify each kind converts to its
+    /// HotSpot `String.valueOf` text instead of being silently dropped.
+    #[test]
+    fn resolve_concat_constant_all_kinds() {
+        use cratonvm_reader::constant_pool::ConstantPoolEntry as CPE;
+        let entries = vec![
+            CPE::Tombstone,                               // 0 (unused)
+            CPE::Utf8("lit".to_string().into()),          // 1
+            CPE::StringReference { string_index: 1 },     // 2  -> "lit"
+            CPE::Integer(42),                             // 3  -> "42"
+            CPE::Long(123456789012345),                   // 4  -> decimal
+            CPE::Float(1.0),                              // 5  -> "1.0"
+            CPE::Double(2.5),                             // 6  -> "2.5"
+            CPE::Utf8("verbatim".to_string().into()),     // 7  -> "verbatim"
+        ];
+        let cp = ConstantPool::new(entries);
+
+        assert_eq!(resolve_concat_constant(&cp, 2).as_deref(), Some("lit"));
+        assert_eq!(resolve_concat_constant(&cp, 3).as_deref(), Some("42"));
+        assert_eq!(
+            resolve_concat_constant(&cp, 4).as_deref(),
+            Some("123456789012345")
+        );
+        // Float/double must keep the Java ".0" suffix, not "1" / "2".
+        assert_eq!(resolve_concat_constant(&cp, 5).as_deref(), Some("1.0"));
+        assert_eq!(resolve_concat_constant(&cp, 6).as_deref(), Some("2.5"));
+        assert_eq!(resolve_concat_constant(&cp, 7).as_deref(), Some("verbatim"));
     }
 
     #[test]
