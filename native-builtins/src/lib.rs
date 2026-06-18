@@ -31418,6 +31418,7 @@ fn register_security_natives(registry: &mut NativeMethodRegistry) {
     registry.register(md, "update", "([BII)V", native_md_update_bytes_off);
     registry.register(md, "digest", "()[B", native_md_digest);
     registry.register(md, "digest", "([B)[B", native_md_digest_input);
+    registry.register(md, "digest", "([BII)I", native_md_digest_buf);
     registry.register(md, "reset", "()V", native_md_reset);
     registry.register(
         md,
@@ -32257,6 +32258,60 @@ fn native_md_digest_input(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         md_append_bytes(ctx, this, &bytes);
     }
     native_md_digest(ctx, args)
+}
+
+/// `int MessageDigest.digest(byte[] buf, int offset, int len)` — completes the
+/// digest into the caller's buffer and returns the number of bytes written.
+/// Without this native the call ran the real JDK bytecode, which dispatches to
+/// the abstract `MessageDigestSpi.engineDigest()` (no Code attribute) and threw
+/// `AbstractMethodError` — e.g. Kafka's `SkimpyOffsetMap.hashInto` uses this
+/// overload (OffsetMapTest), not the `digest()[B` form the other natives cover.
+fn native_md_digest_buf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let buf = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let offset = match args.get(2) {
+        Some(Value::Int(v)) => (*v).max(0) as usize,
+        _ => 0,
+    };
+    let len = match args.get(3) {
+        Some(Value::Int(v)) => (*v).max(0) as usize,
+        _ => 0,
+    };
+    let algo = match ctx.get_field(this, MD_FIELD_ALGO) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let data = match ctx.get_field(this, MD_FIELD_DATA) {
+        Value::Object(Some(arr)) => {
+            let n = ctx.array_length(arr);
+            let mut v = Vec::with_capacity(n);
+            for i in 0..n {
+                if let Value::Int(b) = ctx.get_array_element(arr, i) {
+                    v.push(b as u8);
+                }
+            }
+            v
+        }
+        _ => Vec::new(),
+    };
+    let digest = compute_digest(&algo, &data);
+    // JDK writes the full digest (callers size `len` to the digest length); we
+    // additionally clamp to both `len` and the array bounds to fail safe.
+    let cap = ctx.array_length(buf);
+    let n = digest.len().min(len).min(cap.saturating_sub(offset));
+    for i in 0..n {
+        ctx.set_array_element(buf, offset + i, Value::Int(digest[i] as i8 as i32));
+    }
+    // Reset the running state, matching `digest()`'s post-finalization reset.
+    let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
+    ctx.set_field(this, MD_FIELD_DATA, Value::Object(Some(empty)));
+    Ok(Some(Value::Int(digest.len() as i32)))
 }
 
 fn native_md_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

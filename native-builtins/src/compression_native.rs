@@ -506,6 +506,267 @@ fn zstd_set_compression_level(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(Value::Int(0)))
 }
 
+// ===========================================================================
+// lz4-java — net.jpountz.lz4.LZ4JNI (canonical LZ4 block format)
+// ===========================================================================
+//
+// All LZ4JNI methods are *static*, so args start at index 0 (no receiver). Each
+// (byte[] arr, ByteBuffer buf) pair is "heap array XOR direct buffer"; Kafka's
+// codec always takes the heap-array branch (arr non-null, buf null), which is
+// all we back here.
+
+fn lz4_compress_bound(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let n = arg_int(args, 0).max(0) as usize;
+    Ok(Some(Value::Int(lz4_flex::block::get_maximum_output_size(n) as i32)))
+}
+
+/// Shared body for `LZ4_compress_limitedOutput` / `LZ4_compressHC`. lz4_flex
+/// emits the same raw LZ4 block regardless of "HC", so both route here; the
+/// HC level only affects ratio, not format/correctness.
+fn lz4_compress_into_dst(
+    ctx: &mut dyn NativeContext,
+    src_arr: Option<ObjectRef>,
+    src_off: usize,
+    src_len: usize,
+    dst_arr: Option<ObjectRef>,
+    dst_off: usize,
+    max_dst_len: usize,
+) -> MethodCallResult {
+    let input = read_bytes(ctx, src_arr, src_off, src_len);
+    let mut tmp = vec![0u8; lz4_flex::block::get_maximum_output_size(input.len())];
+    let clen = match lz4_flex::block::compress_into(&input, &mut tmp) {
+        Ok(n) => n,
+        Err(e) => {
+            return Err(RuntimeError::IOException {
+                message: format!("lz4 compress: {e}"),
+            }
+            .into());
+        }
+    };
+    // liblz4 LZ4_compress_limitedOutput contract: 0 when the result does not fit.
+    if clen > max_dst_len {
+        return Ok(Some(Value::Int(0)));
+    }
+    if let Some(d) = dst_arr {
+        ctx.write_byte_array_from(d, dst_off, &tmp[..clen]);
+    }
+    Ok(Some(Value::Int(clen as i32)))
+}
+
+fn lz4_compress_limited_output(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // (byte[] src, ByteBuffer, int srcOff, int srcLen, byte[] dst, ByteBuffer, int dstOff, int maxDstLen)
+    lz4_compress_into_dst(
+        ctx,
+        arg_obj(args, 0),
+        arg_int(args, 2).max(0) as usize,
+        arg_int(args, 3).max(0) as usize,
+        arg_obj(args, 4),
+        arg_int(args, 6).max(0) as usize,
+        arg_int(args, 7).max(0) as usize,
+    )
+}
+
+fn lz4_compress_hc(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // same as limitedOutput plus a trailing compression-level int (args[8], ignored)
+    lz4_compress_into_dst(
+        ctx,
+        arg_obj(args, 0),
+        arg_int(args, 2).max(0) as usize,
+        arg_int(args, 3).max(0) as usize,
+        arg_obj(args, 4),
+        arg_int(args, 6).max(0) as usize,
+        arg_int(args, 7).max(0) as usize,
+    )
+}
+
+fn lz4_decompress_safe(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // (byte[] src, ByteBuffer, int srcOff, int srcLen, byte[] dst, ByteBuffer, int dstOff, int maxDstLen)
+    let src_off = arg_int(args, 2).max(0) as usize;
+    let src_len = arg_int(args, 3).max(0) as usize;
+    let dst_off = arg_int(args, 6).max(0) as usize;
+    let max_dst_len = arg_int(args, 7).max(0) as usize;
+    let input = read_bytes(ctx, arg_obj(args, 0), src_off, src_len);
+
+    // `decompress` allocates to the actual size given a `min_uncompressed_size`
+    // upper bound (which `maxDstLen` is — Kafka sizes it to the block size).
+    let out = match lz4_flex::block::decompress(&input, max_dst_len) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(RuntimeError::IOException {
+                message: format!("lz4 decompress_safe: {e}"),
+            }
+            .into());
+        }
+    };
+    if let Some(d) = arg_obj(args, 4) {
+        ctx.write_byte_array_from(d, dst_off, &out);
+    }
+    Ok(Some(Value::Int(out.len() as i32)))
+}
+
+fn lz4_decompress_fast(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // (byte[] src, ByteBuffer, int srcOff, byte[] dst, ByteBuffer, int dstOff, int destLen)
+    // The "fast" decompressor knows the output size up front and returns the
+    // number of *source* bytes consumed. lz4_flex doesn't surface source-bytes
+    // read, so we decompress exactly `destLen` bytes from the source tail and
+    // report its length as consumed. Kafka's codec uses the *safe* path, so
+    // this branch is exercised only by direct LZ4FastDecompressor users.
+    let src_off = arg_int(args, 2).max(0) as usize;
+    let dst_off = arg_int(args, 5).max(0) as usize;
+    let dest_len = arg_int(args, 6).max(0) as usize;
+
+    let src_arr = arg_obj(args, 0);
+    let src_total = src_arr.map(|a| ctx.array_length(a)).unwrap_or(0);
+    let input = read_bytes(ctx, src_arr, src_off, src_total.saturating_sub(src_off));
+
+    let mut out = vec![0u8; dest_len];
+    match lz4_flex::block::decompress_into(&input, &mut out) {
+        Ok(written) if written == dest_len => {
+            if let Some(d) = arg_obj(args, 3) {
+                ctx.write_byte_array_from(d, dst_off, &out);
+            }
+            Ok(Some(Value::Int(input.len() as i32)))
+        }
+        _ => Ok(Some(Value::Int(-1))),
+    }
+}
+
+// ===========================================================================
+// lz4-java — net.jpountz.xxhash.XXHashJNI (xxHash32/64 for LZ4 frame checksums)
+// ===========================================================================
+//
+// All static. `twox-hash` is reference-xxHash-compatible, so the block
+// checksums it produces match what a real liblz4/xxhash decoder verifies.
+
+fn xxh32_table() -> &'static Mutex<HashMap<i64, twox_hash::XxHash32>> {
+    static T: OnceLock<Mutex<HashMap<i64, twox_hash::XxHash32>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn xxh64_table() -> &'static Mutex<HashMap<i64, twox_hash::XxHash64>> {
+    static T: OnceLock<Mutex<HashMap<i64, twox_hash::XxHash64>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn xxh32_oneshot(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    use std::hash::Hasher;
+    // XXH32(byte[] buf, int off, int len, int seed)
+    let off = arg_int(args, 1).max(0) as usize;
+    let len = arg_int(args, 2).max(0) as usize;
+    let seed = arg_int(args, 3) as u32;
+    let data = read_bytes(ctx, arg_obj(args, 0), off, len);
+    let mut h = twox_hash::XxHash32::with_seed(seed);
+    h.write(&data);
+    Ok(Some(Value::Int(h.finish() as u32 as i32)))
+}
+
+fn xxh32_init(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let seed = arg_int(args, 0) as u32;
+    let handle = next_handle();
+    xxh32_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(handle, twox_hash::XxHash32::with_seed(seed));
+    Ok(Some(Value::Long(handle)))
+}
+
+fn xxh32_update(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    use std::hash::Hasher;
+    // XXH32_update(long state, byte[] buf, int off, int len)
+    let h = arg_long(args, 0);
+    let off = arg_int(args, 2).max(0) as usize;
+    let len = arg_int(args, 3).max(0) as usize;
+    let data = read_bytes(ctx, arg_obj(args, 1), off, len);
+    if let Some(st) = xxh32_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(&h)
+    {
+        st.write(&data);
+    }
+    Ok(None)
+}
+
+fn xxh32_digest(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    use std::hash::Hasher;
+    let h = arg_long(args, 0);
+    let v = xxh32_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&h)
+        .map(|s| s.finish() as u32 as i32)
+        .unwrap_or(0);
+    Ok(Some(Value::Int(v)))
+}
+
+fn xxh32_free(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let h = arg_long(args, 0);
+    xxh32_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&h);
+    Ok(None)
+}
+
+fn xxh64_oneshot(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    use std::hash::Hasher;
+    // XXH64(byte[] buf, int off, int len, long seed)
+    let off = arg_int(args, 1).max(0) as usize;
+    let len = arg_int(args, 2).max(0) as usize;
+    let seed = arg_long(args, 3) as u64;
+    let data = read_bytes(ctx, arg_obj(args, 0), off, len);
+    let mut h = twox_hash::XxHash64::with_seed(seed);
+    h.write(&data);
+    Ok(Some(Value::Long(h.finish() as i64)))
+}
+
+fn xxh64_init(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let seed = arg_long(args, 0) as u64;
+    let handle = next_handle();
+    xxh64_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(handle, twox_hash::XxHash64::with_seed(seed));
+    Ok(Some(Value::Long(handle)))
+}
+
+fn xxh64_update(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    use std::hash::Hasher;
+    let h = arg_long(args, 0);
+    let off = arg_int(args, 2).max(0) as usize;
+    let len = arg_int(args, 3).max(0) as usize;
+    let data = read_bytes(ctx, arg_obj(args, 1), off, len);
+    if let Some(st) = xxh64_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(&h)
+    {
+        st.write(&data);
+    }
+    Ok(None)
+}
+
+fn xxh64_digest(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    use std::hash::Hasher;
+    let h = arg_long(args, 0);
+    let v = xxh64_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&h)
+        .map(|s| s.finish() as i64)
+        .unwrap_or(0);
+    Ok(Some(Value::Long(v)))
+}
+
+fn xxh64_free(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let h = arg_long(args, 0);
+    xxh64_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&h);
+    Ok(None)
+}
+
 // ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
@@ -520,6 +781,49 @@ pub fn register_compression_natives(r: &mut NativeMethodRegistry) {
     r.register(sn, "rawUncompress", "(Ljava/lang/Object;IILjava/lang/Object;I)I", snappy_raw_uncompress);
     r.register(sn, "isValidCompressedBuffer", "(Ljava/lang/Object;II)Z", snappy_is_valid_compressed_buffer);
     r.register(sn, "arrayCopy", "(Ljava/lang/Object;IILjava/lang/Object;I)V", snappy_array_copy);
+
+    // --- lz4-java: net.jpountz.lz4.LZ4JNI (static methods, block format) ---
+    let lz = "net/jpountz/lz4/LZ4JNI";
+    r.register(lz, "init", "()V", |_c, _a| Ok(None));
+    r.register(lz, "LZ4_compressBound", "(I)I", lz4_compress_bound);
+    r.register(
+        lz,
+        "LZ4_compress_limitedOutput",
+        "([BLjava/nio/ByteBuffer;II[BLjava/nio/ByteBuffer;II)I",
+        lz4_compress_limited_output,
+    );
+    r.register(
+        lz,
+        "LZ4_compressHC",
+        "([BLjava/nio/ByteBuffer;II[BLjava/nio/ByteBuffer;III)I",
+        lz4_compress_hc,
+    );
+    r.register(
+        lz,
+        "LZ4_decompress_safe",
+        "([BLjava/nio/ByteBuffer;II[BLjava/nio/ByteBuffer;II)I",
+        lz4_decompress_safe,
+    );
+    r.register(
+        lz,
+        "LZ4_decompress_fast",
+        "([BLjava/nio/ByteBuffer;I[BLjava/nio/ByteBuffer;II)I",
+        lz4_decompress_fast,
+    );
+
+    // --- lz4-java: net.jpountz.xxhash.XXHashJNI (static, LZ4 frame checksums) ---
+    let xx = "net/jpountz/xxhash/XXHashJNI";
+    r.register(xx, "init", "()V", |_c, _a| Ok(None));
+    r.register(xx, "XXH32", "([BIII)I", xxh32_oneshot);
+    r.register(xx, "XXH32_init", "(I)J", xxh32_init);
+    r.register(xx, "XXH32_update", "(J[BII)V", xxh32_update);
+    r.register(xx, "XXH32_digest", "(J)I", xxh32_digest);
+    r.register(xx, "XXH32_free", "(J)V", xxh32_free);
+    r.register(xx, "XXH64", "([BIIJ)J", xxh64_oneshot);
+    r.register(xx, "XXH64_init", "(J)J", xxh64_init);
+    r.register(xx, "XXH64_update", "(J[BII)V", xxh64_update);
+    r.register(xx, "XXH64_digest", "(J)J", xxh64_digest);
+    r.register(xx, "XXH64_free", "(J)V", xxh64_free);
 
     // --- zstd-jni: streaming compress (ZstdOutputStreamNoFinalizer) ---
     let zo = "com/github/luben/zstd/ZstdOutputStreamNoFinalizer";
@@ -684,6 +988,34 @@ mod tests {
         let mut out = vec![0u8; dlen];
         let n = snap::raw::Decoder::new().decompress(&comp[..clen], &mut out).unwrap();
         assert_eq!(&out[..n], original);
+    }
+
+    #[test]
+    fn lz4_block_round_trip() {
+        let original: Vec<u8> = (0..3000u32).map(|i| (i % 97) as u8).collect();
+        let mut comp = vec![0u8; lz4_flex::block::get_maximum_output_size(original.len())];
+        let clen = lz4_flex::block::compress_into(&original, &mut comp).unwrap();
+        assert!(clen > 0 && clen <= comp.len());
+        // safe-decompress path (the one Kafka uses), bounded by max output size.
+        let out = lz4_flex::block::decompress(&comp[..clen], original.len()).unwrap();
+        assert_eq!(out, original);
+    }
+
+    #[test]
+    fn xxhash32_oneshot_matches_streaming_and_reference() {
+        use std::hash::Hasher;
+        // Reference xxHash32 of the empty input with seed 0 is 0x02CC5D05.
+        let mut empty = twox_hash::XxHash32::with_seed(0);
+        empty.write(&[]);
+        assert_eq!(empty.finish() as u32, 0x02CC_5D05);
+
+        // One-shot over "hello world" must equal the streamed "hello"+" world".
+        let mut one = twox_hash::XxHash32::with_seed(0);
+        one.write(b"hello world");
+        let mut stream = twox_hash::XxHash32::with_seed(0);
+        stream.write(b"hello");
+        stream.write(b" world");
+        assert_eq!(one.finish(), stream.finish());
     }
 
     #[test]

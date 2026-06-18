@@ -20832,6 +20832,30 @@ pub(crate) fn register_p62_navigable_expansion(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         p62_tm_higher_key,
     );
+    r.register(
+        tm,
+        "floorEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        p62_tm_floor_entry,
+    );
+    r.register(
+        tm,
+        "ceilingEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        p62_tm_ceiling_entry,
+    );
+    r.register(
+        tm,
+        "lowerEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        p62_tm_lower_entry,
+    );
+    r.register(
+        tm,
+        "higherEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        p62_tm_higher_entry,
+    );
 
     let nm = "java/util/NavigableMap";
     r.register(
@@ -20857,6 +20881,30 @@ pub(crate) fn register_p62_navigable_expansion(r: &mut NativeMethodRegistry) {
         "higherKey",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         p62_tm_higher_key,
+    );
+    r.register(
+        nm,
+        "floorEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        p62_tm_floor_entry,
+    );
+    r.register(
+        nm,
+        "ceilingEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        p62_tm_ceiling_entry,
+    );
+    r.register(
+        nm,
+        "lowerEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        p62_tm_lower_entry,
+    );
+    r.register(
+        nm,
+        "higherEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        p62_tm_higher_entry,
     );
 
     let ts = "java/util/TreeSet";
@@ -21007,6 +21055,111 @@ fn p62_tm_higher_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         let k = ctx.get_array_element(data, i * 2);
         if natural_compare_values(k, key) > 0 {
             return Ok(Some(k));
+        }
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+// The relative-`*Entry` variants for the p62 TreeMap layout (field0 = sorted
+// key/value array with key at i*2 + value at i*2+1, field1 = size). These
+// mirror the p62 `*Key` scans exactly but return a `Map.Entry` for the
+// resolved slot — needed so that whichever TreeMap impl registers last (this
+// linear-scan one or native-collections' array/fast-mode one) has a layout-
+// consistent `*Entry` alongside its `*Key`.
+
+/// Build a `Map.Entry` for the p62 slot at logical index `idx` (None → null).
+fn p62_tm_entry_at(ctx: &mut dyn NativeContext, data: ObjectRef, idx: Option<usize>) -> Value {
+    match idx {
+        Some(i) => {
+            let k = ctx.get_array_element(data, i * 2);
+            let v = ctx.get_array_element(data, i * 2 + 1);
+            Value::Object(Some(p64_make_entry(ctx, k, v)))
+        }
+        None => Value::Object(None),
+    }
+}
+
+fn p62_tm_floor_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    let data = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) if size != 0 => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let mut found: Option<usize> = None;
+    for i in 0..size {
+        let k = ctx.get_array_element(data, i * 2);
+        if natural_compare_values(k, key) <= 0 {
+            found = Some(i);
+        } else {
+            break;
+        }
+    }
+    Ok(Some(p62_tm_entry_at(ctx, data, found)))
+}
+
+fn p62_tm_ceiling_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    let data = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) if size != 0 => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    for i in 0..size {
+        let k = ctx.get_array_element(data, i * 2);
+        if natural_compare_values(k, key) >= 0 {
+            return Ok(Some(p62_tm_entry_at(ctx, data, Some(i))));
+        }
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+fn p62_tm_lower_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    let data = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) if size != 0 => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let mut found: Option<usize> = None;
+    for i in 0..size {
+        let k = ctx.get_array_element(data, i * 2);
+        if natural_compare_values(k, key) < 0 {
+            found = Some(i);
+        } else {
+            break;
+        }
+    }
+    Ok(Some(p62_tm_entry_at(ctx, data, found)))
+}
+
+fn p62_tm_higher_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    let data = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) if size != 0 => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    for i in 0..size {
+        let k = ctx.get_array_element(data, i * 2);
+        if natural_compare_values(k, key) > 0 {
+            return Ok(Some(p62_tm_entry_at(ctx, data, Some(i))));
         }
     }
     Ok(Some(Value::Object(None)))
