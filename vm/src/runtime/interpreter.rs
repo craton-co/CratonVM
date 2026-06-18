@@ -14365,7 +14365,39 @@ fn execute_invokestatic_cached(
                 cached.method_name.as_ref(),
                 cached.method_descriptor.as_ref(),
             );
-            let _recommended_tier = shared.tiered_manager.on_method_invocation(&tiered_key);
+            // wire-tiered-manager increment 1: start the background compile
+            // thread once (idempotent) so enqueued tasks are drained OFF the
+            // mutator thread. `on_method_invocation` increments the per-method
+            // counter and, when the tiered thresholds are crossed, ENQUEUES a
+            // CompilationTask at the recommended tier (instead of the old code
+            // discarding the tier into `_`). The background worker consumes that
+            // queue. For this increment the worker uses a drain-only compile
+            // closure and the mutator keeps its existing inline upgrade below;
+            // moving compilation fully off-mutator is increment 2.
+            crate::jit::tiered::ensure_background_compiler(&shared.tiered_manager, || {
+                Box::new(|_task: &crate::jit::tiered::CompilationTask| -> u64 {
+                    // Increment-1 placeholder: real codegen wiring (which needs
+                    // VM-init / class-metadata access outside this item's
+                    // subsystem boundary) lands in a later increment. Draining
+                    // here proves tasks flow off-thread and clears the queued
+                    // flag via `complete_task`.
+                    0
+                })
+            });
+            let recommended_tier =
+                shared.tiered_manager.on_method_invocation(&tiered_key);
+            if let Some(tier) = recommended_tier {
+                if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+                    eprintln!(
+                        "[cratonvm-jitc] tiered-enqueue {}.{}{} tier={:?} invoc_count={}",
+                        cached.class_name,
+                        cached.method_name,
+                        cached.method_descriptor,
+                        tier,
+                        invoc_count
+                    );
+                }
+            }
             // WP2.4-F1: pass the bytecode entry's gate to inherit
             // the staleness binding — the JIT'd body executes the same
             // declaring class, so a future `redefine_class` must

@@ -1,5 +1,32 @@
 # Wire the Tiered Compilation Manager
 
+> **Increment 1 (tier recommendation wired + background compile thread) landed.**
+> Steps 1–2 of the ordered plan below are now real:
+> - The interpreter no longer discards the recommended tier
+>   (`vm/src/runtime/interpreter.rs` ~14361–14400). `on_method_invocation` now
+>   *enqueues* a `CompilationTask` at the policy-recommended tier when the C1/C2
+>   thresholds are crossed (the result is bound to `recommended_tier` and acted
+>   on, not dropped into `_`).
+> - A real **background compile thread** now drains the queue off the mutator
+>   thread. `jit/src/tiered.rs` grew a shared `CompilerCore` (per-method state +
+>   queue + stats + wake condvar + shutdown flag behind an `Arc`), a
+>   `BackgroundCompiler` worker handle (RAII: drop → drain+join, so no thread
+>   outlives the VM), `start_background_compiler(compile_fn)`, and a process-
+>   global `ensure_background_compiler(mgr, make_compile_fn)` started once via
+>   `Once` from the interpreter hook. The worker blocks on the condvar (no spin),
+>   dequeues highest-priority first, runs the compile callback off-thread, then
+>   publishes the tier via `CompilerCore::complete_task`.
+> - **Scope note:** for this increment the worker runs a *drain-only* compile
+>   closure and the mutator keeps its existing inline `try_jit_upgrade_with_gate`
+>   path, because the real codegen callback needs VM-init / class-metadata access
+>   that lives outside this item's subsystem boundary. Wiring the real
+>   `compile_fn` and switching the mutator to enqueue-only (removing the inline
+>   stall) is the remainder of step 2 / step 3.
+> - Test: `background_worker_drains_enqueued_task_off_thread` in
+>   `jit/src/tiered.rs` (deterministic via an `mpsc` sync handle — asserts the
+>   task is compiled on a *different* `ThreadId` than the caller).
+> - Step 5 (precise OSR) remains gated on `real-frame-deopt.md` state maps.
+
 Status: design / not started. L. `jit/src/tiered.rs` is a full HotSpot-style
 tiered policy + priority compilation queue that the interpreter currently
 **throws away** — it compiles exactly one tier at one fixed invocation
