@@ -306,8 +306,45 @@ fn bool_arg(args: &[Value], idx: usize) -> bool {
 /// the `alloc_t16` helper in `nio_native.rs`.
 fn alloc_obj(ctx: &mut dyn NativeContext, class_name: &str, nfields: usize) -> ObjectRef {
     match ctx.ensure_class_initialized(class_name) {
-        Ok(cid) => ctx.alloc_object(cid, nfields),
+        Ok(cid) => {
+            // Allocate the FULL real field layout (not just the synthetic
+            // `nfields`) so the inherited `AbstractInterruptibleChannel.closeLock`
+            // / `AbstractSelectableChannel.keyLock`/`regLock` monitor fields
+            // actually exist and can be seeded by `init_channel_locks`. The
+            // synthetic per-channel state lives in the `chan_fields` side-table
+            // (keyed by identity, see cf_set), so the extra real slots are inert
+            // for the natives but let any real channel bytecode that runs (e.g.
+            // `close()` reached from the Apache NIO reactor) find non-null locks.
+            let real = ctx.class_num_total_fields(cid);
+            ctx.alloc_object(cid, real.max(nfields))
+        }
         Err(_) => ctx.alloc_object(ClassId::new(0), nfields),
+    }
+}
+
+/// Seed the `AbstractInterruptibleChannel` / `AbstractSelectableChannel` monitor
+/// fields the real JDK `close()`/`register()` bytecode does `synchronized(...)`
+/// on. CratonVM creates channels without running those constructors, leaving the
+/// `final` locks null → `monitorenter ... null` NPE on any path that reaches the
+/// real bytecode. The Apache httpasyncclient I/O reactor closes each session's
+/// `SocketChannel` via the final `AbstractInterruptibleChannel.close()` (not the
+/// overridable `SocketChannelImpl.close`), so a null `closeLock` killed the
+/// reactor worker under load → "I/O reactor has been shut down" (ES
+/// testManyAsyncRequests). Idempotent; safe to call on any channel.
+fn init_channel_locks(ctx: &mut dyn NativeContext, ch: ObjectRef) {
+    // Seed each monitor field with the channel object ITSELF rather than a fresh
+    // `new Object()`. The fields only need to be a non-null, stable monitor; the
+    // channel is one, and using it avoids the allocation entirely — which matters
+    // because `new_object` can trigger a moving GC that relocates `ch`, and under
+    // concurrent load (the Apache reactor opening hundreds of channels) that race
+    // left `closeLock` null for a few channels → reactor-killing NPE on close (ES
+    // testManyAsyncRequests). `synchronized(closeLock)` then `synchronized(keyLock)`
+    // both lock the same channel monitor reentrantly (same thread) — correct, and
+    // distinct channels still use distinct monitors.
+    for f in ["closeLock", "keyLock", "regLock"] {
+        if !matches!(ctx.get_field_by_name(ch, f), Value::Object(Some(_))) {
+            ctx.set_field_by_name(ch, f, Value::Object(Some(ch)));
+        }
     }
 }
 
@@ -688,6 +725,7 @@ fn buffer_write_bytes(ctx: &mut dyn NativeContext, bb: ObjectRef, data: &[u8]) -
 /// or connect yet; that happens on `connect`.
 fn sc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let ch = alloc_obj(ctx, "java/nio/channels/SocketChannel", N_FIELDS);
+    init_channel_locks(ctx, ch);
     cf_set(ctx, ch, F_OPEN, Value::Int(1));
     cf_set(ctx, ch, F_BLOCKING, Value::Int(1));
     cf_set(ctx, ch, F_REG_ID, Value::Int(-1));
@@ -799,30 +837,29 @@ fn sc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         Some(o) => o,
         None => return Err(ioex("socket: null channel")),
     };
-    // Under CRATONVM_REAL_NET_SOCKETS the central registry filter drops every
-    // java/net/Socket native, so the real java.net.Socket bytecode runs. A bare
-    // `new java/net/Socket` allocated WITHOUT its <init> leaves `socketLock`
-    // (a `final Object` instance-initializer field) null, so the first real
-    // Socket method that does `synchronized (socketLock)` — e.g. getImpl() from
-    // Socket.connect() — throws "monitorenter ... null". This is exactly the
-    // path Gradle's TcpOutgoingConnector takes: socketChannel.socket().connect().
-    //
-    // Mirror the real SocketChannelImpl.socket() (return SocketAdaptor.create(this)):
-    // the adaptor is a proper java.net.Socket subclass whose connect/getInputStream/
-    // getOutputStream/options delegate to the channel, and whose construction runs
-    // the Socket instance initializers (socketLock = new Object()).
-    if std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some() {
-        match ctx.invoke(
-            "sun/nio/ch/SocketAdaptor",
-            "create",
-            "(Lsun/nio/ch/SocketChannelImpl;)Ljava/net/Socket;",
-            &[Value::Object(Some(this))],
-        ) {
-            Ok(Some(v @ Value::Object(Some(_)))) => return Ok(Some(v)),
-            // Fall through to the bare-Socket fallback on any failure so the
-            // non-real-net callers (Tomcat option getters) still get an object.
-            _ => {}
-        }
+    // Mirror the real `SocketChannelImpl.socket()` → `SocketAdaptor.create(this)`:
+    // the adaptor is a proper `java.net.Socket` subclass whose option getters
+    // (`getKeepAlive`/`getTcpNoDelay`/…), `connect`, `getInputStream`/
+    // `getOutputStream` are OVERRIDDEN to delegate to the channel — so they never
+    // touch `Socket.getImpl()` / the `socketLock` monitor. A bare
+    // `new java/net/Socket` (no `<init>`) leaves `socketLock` (a `final Object`
+    // instance-initializer field) null, so the FIRST real `Socket` method that
+    // does `synchronized (socketLock)` — e.g. `getKeepAlive()`→`getImpl()` —
+    // throws "monitorenter ... null". The Apache httpasyncclient I/O reactor
+    // (`BaseIOReactor`) inspects `channel.socket()` options on every accepted
+    // session, so that NPE kills the reactor worker → every request's future
+    // hangs (ES-HANG-02). The adaptor is correct regardless of the
+    // `CRATONVM_REAL_NET_SOCKETS` gate, so build it unconditionally.
+    match ctx.invoke(
+        "sun/nio/ch/SocketAdaptor",
+        "create",
+        "(Lsun/nio/ch/SocketChannelImpl;)Ljava/net/Socket;",
+        &[Value::Object(Some(this))],
+    ) {
+        Ok(Some(v @ Value::Object(Some(_)))) => return Ok(Some(v)),
+        // Fall through to the bare-Socket fallback on any failure so callers
+        // still get an object.
+        _ => {}
     }
     let sock = ctx
         .new_object("java/net/Socket")
@@ -832,6 +869,16 @@ fn sc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             _ => None,
         })
         .ok_or_else(|| ioex("socket: could not allocate Socket"))?;
+    // Safety net: the bare Socket skipped <init>, so seed `socketLock` with a
+    // live monitor object so any `synchronized (socketLock)` method doesn't NPE.
+    if !matches!(
+        ctx.get_field_by_name(sock, "socketLock"),
+        Value::Object(Some(_))
+    ) {
+        if let Ok(Some(Value::Object(Some(lock)))) = ctx.new_object("java/lang/Object") {
+            ctx.set_field_by_name(sock, "socketLock", Value::Object(Some(lock)));
+        }
+    }
     Ok(Some(Value::Object(Some(sock))))
 }
 
@@ -1564,14 +1611,54 @@ fn sc_get_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         },
         None => String::new(),
     };
-    if let Some(id) = read_reg_id(ctx, this) {
+    // `SocketChannel.getOption` is declared `<T> T getOption(SocketOption<T>)`,
+    // so the native MUST return a *boxed* object (Boolean/Integer), not a raw
+    // `Value::Int` — a primitive returned for an object-typed method coerces to
+    // null, and the `SocketAdaptor` getters then `((Boolean) ...).booleanValue()`
+    // → NPE. Box by the option's value type.
+    let raw = if let Some(id) = read_reg_id(ctx, this) {
         let map = tcp_registry().read();
-        if let Some(TcpHandle::Stream(s)) = map.get(&id) {
-            let v = read_option(s, &opt_name).unwrap_or(0);
-            return Ok(Some(Value::Int(v)));
+        match map.get(&id) {
+            Some(TcpHandle::Stream(s)) => read_option(s, &opt_name).unwrap_or(0),
+            _ => 0,
         }
+    } else {
+        0
+    };
+    box_socket_option(ctx, &opt_name, raw)
+}
+
+/// Box a socket-option value as the JDK type the `SocketOption<T>` declares:
+/// `Boolean` for the flag options, otherwise `Integer`.
+fn box_socket_option(
+    ctx: &mut dyn NativeContext,
+    opt_name: &str,
+    raw: i32,
+) -> MethodCallResult {
+    let is_bool = matches!(
+        opt_name,
+        "TCP_NODELAY"
+            | "SO_KEEPALIVE"
+            | "SO_REUSEADDR"
+            | "SO_REUSEPORT"
+            | "SO_BROADCAST"
+            | "SO_OOBINLINE"
+    );
+    if is_bool {
+        ctx.invoke(
+            "java/lang/Boolean",
+            "valueOf",
+            "(Z)Ljava/lang/Boolean;",
+            &[Value::Int(if raw != 0 { 1 } else { 0 })],
+        )
+    } else {
+        ctx.invoke(
+            "java/lang/Integer",
+            "valueOf",
+            "(I)Ljava/lang/Integer;",
+            &[Value::Int(raw)],
+        )
     }
-    Ok(Some(Value::Int(0)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1580,6 +1667,7 @@ fn sc_get_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 
 fn ssc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let ch = alloc_obj(ctx, "java/nio/channels/ServerSocketChannel", N_FIELDS);
+    init_channel_locks(ctx, ch);
     cf_set(ctx, ch, F_OPEN, Value::Int(1));
     cf_set(ctx, ch, F_BLOCKING, Value::Int(1));
     cf_set(ctx, ch, F_REG_ID, Value::Int(-1));
@@ -1682,6 +1770,7 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     tcp_blocking_state().write().insert(new_id, blocking);
 
     let child = alloc_obj(ctx, "java/nio/channels/SocketChannel", N_FIELDS);
+    init_channel_locks(ctx, child);
     cf_set(ctx, child, F_OPEN, Value::Int(1));
     cf_set(ctx, child, F_BLOCKING, Value::Int(if blocking { 1 } else { 0 }));
     cf_set(ctx, child, F_REG_ID, Value::Int(new_id));
@@ -1769,6 +1858,16 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             sc_configure_blocking,
         );
         r.register(c, "close", "()V", sc_close);
+        // The reactor (and JDK code) often closes via the FINAL
+        // `AbstractInterruptibleChannel.close()` rather than the overridable
+        // `SocketChannel.close()`. That bytecode runs (closeLock seeded by
+        // init_channel_locks) and calls the abstract `implCloseSelectableChannel()`
+        // — which our synthetic SocketChannel class does not implement. Register
+        // it as the actual socket teardown so the close completes instead of
+        // hitting an AbstractMethodError. (`AbstractSelectableChannel.implCloseChannel`
+        // then cancels keys under keyLock with keyCount==0 — a no-op for us.)
+        r.register(c, "implCloseSelectableChannel", "()V", sc_close);
+        r.register(c, "implCloseChannel", "()V", sc_close);
         r.register(
             c,
             "connect",
@@ -1844,6 +1943,10 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             sc_configure_blocking,
         );
         r.register(c, "close", "()V", ssc_close);
+        // See the SocketChannel loop: handle the real-close abstract hooks so a
+        // close via the final AbstractInterruptibleChannel.close() completes.
+        r.register(c, "implCloseSelectableChannel", "()V", ssc_close);
+        r.register(c, "implCloseChannel", "()V", ssc_close);
         r.register(
             c,
             "bind",

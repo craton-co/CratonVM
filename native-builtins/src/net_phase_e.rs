@@ -1132,6 +1132,64 @@ fn uri_split(s: &str) -> (Option<String>, Option<String>, String, Option<String>
     (scheme, authority, path, query, fragment)
 }
 
+/// Split a URI authority (`[userinfo "@"] host [":" port]`, RFC 3986 §3.2) into
+/// `(userInfo, host, port)`. `port` is -1 when absent or unparsable. Host of an
+/// IPv6 literal keeps its brackets (`[::1]`), matching `java.net.URI.getHost()`.
+pub(crate) fn uri_parse_authority(authority: &str) -> (Option<String>, Option<String>, i32) {
+    // userinfo ends at the last '@' (host cannot contain '@').
+    let (userinfo, hostport) = match authority.rfind('@') {
+        Some(i) => (Some(authority[..i].to_string()), &authority[i + 1..]),
+        None => (None, authority),
+    };
+    let (host, port_str) = if hostport.starts_with('[') {
+        // IPv6 literal: host is "[...]", optional ":port" after the ']'.
+        match hostport.find(']') {
+            Some(j) => {
+                let h = hostport[..=j].to_string();
+                let p = hostport[j + 1..].strip_prefix(':').map(|x| x.to_string());
+                (h, p)
+            }
+            None => (hostport.to_string(), None),
+        }
+    } else {
+        // Reg-name: port (if any) follows the last ':'.
+        match hostport.rfind(':') {
+            Some(j) => (hostport[..j].to_string(), Some(hostport[j + 1..].to_string())),
+            None => (hostport.to_string(), None),
+        }
+    };
+    let port = port_str
+        .and_then(|p| if p.is_empty() { None } else { p.parse::<i32>().ok() })
+        .unwrap_or(-1);
+    let host = if host.is_empty() { None } else { Some(host) };
+    (userinfo, host, port)
+}
+
+/// Match `java.net.URI`'s server-based host acceptance for the cases keycloak's
+/// validators care about: a dotted-decimal that LOOKS like IPv4 must be a valid
+/// IPv4 (4 octets, each 0-255) or the host is rejected (null). IPv6 literals
+/// (`[...]`) and reg-names (anything not pure digits+dots) are accepted.
+fn uri_host_is_valid(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+    if host.starts_with('[') {
+        return true; // IPv6 literal
+    }
+    let looks_ipv4 = host.contains('.')
+        && host
+            .split('.')
+            .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()));
+    if looks_ipv4 {
+        let segs: Vec<&str> = host.split('.').collect();
+        return segs.len() == 4
+            && segs
+                .iter()
+                .all(|s| s.parse::<u32>().map(|n| n <= 255).unwrap_or(false));
+    }
+    true // reg-name
+}
+
 /// RFC 3986 §5.2 — resolve a reference against a base URI string.
 fn uri_resolve_ref(base: &str, reference: &str) -> String {
     if reference.is_empty() {
@@ -1362,9 +1420,32 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(ctx.create_string(&raw_path)))))
     });
 
-    // getHost() → host field (1) or parsed from raw
+    // getHost() → host field (1) or parsed from the raw authority.
     r.register(uri, "getHost", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // Parse the host out of the raw authority FIRST — `native_uri_init`
+        // populates the synthetic host slot inconsistently (empty for
+        // "http://proxy1:8080", but the whole "my-example.com?auth.this" for a
+        // URL with a query), so the raw string is the authoritative source.
+        // (keycloak ProxyMappings host=null, and HostnameV2/ResourceIndicator
+        // URL validation where getHost wrongly included the query.)
+        let raw = uri_raw_string(ctx, this);
+        let (_, auth_opt, _, _, _) = uri_split(&raw);
+        if let Some(auth) = auth_opt {
+            // The raw string HAS an authority section — it is authoritative, even
+            // when empty (`file:///p`, `http://?q` → null host) or when the host
+            // is a malformed IPv4 literal. java.net.URI's server-based parser
+            // returns null for those; matching it makes keycloak's URL validators
+            // reject them (HostnameV2 `192.196.0.5555`, `?my-example.com`).
+            let (_, host_opt, _) = uri_parse_authority(&auth);
+            let host = match host_opt {
+                Some(h) if uri_host_is_valid(&h) => Value::Object(Some(ctx.create_string(&h))),
+                _ => Value::Object(None),
+            };
+            return Ok(Some(host));
+        }
+        // No authority section in the raw string → fall back to an explicit host
+        // slot set during construction.
         if let Value::Object(Some(s)) = ctx.get_field(this, 1) {
             if let Some(v) = ctx.read_string(s) {
                 if !v.is_empty() {
@@ -1375,10 +1456,37 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(None)))
     });
 
-    // getPort() → port field (2)
+    // getPort() → port field (2) when a real port was stored, else parse the raw
+    // authority. Absent port is -1 (java.net.URI contract), not the int-default 0.
     r.register(uri, "getPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 2)))
+        if let Value::Int(p) = ctx.get_field(this, 2) {
+            if p > 0 {
+                return Ok(Some(Value::Int(p)));
+            }
+        }
+        let raw = uri_raw_string(ctx, this);
+        if let (_, Some(auth), _, _, _) = uri_split(&raw) {
+            let (_, _, port) = uri_parse_authority(&auth);
+            return Ok(Some(Value::Int(port)));
+        }
+        Ok(Some(Value::Int(-1)))
+    });
+
+    // getUserInfo() → decoded user-information from the raw authority. Was
+    // unregistered (real bytecode read an unpopulated field → null), so
+    // `URI.create("http://user:pass@host:88").getUserInfo()` returned null
+    // (keycloak ProxyMappings proxy-authentication case).
+    r.register(uri, "getUserInfo", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let raw = uri_raw_string(ctx, this);
+        if let (_, Some(auth), _, _, _) = uri_split(&raw) {
+            if let (Some(ui), _, _) = uri_parse_authority(&auth) {
+                let decoded = uri_percent_decode(&ui);
+                return Ok(Some(Value::Object(Some(ctx.create_string(&decoded)))));
+            }
+        }
+        Ok(Some(Value::Object(None)))
     });
 
     // getQuery() → `query` field by name (slot-order safe), else parse the
@@ -1406,24 +1514,60 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(None)))
     });
 
-    // getFragment() → `fragment` field by name (slot-order safe), else parse
-    // the raw string after '#'. Reading raw slot 5 returned the wrong field
-    // for a real-JDK-constructed URI (the unregistered 5-arg ctor runs
-    // bytecode with a different field layout than the synthetic `make_uri`
-    // one), so a null fragment surfaced as the string "null" — Hadoop's
-    // `Path.toString()` then emitted a spurious trailing "#null".
+    // getFragment() → the (decoded) fragment after '#', parsed from the raw
+    // string. The previous `fragment` field-by-name read was unreliable: for a
+    // `new URI(string)` (native_uri_init) URL it collided with the host/SSP slot
+    // and returned e.g. "something" as the fragment of "https://something"
+    // (keycloak ResourceIndicator/HostnameV2 URL validation: getFragment()!=null
+    // wrongly rejected valid URLs). Parsing the raw string is authoritative for
+    // both synthetic and real-JDK-constructed URIs and also yields the correct
+    // null for a missing fragment (no spurious "#null").
     r.register(uri, "getFragment", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "fragment") {
-            if let Some(v) = ctx.read_string(s) {
-                return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+        let raw = uri_raw_string(ctx, this);
+        match raw.find('#') {
+            Some(i) => {
+                let decoded = uri_percent_decode(&raw[i + 1..]);
+                Ok(Some(Value::Object(Some(ctx.create_string(&decoded)))))
             }
+            None => Ok(Some(Value::Object(None))),
         }
+    });
+
+    // getRawFragment() → raw (undecoded) fragment after '#', else null.
+    r.register(uri, "getRawFragment", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
         let raw = uri_raw_string(ctx, this);
         match raw.find('#') {
             Some(i) => Ok(Some(Value::Object(Some(ctx.create_string(&raw[i + 1..]))))),
             None => Ok(Some(Value::Object(None))),
         }
+    });
+
+    // getRawQuery() → raw (undecoded) query between '?' and '#', else null.
+    // Was unregistered (real bytecode read a mis-populated field → null).
+    r.register(uri, "getRawQuery", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let raw = uri_raw_string(ctx, this);
+        let before_frag = raw.split('#').next().unwrap_or(&raw);
+        match before_frag.find('?') {
+            Some(i) => Ok(Some(Value::Object(Some(
+                ctx.create_string(&before_frag[i + 1..]),
+            )))),
+            None => Ok(Some(Value::Object(None))),
+        }
+    });
+
+    // getRawUserInfo() → raw (undecoded) userinfo from the authority, else null.
+    r.register(uri, "getRawUserInfo", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let raw = uri_raw_string(ctx, this);
+        if let (_, Some(auth), _, _, _) = uri_split(&raw) {
+            if let (Some(ui), _, _) = uri_parse_authority(&auth) {
+                return Ok(Some(Value::Object(Some(ctx.create_string(&ui)))));
+            }
+        }
+        Ok(Some(Value::Object(None)))
     });
 
     // isAbsolute() → true if scheme is non-null
@@ -5512,6 +5656,16 @@ fn http_reject_and_close(stream: &mut TcpStream, status: i32) {
 }
 
 fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
+    // The accept loop sets the LISTENER non-blocking; on Windows the accepted
+    // stream inherits that mode, so a bare `read` returns WouldBlock the instant
+    // the peer hasn't sent yet — which `Err(_) => return None` below would treat
+    // as a dead connection and drop the socket. A well-behaved client that
+    // connects slightly before it writes its request (e.g. the Apache NIO
+    // reactor, which establishes the connection then writes on the next event
+    // loop turn) would then see an immediate EOF / "Connection is closed". Force
+    // the accepted stream BLOCKING so the read timeout below actually governs and
+    // we wait for the request.
+    stream.set_nonblocking(false).ok();
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 1024];
@@ -5793,7 +5947,7 @@ fn re10_dispatch_pending(
                     .map(|e| e.handler)
             })
         };
-        let (status, body_bytes, resp_headers) = match handler_info {
+        let (status, body_bytes, resp_headers, len_hint) = match handler_info {
             Some(h) => {
                 let ex = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpExchange", 8);
                 let m = ctx.create_string(&req.method);
@@ -5838,26 +5992,51 @@ fn re10_dispatch_pending(
                     Value::Object(Some(rh)) => re10_read_headers(ctx, rh),
                     _ => Vec::new(),
                 };
-                (status, body_bytes, resp_headers)
+                // Response-length hint from sendResponseHeaders: -1 => no body /
+                // no Content-Length (HEAD, 204, 304).
+                let len_hint = ctx.get_field(ex, 7).as_int().unwrap_or(0);
+                (status, body_bytes, resp_headers, len_hint)
             }
-            None => (404, b"Not Found".to_vec(), Vec::new()),
+            None => (404, b"Not Found".to_vec(), Vec::new(), 0),
         };
         let stream = req.stream;
         let mut resp = Vec::with_capacity(128 + body_bytes.len());
         use std::io::Write as _;
         let _ = write!(&mut resp, "HTTP/1.1 {status} {}\r\n", http_reason(status));
-        let mut has_content_length = false;
         for (k, v) in &resp_headers {
-            if k.eq_ignore_ascii_case("content-length") {
-                has_content_length = true;
+            // The server owns the message-framing headers (Content-Length,
+            // Connection, Transfer-Encoding) and the Date header; the real
+            // com.sun.net.httpserver emits exactly one of each and ignores any
+            // handler-echoed copy. A handler that copies request headers into the
+            // response (as the ES ResponseHandler does) would otherwise produce a
+            // DUPLICATE Connection/Content-Length, which the client surfaces as an
+            // extra header (ES testHeaders). Skip those here and emit our own.
+            if k.eq_ignore_ascii_case("content-length")
+                || k.eq_ignore_ascii_case("connection")
+                || k.eq_ignore_ascii_case("transfer-encoding")
+                || k.eq_ignore_ascii_case("date")
+            {
+                continue;
             }
             let _ = write!(&mut resp, "{k}: {v}\r\n");
         }
-        if !has_content_length {
+        // Server-controlled framing headers, each exactly once (matches the real
+        // com.sun.net.httpserver, which auto-adds Date + Content-length).
+        let _ = write!(&mut resp, "Date: {}\r\n", http_date_now());
+        // A HEAD response carries no body and (per the real server / ES
+        // testHeaders) no Content-Length. Every other method gets a
+        // Content-Length — including 0 for an empty body — and the body bytes.
+        // (`len_hint` from sendResponseHeaders is captured but the HEAD method is
+        // the distinction the client/test actually keys on.)
+        let _ = len_hint;
+        let is_head = req.method.eq_ignore_ascii_case("HEAD");
+        if !is_head {
             let _ = write!(&mut resp, "Content-Length: {}\r\n", body_bytes.len());
         }
         resp.extend_from_slice(b"Connection: close\r\n\r\n");
-        resp.extend_from_slice(&body_bytes);
+        if !is_head {
+            resp.extend_from_slice(&body_bytes);
+        }
         // Write the response and close on a short-lived I/O thread (pure socket
         // work, no VM context needed) so the dispatcher returns immediately to
         // serve the next queued request instead of blocking on the per-connection
@@ -5906,42 +6085,61 @@ const HS_THREAD_NUM_FIELDS: usize = 5;
 /// Build a daemon VM thread whose `run()` is `re10_serve_loop_run` for
 /// `server_id`, and start it via the VM's real thread machinery. The thread
 /// exits when the server's `running` flag clears (stop()).
+/// Number of VM dispatcher threads draining the request queue concurrently.
+/// More than one lets independent requests run their Java handlers in parallel
+/// (each request is popped by exactly one thread), which is what keeps a burst
+/// of hundreds of concurrent requests (ES testManyAsyncRequests) inside the
+/// client's timeout instead of serializing every handler on one thread.
+const HS_DISPATCHER_POOL: i32 = 4;
+
 fn re10_spawn_dispatcher(
     ctx: &mut dyn NativeContext,
     server_id: i32,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
-    let runner = alloc_concurrent_synthetic(ctx, HS_LOOP_CLASS, 1);
-    ctx.set_field(runner, 0, Value::Int(server_id));
+    let dbg = std::env::var_os("CRATONVM_DBG_HTTPSRV").is_some();
+    for idx in 0..HS_DISPATCHER_POOL {
+        let runner = alloc_concurrent_synthetic(ctx, HS_LOOP_CLASS, 1);
+        ctx.set_field(runner, 0, Value::Int(server_id));
 
-    let worker = alloc_concurrent_synthetic(ctx, "java/lang/Thread", HS_THREAD_NUM_FIELDS);
-    let name = ctx.create_string(&format!("cratonvm-httpserver-dispatch-{server_id}"));
-    // Populate the worker Thread via the registered
-    // `Thread.<init>(ThreadGroup, Runnable, String)` native. This stores the
-    // runnable the right way for BOTH layouts: slot 3 (`target`) on a synthetic
-    // <=8-field Thread, or `holder:FieldHolder.task` on a real-JDK Thread — which
-    // is what `Thread.run()` actually reads. Setting `target` by name on a
-    // real-JDK Thread does NOT work (no top-level `target` field; the runnable
-    // lives in the FieldHolder), which is why the loop never started before.
-    let _ = ctx.invoke(
-        "java/lang/Thread",
-        "<init>",
-        "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;)V",
-        &[
-            Value::Object(Some(worker)),
-            Value::Object(None),
-            Value::Object(Some(runner)),
-            Value::Object(Some(name)),
-        ],
-    );
-    // Best-effort: if the VM has no thread registry (e.g. test mocks) the
-    // start is a no-op; start()/stop() still drain the queue as a fallback.
-    let res = ctx.thread_start(worker);
-    if std::env::var_os("CRATONVM_DBG_HTTPSRV").is_some() {
-        eprintln!(
-            "[HTTPSRV] spawn_dispatcher server={server_id} num_fields={} thread_start_ok={}",
-            ctx.object_num_fields(worker),
-            res.is_ok()
+        let worker = alloc_concurrent_synthetic(ctx, "java/lang/Thread", HS_THREAD_NUM_FIELDS);
+        let name = ctx.create_string(&format!("cratonvm-httpserver-dispatch-{server_id}-{idx}"));
+        // Populate the worker Thread via the registered
+        // `Thread.<init>(ThreadGroup, Runnable, String)` native. This stores the
+        // runnable the right way for BOTH layouts: slot 3 (`target`) on a
+        // synthetic <=8-field Thread, or `holder:FieldHolder.task` on a real-JDK
+        // Thread — which is what `Thread.run()` actually reads. Setting `target`
+        // by name on a real-JDK Thread does NOT work (no top-level `target`
+        // field; the runnable lives in the FieldHolder), which is why the loop
+        // never started before.
+        let _ = ctx.invoke(
+            "java/lang/Thread",
+            "<init>",
+            "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;)V",
+            &[
+                Value::Object(Some(worker)),
+                Value::Object(None),
+                Value::Object(Some(runner)),
+                Value::Object(Some(name)),
+            ],
         );
+        // Daemon so a server left unstopped never wedges VM shutdown after main()
+        // returns (it normally exits on stop() when `running` clears).
+        let _ = ctx.invoke(
+            "java/lang/Thread",
+            "setDaemon",
+            "(Z)V",
+            &[Value::Object(Some(worker)), Value::Int(1)],
+        );
+        // Best-effort: if the VM has no thread registry (e.g. test mocks) the
+        // start is a no-op; start()/stop() still drain the queue as a fallback.
+        let res = ctx.thread_start(worker);
+        if dbg {
+            eprintln!(
+                "[HTTPSRV] spawn_dispatcher server={server_id} idx={idx} num_fields={} thread_start_ok={}",
+                ctx.object_num_fields(worker),
+                res.is_ok()
+            );
+        }
     }
     Ok(())
 }
@@ -5963,7 +6161,6 @@ fn re10_serve_loop_run(
     if server_id < 0 {
         return Ok(None);
     }
-    let mut iters: u64 = 0;
     loop {
         let running = server_registry()
             .lock()
@@ -5972,17 +6169,13 @@ fn re10_serve_loop_run(
             .unwrap_or(false);
         if !running {
             if dbg {
-                eprintln!("[HTTPSRV] serve_loop EXIT server={server_id} (not running) iters={iters}");
+                eprintln!("[HTTPSRV] serve_loop EXIT server={server_id} (not running)");
             }
             break;
         }
         // Dispatch runs Java bytecode (the handler) which cooperates with
         // safepoints normally — only the idle wait needs a blocking region.
         let drained = re10_dispatch_pending(ctx, server_id)?;
-        if dbg && (drained > 0 || iters % 500 == 0) {
-            eprintln!("[HTTPSRV] serve_loop server={server_id} iter={iters} drained={drained}");
-        }
-        iters += 1;
         if drained == 0 {
             ctx.begin_blocking_region();
             std::thread::sleep(Duration::from_millis(2));
@@ -5990,6 +6183,43 @@ fn re10_serve_loop_run(
         }
     }
     Ok(None)
+}
+
+/// Current time as an RFC 1123 HTTP-date (e.g. "Thu, 18 Jun 2026 08:37:05 GMT").
+/// The real `com.sun.net.httpserver` adds a `Date` response header automatically;
+/// clients (and the ES `testHeaders` assertion) expect it.
+fn http_date_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format_http_date(secs)
+}
+
+/// Format epoch seconds as an RFC 1123 date in GMT (civil-from-days per
+/// Howard Hinnant's algorithm; no external date crate).
+fn format_http_date(epoch_secs: u64) -> String {
+    let days = (epoch_secs / 86400) as i64;
+    let rem = epoch_secs % 86400;
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // 1970-01-01 is a Thursday; Sun=0.
+    let dow = (((days % 7) + 4) % 7) as usize;
+    let dow_name = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][dow];
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+    let mon_name = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ][(m - 1) as usize];
+    format!("{dow_name}, {d:02} {mon_name} {year} {hh:02}:{mm:02}:{ss:02} GMT")
 }
 
 fn http_reason(code: i32) -> &'static str {
@@ -6046,13 +6276,25 @@ fn re10_start_server(server_id: i32) -> std::io::Result<()> {
             while state_cl.running.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _peer)) => {
-                        if let Some(pending) = parse_http_request(stream) {
-                            let mut q = request_queue().lock();
-                            q.entry(server_id).or_default().push(pending);
-                        }
+                        // Parse each connection on its own short-lived thread so a
+                        // slow (or merely not-yet-written) request never blocks the
+                        // accept loop. Serially parsing here let the OS listen
+                        // backlog overflow under burst load (hundreds of concurrent
+                        // Connection: close requests), failing requests — see ES
+                        // testManyAsyncRequests. Parse is pure socket work and needs
+                        // no VM context; the dispatcher thread(s) run the handler.
+                        let sid = server_id;
+                        let _ = std::thread::Builder::new()
+                            .name(format!("cratonvm-httpserver-parse-{sid}"))
+                            .spawn(move || {
+                                if let Some(pending) = parse_http_request(stream) {
+                                    let mut q = request_queue().lock();
+                                    q.entry(sid).or_default().push(pending);
+                                }
+                            });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(10));
+                        std::thread::sleep(Duration::from_millis(1));
                     }
                     Err(_) => break,
                 }
@@ -6220,6 +6462,17 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let code = args.get(1).and_then(|v| v.as_int()).unwrap_or(200);
         ctx.set_field(this, 5, Value::Int(code));
+        // Stash the response-length argument (field 7): per the
+        // com.sun.net.httpserver contract, -1 means "no response body and NO
+        // Content-Length header" (HEAD / 204 / 304); >0 is the body length; 0
+        // means chunked. We honour -1 so HEAD responses don't carry a spurious
+        // Content-Length (ES testHeaders). The Long arrives at args[2].
+        let len = match args.get(2) {
+            Some(Value::Long(l)) => *l,
+            Some(v) => v.as_int().map(|i| i as i64).unwrap_or(0),
+            None => 0,
+        };
+        ctx.set_field(this, 7, Value::Int(len.clamp(i32::MIN as i64, i32::MAX as i64) as i32));
         Ok(None)
     });
     r.register(hex, "getResponseBody", "()Ljava/io/OutputStream;", |ctx, args| {

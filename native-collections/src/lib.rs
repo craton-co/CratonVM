@@ -2101,16 +2101,25 @@ fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "set", "(ILjava/lang/Object;)Ljava/lang/Object;", native_asl_set);
     r.register(c, "iterator", "()Ljava/util/Iterator;", native_asl_iterator);
     r.register(c, "toArray", "()[Ljava/lang/Object;", native_asl_to_array);
-    // Typed `toArray(T[])` — delegate to a snapshot ArrayList's typed
-    // `toArray`, which honours the JDK semantics (reuse the passed array when
-    // large enough, else allocate one of the same component type). Without
-    // this overload, `subList(..).toArray(new T[0])` — which Mockito's
-    // internals (and plenty of app code) call — hits NoSuchMethodError.
+    // toArray(T[]) / toArray(IntFunction) — delegate through a fresh snapshot
+    // ArrayList (which registers both overloads). Without these, a caller doing
+    // `subList(..).toArray(new X[0])` (e.g. the JUnit Platform launcher) hits a
+    // NoSuchMethodError on the synthetic ASL class and aborts.
+    r.register(c, "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;", |ctx, args| {
+        asl_delegate_snapshot(ctx, args, "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;")
+    });
     r.register(
         c,
         "toArray",
-        "([Ljava/lang/Object;)[Ljava/lang/Object;",
-        |ctx, args| asl_delegate_snapshot(ctx, args, "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;"),
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+        |ctx, args| {
+            asl_delegate_snapshot(
+                ctx,
+                args,
+                "toArray",
+                "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+            )
+        },
     );
     r.register(c, "toString", "()Ljava/lang/String;", native_asl_to_string);
     // Remaining read methods delegate to a fresh snapshot ArrayList. Without
@@ -2149,6 +2158,23 @@ fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;", |ctx, args| {
         asl_delegate_snapshot(ctx, args, "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;")
     });
+    // `toArray(IntFunction)` sibling of the `toArray(T[])` overload above: the
+    // JUnit Platform launcher calls `subList(..).toArray(X[]::new)`, which 404'd
+    // as a NoSuchMethodError on the synthetic ASL class. A fresh snapshot
+    // ArrayList carries both overloads via `native_collection_to_array_generator`.
+    r.register(
+        c,
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+        |ctx, args| {
+            asl_delegate_snapshot(
+                ctx,
+                args,
+                "toArray",
+                "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+            )
+        },
+    );
     r.register(c, "containsAll", "(Ljava/util/Collection;)Z", |ctx, args| {
         asl_delegate_snapshot(ctx, args, "containsAll", "(Ljava/util/Collection;)Z")
     });
@@ -7249,7 +7275,20 @@ fn native_collections_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let (data, size) = al_state(ctx, list);
     let data = match data {
         Some(d) => d,
-        None => return Ok(None),
+        // Non-ArrayList list (LinkedList, CopyOnWriteArrayList, …): al_state
+        // can't read its backing array. Collections.sort(list) is defined as
+        // list.sort(null) in the JDK — delegate to the receiver's own sort
+        // bytecode (sort is native only on ArrayList, so this runs the real
+        // AbstractList.sort for everything else). Was a silent no-op (kcfull
+        // #17b sibling).
+        None => {
+            return ctx.invoke_virtual(
+                list,
+                "sort",
+                "(Ljava/util/Comparator;)V",
+                &[Value::Object(None)],
+            )
+        }
     };
     let len = size as usize;
     if len <= 1 {
@@ -7782,7 +7821,20 @@ fn sort_with_comparator(
     let (data, size) = al_state(ctx, list);
     let data = match data {
         Some(d) => d,
-        None => return Ok(None),
+        // Non-ArrayList list (LinkedList, CopyOnWriteArrayList, …): al_state
+        // can't read its backing array. Collections.sort(list, c) is defined as
+        // list.sort(c) in the JDK — delegate to the receiver's own sort
+        // bytecode (sort(Comparator) is native only on ArrayList, so this runs
+        // the real AbstractList.sort for everything else). Was a silent no-op
+        // (kcfull #17b: keycloak LDAPMappersComparatorTest sorts a LinkedList).
+        None => {
+            return ctx.invoke_virtual(
+                list,
+                "sort",
+                "(Ljava/util/Comparator;)V",
+                &[Value::Object(Some(comparator))],
+            )
+        }
     };
     let len = size as usize;
     if len <= 1 {
@@ -17518,6 +17570,29 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
                 return collect_collection_elements(ctx, inner);
             }
         }
+        // `cratonvm/internal/ArrayListSubList` (the backed view returned by
+        // ArrayList.subList) has layout (parent, offset, size, expected) — NOT
+        // (elementData, size). The generic field probes below misread it as a
+        // 2-element array → `[null, <garbage>]`, dropping every element of
+        // `new ArrayList<>(list.subList(..))` / `addAll(subList)` and crashing
+        // downstream when the garbage ref is dispatched (kcfull #17a: keycloak
+        // LDAPDn.getParentDn → LdapName.getPrefix/toString SIGSEGV; also a wild
+        // call through StringBuilder.append(Object) → EXCEPTION_ACCESS_VIOLATION).
+        // Read the real slice straight out of the parent's backing array instead.
+        if cls_name == ASL_CLASS {
+            if let Some((parent, offset, size, _expected)) = asl_state(ctx, coll) {
+                if size > 0 {
+                    if let (Some(data), _) = al_state(ctx, parent) {
+                        let mut out = Vec::with_capacity(size as usize);
+                        for i in 0..(size as usize) {
+                            out.push(ctx.get_array_element(data, offset as usize + i));
+                        }
+                        return out;
+                    }
+                }
+            }
+            return Vec::new();
+        }
         if cls_name.starts_with("java/util/Collections$Unmodifiable")
             || cls_name.starts_with("java/util/Collections$Synchronized")
             || cls_name.starts_with("java/util/Collections$Checked")
@@ -18414,13 +18489,28 @@ const TM_DEFAULT_CAPACITY: usize = 16; // initial entry slots (array len = 32)
 
 /// Natural-order key supported by the fast-mode TreeMap. Variants are
 /// ordered so the derived `Ord` matches Java's natural ordering for
-/// homogeneous-typed maps (String, Integer, Long). Mixed-type maps
-/// disable fast mode (the array path handles them via `natural_compare`).
+/// homogeneous-typed maps (String, Integer, Long, Character, Byte, Short,
+/// Boolean). Mixed-type maps disable fast mode (the array path handles them
+/// via `natural_compare`).
+///
+/// Each numeric wrapper has its OWN variant — they must NOT collapse to a
+/// single integer representation. The variant records the original Java
+/// wrapper type so `tree_key_to_value` reboxes a `Character` key back to a
+/// `Character` (not an `Integer`); collapsing `Character`/`Byte`/`Short` to
+/// `I32` made `firstKey()`/`entrySet()` hand back `Integer`s, failing the
+/// `checkcast Character` in e.g. `sun.util.locale.LocaleExtensions.toID`
+/// (ClassCastException Integer→Character on `Locale.forLanguageTag`). The
+/// per-variant in-memory representation matches each wrapper's natural
+/// `compareTo`: `Char` is unsigned (u16), `Byte`/`Short` are signed.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum TreeKey {
     Str(String),
     I32(i32),
     I64(i64),
+    Char(u16),
+    Byte(i8),
+    Short(i16),
+    Bool(bool),
 }
 
 /// Try to extract a fast-mode key from a Java value. Returns None for
@@ -18436,10 +18526,26 @@ fn tree_key_from_value(ctx: &dyn NativeContext, v: &Value) -> Option<TreeKey> {
             if let Some(s) = ctx.read_string(*o) {
                 return Some(TreeKey::Str(s));
             }
-            // Integer / Long boxes: field 0 is the wrapped primitive.
+            // Boxed primitive wrappers: field 0 holds the value. The wrapper
+            // CLASS selects the variant so the key reboxes to its original
+            // type on read-back — Character/Byte/Short/Boolean must NOT
+            // collapse to Integer (see TreeKey doc). An unrecognized
+            // single-field class (a custom Comparable) returns None so the
+            // caller falls back to the array path, which keeps the real
+            // ObjectRef and honors its own compareTo/identity.
+            let name = ctx
+                .class_name_of_id(ctx.class_id_of_object(*o))
+                .unwrap_or_default();
             match ctx.get_field(*o, 0) {
-                Value::Int(i) => Some(TreeKey::I32(i)),
-                Value::Long(l) => Some(TreeKey::I64(l)),
+                Value::Int(i) => match name.as_str() {
+                    "java/lang/Integer" => Some(TreeKey::I32(i)),
+                    "java/lang/Character" => Some(TreeKey::Char(i as u16)),
+                    "java/lang/Byte" => Some(TreeKey::Byte(i as i8)),
+                    "java/lang/Short" => Some(TreeKey::Short(i as i16)),
+                    "java/lang/Boolean" => Some(TreeKey::Bool(i != 0)),
+                    _ => None,
+                },
+                Value::Long(l) if name == "java/lang/Long" => Some(TreeKey::I64(l)),
                 _ => None,
             }
         }
@@ -18903,35 +19009,47 @@ fn tm_migrate_fast_to_array(ctx: &mut dyn NativeContext, this: ObjectRef) {
 /// the corresponding wrapper class; reuses the standard `Integer.valueOf`
 /// / `Long.valueOf` / `String` paths via the NativeContext.
 fn tree_key_to_value(ctx: &mut dyn NativeContext, k: &TreeKey) -> Value {
+    // Box a primitive back to its wrapper via `<Wrapper>.valueOf`, preserving
+    // the original Java type recorded in the TreeKey variant.
+    let box_via = |ctx: &mut dyn NativeContext, cls: &str, desc: &str, arg: Value| -> Value {
+        ctx.invoke(cls, "valueOf", desc, &[arg])
+            .ok()
+            .flatten()
+            .unwrap_or(Value::Object(None))
+    };
     match k {
         TreeKey::Str(s) => Value::Object(Some(ctx.create_string(s))),
-        TreeKey::I32(i) => {
-            // Box via Integer.valueOf
-            let boxed = ctx
-                .invoke(
-                    "java/lang/Integer",
-                    "valueOf",
-                    "(I)Ljava/lang/Integer;",
-                    &[Value::Int(*i)],
-                )
-                .ok()
-                .flatten()
-                .unwrap_or(Value::Object(None));
-            boxed
-        }
-        TreeKey::I64(l) => {
-            let boxed = ctx
-                .invoke(
-                    "java/lang/Long",
-                    "valueOf",
-                    "(J)Ljava/lang/Long;",
-                    &[Value::Long(*l)],
-                )
-                .ok()
-                .flatten()
-                .unwrap_or(Value::Object(None));
-            boxed
-        }
+        TreeKey::I32(i) => box_via(
+            ctx,
+            "java/lang/Integer",
+            "(I)Ljava/lang/Integer;",
+            Value::Int(*i),
+        ),
+        TreeKey::I64(l) => box_via(ctx, "java/lang/Long", "(J)Ljava/lang/Long;", Value::Long(*l)),
+        TreeKey::Char(c) => box_via(
+            ctx,
+            "java/lang/Character",
+            "(C)Ljava/lang/Character;",
+            Value::Int(*c as i32),
+        ),
+        TreeKey::Byte(b) => box_via(
+            ctx,
+            "java/lang/Byte",
+            "(B)Ljava/lang/Byte;",
+            Value::Int(*b as i32),
+        ),
+        TreeKey::Short(s) => box_via(
+            ctx,
+            "java/lang/Short",
+            "(S)Ljava/lang/Short;",
+            Value::Int(*s as i32),
+        ),
+        TreeKey::Bool(b) => box_via(
+            ctx,
+            "java/lang/Boolean",
+            "(Z)Ljava/lang/Boolean;",
+            Value::Int(if *b { 1 } else { 0 }),
+        ),
     }
 }
 

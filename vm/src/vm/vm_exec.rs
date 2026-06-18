@@ -2624,6 +2624,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .insert(normalized, value.to_string())
     }
 
+    fn remove_system_property(&mut self, key: &str) -> Option<String> {
+        let normalized = normalize_system_property_key(key).to_string();
+        self.shared.system_properties.write().remove(&normalized)
+    }
+
     fn alloc_object(&mut self, class_id: ClassId, num_fields: usize) -> ObjectRef {
         // Defense-in-depth: a native caller must never allocate an object
         // with `ClassId::new(0)` (`java/lang/Object`, which declares zero

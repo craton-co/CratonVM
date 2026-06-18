@@ -160,6 +160,35 @@ pub fn keystore_lookup(id: i32) -> Option<LoadedKeyStore> {
     registry().read().stores.get(&id).cloned()
 }
 
+/// Insert/replace a trusted-cert entry in an already-registered store
+/// (in-memory `KeyStore.setCertificateEntry`). Reads and writes share this
+/// side-table, so the entry is visible to `engineAliases`/`engineSize`/
+/// `engineGetCertificate`. Returns true if the store existed.
+pub fn keystore_set_cert_entry(id: i32, alias: &str, cert_der: Vec<u8>) -> bool {
+    let mut g = registry().write();
+    if let Some(store) = g.stores.get_mut(&id) {
+        store.entries.insert(
+            alias.to_string(),
+            KeyStoreEntry {
+                alias: alias.to_string(),
+                creation_time_ms: 0,
+                kind: EntryKind::TrustedCert { cert_der },
+            },
+        );
+        true
+    } else {
+        false
+    }
+}
+
+/// Remove an entry from a registered store (`KeyStore.deleteEntry`).
+pub fn keystore_delete_entry(id: i32, alias: &str) {
+    let mut g = registry().write();
+    if let Some(store) = g.stores.get_mut(&id) {
+        store.entries.remove(alias);
+    }
+}
+
 /// Convenience for the TLS layer: fetch the PKCS#8 private-key DER for an
 /// alias, plus the cert chain (leaf first), without exposing the registry
 /// internals. Returns `None` if no `PrivateKey` entry exists.
@@ -214,6 +243,46 @@ pub fn load_keystore(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, Ke
 // PKCS#12 — backed by the `p12` crate
 // ---------------------------------------------------------------------------
 
+/// Crate-private `p12::bmp_string`, re-implemented: UTF-16BE + trailing 0x0000.
+/// The PKCS#12 PBE/MAC password mixing operates on this BMPString form.
+fn pkcs12_bmp_string(s: &str) -> Vec<u8> {
+    let utf16: Vec<u16> = s.encode_utf16().collect();
+    let mut bytes = Vec::with_capacity(utf16.len() * 2 + 2);
+    for c in utf16 {
+        bytes.push((c >> 8) as u8);
+        bytes.push((c & 0xff) as u8);
+    }
+    bytes.push(0x00);
+    bytes.push(0x00);
+    bytes
+}
+
+/// BER-mode equivalent of `p12::PFX::bags`. Identical structure to the crate's
+/// own `bags()` (auth_safe -> SEQUENCE OF ContentInfo -> per-content data ->
+/// SEQUENCE OF SafeBag) but parsed with `yasna::parse_ber`, which does not
+/// enforce DER canonical SET-OF ordering. The JDK emits trusted-cert bag
+/// attribute sets out of DER order (friendlyName before the Oracle
+/// trustedKeyUsage attribute); SunJSSE accepts them and so must we. BER is a
+/// strict superset of DER — every field is still fully decoded and type-checked;
+/// only the DER-only canonical-ordering constraint is relaxed (kcfull #12).
+fn bags_ber(pfx: &p12::PFX, password_str: &str) -> Result<Vec<p12::SafeBag>, yasna::ASN1Error> {
+    let password = pkcs12_bmp_string(password_str);
+    let data = pfx
+        .auth_safe
+        .data(&password)
+        .ok_or_else(|| yasna::ASN1Error::new(yasna::ASN1ErrorKind::Invalid))?;
+    let contents = yasna::parse_ber(&data, |r| r.collect_sequence_of(p12::ContentInfo::parse))?;
+    let mut result = Vec::new();
+    for content in contents.iter() {
+        let inner = content
+            .data(&password)
+            .ok_or_else(|| yasna::ASN1Error::new(yasna::ASN1ErrorKind::Invalid))?;
+        let safe_bags = yasna::parse_ber(&inner, |r| r.collect_sequence_of(p12::SafeBag::parse))?;
+        result.extend(safe_bags);
+    }
+    Ok(result)
+}
+
 pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStoreError> {
     let pfx = p12::PFX::parse(bytes).map_err(|e| KeyStoreError::Pkcs12Parse(format!("{e:?}")))?;
 
@@ -232,8 +301,14 @@ pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyS
         return Err(KeyStoreError::Pkcs12MacFailed);
     }
 
-    let bags = pfx
-        .bags(password_str)
+    // The `p12` crate parses every layer with yasna::parse_der (strict DER),
+    // which rejects the JDK's per-bag attribute SET because the JDK does not
+    // DER-sort it (friendlyName is written before the Oracle trustedKeyUsage
+    // attribute, but encodes as a larger element so it sorts last). SunJSSE
+    // reads it leniently, so we re-implement PFX::bags in BER mode, which
+    // relaxes the SET-OF ordering check without skipping any structural
+    // validation (kcfull #12).
+    let bags = bags_ber(&pfx, password_str)
         .map_err(|e| KeyStoreError::Pkcs12Parse(format!("bags(): {e:?}")))?;
 
     // Index bags by `localKeyId` so we can pair a private-key bag with the
@@ -465,6 +540,61 @@ pub fn load_jks(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStor
         return Err(KeyStoreError::Truncated(r.pos()));
     }
     Ok(LoadedKeyStore { entries })
+}
+
+/// Serialise a keystore to the JKS v2 wire format (magic, version, entry
+/// count, per-entry records, trailing `SHA1(pw||salt||body)` tag). Used by
+/// `engineStore`: CV's read path (`load_keystore`) detects the format by magic,
+/// so writing JKS round-trips through CV's own JKS parser regardless of the
+/// `KeyStore` type the caller declared (the keycloak truststore round-trip
+/// stores as "PKCS12" but is detected/loaded by content). Mirrors `load_jks`'s
+/// record layout exactly. Trusted certs are written as tag-2 entries; private
+/// keys as tag-1 with the (plaintext) key bytes — `load_jks` keeps them as-is
+/// when JKS key-recovery doesn't apply.
+fn write_jks(store: &LoadedKeyStore, password: &[u8]) -> Vec<u8> {
+    let cert_type: &[u8] = b"X.509";
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(&JKS_MAGIC.to_be_bytes());
+    body.extend_from_slice(&2u32.to_be_bytes()); // version 2
+    body.extend_from_slice(&(store.entries.len() as u32).to_be_bytes());
+
+    // Deterministic alias order for stable, reproducible output.
+    let mut aliases: Vec<&String> = store.entries.keys().collect();
+    aliases.sort_unstable();
+    for alias in aliases {
+        let entry = &store.entries[alias];
+        let ab = alias.as_bytes();
+        match &entry.kind {
+            EntryKind::TrustedCert { cert_der } => {
+                body.extend_from_slice(&2u32.to_be_bytes()); // tag = TrustedCertEntry
+                body.extend_from_slice(&(ab.len() as u16).to_be_bytes());
+                body.extend_from_slice(ab);
+                body.extend_from_slice(&(entry.creation_time_ms as u64).to_be_bytes());
+                body.extend_from_slice(&(cert_type.len() as u16).to_be_bytes());
+                body.extend_from_slice(cert_type);
+                body.extend_from_slice(&(cert_der.len() as u32).to_be_bytes());
+                body.extend_from_slice(cert_der);
+            }
+            EntryKind::PrivateKey { key_der, chain } => {
+                body.extend_from_slice(&1u32.to_be_bytes()); // tag = PrivateKeyEntry
+                body.extend_from_slice(&(ab.len() as u16).to_be_bytes());
+                body.extend_from_slice(ab);
+                body.extend_from_slice(&(entry.creation_time_ms as u64).to_be_bytes());
+                body.extend_from_slice(&(key_der.len() as u32).to_be_bytes());
+                body.extend_from_slice(key_der);
+                body.extend_from_slice(&(chain.len() as u32).to_be_bytes());
+                for c in chain {
+                    body.extend_from_slice(&(cert_type.len() as u16).to_be_bytes());
+                    body.extend_from_slice(cert_type);
+                    body.extend_from_slice(&(c.len() as u32).to_be_bytes());
+                    body.extend_from_slice(c);
+                }
+            }
+        }
+    }
+    let mac = jks_password_mac(password, &body);
+    body.extend_from_slice(&mac);
+    body
 }
 
 /// JKS integrity tag: `SHA1(password_utf16be || "Mighty Aphrodite" || body)`.
@@ -795,6 +925,24 @@ fn register_engine_surface(r: &mut NativeMethodRegistry, fqn: &'static str) {
         "(Ljava/lang/String;)Ljava/util/Date;",
         engine_get_creation_date,
     );
+
+    // engineSetCertificateEntry(String, Certificate) — in-memory mutation,
+    // writes the same side-table the read natives consult (the real bytecode
+    // updated a separate `entries` field invisible to engineAliases).
+    r.register(
+        fqn,
+        "engineSetCertificateEntry",
+        "(Ljava/lang/String;Ljava/security/cert/Certificate;)V",
+        engine_set_certificate_entry,
+    );
+
+    // engineDeleteEntry(String) — companion in-memory removal.
+    r.register(fqn, "engineDeleteEntry", "(Ljava/lang/String;)V", engine_delete_entry);
+
+    // engineStore(OutputStream, char[]) — serialise the side-table (as JKS,
+    // which CV's load path detects by magic) so a store→load round-trip
+    // preserves entries.
+    r.register(fqn, "engineStore", "(Ljava/io/OutputStream;[C)V", engine_store);
     r.set_category(__prev_cat);
 }
 
@@ -1107,6 +1255,87 @@ fn engine_get_creation_date(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let date = alloc_concurrent_synthetic(ctx, "java/util/Date", 1);
     ctx.set_field(date, 0, Value::Long(ms));
     Ok(Some(Value::Object(Some(date))))
+}
+
+/// engineSetCertificateEntry(String alias, Certificate cert) — in-memory
+/// mutation. The read-side natives (engineAliases/engineSize/engineGetCertificate)
+/// are backed by the CV keystore side-table, but the real PKCS12KeyStore
+/// bytecode for setCertificateEntry updates its own `entries` field, which the
+/// natives never read — so `setCertificateEntry` was invisible to `aliases()`
+/// (keycloak TruststoreBuilder: merged truststore reported 0 entries). Intercept
+/// it and write the same side-table the reads consult. The cert DER is obtained
+/// from the real `Certificate.getEncoded()`.
+fn engine_set_certificate_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let id = get_store_id(ctx, this);
+    let alias = args.get(1).and_then(|v| read_string_arg(ctx, v)).unwrap_or_default();
+    let cert = match args.get(2) {
+        Some(Value::Object(Some(c))) => *c,
+        _ => return Ok(None),
+    };
+    // Pull the DER via the real Certificate.getEncoded().
+    let der = match ctx.invoke_virtual(cert, "getEncoded", "()[B", &[]) {
+        Ok(Some(Value::Object(Some(arr)))) => {
+            let len = ctx.array_length(arr);
+            let mut v = Vec::with_capacity(len);
+            for i in 0..len {
+                if let Value::Int(b) = ctx.get_array_element(arr, i) {
+                    v.push(b as u8);
+                }
+            }
+            v
+        }
+        _ => Vec::new(),
+    };
+    if der.is_empty() {
+        // No encoding available — nothing to store (lenient; real JDK would
+        // throw KeyStoreException, but a valid Certificate always encodes).
+        return Ok(None);
+    }
+    // Mirror into the rustls trust set too (harmless for non-TLS uses), matching
+    // engine_load's bridging.
+    crate::t27_tls::add_extra_trust_root_der(der.clone());
+    keystore_set_cert_entry(id, &alias, der);
+    Ok(None)
+}
+
+/// engineDeleteEntry(String alias) — in-memory removal (companion to
+/// engine_set_certificate_entry; same side-table consistency rationale).
+fn engine_delete_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let id = get_store_id(ctx, this);
+    let alias = args.get(1).and_then(|v| read_string_arg(ctx, v)).unwrap_or_default();
+    keystore_delete_entry(id, &alias);
+    Ok(None)
+}
+
+/// engineStore(OutputStream, char[]) — serialise the side-table to the JKS wire
+/// format and write it to the stream. The read natives are backed by the CV
+/// side-table; real PKCS12KeyStore.engineStore would serialise its own (empty)
+/// `entries` field, so a round-trip (store → load → aliases) reported 0 entries
+/// (keycloak TruststoreBuilderTest.testMergedTrustStore). Writing JKS (which
+/// CV's load path detects by magic and parses via load_jks) round-trips the
+/// entries through CV regardless of the declared KeyStore type.
+fn engine_store(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let id = get_store_id(ctx, this);
+    let out = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let password = match args.get(2) {
+        Some(v) => read_password(ctx, v),
+        None => Vec::new(),
+    };
+    let store = keystore_lookup(id).unwrap_or_default();
+    let bytes = write_jks(&store, &password);
+    // Build a Java byte[] and call OutputStream.write(byte[]).
+    let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+    for (i, b) in bytes.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
+    }
+    ctx.invoke_virtual(out, "write", "([B)V", &[Value::Object(Some(arr))])?;
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------

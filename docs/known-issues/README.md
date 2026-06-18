@@ -28,8 +28,10 @@ After consolidation (full re-count 2026-06-18), the ~30 docs map to **one root-c
 10. **Hibernate JTA** (Narayana XA completion + synthetic-socket loopback) — **two docs consolidated into one** (open layers).
 11. **Hibernate JAXB/ByteBuddy bootstrap slow** (class-loading/`MethodGraph` throughput; open).
 12. **Hibernate deserialized-`SessionFactory`-null** (`SessionFactoryRegistry` reconnect; open).
-13. **ES-HANG-01** (Lucene/`ESTestCase` JIT livelock), **ES-FAIL-03** (`catch (LinkageError)` not honored),
-    **ES-HANG-02** (RestClient embedded-HTTP-server hang) — three distinct ES-suite defects (open).
+13. **[ES-HANG-02](ES-HANG-02-restclient-integ-http-server.md)** (RestClient embedded-HTTP-server hang;
+    socket/NIO) — the lone still-open ES-suite defect (re-verified 2026-06-18). Its three former siblings
+    are resolved on `dev` and their docs removed as stale: **ES-HANG-01** (Lucene JIT livelock; fixed by
+    `1cd0ab26`), **ES-FAIL-03** (`catch (LinkageError)` now honored), **ES-FAIL-04** (`ArrayListSubList.toArray(T[])` added).
 
 FIXED docs kept for the trail: A1 (`jit-junit-discovery-…`), A3 (`SB-SUITE-CRASH-04`), the Hibernate
 JAXB class-load rescan storm (HIB-DEV-03), the JSON-function `al_state` SIGSEGV, the reversed

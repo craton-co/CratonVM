@@ -116,6 +116,13 @@ quick-xml = "0.31"
 # crate provides PFX/SafeBag/CertBag DER parsing and PBE-decrypt of shrouded
 # private-key bags — the surface real-JDK exposes.
 p12 = "0.6"
+# kcfull #12 (truststore): the `p12` crate parses every PKCS#12 layer with
+# yasna::parse_der (strict DER), which rejects the JDK's per-bag attribute SET
+# because the JDK does not DER-sort it (friendlyName before the Oracle
+# trustedKeyUsage attribute). SunJSSE reads it leniently. We re-run the SafeBag
+# walk in BER mode, so we need yasna directly (already in the tree via p12,
+# pinned to the same 0.5).
+yasna = "0.5"
 # WP5.2: SHA-1 needed for the JKS keystore HMAC integrity tag (a non-standard
 # `SHA1(password_utf16be || "Mighty Aphrodite" || body)` construction — not a
 # real HMAC). Pulled transitively by `p12` already, declared here so direct use

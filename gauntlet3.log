@@ -1,0 +1,27 @@
+== h2-testall-fast ==
+  cratonvm rc=0 PASS     1.3s  [2m2026-06-18T11:18:30.452164Z[0m [33m WARN[0m [2mcratonvm_vm::jit::conserv
+  hotspot  rc=0 PASS     0.3s  00:00.029 total
+
+== hibernate-smoke ==
+  cratonvm rc=0 PASS     6.5s  DEBUG [org.hibernate.boot.registry.internal.BootstrapServiceRegistryImpl] Implic
+  hotspot  rc=0 PASS     2.1s  INFO: HHH10001008: Cleaning up connection pool [jdbc:h2:mem:smoke]
+
+== gpu-bench-cpu ==
+  cratonvm rc=0 PASS     1.5s  [cratonvm] System.exit(0) called — process terminating
+  hotspot  rc=0 PASS     0.2s  correctness=OK
+
+== pool:kafka-codec ==
+  cratonvm rc=0 PASS 1.56s  regression-pool: total=1 pass=1 regress=0 slow=0 no_base=0 no_stage=0 results: /c/craton/CratonVM/apps/probe/test-infra
+  hotspot  rc=1 REGRESS 0.12s
+
+== pool:spring-boot-run ==
+  cratonvm rc=0 PASS 2.96s  regression-pool: total=1 pass=1 regress=0 slow=0 no_base=0 no_stage=0 results: /c/craton/CratonVM/apps/probe/test-infra
+  hotspot  rc=1 REGRESS 0.15s
+
+== pool:tomcat-server-info ==
+  cratonvm rc=0 PASS 1.30s  regression-pool: total=1 pass=1 regress=0 slow=0 no_base=0 no_stage=0 results: /c/craton/CratonVM/apps/probe/test-infra
+  hotspot  rc=1 REGRESS 0.09s
+
+Wrote C:/craton/CratonVM/apps/APPS_SUITE_RESULTS.md
+TSV: C:/craton/CratonVM/test-infra/suite-results/apps-all-20260618-081827/results.tsv
+Done.

@@ -605,6 +605,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "unicode-normalization",
+ "yasna",
  "zip",
 ]
 

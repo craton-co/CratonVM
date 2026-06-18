@@ -209,9 +209,71 @@ fn locale_tag(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 tag.push_str(&sub.to_ascii_lowercase());
             }
         }
+        // Append BCP-47 extension subtags (e.g. "-u-ca-japanese", "-x-foo-bar").
+        // `LocaleExtensions.id` already holds the canonical, lower-cased
+        // extension sequence with the privateuse ('x') singleton ordered last —
+        // exactly the suffix real `toLanguageTag` emits. Without this the
+        // extensions were silently dropped (e.g.
+        // `forLanguageTag("en-US-u-ca-japanese").toLanguageTag()` -> "en-US").
+        // Only real Locales constructed WITH extensions have a non-null
+        // `localeExtensions`, so plain locales are unaffected.
+        if let Value::Object(Some(le)) = ctx.get_field_by_name(*this, "localeExtensions") {
+            if let Value::Object(Some(id_s)) = ctx.get_field_by_name(le, "id") {
+                if let Some(id) = ctx.read_string(id_s) {
+                    if !id.is_empty() {
+                        tag.push('-');
+                        tag.push_str(&id);
+                    }
+                }
+            }
+        }
         return Ok(Some(Value::Object(Some(ctx.create_string(&tag)))));
     }
     Ok(Some(Value::Object(Some(ctx.create_string("und")))))
+}
+
+/// `java.util.Locale.getExtension(char)` — return the BCP-47 extension value
+/// for a given singleton key (e.g. 'u' -> "ca-japanese", 'x' -> "foo-bar").
+///
+/// The previous implementation was an unconditional `null` stub, which dropped
+/// every extension for real Locales (Keycloak `FolderThemeTest`). Instead,
+/// delegate to the real `LocaleExtensions.getExtensionValue(Character)`
+/// bytecode — its `SortedMap<Character,Extension>` lookup now preserves the
+/// `Character` key type (the TreeMap key-rebox fix). The synthetic default
+/// Locale carries no extensions, so it returns null either way.
+fn locale_get_extension(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key_char = match args.get(1) {
+        Some(Value::Int(c)) => *c,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // Synthetic default Locale (getDefault) defines no extensions.
+    if synthetic_locale_data().lock().contains_key(&this) {
+        return Ok(Some(Value::Object(None)));
+    }
+    // hasExtensions() == (localeExtensions != null).
+    let le = match ctx.get_field_by_name(this, "localeExtensions") {
+        Value::Object(Some(le)) => le,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // Box the char key as java.lang.Character; getExtensionValue lower-cases it.
+    let boxed = ctx
+        .invoke(
+            "java/lang/Character",
+            "valueOf",
+            "(C)Ljava/lang/Character;",
+            &[Value::Int(key_char)],
+        )?
+        .unwrap_or(Value::Object(None));
+    ctx.invoke_virtual(
+        le,
+        "getExtensionValue",
+        "(Ljava/lang/Character;)Ljava/lang/String;",
+        &[boxed],
+    )
 }
 
 fn locale_script(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -309,7 +371,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "java/util/Locale",
         "getExtension",
         "(C)Ljava/lang/String;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        locale_get_extension,
     );
 
     // Display-name overrides — the JDK's real implementations consult

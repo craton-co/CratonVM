@@ -1545,6 +1545,74 @@ fn selector_wakeup_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 /// `SelectorImpl.select0(long timeout)` → int count
+/// Re-resolve the OS handle of any registered key whose channel has become
+/// connected/bound since it was registered. NIO reactors (e.g. Apache
+/// httpasyncclient's `DefaultConnectingIOReactor`) `register(OP_CONNECT)` a
+/// `SocketChannel` *before* `connect()` completes; at registration time the
+/// channel has no live socket so the key holds a `Dummy` handle and the kernel
+/// wait skips it — `select()` then returns 0 forever and the connection never
+/// progresses. CratonVM connects loopback synchronously, so by the first
+/// `select()` the socket IS connected; pull its now-live clone into the key so
+/// `OP_CONNECT`/`OP_READ`/`OP_WRITE` readiness is reported. Called on every
+/// blocking/poll select entry (it has the `ctx` needed to read channel state).
+fn refresh_selector_handles(ctx: &mut dyn NativeContext, id: i32) {
+    // Snapshot keys that currently have no pollable OS handle but want events.
+    let candidates: Vec<(i32, i32)> = {
+        let regs = selectors().read();
+        let Some(s) = regs.get(&id) else {
+            return;
+        };
+        let st = s.lock();
+        st.keys
+            .values()
+            .filter(|k| {
+                k.interest_ops != 0 && k.key_hash != 0 && k.handle.os_handle().is_none()
+            })
+            .map(|k| (k.net_fd, k.key_hash))
+            .collect()
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    for (old_fd, key_hash) in candidates {
+        let channel = {
+            let t = sk_table().read();
+            match t.get(&key_hash) {
+                Some(s) => s.channel,
+                None => continue,
+            }
+        };
+        let new_fd = crate::socket_channel::channel_net_fd(ctx, channel).unwrap_or(-1);
+        if new_fd < 0 {
+            continue;
+        }
+        let Some(clone) = crate::socket_channel::tcp_clone_for_selector(new_fd) else {
+            continue;
+        };
+        let handle = match clone {
+            crate::socket_channel::TcpHandleClone::Listener(l) => {
+                let _ = l.set_nonblocking(true);
+                SelectableHandle::Listener(l)
+            }
+            crate::socket_channel::TcpHandleClone::Stream(s) => {
+                let _ = s.set_nonblocking(true);
+                SelectableHandle::Stream(s)
+            }
+        };
+        let regs = selectors().read();
+        let Some(s) = regs.get(&id) else {
+            return;
+        };
+        let mut st = s.lock();
+        // Re-key under the now-resolved net_fd (was likely -1 while unconnected).
+        if let Some(mut ks) = st.keys.remove(&old_fd) {
+            ks.net_fd = new_fd;
+            ks.handle = handle;
+            st.keys.insert(new_fd, ks);
+        }
+    }
+}
+
 fn selector_select_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(obj))) = args.first().copied() else {
         return Ok(Some(Value::Int(0)));
@@ -1574,6 +1642,7 @@ fn selector_select_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     if id == 0 {
         return Ok(Some(Value::Int(0)));
     }
+    refresh_selector_handles(ctx, id);
     let n = selector_select(id, timeout)?;
     apply_ready_ops(ctx, id);
     Ok(Some(Value::Int(n)))
@@ -1616,6 +1685,7 @@ fn selector_select_now_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     if id == 0 {
         return Ok(Some(Value::Int(0)));
     }
+    refresh_selector_handles(ctx, id);
     let n = selector_select(id, 0)?;
     apply_ready_ops(ctx, id);
     Ok(Some(Value::Int(n)))

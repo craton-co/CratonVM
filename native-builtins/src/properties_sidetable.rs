@@ -1296,6 +1296,13 @@ fn native_properties_remove(
         return Ok(Some(Value::Object(None)));
     }
     let removed = remove_kv(ctx, this, &key);
+    // The system-properties view must propagate removal to the global store,
+    // mirroring how `setProperty`/`put` propagate writes — otherwise
+    // `System.getProperties().remove(k)` (keycloak ExportImportConfig.reset)
+    // leaves `System.getProperty(k)` returning the stale value.
+    if is_system_props(ctx, this) {
+        let _ = ctx.remove_system_property(&key);
+    }
     // Keep the real JDK `map` CHM backing in sync with the side-table: `put`/
     // `setProperty` mirror INTO it, so a `remove` that touched only the
     // side-table would let generic Map walkers (HashMap.putAll /
@@ -1885,10 +1892,102 @@ fn native_properties_for_each(
     Ok(None)
 }
 
+/// `Properties.equals(Object)` — content comparison (the `Map.equals` contract).
+/// `Properties` inherits `Hashtable.equals` but under CratonVM that resolved to
+/// `Object.equals` (identity) for a `Properties` receiver, so two equal-content
+/// Properties compared unequal (keycloak `LocaleUtilTest.mergeGroupedMessages`,
+/// which prints byte-identical maps yet failed `assertThat(equalTo(...))`).
+/// Because our `Properties` data lives in the side-table, we replicate
+/// `Hashtable.equals` over the (working) `size`/`entrySet`/`get` natives via
+/// virtual dispatch rather than reading the raw fields.
+fn native_properties_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let other = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    if this == other {
+        return Ok(Some(Value::Int(1)));
+    }
+    let int_of = |r: MethodCallResult| -> i32 {
+        match r {
+            Ok(Some(Value::Int(n))) => n,
+            _ => -1,
+        }
+    };
+    let obj_of = |r: MethodCallResult| -> Option<ObjectRef> {
+        match r {
+            Ok(Some(Value::Object(o))) => o,
+            _ => None,
+        }
+    };
+    // `other` must be a Map of the same size. A non-Map `size()` call fails →
+    // treated as not equal (the `instanceof Map` guard in Hashtable.equals).
+    let this_size = int_of(ctx.invoke_virtual(this, "size", "()I", &[]));
+    let other_size = int_of(ctx.invoke_virtual(other, "size", "()I", &[]));
+    if this_size < 0 || other_size != this_size {
+        return Ok(Some(Value::Int(0)));
+    }
+    let es = match obj_of(ctx.invoke_virtual(this, "entrySet", "()Ljava/util/Set;", &[])) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let it = match obj_of(ctx.invoke_virtual(es, "iterator", "()Ljava/util/Iterator;", &[])) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    loop {
+        if int_of(ctx.invoke_virtual(it, "hasNext", "()Z", &[])) != 1 {
+            break;
+        }
+        let entry = match obj_of(ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[])) {
+            Some(o) => o,
+            None => return Ok(Some(Value::Int(0))),
+        };
+        let key = ctx.invoke_virtual(entry, "getKey", "()Ljava/lang/Object;", &[])?;
+        let value = obj_of(ctx.invoke_virtual(entry, "getValue", "()Ljava/lang/Object;", &[]));
+        let key_arg = key.clone().unwrap_or(Value::Object(None));
+        let other_val = obj_of(ctx.invoke_virtual(
+            other,
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[key_arg],
+        ));
+        match value {
+            None => {
+                if other_val.is_some() {
+                    return Ok(Some(Value::Int(0)));
+                }
+            }
+            Some(v) => {
+                let eq = int_of(ctx.invoke_virtual(
+                    v,
+                    "equals",
+                    "(Ljava/lang/Object;)Z",
+                    &[Value::Object(other_val)],
+                ));
+                if eq != 1 {
+                    return Ok(Some(Value::Int(0)));
+                }
+            }
+        }
+    }
+    Ok(Some(Value::Int(1)))
+}
+
 /// Register the side-table-backed `Properties` natives.  Called from
 /// `register_essential_natives` (real-JDK mode) so KeycloakMain's
 /// `Version.<clinit>` finds a non-null `version` value.
 pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
+    registry.register(
+        "java/util/Properties",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_properties_equals,
+    );
     registry.register(
         "java/util/Properties",
         "load",
