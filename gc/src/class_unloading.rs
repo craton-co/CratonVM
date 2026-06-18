@@ -384,19 +384,38 @@ impl ClassLoaderHierarchy {
     }
 
     /// Check if `ancestor` is an ancestor of `descendant`.
+    ///
+    /// Cycle protection (bug gc-classunload): a malformed parent chain
+    /// (e.g. `A -> B -> A`) previously spun this loop forever and hung the GC
+    /// thread. We now bound the walk by the number of registered loaders and
+    /// track visited nodes; on a revisit (or once we exceed the loader count)
+    /// we bail out to `false` rather than looping. A correct, acyclic chain can
+    /// never be longer than `parents.len()`, so this never rejects a valid
+    /// ancestor relationship.
     pub fn is_ancestor(&self, ancestor: usize, descendant: usize) -> bool {
         let mut current = descendant;
-        loop {
+        let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        // Hard upper bound on iterations as a second line of defence in case a
+        // future change drops the visited-set guard.
+        let max_iterations = self.parents.len() + 1;
+        for _ in 0..max_iterations {
             match self.parents.get(&current) {
                 Some(Some(parent)) => {
                     if *parent == ancestor {
                         return true;
+                    }
+                    // Revisiting a node we've already seen means the chain is
+                    // cyclic; stop instead of spinning forever.
+                    if !visited.insert(current) {
+                        return false;
                     }
                     current = *parent;
                 }
                 _ => return false,
             }
         }
+        // Exceeded the loader-count bound -> chain is cyclic/malformed.
+        false
     }
 
     /// Get all loaders in the hierarchy.
@@ -410,11 +429,38 @@ impl ClassLoaderHierarchy {
     }
 
     /// Update addresses after GC.
+    ///
+    /// Collision rejection (bug gc-classunload): the loader address and its
+    /// parent address are remapped independently. A pathological/contended
+    /// `pointer_map` can map two distinct old loader addresses onto the same
+    /// new address, which would collapse two nodes into one and could make the
+    /// hierarchy cyclic (e.g. `A -> B` and `B -> A` both landing on the same
+    /// key), which in turn would hang `is_ancestor`. To guarantee the hierarchy
+    /// stays acyclic, we drop (do not re-insert) any entry whose remapped
+    /// loader address would collide with an entry already inserted this pass,
+    /// and we reject any self-referential parent (`new_addr == new_parent`)
+    /// produced by remapping.
     pub fn update_after_gc(&mut self, pointer_map: &HashMap<usize, usize>) {
         let old: Vec<(usize, Option<usize>)> = self.parents.drain().collect();
         for (addr, parent) in old {
             let new_addr = pointer_map.get(&addr).copied().unwrap_or(addr);
             let new_parent = parent.map(|p| pointer_map.get(&p).copied().unwrap_or(p));
+
+            // Skip an entry whose remapped loader address collides with one we
+            // already re-inserted: re-inserting would silently overwrite the
+            // earlier node and risk fusing two chains into a cycle.
+            if self.parents.contains_key(&new_addr) {
+                continue;
+            }
+
+            // Reject a parent edge that became self-referential after remapping
+            // (a one-node cycle), which would hang `is_ancestor`. Treat such a
+            // loader as having no parent rather than pointing at itself.
+            let new_parent = match new_parent {
+                Some(p) if p == new_addr => None,
+                other => other,
+            };
+
             self.parents.insert(new_addr, new_parent);
         }
     }
@@ -861,6 +907,80 @@ mod tests {
         assert!(h.parent_of(0xB00).is_some());
         assert_eq!(h.parent_of(0xB00), Some(Some(0xA00)));
         assert!(h.parent_of(0x100).is_none()); // old address gone
+    }
+
+    // -- cycle protection (bug gc-classunload) -----------------------------
+
+    #[test]
+    fn hierarchy_is_ancestor_terminates_on_direct_cycle() {
+        // A -> B -> A is a 2-node cycle; is_ancestor must return without
+        // spinning forever and must not falsely report an ancestor.
+        let mut h = ClassLoaderHierarchy::new();
+        h.register(0xA, Some(0xB));
+        h.register(0xB, Some(0xA));
+        assert!(!h.is_ancestor(0xC, 0xA));
+        assert!(!h.is_ancestor(0xC, 0xB));
+        // The two nodes are mutual parents; querying their real relationship
+        // still terminates.
+        assert!(h.is_ancestor(0xB, 0xA));
+        assert!(h.is_ancestor(0xA, 0xB));
+    }
+
+    #[test]
+    fn hierarchy_is_ancestor_terminates_on_self_cycle() {
+        // A node that is its own parent must not hang the walk.
+        let mut h = ClassLoaderHierarchy::new();
+        h.register(0xA, Some(0xA));
+        assert!(h.is_ancestor(0xA, 0xA)); // immediate parent match
+        assert!(!h.is_ancestor(0xB, 0xA)); // unrelated, must terminate
+    }
+
+    #[test]
+    fn hierarchy_is_ancestor_terminates_on_longer_cycle() {
+        // A -> B -> C -> A: a 3-node cycle with an unrelated query target.
+        let mut h = ClassLoaderHierarchy::new();
+        h.register(0xA, Some(0xB));
+        h.register(0xB, Some(0xC));
+        h.register(0xC, Some(0xA));
+        assert!(!h.is_ancestor(0xD, 0xA));
+    }
+
+    #[test]
+    fn update_after_gc_rejects_colliding_remap() {
+        // Two distinct loaders remap onto the same new address. The collision
+        // must be dropped (not fused) so the hierarchy cannot become cyclic.
+        let mut h = ClassLoaderHierarchy::new();
+        h.register(0x100, Some(0x200));
+        h.register(0x200, Some(0x100));
+
+        let mut map = HashMap::new();
+        map.insert(0x100, 0x900);
+        map.insert(0x200, 0x900); // collision onto the same new address
+
+        h.update_after_gc(&map);
+
+        // Exactly one node survives at the collided address; no infinite loop.
+        assert_eq!(h.all_loaders().len(), 1);
+        assert!(h.all_loaders().contains(&0x900));
+        // Whatever survived, is_ancestor must terminate.
+        assert!(!h.is_ancestor(0xDEAD, 0x900));
+    }
+
+    #[test]
+    fn update_after_gc_rejects_self_referential_remap() {
+        // A loader whose parent remaps onto its own new address would become a
+        // one-node cycle; the parent edge must be cleared to None.
+        let mut h = ClassLoaderHierarchy::new();
+        h.register(0x100, Some(0x200));
+
+        let mut map = HashMap::new();
+        map.insert(0x100, 0x500);
+        map.insert(0x200, 0x500); // parent now points at the loader itself
+
+        h.update_after_gc(&map);
+
+        assert_eq!(h.parent_of(0x500), Some(None));
+        assert!(!h.is_ancestor(0x500, 0x500));
     }
 
     // -- Default impls -----------------------------------------------------

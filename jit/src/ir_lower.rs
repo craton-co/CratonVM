@@ -96,6 +96,111 @@ impl<'a> Lowerer<'a> {
         self.node_slot[id as usize]
     }
 
+    // ── Phi resolution (BUG FIX [jit-irlower #2]) ────────────────────────
+    //
+    // Previously `Op::Phi` only called `alloc_slot` with the comment
+    // "predecessors will write it" — but no code ever emitted those writes,
+    // so a phi read an uninitialised frame slot. We now perform a standard
+    // edge-split parallel copy: before a predecessor block branches to a
+    // merge/region successor, store each incoming phi-argument value into
+    // the corresponding phi's slot.
+
+    /// Reserve a frame slot for every `Op::Phi` up front.
+    ///
+    /// A forward branch can target a merge block whose phis have not yet
+    /// been lowered, so the destination slots must exist before any edge
+    /// copy is emitted. Phis are skipped by `lower_data_node`.
+    fn prealloc_phi_slots(&mut self) {
+        for id in 0..self.graph.nodes.len() {
+            if matches!(self.graph.nodes[id].op, Op::Phi) {
+                self.alloc_slot(id as NodeId);
+            }
+        }
+    }
+
+    /// Resolve the block that produces control token `ctrl` by walking up
+    /// control inputs until we reach a node that heads some block.
+    ///
+    /// Merge predecessor `k` records `self.ctrl` (the predecessor's live
+    /// control node) as `merge.inputs[k]`; that token is either a block
+    /// head directly (goto fall-through) or a `Proj` off an `If` (block
+    /// head). Walking control inputs makes the mapping robust to either.
+    fn block_of_ctrl(&self, mut ctrl: NodeId) -> Option<usize> {
+        for _ in 0..self.graph.nodes.len() {
+            if ctrl == NO_NODE {
+                return None;
+            }
+            let blk = self.schedule.node_to_block[ctrl as usize];
+            if blk != usize::MAX && self.schedule.blocks[blk].ctrl == ctrl {
+                return Some(blk);
+            }
+            // Step up the control chain (first input is the control edge for
+            // Proj/If/Merge-derived nodes).
+            let node = &self.graph.nodes[ctrl as usize];
+            match node.inputs.first() {
+                Some(&next) if next != ctrl => ctrl = next,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Emit the parallel-copy stores for every phi at `succ_block` whose
+    /// merge has `pred_block` as the source for that phi argument.
+    ///
+    /// Each copy loads the incoming SSA value (already spilled by the
+    /// predecessor block, which is lowered before its terminator) into RAX
+    /// and stores it into the phi's reserved slot. The phi value sources
+    /// are predecessor-side snapshots, never this merge's own phis, so the
+    /// copies have no read-after-write cycle and a single scratch register
+    /// is sufficient.
+    fn emit_phi_copies(&mut self, pred_block: usize, succ_block: usize) {
+        let merge_ctrl = self.schedule.blocks[succ_block].ctrl;
+        // Only Merge/Region blocks carry phis tied to incoming edges.
+        if !matches!(
+            self.graph.nodes[merge_ctrl as usize].op,
+            Op::Merge | Op::Region
+        ) {
+            return;
+        }
+
+        // Gather (phi_slot, value_id) pairs first to avoid borrowing `self`
+        // immutably while emitting (which borrows `self` mutably).
+        let mut copies: Vec<(i32, i32)> = Vec::new();
+        for id in 0..self.graph.nodes.len() {
+            let node = &self.graph.nodes[id];
+            if !matches!(node.op, Op::Phi) {
+                continue;
+            }
+            // Only value phis materialise a frame slot; memory/control phis
+            // are bookkeeping tokens with no machine value to copy.
+            if matches!(node.ty, IrType::Memory | IrType::Control | IrType::Void) {
+                continue;
+            }
+            // phi.inputs = [merge, val_0, val_1, …]
+            if node.inputs.first().copied() != Some(merge_ctrl) {
+                continue;
+            }
+            // merge.inputs[k] is the control token for phi value k (= input k+1).
+            let merge_node = &self.graph.nodes[merge_ctrl as usize];
+            for (k, &ctrl_in) in merge_node.inputs.iter().enumerate() {
+                if self.block_of_ctrl(ctrl_in) != Some(pred_block) {
+                    continue;
+                }
+                if let Some(&val_id) = node.inputs.get(k + 1) {
+                    if val_id != NO_NODE {
+                        copies.push((self.slot_of(id as NodeId), self.slot_of(val_id)));
+                    }
+                }
+            }
+        }
+
+        for (dst_slot, src_slot) in copies {
+            self.load_to_rax(src_slot);
+            self.store_rax(dst_slot);
+        }
+    }
+
     // ── Code emission helpers ────────────────────────────────────────
 
     fn emit_prologue(&mut self) {
@@ -228,6 +333,20 @@ impl<'a> Lowerer<'a> {
         // Emit terminator
         if let Some(term) = block.terminator {
             self.lower_terminator(term, block_idx);
+        } else {
+            // No explicit terminator: this is a goto / fall-through edge into
+            // a Merge/Region. BUG FIX [jit-irlower #2]: emit the edge's phi
+            // copies before transferring control, then jump to the successor
+            // explicitly (block emission order is not guaranteed to place the
+            // successor physically next).
+            let succ = self.schedule.blocks[block_idx].successors.first().copied();
+            if let Some(succ_block) = succ {
+                self.emit_phi_copies(block_idx, succ_block);
+                self.buf.emit_byte(0xE9); // JMP succ_block
+                let patch_pos = self.buf.pos();
+                self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                self.branch_patches.push((patch_pos, succ_block));
+            }
         }
     }
 
@@ -401,7 +520,14 @@ impl<'a> Lowerer<'a> {
                 // CMP EAX, ECX
                 self.buf.emit(&[0x39, 0xC8]);
                 // SETcc AL
-                self.buf.emit(&[0x0F, cc.x64_cc() - 0x10]); // SETcc = 0x0F 0x9x
+                //
+                // BUG FIX [jit-irlower #1]: `x64_cc()` returns the *near-Jcc*
+                // second byte (0x84..=0x8F, i.e. `0F 8x`). The SETcc second
+                // byte is the Jcc value PLUS 0x10 (0x94..=0x9F, i.e. `0F 9x`),
+                // NOT minus. The old `- 0x10` produced `0F 7x` (MMX
+                // PCMPEQB/etc.), which never sets AL — RAX was left untouched
+                // so every Op::Cmp returned garbage. Use `+ 0x10`.
+                self.buf.emit(&[0x0F, cc.x64_cc() + 0x10]); // SETcc = 0x0F 0x9x
                                                             // MOVZX EAX, AL
                 self.buf.emit(&[0x0F, 0xB6, 0xC0]);
                 self.store_rax(slot);
@@ -421,9 +547,14 @@ impl<'a> Lowerer<'a> {
                 self.store_rax(slot);
             }
             Op::Phi => {
-                // Phi nodes are resolved by predecessors storing to the phi's slot.
-                // Just allocate a slot — the predecessors will write to it.
-                self.alloc_slot(id);
+                // Phi nodes are resolved by predecessors storing their
+                // incoming value into the phi's slot at the controlling
+                // block edge. The slot is reserved up front by
+                // `prealloc_phi_slots` (a forward branch may target a phi
+                // whose block has not yet been lowered), and the parallel
+                // copy is emitted by `emit_phi_copies` (see BUG FIX
+                // [jit-irlower #2]) just before each predecessor's branch
+                // to this phi's merge block. Nothing to emit here.
             }
             // Control and meta nodes — skip
             Op::Start | Op::Return | Op::If | Op::Merge | Op::Region | Op::Proj(_) | Op::Dead => {}
@@ -449,25 +580,58 @@ impl<'a> Lowerer<'a> {
                 // Load condition into RAX
                 let cond_id = node.inputs[1];
                 self.load_to_rax(self.slot_of(cond_id));
-                // TEST EAX, EAX
+                // TEST EAX, EAX  (does not disturb RAX; sets ZF)
                 self.buf.emit(&[0x85, 0xC0]);
-                // JNE true_block (jump if condition != 0)
-                self.buf.emit(&[0x0F, 0x85]);
-                let patch_pos = self.buf.pos();
-                self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
 
-                // Find true/false successor blocks
-                let block = &self.schedule.blocks[block_idx];
-                if block.successors.len() >= 2 {
-                    // Patch JNE to true block (successor 0)
-                    self.branch_patches.push((patch_pos, block.successors[0]));
-                    // Fall through to false block (successor 1) — emit JMP
-                    self.buf.emit_byte(0xE9);
-                    let patch_pos2 = self.buf.pos();
-                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-                    self.branch_patches.push((patch_pos2, block.successors[1]));
-                } else if block.successors.len() == 1 {
-                    self.branch_patches.push((patch_pos, block.successors[0]));
+                // Snapshot successor block indices (immutable borrow ends
+                // here so `emit_phi_copies` can borrow `self` mutably).
+                let succ0 = self.schedule.blocks[block_idx].successors.first().copied();
+                let succ1 = self.schedule.blocks[block_idx].successors.get(1).copied();
+
+                match (succ0, succ1) {
+                    (Some(true_block), Some(false_block)) => {
+                        // BUG FIX [jit-irlower #2]: phi copies must execute on
+                        // the edge actually taken, so the conditional branch
+                        // splits the critical edges. Layout:
+                        //   TEST; JE around_true;
+                        //   <true-edge phi copies>; JMP true_block;
+                        //   around_true: <false-edge phi copies>; JMP false_block;
+                        //
+                        // JE around_true (jump when condition == 0)
+                        self.buf.emit(&[0x0F, 0x84]);
+                        let je_patch = self.buf.pos();
+                        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+
+                        // Taken (true) edge.
+                        self.emit_phi_copies(block_idx, true_block);
+                        self.buf.emit_byte(0xE9); // JMP true_block
+                        let jmp_true = self.buf.pos();
+                        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                        self.branch_patches.push((jmp_true, true_block));
+
+                        // around_true: false edge. Patch the JE here.
+                        let around_true = self.buf.pos();
+                        let rel = around_true as i32 - (je_patch as i32 + 4);
+                        self.buf
+                            .try_patch_i32(je_patch, rel)
+                            .expect("codegen patch in-bounds");
+                        self.emit_phi_copies(block_idx, false_block);
+                        self.buf.emit_byte(0xE9); // JMP false_block
+                        let jmp_false = self.buf.pos();
+                        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                        self.branch_patches.push((jmp_false, false_block));
+                    }
+                    (Some(only_block), None) => {
+                        // Degenerate single-successor If: copies are
+                        // unconditional, then a plain JNE to the target
+                        // (preserving the original taken-on-nonzero shape).
+                        self.emit_phi_copies(block_idx, only_block);
+                        self.buf.emit(&[0x0F, 0x85]); // JNE only_block
+                        let patch_pos = self.buf.pos();
+                        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                        self.branch_patches.push((patch_pos, only_block));
+                    }
+                    _ => {}
                 }
             }
             _ => {}
@@ -538,6 +702,11 @@ pub fn lower(
         num_locals,
         graph.nodes.len(),
     );
+
+    // BUG FIX [jit-irlower #2]: reserve phi destination slots before any
+    // block is lowered — a forward branch's edge copies (emit_phi_copies)
+    // reference slots of phis in not-yet-lowered merge blocks.
+    lowerer.prealloc_phi_slots();
 
     lowerer.emit_prologue();
 
@@ -641,5 +810,83 @@ mod tests {
         let method = compiled.unwrap();
         let result = unsafe { method.try_call(&[6, 7]).expect("test JIT call") };
         assert_eq!(result, 42, "6 * 7 = 42");
+    }
+
+    // ── Regression: BUG FIX [jit-irlower #1] — Op::Cmp SETcc ─────────────
+    //
+    // Hand-build a single-block graph whose Return value is a bare
+    // `Op::Cmp(Lt)`, so the SETcc store is the only thing producing the
+    // result. With the old `cc.x64_cc() - 0x10` the second opcode byte was
+    // 0x7C (a short Jcc / not a SETcc), leaving RAX untouched and returning
+    // garbage. With the fix (`+ 0x10` → 0x9C = SETL) the boolean is correct.
+    #[test]
+    fn test_lower_cmp_lt_setcc() {
+        use crate::ir::{CmpOp, Graph, IrType, Op, NO_NODE};
+
+        // Mirror IrBuilder::new node layout: Start, Proj(0)=ctrl, Proj(1)=mem,
+        // Param(0), Param(1).
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let _mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let a = graph.add(Op::Param(0), IrType::Int, vec![start], None);
+        let b = graph.add(Op::Param(1), IrType::Int, vec![start], None);
+        // cmp = (a < b) ? 1 : 0
+        let cmp = graph.add(Op::Cmp(CmpOp::Lt), IrType::Int, vec![a, b], None);
+        // Return [ctrl, cmp]
+        let ret = graph.add(Op::Return, IrType::Void, vec![ctrl, cmp], None);
+        graph.exit = ret;
+
+        let schedule = ir_schedule::schedule(&graph);
+        let method = lower(&graph, &schedule, 2, 2).expect("lower cmp graph");
+
+        // a < b  → 1
+        let r_true = unsafe { method.try_call(&[3, 7]).expect("test JIT call") };
+        assert_eq!(r_true, 1, "3 < 7 should set the boolean to 1");
+        // a >= b → 0
+        let r_false = unsafe { method.try_call(&[7, 3]).expect("test JIT call") };
+        assert_eq!(r_false, 0, "7 < 3 is false → 0");
+        let r_eq = unsafe { method.try_call(&[5, 5]).expect("test JIT call") };
+        assert_eq!(r_eq, 0, "5 < 5 is false → 0");
+    }
+
+    // ── Regression: BUG FIX [jit-irlower #1 + #2] — ternary via IR path ──
+    //
+    // int f(int a, int b) { return a < b ? 1 : 0; }
+    //
+    // javac lowers the ternary to a compare-and-branch joined by a phi:
+    //   iload_0; iload_1; if_icmpge else; iconst_1; goto end;
+    //   else: iconst_0; end: ireturn
+    // This exercises BOTH fixes end-to-end: the `Op::Cmp(Ge)` feeding the
+    // `If` (#1) and the edge-split parallel copy that materialises the phi
+    // value 1/0 at each branch edge (#2). Before #2 the phi read an
+    // uninitialised frame slot and returned garbage.
+    #[test]
+    fn test_lower_ternary_lt_phi() {
+        // PCs:
+        //  0: iload_0      1a
+        //  1: iload_1      1b
+        //  2: if_icmpge 9  a2 00 07   (offset 7 from pc 2 → pc 9)
+        //  5: iconst_1     04
+        //  6: goto 10      a7 00 04   (offset 4 from pc 6 → pc 10)
+        //  9: iconst_0     03
+        // 10: ireturn      ac
+        let code = [
+            0x1a, 0x1b, 0xa2, 0x00, 0x07, 0x04, 0xa7, 0x00, 0x04, 0x03, 0xac, 0, 0,
+        ];
+        let compiled = compile_via_ir(&code, 11, 2, 2);
+        assert!(compiled.is_some(), "ternary should compile via IR path");
+        let method = compiled.unwrap();
+
+        let r_true = unsafe { method.try_call(&[3, 7]).expect("test JIT call") };
+        assert_eq!(r_true, 1, "3 < 7 → 1");
+        let r_false = unsafe { method.try_call(&[7, 3]).expect("test JIT call") };
+        assert_eq!(r_false, 0, "7 < 3 → 0");
+        let r_eq = unsafe { method.try_call(&[5, 5]).expect("test JIT call") };
+        assert_eq!(r_eq, 0, "5 == 5, not < → 0");
     }
 }

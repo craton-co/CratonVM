@@ -124,6 +124,87 @@ enum FontCategory {
     Monospaced,
 }
 
+// ── Shared advance model (bug awt-font-image #1) ──────────────────────────
+//
+// FontMetrics (natives.rs), FontEngine::{string_width,char_width,
+// compute_metrics} (this file), and Graphics2D::draw_string (graphics2d.rs)
+// previously each carried their OWN width heuristic (char_count*size*0.55,
+// size*0.55, size/2, etc.), so Swing's text layout measured one width while
+// the software renderer advanced the pen by a different one. The functions
+// below are the SINGLE source of truth for per-glyph advance, so measurement
+// and drawing agree by construction. They are deliberately framework-free
+// (no fontdue Font handle, which only the platform backends own) so every
+// in-process caller — including the headless software path — shares them.
+
+/// Resolve the logical category for a family name. Free function (no
+/// `FontEngine` needed) so the shared advance helpers below — and external
+/// callers like `Graphics2D::draw_string` — can categorize a family directly.
+fn category_of(family: &str) -> FontCategory {
+    match FontEngine::get_logical_family(family) {
+        "Monospaced" => FontCategory::Monospaced,
+        "Serif" => FontCategory::Serif,
+        _ => FontCategory::SansSerif,
+    }
+}
+
+/// Per-character advance ratio (× point size), before the bold widening
+/// multiplier. This is the one place per-glyph width is defined; every
+/// width/advance result in the crate is built from it.
+fn char_advance_ratio(cat: FontCategory, ch: char) -> f64 {
+    match cat {
+        // Monospaced: every glyph (including space) advances identically.
+        FontCategory::Monospaced => 0.6,
+        _ => match ch {
+            'i' | 'l' | '!' | '|' | '\'' | ',' | '.' | ':' | ';' | 'j' | 'f' | 't' | 'r' => 0.35,
+            'M' | 'W' | 'm' | 'w' | '@' => 0.80,
+            ' ' => 0.30,
+            // Serif faces run slightly wider than sans for the average glyph.
+            _ => {
+                if matches!(cat, FontCategory::Serif) {
+                    0.58
+                } else {
+                    0.55
+                }
+            }
+        },
+    }
+}
+
+/// Fractional advance width of a single glyph, in pixels. Source of truth
+/// shared by FontMetrics.charWidth, FontEngine::char_width, and
+/// Graphics2D::draw_string's pen advance.
+pub fn glyph_advance(family: &str, style: i32, size: i32, ch: char) -> f64 {
+    let cat = category_of(family);
+    let ratio = char_advance_ratio(cat, ch);
+    let multiplier = if style & BOLD != 0 { 1.05 } else { 1.0 };
+    ratio * size as f64 * multiplier
+}
+
+/// Fractional total advance of a string, in pixels — the exact sum of each
+/// glyph's [`glyph_advance`]. Summing per-glyph (rather than char_count ×
+/// average) keeps this identical to what `draw_string` lays out.
+pub fn text_advance(family: &str, style: i32, size: i32, text: &str) -> f64 {
+    let cat = category_of(family);
+    let multiplier = if style & BOLD != 0 { 1.05 } else { 1.0 };
+    let s = size as f64;
+    text.chars()
+        .map(|ch| char_advance_ratio(cat, ch) * s * multiplier)
+        .sum()
+}
+
+/// Maximum advance of any glyph at this size — the widest per-glyph ratio,
+/// consistent with [`glyph_advance`].
+pub fn max_glyph_advance(family: &str, style: i32, size: i32) -> f64 {
+    let cat = category_of(family);
+    let multiplier = if style & BOLD != 0 { 1.05 } else { 1.0 };
+    // Widest ratio in `char_advance_ratio`: 0.6 for monospaced, 0.80 otherwise.
+    let widest = match cat {
+        FontCategory::Monospaced => 0.6,
+        _ => 0.80,
+    };
+    widest * size as f64 * multiplier
+}
+
 impl FontEngine {
     pub fn new() -> Self {
         FontEngine {
@@ -171,74 +252,23 @@ impl FontEngine {
         m
     }
 
-    /// Approximate the total width of a string in pixels.
+    /// Total width of a string in pixels.
+    ///
+    /// Bug awt-font-image #1: this now SUMS per-glyph [`text_advance`] (the
+    /// shared advance model) instead of `char_count × average`, so the value
+    /// matches glyph-by-glyph what `Graphics2D::draw_string` lays out and what
+    /// `FontMetrics.stringWidth` reports.
     pub fn string_width(&mut self, spec: &FontSpec, text: &str) -> i32 {
         if text.is_empty() {
             return 0;
         }
-        // Hoist all per-call lookups out of the per-character path. Each
-        // of these is cheap in isolation but `string_width` is hot in
-        // measure passes during layout, so we compute them exactly once.
-        let cat = Self::categorize(&spec.family);
-        let size = spec.size as f64;
-        let is_bold = spec.is_bold();
-
-        // Heuristic character count. For ASCII text (the common case for
-        // Swing label/menu strings) `str::len` equals the char count and
-        // skips the full UTF-8 iteration that `chars().count()` requires.
-        // Fall back to `chars().count()` for non-ASCII so multi-byte
-        // glyphs aren't over-counted by their byte length.
-        let char_count = if text.is_ascii() {
-            text.len() as i32
-        } else {
-            text.chars().count() as i32
-        };
-
-        match cat {
-            FontCategory::Monospaced => {
-                // Every character has the same advance width.
-                let char_w = (0.6 * size).round() as i32;
-                char_w * char_count
-            }
-            _ => {
-                // Proportional: per-character width varies, but we use
-                // a heuristic average. Narrow chars (i, l, 1) are ~0.3*S,
-                // wide chars (M, W) are ~0.8*S. Average ~ 0.55*S for
-                // sans-serif, slightly wider for serif.
-                let avg = if matches!(cat, FontCategory::Serif) {
-                    0.58 * size
-                } else {
-                    0.55 * size
-                };
-                // Bold glyphs are ~5% wider.
-                let multiplier = if is_bold { 1.05 } else { 1.0 };
-                let total = avg * multiplier * char_count as f64;
-                total.round() as i32
-            }
-        }
+        text_advance(&spec.family, spec.style, spec.size, text).round() as i32
     }
 
-    /// Approximate the advance width of a single character.
+    /// Advance width of a single character, from the shared [`glyph_advance`]
+    /// model (bug awt-font-image #1).
     pub fn char_width(&mut self, spec: &FontSpec, ch: char) -> i32 {
-        let cat = Self::categorize(&spec.family);
-        let size = spec.size as f64;
-
-        match cat {
-            FontCategory::Monospaced => (0.6 * size).round() as i32,
-            _ => {
-                // Rough per-character heuristic.
-                let ratio = match ch {
-                    'i' | 'l' | '!' | '|' | '\'' | ',' | '.' | ':' | ';' | 'j' | 'f'
-                    | 't' | 'r' => 0.35,
-                    'M' | 'W' | 'm' | 'w' | '@' => 0.80,
-                    ' ' => 0.30,
-                    _ => 0.55,
-                };
-                let base = ratio * size;
-                let multiplier = if spec.is_bold() { 1.05 } else { 1.0 };
-                (base * multiplier).round() as i32
-            }
-        }
+        glyph_advance(&spec.family, spec.style, spec.size, ch).round() as i32
     }
 
     /// Map a logical font name to its canonical family.
@@ -273,15 +303,6 @@ impl FontEngine {
 
     // ── Internal helpers ─────────────────────────────────────────────
 
-    fn categorize(family: &str) -> FontCategory {
-        let canonical = Self::get_logical_family(family);
-        match canonical {
-            "Monospaced" => FontCategory::Monospaced,
-            "Serif" => FontCategory::Serif,
-            _ => FontCategory::SansSerif,
-        }
-    }
-
     /// Compute heuristic metrics for a font specification.
     ///
     /// For a font of size S:
@@ -289,7 +310,9 @@ impl FontEngine {
     /// - descent = round(0.20 * S)
     /// - leading = round(0.05 * S)
     /// - height  = ascent + descent + leading
-    /// - max_advance: monospaced = round(0.6*S), proportional = S (upper bound)
+    /// - max_advance = widest per-glyph advance from the shared model
+    ///   ([`max_glyph_advance`]): monospaced = round(0.6*S), proportional =
+    ///   round(0.80*S), each times the bold widening factor.
     fn compute_metrics(spec: &FontSpec) -> FontMetrics {
         let s = spec.size as f64;
         let ascent = (0.80 * s).round() as i32;
@@ -297,11 +320,11 @@ impl FontEngine {
         let leading = (0.05 * s).round() as i32;
         let height = ascent + descent + leading;
 
-        let cat = Self::categorize(&spec.family);
-        let max_advance = match cat {
-            FontCategory::Monospaced => (0.6 * s).round() as i32,
-            _ => spec.size, // upper bound for proportional
-        };
+        // Bug awt-font-image #1: derive max_advance from the SAME shared
+        // advance model as stringWidth/charWidth/draw_string (the widest
+        // per-glyph advance), instead of the decoupled `spec.size` upper bound
+        // that over-stated the proportional case.
+        let max_advance = max_glyph_advance(&spec.family, spec.style, spec.size).round() as i32;
 
         FontMetrics {
             ascent,
@@ -659,7 +682,10 @@ mod tests {
         assert_eq!(m.descent, 2);
         assert_eq!(m.leading, 1);
         assert_eq!(m.height, 13);
-        assert_eq!(m.max_advance, 12);
+        // Bug awt-font-image #1: max_advance is the widest per-glyph advance
+        // (0.80 * 12 = 9.6 -> 10), matching the shared advance model, not the
+        // old decoupled `spec.size` upper bound (12).
+        assert_eq!(m.max_advance, 10);
     }
 
     #[test]
@@ -708,7 +734,9 @@ mod tests {
         let mut engine = FontEngine::new();
         let spec = FontSpec::new("SansSerif", PLAIN, 20);
         let w = engine.string_width(&spec, "Hello");
-        assert_eq!(w, 55);
+        // Bug awt-font-image #1: per-glyph sum, not char_count * average.
+        // H,e,o = 0.55 each; l,l = 0.35 each -> (3*0.55 + 2*0.35) * 20 = 47.
+        assert_eq!(w, 47);
     }
 
     #[test]
@@ -727,6 +755,53 @@ mod tests {
         let wp = engine.string_width(&plain, "Hello World");
         let wb = engine.string_width(&bold, "Hello World");
         assert!(wb > wp, "bold ({}) should be wider than plain ({})", wb, wp);
+    }
+
+    // ── Shared advance model agreement (bug awt-font-image #1) ───────────
+
+    #[test]
+    fn string_width_equals_sum_of_glyph_advances() {
+        // FontMetrics.stringWidth, FontEngine::string_width, and the
+        // Graphics2D::draw_string pen advance must all derive from ONE model.
+        // Here we prove FontEngine::string_width equals round(sum of
+        // per-glyph glyph_advance), i.e. the same arithmetic draw_string runs.
+        let mut engine = FontEngine::new();
+        for (family, style, size, text) in [
+            ("SansSerif", PLAIN, 20, "Hello World"),
+            ("Serif", BOLD, 14, "Mixed Width jiM!"),
+            ("Monospaced", PLAIN, 18, "code()"),
+            ("Dialog", BOLD_ITALIC, 12, "aWl.iM"),
+        ] {
+            let spec = FontSpec::new(family, style, size);
+            let summed: f64 = text
+                .chars()
+                .map(|ch| glyph_advance(family, style, size, ch))
+                .sum();
+            assert_eq!(
+                engine.string_width(&spec, text),
+                summed.round() as i32,
+                "string_width must equal the summed per-glyph advance for {family}/{style}/{size} {text:?}",
+            );
+            // And the convenience aggregate matches the per-glyph sum exactly.
+            assert!(
+                (text_advance(family, style, size, text) - summed).abs() < 1e-9,
+                "text_advance must equal the per-glyph sum",
+            );
+        }
+    }
+
+    #[test]
+    fn max_advance_is_widest_glyph() {
+        // getMaxAdvance must bound every single-glyph advance.
+        let family = "SansSerif";
+        let (style, size) = (PLAIN, 24);
+        let maxa = max_glyph_advance(family, style, size);
+        for ch in "iMWla@. jr".chars() {
+            assert!(
+                glyph_advance(family, style, size, ch) <= maxa + 1e-9,
+                "glyph {ch:?} advance exceeds max_advance {maxa}",
+            );
+        }
     }
 
     #[test]

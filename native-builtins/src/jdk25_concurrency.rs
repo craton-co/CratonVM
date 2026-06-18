@@ -20,7 +20,9 @@
 //! ## Phase 82 — Full Implementation
 //!
 //! All methods are real implementations with no stubs:
-//! - `fork()` invokes `Callable.call()` synchronously, captures result/exception
+//! - `fork()` spawns a real VM worker thread per subtask (no longer
+//!   synchronous); `join()`/`joinUntil()` block on those workers and then
+//!   aggregate outcomes (see the "nb-jdk25-concurrency fix" block below)
 //! - `ShutdownOnFailure` auto-shuts down on first failure with exception propagation
 //! - `ShutdownOnSuccess` auto-shuts down on first success with result capture
 //! - `Carrier.run()/call()` invokes Runnable/Callable with scoped value binding
@@ -145,6 +147,47 @@ const CLS_SHUTDOWN_ON_FAILURE: &str =
     "java/util/concurrent/StructuredTaskScope$ShutdownOnFailure";
 const CLS_SHUTDOWN_ON_SUCCESS: &str =
     "java/util/concurrent/StructuredTaskScope$ShutdownOnSuccess";
+
+// ===========================================================================
+// nb-jdk25-concurrency fix — real worker-thread fork()/join()
+// ===========================================================================
+//
+// Bug: the previous model ran every forked `Callable` SYNCHRONOUSLY on the
+// forking (owner) thread inside `fork()`, and `join()` was a no-op. That
+// deadlocks any set of subtasks where one blocks waiting for another (the
+// classic producer/consumer fork pattern) and gives zero parallelism — the
+// exact opposite of `StructuredTaskScope`'s contract.
+//
+// Fix: `fork()` now spawns a REAL VM worker thread per subtask (reusing the
+// VM's `thread_start` machinery — the same path `Thread.start()` and the
+// virtual-thread helpers use). Each worker runs a synthetic
+// `CratonVM$StsForkRunner` whose native `run()` invokes the `Callable` and
+// records SUCCESS+result / FAILED+exception into ITS OWN `Subtask` only (so
+// there is no cross-thread race on the scope object). `join()` blocks on
+// every spawned worker via `thread_join` and THEN performs all scope-level
+// aggregation (completed count, policy-driven shutdown, primary/suppressed
+// exception, ShutdownOnSuccess result) on the owner thread.
+//
+// The forked Thread objects and their Subtasks are tracked per-scope in a
+// Rust side-table (mirroring the existing `SCOPE_OWNERS` / `SCOPE_JOINERS`
+// tables in this file).
+
+/// Synthetic Runnable executed on each fork worker thread.  Field layout:
+///   slot 0 = the Callable to invoke
+///   slot 1 = the Subtask to record the outcome into
+const CLS_FORK_RUNNER: &str = "CratonVM$StsForkRunner";
+const FORK_RUNNER_FIELD_CALLABLE: usize = 0;
+const FORK_RUNNER_FIELD_SUBTASK: usize = 1;
+const FORK_RUNNER_NUM_FIELDS: usize = 2;
+
+/// Synthetic Thread layout (matches the VM's synthetic-Thread natives):
+///   slot 0 = name, slot 1 = priority, slot 2 = tid, slot 3 = Runnable,
+///   slot 4 = virtual flag.
+const THREAD_SYNTHETIC_NUM_FIELDS: usize = 5;
+const THREAD_FIELD_NAME: usize = 0;
+const THREAD_FIELD_PRIORITY: usize = 1;
+const THREAD_FIELD_TARGET: usize = 3;
+const THREAD_FIELD_VIRTUAL: usize = 4;
 
 // ===========================================================================
 // 15.1 — ScopedValue natives
@@ -433,6 +476,155 @@ fn sts_get_int(ctx: &mut dyn NativeContext, this: ObjectRef, field: usize) -> i3
     }
 }
 
+// ---------------------------------------------------------------------------
+// nb-jdk25-concurrency — per-scope forked-worker tracking
+// ---------------------------------------------------------------------------
+
+/// Tracks, for each open scope, the `(Subtask, worker Thread)` pairs created
+/// by `fork()` so that `join()` can block on every worker and then aggregate
+/// outcomes.  Keyed by the scope `ObjectRef` raw pointer, exactly like the
+/// `SCOPE_OWNERS` / `SCOPE_JOINERS` tables below.
+///
+/// Stored `ObjectRef`s stay reachable for the worker's lifetime: each worker
+/// Thread is registered with the VM `ThreadRegistry` by `thread_start` (so GC
+/// scans its stack and the Thread mirror), and the Subtask is returned to the
+/// Java caller. Workers are short-lived — `join()` reaps them and the entry is
+/// cleared on close — so this side-table never accumulates.
+static SCOPE_FORKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, Vec<(ObjectRef, ObjectRef)>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn register_scope_fork(scope: ObjectRef, subtask: ObjectRef, thread_obj: ObjectRef) {
+    let key = scope.as_ptr() as usize;
+    SCOPE_FORKS
+        .lock()
+        .unwrap()
+        .entry(key)
+        .or_default()
+        .push((subtask, thread_obj));
+}
+
+/// Take (and clear) the recorded forks for a scope. Returns an empty Vec if
+/// none were recorded.
+fn take_scope_forks(scope: ObjectRef) -> Vec<(ObjectRef, ObjectRef)> {
+    let key = scope.as_ptr() as usize;
+    SCOPE_FORKS
+        .lock()
+        .unwrap()
+        .remove(&key)
+        .unwrap_or_default()
+}
+
+/// Peek at the recorded forks for a scope without clearing them. Test-only
+/// (the production paths always drain via `take_scope_forks`).
+#[cfg(test)]
+fn peek_scope_forks(scope: ObjectRef) -> Vec<(ObjectRef, ObjectRef)> {
+    let key = scope.as_ptr() as usize;
+    SCOPE_FORKS
+        .lock()
+        .unwrap()
+        .get(&key)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// `CratonVM$StsForkRunner.run()V` — the body executed on each fork worker
+/// thread. Invokes the forked `Callable` and records the outcome into its OWN
+/// `Subtask` only (slot 0 STATE + slot 1 RESULT / slot 2 EXCEPTION). All
+/// scope-level aggregation is deferred to `join()` on the owner thread, so no
+/// two worker threads ever write the same object's fields concurrently.
+fn native_fork_runner_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let callable_val = ctx.get_field(this, FORK_RUNNER_FIELD_CALLABLE);
+    let subtask = match ctx.get_field(this, FORK_RUNNER_FIELD_SUBTASK) {
+        Value::Object(Some(s)) => s,
+        _ => return Ok(None),
+    };
+
+    let call_result = if let Value::Object(Some(callable)) = callable_val {
+        ctx.invoke_virtual(callable, "call", "()Ljava/lang/Object;", &[])
+    } else {
+        Ok(Some(Value::Object(None)))
+    };
+
+    match call_result {
+        Ok(result_val) => {
+            ctx.set_field(subtask, SUBTASK_FIELD_STATE, Value::Int(SUBTASK_STATE_SUCCESS));
+            ctx.set_field(
+                subtask,
+                SUBTASK_FIELD_RESULT,
+                result_val.unwrap_or(Value::Object(None)),
+            );
+            ctx.set_field(subtask, SUBTASK_FIELD_EXCEPTION, Value::Object(None));
+        }
+        Err(err) => {
+            let exc_ref = match &err {
+                cratonvm_types::error::MethodCallFailed::ExceptionThrown(obj) => {
+                    Value::Object(Some(*obj))
+                }
+                _ => Value::Object(None),
+            };
+            ctx.set_field(subtask, SUBTASK_FIELD_STATE, Value::Int(SUBTASK_STATE_FAILED));
+            ctx.set_field(subtask, SUBTASK_FIELD_RESULT, Value::Object(None));
+            ctx.set_field(subtask, SUBTASK_FIELD_EXCEPTION, exc_ref);
+        }
+    }
+    // The worker's Thread.run() returns normally regardless of the Callable's
+    // outcome — the failure is captured on the Subtask, not propagated as an
+    // uncaught exception on the worker (which would just be logged + dropped).
+    Ok(None)
+}
+
+/// Aggregate a single completed Subtask's outcome into the scope's policy
+/// bookkeeping. Runs on the owner thread inside `join()` after the worker has
+/// been reaped, so all scope-field writes are single-threaded here.
+fn sts_aggregate_subtask(ctx: &mut dyn NativeContext, scope: ObjectRef, subtask: ObjectRef) {
+    let policy = sts_get_int(ctx, scope, STS_FIELD_POLICY);
+    let sub_state = match ctx.get_field(subtask, SUBTASK_FIELD_STATE) {
+        Value::Int(s) => s,
+        _ => SUBTASK_STATE_UNAVAILABLE,
+    };
+
+    let completed = sts_get_int(ctx, scope, STS_FIELD_COMPLETED_COUNT);
+    ctx.set_field(scope, STS_FIELD_COMPLETED_COUNT, Value::Int(completed + 1));
+
+    match sub_state {
+        SUBTASK_STATE_SUCCESS => {
+            let result_val = ctx.get_field(subtask, SUBTASK_FIELD_RESULT);
+            // ShutdownOnSuccess: capture the first success and shut down.
+            if policy == STS_POLICY_SHUTDOWN_ON_SUCCESS
+                && sts_get_int(ctx, scope, STS_FIELD_STATE) == STS_STATE_OPEN
+            {
+                ctx.set_field(scope, STS_FIELD_STATE, Value::Int(STS_STATE_SHUTDOWN));
+                ctx.set_field(scope, STS_FIELD_EXCEPTION, result_val);
+            }
+        }
+        SUBTASK_STATE_FAILED => {
+            let exc_ref = ctx.get_field(subtask, SUBTASK_FIELD_EXCEPTION);
+            if policy == STS_POLICY_SHUTDOWN_ON_FAILURE {
+                let current_state = sts_get_int(ctx, scope, STS_FIELD_STATE);
+                if current_state == STS_STATE_OPEN {
+                    ctx.set_field(scope, STS_FIELD_STATE, Value::Int(STS_STATE_SHUTDOWN));
+                    ctx.set_field(scope, STS_FIELD_EXCEPTION, exc_ref);
+                } else {
+                    let suppressed = sts_get_int(ctx, scope, STS_FIELD_SUPPRESSED_COUNT);
+                    ctx.set_field(
+                        scope,
+                        STS_FIELD_SUPPRESSED_COUNT,
+                        Value::Int(suppressed + 1),
+                    );
+                }
+            } else if policy == STS_POLICY_BASE {
+                let existing = ctx.get_field(scope, STS_FIELD_EXCEPTION);
+                if matches!(existing, Value::Object(None)) {
+                    ctx.set_field(scope, STS_FIELD_EXCEPTION, exc_ref);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// `StructuredTaskScope.<init>()V`
 fn native_sts_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
@@ -465,10 +657,13 @@ fn native_sts_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRe
 
 /// `StructuredTaskScope.fork(Callable)Subtask`
 ///
-/// Forks a subtask that executes the Callable synchronously. On success the
-/// subtask holds the result; on failure it holds the exception. Policy-aware:
-/// ShutdownOnFailure auto-shuts down on first failure; ShutdownOnSuccess
-/// auto-shuts down on first success.
+/// nb-jdk25-concurrency fix: forks a subtask that executes the `Callable` on
+/// its OWN VM worker thread (no longer synchronously on the forking thread).
+/// The subtask is returned immediately in the UNAVAILABLE state; its outcome
+/// is filled in by the worker, and `join()` blocks until the worker finishes
+/// and then aggregates the outcome into the scope's policy bookkeeping. This
+/// provides real parallelism and, critically, prevents the deadlock that the
+/// old synchronous model produced for blocking-dependent subtasks.
 fn native_sts_fork(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let state = sts_get_int(ctx, this, STS_FIELD_STATE);
@@ -486,109 +681,119 @@ fn native_sts_fork(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let count = sts_get_int(ctx, this, STS_FIELD_TASK_COUNT);
     ctx.set_field(this, STS_FIELD_TASK_COUNT, Value::Int(count + 1));
 
-    // Allocate the subtask
+    // Allocate the subtask (returned to the caller immediately, UNAVAILABLE).
     let subtask = alloc_concurrent_synthetic(ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS);
     ctx.set_field(subtask, SUBTASK_FIELD_CALLABLE, callable_val);
+    ctx.set_field(subtask, SUBTASK_FIELD_STATE, Value::Int(SUBTASK_STATE_UNAVAILABLE));
+    ctx.set_field(subtask, SUBTASK_FIELD_RESULT, Value::Object(None));
+    ctx.set_field(subtask, SUBTASK_FIELD_EXCEPTION, Value::Object(None));
 
-    // If scope is SHUTDOWN, don't execute — subtask stays UNAVAILABLE
+    // If the scope is already SHUTDOWN, the spec does not run new subtasks —
+    // they stay UNAVAILABLE and are still accounted as completed. Do not spawn
+    // a worker.
     if state == STS_STATE_SHUTDOWN {
-        ctx.set_field(subtask, SUBTASK_FIELD_STATE, Value::Int(SUBTASK_STATE_UNAVAILABLE));
-        ctx.set_field(subtask, SUBTASK_FIELD_RESULT, Value::Object(None));
-        ctx.set_field(subtask, SUBTASK_FIELD_EXCEPTION, Value::Object(None));
-        // Still counts as completed (not executed but accounted for)
         let completed = sts_get_int(ctx, this, STS_FIELD_COMPLETED_COUNT);
         ctx.set_field(this, STS_FIELD_COMPLETED_COUNT, Value::Int(completed + 1));
         return Ok(Some(Value::Object(Some(subtask))));
     }
 
-    // Execute the Callable synchronously
-    let call_result = if let Value::Object(Some(callable)) = callable_val {
-        ctx.invoke_virtual(callable, "call", "()Ljava/lang/Object;", &[])
+    // Build the runner Runnable that the worker thread will execute. It holds
+    // the Callable + the Subtask and writes the outcome into the Subtask.
+    let runner = alloc_concurrent_synthetic(ctx, CLS_FORK_RUNNER, FORK_RUNNER_NUM_FIELDS);
+    ctx.set_field(runner, FORK_RUNNER_FIELD_CALLABLE, callable_val);
+    ctx.set_field(runner, FORK_RUNNER_FIELD_SUBTASK, Value::Object(Some(subtask)));
+
+    // Build a Thread whose Thread.run() dispatches to the runner, then start it
+    // via the VM's real thread machinery. The worker is reaped by join().
+    let worker = alloc_concurrent_synthetic(ctx, "java/lang/Thread", THREAD_SYNTHETIC_NUM_FIELDS);
+    let name = ctx.create_string("StsFork");
+    // Choose the field-set strategy by the object's actual layout. A synthetic
+    // 5-slot Thread (num_fields <= 8, matching the VM's
+    // `is_synthetic_thread_layout` cutoff) keeps name/priority/tid/target/virtual
+    // at fixed slots; a real-JDK Thread has dozens of fields with `target`
+    // resolved by name (and slot 3 holding an unrelated real field that we must
+    // NOT clobber). Set the target the right way for whichever layout this VM
+    // produced so the worker's Thread.run() finds the runner and invokes it.
+    //
+    // Note on virtual vs platform: this worker is deliberately a PLATFORM
+    // thread, NOT a virtual thread. Real StructuredTaskScope runs each subtask
+    // on its own virtual thread, but the VM's virtual scheduler bounds
+    // concurrently-running virtual threads to `available_parallelism()`
+    // carriers and only releases a carrier on park/sleep/wait. A
+    // blocking-dependent fork pattern (consumer waits for a producer) could
+    // then deadlock if the consumer holds the only free carrier while spinning
+    // rather than parking — exactly the deadlock class this fix exists to
+    // remove. A dedicated OS thread per subtask has no such bound, so
+    // independent AND blocking-dependent subtasks all make progress. For the
+    // synthetic layout that means leaving the slot-4 virtual flag at 0; for the
+    // real-JDK layout it means NOT constructing a BaseVirtualThread subtype.
+    let worker_fields = ctx.object_num_fields(worker);
+    let synthetic_thread = worker_fields <= 8;
+    if synthetic_thread {
+        ctx.set_field(worker, THREAD_FIELD_NAME, Value::Object(Some(name)));
+        ctx.set_field(worker, THREAD_FIELD_PRIORITY, Value::Int(5));
+        ctx.set_field(worker, THREAD_FIELD_TARGET, Value::Object(Some(runner)));
+        ctx.set_field(worker, THREAD_FIELD_VIRTUAL, Value::Int(0));
     } else {
-        Ok(Some(Value::Object(None)))
-    };
-
-    let policy = sts_get_int(ctx, this, STS_FIELD_POLICY);
-
-    match call_result {
-        Ok(result_val) => {
-            // Callable succeeded
-            ctx.set_field(
-                subtask,
-                SUBTASK_FIELD_STATE,
-                Value::Int(SUBTASK_STATE_SUCCESS),
-            );
-            ctx.set_field(
-                subtask,
-                SUBTASK_FIELD_RESULT,
-                result_val.unwrap_or(Value::Object(None)),
-            );
-            ctx.set_field(subtask, SUBTASK_FIELD_EXCEPTION, Value::Object(None));
-
-            // ShutdownOnSuccess: auto-shutdown on first success, store result
-            if policy == STS_POLICY_SHUTDOWN_ON_SUCCESS
-                && sts_get_int(ctx, this, STS_FIELD_STATE) == STS_STATE_OPEN
-            {
-                ctx.set_field(this, STS_FIELD_STATE, Value::Int(STS_STATE_SHUTDOWN));
-                ctx.set_field(
-                    this,
-                    STS_FIELD_EXCEPTION,
-                    result_val.unwrap_or(Value::Object(None)),
-                );
-            }
-        }
-        Err(err) => {
-            // Callable failed — extract exception ObjectRef if possible
-            let exc_ref = match &err {
-                cratonvm_types::error::MethodCallFailed::ExceptionThrown(obj) => {
-                    Value::Object(Some(*obj))
-                }
-                _ => Value::Object(None),
-            };
-            ctx.set_field(subtask, SUBTASK_FIELD_STATE, Value::Int(SUBTASK_STATE_FAILED));
-            ctx.set_field(subtask, SUBTASK_FIELD_RESULT, Value::Object(None));
-            ctx.set_field(subtask, SUBTASK_FIELD_EXCEPTION, exc_ref);
-
-            // ShutdownOnFailure: auto-shutdown on first failure, store exception
-            if policy == STS_POLICY_SHUTDOWN_ON_FAILURE {
-                let current_state = sts_get_int(ctx, this, STS_FIELD_STATE);
-                if current_state == STS_STATE_OPEN {
-                    // First failure — store as primary exception
-                    ctx.set_field(this, STS_FIELD_STATE, Value::Int(STS_STATE_SHUTDOWN));
-                    ctx.set_field(this, STS_FIELD_EXCEPTION, exc_ref);
-                } else {
-                    // Subsequent failure — count as suppressed
-                    let suppressed = sts_get_int(ctx, this, STS_FIELD_SUPPRESSED_COUNT);
-                    ctx.set_field(
-                        this,
-                        STS_FIELD_SUPPRESSED_COUNT,
-                        Value::Int(suppressed + 1),
-                    );
-                }
-            }
-
-            // For base policy, store the first exception
-            if policy == STS_POLICY_BASE {
-                let existing = ctx.get_field(this, STS_FIELD_EXCEPTION);
-                if matches!(existing, Value::Object(None)) {
-                    ctx.set_field(this, STS_FIELD_EXCEPTION, exc_ref);
-                }
-            }
-        }
+        // Real-JDK Thread: set name + target by name; leave the rest to the
+        // real field layout (thread_start fills in tid/daemon itself, and a
+        // plain Thread is non-virtual by construction). Do NOT write fixed slots
+        // — they hold unrelated real fields.
+        ctx.set_field_by_name(worker, "name", Value::Object(Some(name)));
+        ctx.set_field_by_name(worker, "target", Value::Object(Some(runner)));
     }
 
-    // Increment completed count
-    let completed = sts_get_int(ctx, this, STS_FIELD_COMPLETED_COUNT);
-    ctx.set_field(this, STS_FIELD_COMPLETED_COUNT, Value::Int(completed + 1));
+    // Record the (subtask, worker) pair BEFORE starting so a racing fast worker
+    // is already tracked when join() runs.
+    register_scope_fork(this, subtask, worker);
+
+    // Spawn the worker via the VM's real thread machinery.
+    let start_result = ctx.thread_start(worker);
+
+    // Decide whether the worker actually ran. Two cases require an inline
+    // fallback so the work is never silently lost:
+    //   1. thread_start returned Err (no thread registry available), or
+    //   2. the context has no real threading (e.g. test mocks whose
+    //      thread_start is a no-op): the worker is not alive AND the subtask
+    //      is still UNAVAILABLE, meaning the Callable never ran.
+    // A real worker is either still alive (skip inline; join() reaps it) or
+    // already finished — in which case it has written SUCCESS/FAILED onto the
+    // subtask (because the registry only marks a thread dead after run()
+    // returns), so the UNAVAILABLE check below is false and we skip inline.
+    let needs_inline = start_result.is_err()
+        || (!ctx.thread_is_alive(worker)
+            && matches!(
+                ctx.get_field(subtask, SUBTASK_FIELD_STATE),
+                Value::Int(SUBTASK_STATE_UNAVAILABLE)
+            ));
+
+    if needs_inline {
+        // Drop the (untracked-by-a-real-thread) tracking entry for this subtask
+        // so join() doesn't try to thread_join a worker that isn't running.
+        let mut remaining = take_scope_forks(this);
+        remaining.retain(|(st, _)| *st != subtask);
+        for (st, th) in remaining {
+            register_scope_fork(this, st, th);
+        }
+        // Run the Callable inline on this thread and aggregate immediately.
+        let inline = native_fork_runner_run(ctx, &[Value::Object(Some(runner))]);
+        sts_aggregate_subtask(ctx, this, subtask);
+        inline?;
+        return Ok(Some(Value::Object(Some(subtask))));
+    }
 
     Ok(Some(Value::Object(Some(subtask))))
 }
 
 /// `StructuredTaskScope.join()StructuredTaskScope`
 ///
-/// Waits for all forked tasks to complete. In the synchronous model all tasks
-/// are already complete when fork() returns, so this just validates state and
-/// marks the scope as joined.
+/// nb-jdk25-concurrency fix: BLOCKS until every forked worker thread finishes
+/// (was previously a no-op that simply stamped completed = count). After all
+/// workers are reaped, aggregates each subtask's outcome into the scope's
+/// policy bookkeeping on this (owner) thread — single-threaded, so no race on
+/// the scope object. This is what makes blocking-dependent subtasks work:
+/// the producer worker can complete and unblock the consumer worker because
+/// both run on real threads, and the owner only proceeds once both are done.
 fn native_sts_join(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let state = sts_get_int(ctx, this, STS_FIELD_STATE);
@@ -597,17 +802,41 @@ fn native_sts_join(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             message: "StructuredTaskScope is closed".to_string(),
         }.into());
     }
-    // In synchronous mode, all tasks are already complete
-    let count = sts_get_int(ctx, this, STS_FIELD_TASK_COUNT);
-    ctx.set_field(this, STS_FIELD_COMPLETED_COUNT, Value::Int(count));
+
+    // Take the forked (subtask, worker) pairs and block on each worker. The
+    // pairs are taken (not peeked) so a re-entrant or second join() is a no-op
+    // over already-reaped workers.
+    let forks = take_scope_forks(this);
+    for (_subtask, worker) in &forks {
+        // thread_join blocks until the worker's Thread.run() — i.e. the
+        // runner's Callable.call() — has fully completed and recorded its
+        // outcome on the subtask. Errors here are non-fatal: a worker that
+        // already exited yields Ok immediately.
+        let _ = ctx.thread_join(*worker);
+    }
+
+    // All workers done — aggregate outcomes on the owner thread in fork order.
+    for (subtask, _worker) in &forks {
+        sts_aggregate_subtask(ctx, this, *subtask);
+    }
+
     ctx.set_field(this, STS_FIELD_JOINED, Value::Int(1));
     Ok(Some(Value::Object(Some(this))))
 }
 
 /// `StructuredTaskScope.joinUntil(Ljava/time/Instant;)StructuredTaskScope`
 ///
-/// Like `join()` but with a deadline. In the synchronous model all tasks are
-/// already complete, so we just check if the deadline has already passed.
+/// Like `join()` but with a deadline. We honour the deadline only as an
+/// up-front check: if the supplied `Instant` is already in the past we throw a
+/// TimeoutException immediately. Otherwise we delegate to `join()`, which now
+/// actually BLOCKS on the worker threads.
+///
+/// nb-jdk25-concurrency gap: `join()` uses the VM's untimed `thread_join`, so
+/// once the deadline check passes we wait for the workers to finish rather
+/// than abandoning them when the deadline elapses mid-wait. A fully faithful
+/// `joinUntil` would need a timed thread-join primitive on `NativeContext`
+/// (cross-file follow-up). For the common case (deadline comfortably exceeds
+/// the actual work) the observable result is identical.
 fn native_sts_join_until(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Check deadline: if the Instant represents a time in the past, throw TimeoutException.
     // Instant is stored as (seconds, nanos). We compare against system time.
@@ -628,7 +857,7 @@ fn native_sts_join_until(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             }.into());
         }
     }
-    // All tasks already complete in synchronous model — delegate to join
+    // Deadline not yet exceeded — block on the workers via join().
     native_sts_join(ctx, args)
 }
 
@@ -640,7 +869,9 @@ fn native_sts_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let this = obj_arg(args, 0)?;
     let state = sts_get_int(ctx, this, STS_FIELD_STATE);
     if state == STS_STATE_CLOSED {
-        return Ok(None); // Already closed — idempotent
+        // Already closed — idempotent. Still ensure no tracking lingers.
+        let _ = take_scope_forks(this);
+        return Ok(None);
     }
     // Verify join() was called
     let joined = sts_get_int(ctx, this, STS_FIELD_JOINED);
@@ -651,6 +882,13 @@ fn native_sts_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
                 message: "StructuredTaskScope has not been joined".to_string(),
             }.into());
         }
+    }
+    // nb-jdk25-concurrency: reap any worker threads that join() did not (e.g.
+    // a scope closed after shutdown without a final join) so close() never
+    // leaks live workers, then drop the per-scope tracking entry. thread_join
+    // returns immediately for already-dead workers.
+    for (_subtask, worker) in take_scope_forks(this) {
+        let _ = ctx.thread_join(worker);
     }
     ctx.set_field(this, STS_FIELD_STATE, Value::Int(STS_STATE_CLOSED));
     Ok(None)
@@ -1596,6 +1834,12 @@ pub(crate) fn register_jdk25_concurrency_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         native_sts_to_string,
     );
+
+    // --- nb-jdk25-concurrency: fork worker Runnable ---
+    // Each fork() spawns a real worker Thread whose Thread.run() dispatches to
+    // a CratonVM$StsForkRunner; this native is the runner body that invokes
+    // the Callable and records the outcome on the Subtask.
+    r.register(CLS_FORK_RUNNER, "run", "()V", native_fork_runner_run);
 
     // --- StructuredTaskScope$Subtask ---
     r.register(
@@ -3052,6 +3296,113 @@ mod jdk25_concurrency_tests {
             let state = ctx.get_field(subtask, SUBTASK_FIELD_STATE);
             assert_eq!(state, Value::Int(SUBTASK_STATE_SUCCESS));
         }
+    }
+
+    // -- nb-jdk25-concurrency: worker-thread fork()/join() --
+
+    // Under the mock NativeContext, `thread_start` is a no-op (no real thread
+    // machinery), so fork() detects this (worker not alive + subtask still
+    // UNAVAILABLE) and runs the Callable inline. These tests pin that
+    // fallback's correctness and the side-table lifecycle. True parallelism is
+    // exercised by the real VM (which provides a working thread_start), not the
+    // mock.
+
+    #[test]
+    fn nb25_fork_inline_fallback_captures_result() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        native_sts_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
+
+        // A non-null callable so the runner calls invoke_virtual("call").
+        let callable = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Callable", 1);
+        // Script the callable's result.
+        ctx.set_invoke_virtual_result(Ok(Some(Value::Int(7))));
+
+        let result = native_sts_fork(
+            &mut ctx,
+            &[Value::Object(Some(scope)), Value::Object(Some(callable))],
+        );
+        let subtask = match result {
+            Ok(Some(Value::Object(Some(s)))) => s,
+            other => panic!("expected subtask, got {:?}", other),
+        };
+        // Inline fallback ran the callable -> SUCCESS + scripted result.
+        assert_eq!(
+            ctx.get_field(subtask, SUBTASK_FIELD_STATE),
+            Value::Int(SUBTASK_STATE_SUCCESS)
+        );
+        assert_eq!(ctx.get_field(subtask, SUBTASK_FIELD_RESULT), Value::Int(7));
+
+        // join() must succeed and stamp JOINED; the side-table is drained.
+        native_sts_join(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
+        assert_eq!(sts_get_int(&mut ctx, scope, STS_FIELD_JOINED), 1);
+        assert!(peek_scope_forks(scope).is_empty());
+
+        // Subtask.get() returns the captured value.
+        let got = native_subtask_get(&mut ctx, &[Value::Object(Some(subtask))]).unwrap();
+        assert_eq!(got, Some(Value::Int(7)));
+
+        native_sts_close(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
+    }
+
+    #[test]
+    fn nb25_fork_inline_fallback_captures_failure() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        // ShutdownOnFailure policy so join() should record the failure.
+        sts_init_fields(&mut ctx, scope, Value::Object(None), STS_POLICY_SHUTDOWN_ON_FAILURE);
+
+        let callable = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Callable", 1);
+        let exc = alloc_concurrent_synthetic(&mut ctx, "java/lang/RuntimeException", 1);
+        ctx.set_invoke_virtual_result(Err(
+            cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc),
+        ));
+
+        let result = native_sts_fork(
+            &mut ctx,
+            &[Value::Object(Some(scope)), Value::Object(Some(callable))],
+        );
+        let subtask = match result {
+            Ok(Some(Value::Object(Some(s)))) => s,
+            other => panic!("expected subtask, got {:?}", other),
+        };
+        assert_eq!(
+            ctx.get_field(subtask, SUBTASK_FIELD_STATE),
+            Value::Int(SUBTASK_STATE_FAILED)
+        );
+        assert_eq!(
+            ctx.get_field(subtask, SUBTASK_FIELD_EXCEPTION),
+            Value::Object(Some(exc))
+        );
+
+        // The inline fallback aggregated immediately: ShutdownOnFailure shut the
+        // scope down and stored the exception as the primary failure.
+        assert_eq!(sts_get_int(&mut ctx, scope, STS_FIELD_STATE), STS_STATE_SHUTDOWN);
+        assert_eq!(
+            ctx.get_field(scope, STS_FIELD_EXCEPTION),
+            Value::Object(Some(exc))
+        );
+
+        native_sts_join(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
+    }
+
+    #[test]
+    fn nb25_close_drains_fork_side_table() {
+        // Even if a tracked entry somehow survives (defensive), close() must
+        // drop the per-scope tracking so a recycled scope pointer can't inherit
+        // stale workers.
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        native_sts_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
+        let st = alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS);
+        let th = alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", THREAD_SYNTHETIC_NUM_FIELDS);
+        register_scope_fork(scope, st, th);
+        assert!(!peek_scope_forks(scope).is_empty());
+
+        // Mark joined so close() does not reject (it has no real workers).
+        ctx.set_field(scope, STS_FIELD_JOINED, Value::Int(1));
+        native_sts_close(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
+        assert!(peek_scope_forks(scope).is_empty());
     }
 
     #[test]
