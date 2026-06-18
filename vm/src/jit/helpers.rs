@@ -4641,7 +4641,14 @@ mod savebase_watcher {
     static STARTED: AtomicBool = AtomicBool::new(false);
 
     extern "system" {
-        fn GetCurrentProcess() -> isize;
+        // Returns the Win32 pseudo-HANDLE as `*mut c_void` to stay structurally
+        // identical to the `GetCurrentProcess` decl in
+        // `runtime::crash_handler::windows_fault` — same symbol, so
+        // `clashing_extern_declarations` compares the two and warns if they
+        // diverge. The handle is pointer-sized either way; this module treats
+        // handles as `isize` (see `DuplicateHandle` below), so the single call
+        // site casts the result with `as isize`.
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
         fn GetCurrentThread() -> isize;
         fn DuplicateHandle(
             sp: isize,
@@ -4677,7 +4684,7 @@ mod savebase_watcher {
             return;
         }
         let mut h: isize = 0;
-        let proc = GetCurrentProcess();
+        let proc = GetCurrentProcess() as isize;
         DuplicateHandle(
             proc,
             GetCurrentThread(),

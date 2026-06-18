@@ -117,6 +117,13 @@ unused_imports = "allow"
 unused_variables = "allow"
 unused_mut = "allow"
 unused_assignments = "allow"
+# Unlike the style allows above, this is an ABI-safety lint: two `extern`
+# declarations of the same Win32/native symbol with different signatures or
+# struct layouts are a real defect (one call path can read a mis-laid-out
+# struct). We had two such clashes in the vm crate (`VirtualQuery`,
+# `GetCurrentProcess`) declared per-module; both are now unified. Deny it so a
+# future divergent re-declaration fails the build instead of warning silently.
+clashing_extern_declarations = "deny"
 
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "allow"
