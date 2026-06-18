@@ -31427,6 +31427,19 @@ fn register_security_natives(registry: &mut NativeMethodRegistry) {
     registry.register(md, "digest", "()[B", native_md_digest);
     registry.register(md, "digest", "([B)[B", native_md_digest_input);
     registry.register(md, "digest", "([BII)I", native_md_digest_buf);
+    // The real `MessageDigest.digest(byte[],int,int)` has a concrete body that
+    // delegates to the SPI's `engineDigest()` / `engineDigest(byte[],int,int)`
+    // — abstract on `MessageDigestSpi` (no Code attribute). For our synthetic
+    // MessageDigest (which IS-A MessageDigestSpi, so `this` carries the
+    // MD_FIELD_ALGO/DATA state), back those SPI hooks directly so the buffer
+    // digest path resolves instead of hitting `AbstractMethodError:
+    // MessageDigestSpi.engineDigest()[B has no Code attribute` (OffsetMapTest /
+    // SkimpyOffsetMap). `native_md_digest`/`native_md_digest_buf` read the same
+    // fields and so serve the SPI signatures unchanged.
+    let mdspi = "java/security/MessageDigestSpi";
+    registry.register(mdspi, "engineDigest", "()[B", native_md_digest);
+    registry.register(mdspi, "engineDigest", "([BII)I", native_md_digest_buf);
+    registry.register(mdspi, "engineGetDigestLength", "()I", native_md_get_digest_length);
     registry.register(md, "reset", "()V", native_md_reset);
     registry.register(
         md,
