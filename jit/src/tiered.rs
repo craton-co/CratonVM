@@ -1492,7 +1492,7 @@ mod tests {
         mgr.dequeue_compilation();
         mgr.dequeue_compilation();
 
-        let q = mgr.queue.lock();
+        let q = mgr.core.queue.lock();
         assert_eq!(q.total_processed, 2);
     }
 
