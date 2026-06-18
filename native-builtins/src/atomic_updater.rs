@@ -683,6 +683,64 @@ fn native_aifu_decrement_and_get(ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(Value::Int(0)))
 }
 
+// getAndIncrement/getAndDecrement/addAndGet — concrete methods on the abstract
+// AtomicIntegerFieldUpdater base that the synthetic `$RustJvmImpl` subclass does
+// not inherit, so they were NoSuchMethodError before (breaking Reactor, which
+// uses them on field updaters for backpressure/state). getAnd* return the OLD
+// value; addAndGet returns the NEW value. CAS loop mirrors `getAndAdd`.
+fn native_aifu_get_and_increment(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = arg_obj_or_npe(args, 0, "updater")?;
+    let target = require_target(args, 1)?;
+    let slot = impl_slot(ctx, this).unwrap_or(0);
+    for _ in 0..1024 {
+        let current = match ctx.get_field_volatile(target, slot) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        if ctx.compare_and_swap_field(target, slot, Value::Int(current), Value::Int(current.wrapping_add(1))) {
+            return Ok(Some(Value::Int(current)));
+        }
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_aifu_get_and_decrement(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = arg_obj_or_npe(args, 0, "updater")?;
+    let target = require_target(args, 1)?;
+    let slot = impl_slot(ctx, this).unwrap_or(0);
+    for _ in 0..1024 {
+        let current = match ctx.get_field_volatile(target, slot) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        if ctx.compare_and_swap_field(target, slot, Value::Int(current), Value::Int(current.wrapping_sub(1))) {
+            return Ok(Some(Value::Int(current)));
+        }
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_aifu_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = arg_obj_or_npe(args, 0, "updater")?;
+    let target = require_target(args, 1)?;
+    let delta = match arg_value(args, 2) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let slot = impl_slot(ctx, this).unwrap_or(0);
+    for _ in 0..1024 {
+        let current = match ctx.get_field_volatile(target, slot) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        let new_val = current.wrapping_add(delta);
+        if ctx.compare_and_swap_field(target, slot, Value::Int(current), Value::Int(new_val)) {
+            return Ok(Some(Value::Int(new_val)));
+        }
+    }
+    Ok(Some(Value::Int(0)))
+}
+
 // ---------------------------------------------------------------------------
 // Long-variant accessors
 // ---------------------------------------------------------------------------
@@ -784,6 +842,62 @@ fn native_alfu_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             Value::Long(new_val),
         ) {
             return Ok(Some(Value::Long(current)));
+        }
+    }
+    Ok(Some(Value::Long(0)))
+}
+
+// Long variants of getAndIncrement/getAndDecrement/addAndGet — see the int
+// equivalents for rationale (synthetic `$RustJvmImpl` doesn't inherit the base's
+// concrete methods).
+fn native_alfu_get_and_increment(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = arg_obj_or_npe(args, 0, "updater")?;
+    let target = require_target(args, 1)?;
+    let slot = impl_slot(ctx, this).unwrap_or(0);
+    for _ in 0..1024 {
+        let current = match ctx.get_field_volatile(target, slot) {
+            Value::Long(v) => v,
+            _ => 0,
+        };
+        if ctx.compare_and_swap_field(target, slot, Value::Long(current), Value::Long(current.wrapping_add(1))) {
+            return Ok(Some(Value::Long(current)));
+        }
+    }
+    Ok(Some(Value::Long(0)))
+}
+
+fn native_alfu_get_and_decrement(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = arg_obj_or_npe(args, 0, "updater")?;
+    let target = require_target(args, 1)?;
+    let slot = impl_slot(ctx, this).unwrap_or(0);
+    for _ in 0..1024 {
+        let current = match ctx.get_field_volatile(target, slot) {
+            Value::Long(v) => v,
+            _ => 0,
+        };
+        if ctx.compare_and_swap_field(target, slot, Value::Long(current), Value::Long(current.wrapping_sub(1))) {
+            return Ok(Some(Value::Long(current)));
+        }
+    }
+    Ok(Some(Value::Long(0)))
+}
+
+fn native_alfu_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = arg_obj_or_npe(args, 0, "updater")?;
+    let target = require_target(args, 1)?;
+    let delta = match arg_value(args, 2) {
+        Value::Long(v) => v,
+        _ => 0,
+    };
+    let slot = impl_slot(ctx, this).unwrap_or(0);
+    for _ in 0..1024 {
+        let current = match ctx.get_field_volatile(target, slot) {
+            Value::Long(v) => v,
+            _ => 0,
+        };
+        let new_val = current.wrapping_add(delta);
+        if ctx.compare_and_swap_field(target, slot, Value::Long(current), Value::Long(new_val)) {
+            return Ok(Some(Value::Long(new_val)));
         }
     }
     Ok(Some(Value::Long(0)))
@@ -946,6 +1060,12 @@ fn register_aifu(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)I",
         native_aifu_decrement_and_get,
     );
+    // getAndIncrement / getAndDecrement / addAndGet on both impl + base.
+    for cls in [CLS_INT_FIELD_UPDATER_IMPL, CLS_INT_FIELD_UPDATER] {
+        r.register(cls, "getAndIncrement", "(Ljava/lang/Object;)I", native_aifu_get_and_increment);
+        r.register(cls, "getAndDecrement", "(Ljava/lang/Object;)I", native_aifu_get_and_decrement);
+        r.register(cls, "addAndGet", "(Ljava/lang/Object;I)I", native_aifu_add_and_get);
+    }
     // Also on the abstract base for virtual dispatch.
     r.register(
         CLS_INT_FIELD_UPDATER,
@@ -1042,6 +1162,12 @@ fn register_alfu(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;J)J",
         native_alfu_get_and_add,
     );
+    // getAndIncrement / getAndDecrement / addAndGet on both impl + base.
+    for cls in [CLS_LONG_FIELD_UPDATER_IMPL, CLS_LONG_FIELD_UPDATER] {
+        r.register(cls, "getAndIncrement", "(Ljava/lang/Object;)J", native_alfu_get_and_increment);
+        r.register(cls, "getAndDecrement", "(Ljava/lang/Object;)J", native_alfu_get_and_decrement);
+        r.register(cls, "addAndGet", "(Ljava/lang/Object;J)J", native_alfu_add_and_get);
+    }
     r.register(
         CLS_LONG_FIELD_UPDATER,
         "compareAndSet",
