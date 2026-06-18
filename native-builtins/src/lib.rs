@@ -5064,7 +5064,25 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("jdk/internal/misc/VM", "getegid", "()J", |_ctx, _args| Ok(Some(Value::Long(0))));
 
     // --- java/lang/NullPointerException ---
-    registry.register("java/lang/NullPointerException", "getExtendedNPEMessage", "()Ljava/lang/String;", |_ctx, _args| Ok(Some(Value::Object(None))));
+    // JEP 358: return the synthesized HotSpot-style extended message. The VM
+    // computes the message eagerly at the throw site (interpreter null-deref
+    // path) and stores it in `Throwable.detailMessage`, so the extended-message
+    // accessor simply surfaces that String. When no message was synthesized
+    // (e.g. an NPE thrown by `new NullPointerException()` with no detail, or a
+    // path the analysis couldn't classify), `detailMessage` is null and we
+    // return null — matching `Throwable.getMessage()`/the JDK accessor shape.
+    registry.register(
+        "java/lang/NullPointerException",
+        "getExtendedNPEMessage",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            match ctx.get_field_by_name(this, "detailMessage") {
+                Value::Object(Some(s)) => Ok(Some(Value::Object(Some(s)))),
+                _ => Ok(Some(Value::Object(None))),
+            }
+        },
+    );
 
     // --- java/lang/StackTraceElement ---
     registry.register("java/lang/StackTraceElement", "initStackTraceElement", "(Ljava/lang/StackTraceElement;Ljava/lang/StackFrameInfo;)V", native_noop_with_this);
