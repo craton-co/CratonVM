@@ -58,6 +58,24 @@
 //!   `post_clinit_fixup` carrier write) become unnecessary and should be
 //!   removed.
 //!
+//! GATED REAL PATH (real-cdi-bean-container increment 2, Step 2):
+//!   `CRATONVM_REAL_SPRING_STARTUP` (default OFF) is the opt-in gate that runs
+//!   the real chain. When set, the startup-metrics no-op natives below
+//!   (`getApplicationStartup`/`start`/`tag`/`end`/`getName`/`getId`/
+//!   `getParentId`/`getTags`) are NOT registered (see `register`), the
+//!   matching `check_override` force arms in `vm/src/vm/vm_exec.rs` are
+//!   suppressed, and `vm/src/vm/vm_util.rs` drops `ApplicationStartup` from the
+//!   lenient `<clinit>`-swallow allowlist + skips its `post_clinit_fixup` arm —
+//!   so the real `ApplicationStartup.<clinit>` → `new DefaultApplicationStartup`
+//!   → `DefaultApplicationStartup.<clinit>` → `new DefaultStartupStep` →
+//!   `new DefaultTags` chain runs to completion. The disassembly shows that
+//!   chain is trivial bytecode; the only reason it failed by default was that
+//!   the no-op `getApplicationStartup` native shadowed the real `getstatic
+//!   DEFAULT` getter (so the chain was never triggered) and the nested-JAR
+//!   `<clinit>` was swallowed + backfilled. The environment / bean-factory /
+//!   property-source natives in this module cover SEPARATE partial-bootstrap
+//!   gaps and remain registered regardless of the gate.
+//!
 //! Fix strategy (the shim's moving parts):
 //! 1. Native override for `getApplicationStartup()` in `AbstractApplicationContext`
 //!    that returns a process-global no-op `ApplicationStartup` singleton if the
@@ -74,6 +92,20 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ObjectRef, Value};
 use std::sync::OnceLock;
+
+/// `CRATONVM_REAL_SPRING_STARTUP` — real-cdi-bean-container increment 2 (Step 2)
+/// opt-in gate (default OFF). When set, the no-op `ApplicationStartup` /
+/// `StartupStep` startup-metrics natives below are NOT registered, so Spring's
+/// real `org.springframework.core.metrics.DefaultApplicationStartup` /
+/// `DefaultStartupStep` bytecode runs (its `<clinit>` chain is allowed to
+/// complete — see the matching guards in `vm/src/vm/vm_util.rs` and
+/// `vm/src/vm/vm_exec.rs`). The environment / bean-factory / property-source
+/// natives in this module cover *separate* partial-bootstrap gaps and are
+/// always registered. Cached once for the process lifetime.
+fn real_spring_startup() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_REAL_SPRING_STARTUP").is_some())
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Singleton no-op ApplicationStartup object
@@ -1098,65 +1130,76 @@ const STEP_IFACE: &str = "org/springframework/core/metrics/StartupStep";
 pub fn register(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
-    // AbstractApplicationContext.getApplicationStartup() — always return the
-    // global no-op singleton so applicationStartup null can never crash.
-    registry.register(
-        ABSTRACT_CTX,
-        "getApplicationStartup",
-        "()Lorg/springframework/core/metrics/ApplicationStartup;",
-        get_application_startup,
-    );
 
-    // DefaultApplicationStartup.start(String) → no-op step
-    registry.register(
-        DEF_STARTUP,
-        "start",
-        "(Ljava/lang/String;)Lorg/springframework/core/metrics/StartupStep;",
-        startup_start,
-    );
-    // Also register on the interface class so invokevirtual on an interface
-    // receiver still finds a native.
-    registry.register(
-        STARTUP_IFACE,
-        "start",
-        "(Ljava/lang/String;)Lorg/springframework/core/metrics/StartupStep;",
-        startup_start,
-    );
+    // ── Startup-metrics no-op shim (GATED) ──────────────────────────────────
+    // real-cdi-bean-container increment 2 (Step 2): the `ApplicationStartup` /
+    // `StartupStep` no-op natives are the part of this shim that covers the
+    // `DefaultApplicationStartup.<clinit>` NPE. Under
+    // `CRATONVM_REAL_SPRING_STARTUP` we DON'T register them, so the real Spring
+    // `org.springframework.core.metrics` bytecode runs (the `<clinit>` chain is
+    // allowed to complete by the matching guards in `vm_util.rs` / `vm_exec.rs`).
+    // Default OFF: registered exactly as before so the working path is unchanged.
+    if !real_spring_startup() {
+        // AbstractApplicationContext.getApplicationStartup() — always return the
+        // global no-op singleton so applicationStartup null can never crash.
+        registry.register(
+            ABSTRACT_CTX,
+            "getApplicationStartup",
+            "()Lorg/springframework/core/metrics/ApplicationStartup;",
+            get_application_startup,
+        );
 
-    // DefaultStartupStep methods
-    for step_class in &[DEF_STEP, STEP_IFACE] {
+        // DefaultApplicationStartup.start(String) → no-op step
         registry.register(
-            step_class,
-            "tag",
-            "(Ljava/lang/String;Ljava/lang/String;)Lorg/springframework/core/metrics/StartupStep;",
-            step_tag_sv,
+            DEF_STARTUP,
+            "start",
+            "(Ljava/lang/String;)Lorg/springframework/core/metrics/StartupStep;",
+            startup_start,
         );
+        // Also register on the interface class so invokevirtual on an interface
+        // receiver still finds a native.
         registry.register(
-            step_class,
-            "tag",
-            "(Ljava/lang/String;Ljava/util/function/Supplier;)Lorg/springframework/core/metrics/StartupStep;",
-            step_tag_ssup,
+            STARTUP_IFACE,
+            "start",
+            "(Ljava/lang/String;)Lorg/springframework/core/metrics/StartupStep;",
+            startup_start,
         );
-        registry.register(step_class, "end", "()V", step_end);
-        registry.register(
-            step_class,
-            "getName",
-            "()Ljava/lang/String;",
-            step_get_name,
-        );
-        registry.register(step_class, "getId", "()J", step_get_id);
-        registry.register(
-            step_class,
-            "getParentId",
-            "()Ljava/lang/Long;",
-            step_get_parent_id,
-        );
-        registry.register(
-            step_class,
-            "getTags",
-            "()Ljava/lang/Iterable;",
-            step_get_tags,
-        );
+
+        // DefaultStartupStep methods
+        for step_class in &[DEF_STEP, STEP_IFACE] {
+            registry.register(
+                step_class,
+                "tag",
+                "(Ljava/lang/String;Ljava/lang/String;)Lorg/springframework/core/metrics/StartupStep;",
+                step_tag_sv,
+            );
+            registry.register(
+                step_class,
+                "tag",
+                "(Ljava/lang/String;Ljava/util/function/Supplier;)Lorg/springframework/core/metrics/StartupStep;",
+                step_tag_ssup,
+            );
+            registry.register(step_class, "end", "()V", step_end);
+            registry.register(
+                step_class,
+                "getName",
+                "()Ljava/lang/String;",
+                step_get_name,
+            );
+            registry.register(step_class, "getId", "()J", step_get_id);
+            registry.register(
+                step_class,
+                "getParentId",
+                "()Ljava/lang/Long;",
+                step_get_parent_id,
+            );
+            registry.register(
+                step_class,
+                "getTags",
+                "()Ljava/lang/Iterable;",
+                step_get_tags,
+            );
+        }
     }
 
     // ── Environment fix ────────────────────────────────────────────────────
