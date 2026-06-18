@@ -446,11 +446,517 @@ pub extern "C" fn JNI_CreateJavaVM(
     .unwrap_or(JNI_ERR)
 }
 
+// ===========================================================================
+// Layer 2 — flat opaque-handle C API (`cratonvm_*`)
+// ===========================================================================
+//
+// This is **Layer 2** of `docs/feature-designs/embedding-api.md`: a flat C API
+// of `extern "C"` functions over **opaque handles + POD** that wraps the
+// Layer-1 Rust `Vm` directly. No Rust types cross the boundary.
+//
+// ## Relationship to the Layer-1 / Invocation-API side
+//
+// The `JNI_CreateJavaVM` path above is the `libjvm`-substitute bootstrap: it
+// publishes a *process-global* `JavaVM*`/`JNIEnv*` and parks the single VM in
+// `CREATED_VM`. The flat API here is the *curated convenience* surface for a
+// host that does not want to drive the raw 234-slot JNIEnv table by index. It
+// gives the caller an explicit owned handle (`*mut CratonVm`) whose lifetime
+// the caller controls via `cratonvm_destroy`.
+//
+// Both surfaces sit on the same machinery: `cratonvm_create` builds a `Vm`
+// (the same `Vm::new` + `bootstrap` used by `JNI_CreateJavaVM`) and publishes
+// the calling thread's JNI TLS context via `set_jni_context_arc` — so a host
+// can mix the two (e.g. take the flat handle for invocation but still reach
+// the JNIEnv table). It does **not** touch the `CREATED_VM` registry, so it is
+// independent of the one-VM-per-process Invocation-API guard; a host that uses
+// only the flat API may create and destroy handles freely. (The GC-safepoint
+// thread-registration contract for *foreign* call-in threads is owned by
+// another work item and is intentionally out of scope here — see the design
+// doc Risks; the flat API only drives the VM from the creating thread.)
+//
+// ## Handle encoding
+//
+// * `CratonVm*` — owning, opaque; `Box<Vm>` behind the pointer.
+// * `CratonClass` (`u64`) — a `ClassId` widened from its `u32`; `0` is a valid
+//   class id (`java/lang/Object` is id 0), so class errors are signalled by
+//   the function's return code, not a sentinel handle.
+// * `CratonRef` (`u64`) — an object/string handle: `ObjectRef::as_ptr() as
+//   u64`, with `0` == `null` (identical to the JNIEnv side's `JObject = u64`).
+//
+// ## Value marshalling
+//
+// `CratonValue` is a `#[repr(C)]` tagged POD (tag + 8-byte payload) mirroring
+// the subset of `cratonvm_vm`'s `Value` an embedder exchanges. Method args are
+// passed as a `*const CratonValue` + count (not C varargs: varargs across FFI
+// are unsound for non-`int`/`double` types and not ABI-portable — a typed
+// array is the stable form; a varargs shim is noted as a next step).
+
+use std::cell::RefCell;
+use std::ffi::{CStr, CString};
+
+use cratonvm_vm::types::{ObjectRef, Value};
+use cratonvm_vm::ClassId;
+use cratonvm_vm::MethodCallFailed;
+
+/// Opaque VM handle returned by [`cratonvm_create`]. The host treats this as a
+/// pointer-sized token; the only valid operations are passing it back to the
+/// other `cratonvm_*` functions and finally to [`cratonvm_destroy`].
+pub struct CratonVm {
+    vm: Vm,
+}
+
+/// A `u64` object/string/throwable handle (`ObjectRef::as_ptr()`; `0` = null).
+pub type CratonRef = u64;
+/// A `u64` class handle (a widened [`ClassId`]).
+pub type CratonClass = u64;
+
+/// Discriminant for [`CratonValue`].
+pub mod craton_tag {
+    use super::JInt;
+    /// No value (void return) / empty slot.
+    pub const VOID: JInt = 0;
+    /// 32-bit int (also boolean/byte/char/short).
+    pub const INT: JInt = 1;
+    /// 64-bit long.
+    pub const LONG: JInt = 2;
+    /// 32-bit float (bit-cast into the low 32 bits of the payload).
+    pub const FLOAT: JInt = 3;
+    /// 64-bit double (bit-cast into the payload).
+    pub const DOUBLE: JInt = 4;
+    /// Object/string reference handle ([`super::CratonRef`]).
+    pub const OBJECT: JInt = 5;
+    /// The call failed; inspect [`super::cratonvm_last_error`].
+    pub const ERROR: JInt = -1;
+}
+
+/// A C-ABI tagged value exchanged with the flat API. `tag` is one of the
+/// [`craton_tag`] constants; `payload` is interpreted accordingly:
+/// `INT`→low 32 bits (sign-extended), `LONG`→all 64 bits, `FLOAT`→`f32` bits
+/// in the low 32, `DOUBLE`→`f64` bits, `OBJECT`→a [`CratonRef`]. For `VOID`
+/// and `ERROR` the payload is unspecified (`0`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CratonValue {
+    /// One of the [`craton_tag`] discriminants.
+    pub tag: JInt,
+    /// Bit-packed payload; see the type-level docs.
+    pub payload: u64,
+}
+
+impl CratonValue {
+    const fn void() -> Self {
+        CratonValue { tag: craton_tag::VOID, payload: 0 }
+    }
+    const fn error() -> Self {
+        CratonValue { tag: craton_tag::ERROR, payload: 0 }
+    }
+
+    /// Convert an inbound `CratonValue` (from C) into a VM [`Value`].
+    /// Unknown tags map to `Value::Object(None)` (null) defensively.
+    fn to_value(self) -> Value {
+        match self.tag {
+            craton_tag::INT => Value::Int(self.payload as u32 as i32),
+            craton_tag::LONG => Value::Long(self.payload as i64),
+            craton_tag::FLOAT => Value::Float(f32::from_bits(self.payload as u32)),
+            craton_tag::DOUBLE => Value::Double(f64::from_bits(self.payload)),
+            craton_tag::OBJECT => Value::Object(ref_from_handle(self.payload)),
+            _ => Value::Object(None),
+        }
+    }
+
+    /// Convert an outbound VM [`Value`] into a `CratonValue` for C.
+    fn from_value(v: Value) -> Self {
+        match v {
+            Value::Int(i) => CratonValue { tag: craton_tag::INT, payload: i as u32 as u64 },
+            Value::Long(l) => CratonValue { tag: craton_tag::LONG, payload: l as u64 },
+            Value::Float(f) => CratonValue { tag: craton_tag::FLOAT, payload: f.to_bits() as u64 },
+            Value::Double(d) => CratonValue { tag: craton_tag::DOUBLE, payload: d.to_bits() },
+            Value::Object(o) => CratonValue { tag: craton_tag::OBJECT, payload: handle_from_ref(o) },
+            // ReturnAddress / Uninitialized never escape a normal return; treat
+            // as void so the C side sees a defined (if empty) result.
+            Value::ReturnAddress(_) | Value::Uninitialized => CratonValue::void(),
+        }
+    }
+}
+
+/// `ObjectRef` → `CratonRef` (`0` == null).
+fn handle_from_ref(o: Option<ObjectRef>) -> CratonRef {
+    match o {
+        Some(r) => r.as_ptr() as u64,
+        None => 0,
+    }
+}
+
+/// `CratonRef` → `Option<ObjectRef>` (`0` == null). The non-null pointer is
+/// reconstructed from the handle the VM previously handed out; the caller
+/// contract is that it is still a live heap object (the VM does not move
+/// objects out from under a handed-out handle within a single call sequence).
+fn ref_from_handle(h: CratonRef) -> Option<ObjectRef> {
+    if h == 0 {
+        None
+    } else {
+        // SAFETY: `h` is a handle the flat API produced from a live
+        // `ObjectRef` (`as_ptr()`), so it is non-null and 8-byte aligned.
+        Some(unsafe { ObjectRef::from_raw(h as *mut u8) })
+    }
+}
+
+// --- thread-local last-error -----------------------------------------------
+
+thread_local! {
+    /// Last error message for the calling thread, as a NUL-terminated C string.
+    /// `None` means "no pending error". Mirrors HotSpot/JNI's
+    /// per-thread pending-exception model: an error set on one thread is not
+    /// visible on another.
+    static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+}
+
+/// Record `msg` as this thread's last error (lossily NUL-sanitised so an
+/// interior NUL cannot truncate or panic the conversion).
+fn set_last_error(msg: impl Into<Vec<u8>>) {
+    let mut bytes = msg.into();
+    bytes.retain(|&b| b != 0);
+    let c = CString::new(bytes).unwrap_or_default();
+    LAST_ERROR.with(|e| *e.borrow_mut() = Some(c));
+}
+
+/// Clear this thread's last error.
+fn clear_last_error() {
+    LAST_ERROR.with(|e| *e.borrow_mut() = None);
+}
+
+// --- create / destroy ------------------------------------------------------
+
+/// `CratonVm *cratonvm_create(const JavaVMInitArgs *args)`
+///
+/// Build and bootstrap a VM, returning an owning opaque handle. `args` may be
+/// null (defaults are used). Reuses the exact `Vm::new` + [`bootstrap`] +
+/// `set_jni_context_arc` path the Invocation API uses, so the returned handle's
+/// thread may immediately invoke. Returns null on failure (and sets the
+/// thread's last error, retrievable via [`cratonvm_last_error`]).
+///
+/// The returned pointer must be released with [`cratonvm_destroy`].
+///
+/// # Safety
+/// `args`, when non-null, must be a valid `*const JavaVMInitArgs`.
+#[no_mangle]
+pub extern "C" fn cratonvm_create(args: *const JavaVMInitArgs) -> *mut CratonVm {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        clear_last_error();
+        // SAFETY: caller contract — `args` is a valid `*const JavaVMInitArgs`
+        // or null (handled inside `config_from_args`).
+        let config = unsafe { config_from_args(args) };
+        let mut vm = Vm::new(config);
+        bootstrap(&mut vm);
+        // Publish this thread's JNI context so JNIEnv-table calls on the
+        // creating thread resolve this VM (parity with JNI_CreateJavaVM).
+        set_jni_context_arc(vm.shared.get_arc());
+        Box::into_raw(Box::new(CratonVm { vm }))
+    }));
+    match result {
+        Ok(ptr) => ptr,
+        Err(_) => {
+            set_last_error("cratonvm_create: panic during VM bootstrap");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// `void cratonvm_destroy(CratonVm *vm)`
+///
+/// Drop the VM and free the handle. Passing null is a no-op. After this call
+/// the handle is dangling and must not be reused.
+///
+/// # Safety
+/// `vm` must be a handle returned by [`cratonvm_create`] that has not already
+/// been destroyed, or null.
+#[no_mangle]
+pub extern "C" fn cratonvm_destroy(vm: *mut CratonVm) {
+    if vm.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: caller contract — `vm` came from `cratonvm_create` and is not
+        // double-freed. Reclaim the Box and drop it.
+        let boxed = unsafe { Box::from_raw(vm) };
+        // Clear this thread's JNI context if it still points here is not
+        // tracked precisely; dropping the VM releases its Arc regardless.
+        drop(boxed);
+    }));
+}
+
+// --- helpers to deref the handle safely ------------------------------------
+
+/// Borrow the `CratonVm` behind a raw handle, or return `err_val` after setting
+/// the last error, when the handle is null.
+///
+/// # Safety
+/// `vm` must be a valid `*mut CratonVm` or null.
+unsafe fn with_vm<R>(
+    vm: *mut CratonVm,
+    err_val: R,
+    f: impl FnOnce(&mut CratonVm) -> R,
+) -> R {
+    if vm.is_null() {
+        set_last_error("null CratonVm handle");
+        return err_val;
+    }
+    // SAFETY: caller contract — `vm` is a live handle; we form a unique &mut
+    // for the duration of `f` (the flat API is single-threaded per handle).
+    f(unsafe { &mut *vm })
+}
+
+// --- load_class ------------------------------------------------------------
+
+/// `CratonClass cratonvm_load_class(CratonVm *vm, const char *name)`
+///
+/// Load (and link) a class by its internal name (`"java/lang/System"`), writing
+/// the resolved [`CratonClass`] handle into `*out_class`. Returns [`JNI_OK`] on
+/// success or [`JNI_ERR`] on failure (bad handle, null `name`, non-UTF-8 name,
+/// or a load/link error) — on failure the thread's last error is set and
+/// `*out_class` is left untouched.
+///
+/// (A separate out-pointer + return code is used rather than a sentinel handle
+/// because `0` is a legitimate `ClassId`.)
+///
+/// # Safety
+/// `vm` is a handle from [`cratonvm_create`]; `name` is a valid NUL-terminated
+/// C string; `out_class`, when non-null, is writable.
+#[no_mangle]
+pub extern "C" fn cratonvm_load_class(
+    vm: *mut CratonVm,
+    name: *const c_char,
+    out_class: *mut CratonClass,
+) -> JInt {
+    catch_unwind(AssertUnwindSafe(|| {
+        clear_last_error();
+        // SAFETY: `vm` per caller contract.
+        unsafe {
+            with_vm(vm, JNI_ERR, |h| {
+                if name.is_null() {
+                    set_last_error("cratonvm_load_class: null class name");
+                    return JNI_ERR;
+                }
+                // SAFETY: caller contract — `name` is a valid C string.
+                let name = match unsafe { CStr::from_ptr(name) }.to_str() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        set_last_error("cratonvm_load_class: class name is not valid UTF-8");
+                        return JNI_ERR;
+                    }
+                };
+                match h.vm.load_class(name) {
+                    Ok(class_id) => {
+                        if !out_class.is_null() {
+                            // SAFETY: `out_class` checked non-null; caller
+                            // contract says it is writable.
+                            unsafe { *out_class = class_id.as_u32() as CratonClass };
+                        }
+                        JNI_OK
+                    }
+                    Err(e) => {
+                        set_last_error(format!("cratonvm_load_class({name}): {e}"));
+                        JNI_ERR
+                    }
+                }
+            })
+        }
+    }))
+    .unwrap_or_else(|_| {
+        set_last_error("cratonvm_load_class: panic");
+        JNI_ERR
+    })
+}
+
+// --- invoke_static ---------------------------------------------------------
+
+/// `CratonValue cratonvm_invoke_static(CratonVm *vm, const char *class,
+///     const char *method, const char *sig, const CratonValue *args, int32_t n_args)`
+///
+/// Invoke a static method by class name, method name, and JVM descriptor
+/// (`sig`, e.g. `"(I)I"`). Arguments are a typed [`CratonValue`] array of length
+/// `n_args` (`args` may be null when `n_args == 0`).
+///
+/// Returns a [`CratonValue`]: the method's return value (tag `VOID` for a
+/// `void` method), or `tag == craton_tag::ERROR` on any failure — in which case
+/// [`cratonvm_last_error`] holds a message (for a thrown Java exception it
+/// records the throwable, for an internal error the VM error text).
+///
+/// # Safety
+/// `vm` is a handle from [`cratonvm_create`]; `class`/`method`/`sig` are valid
+/// NUL-terminated C strings; `args` points to `n_args` valid [`CratonValue`]s
+/// (or is null when `n_args == 0`).
+#[no_mangle]
+pub extern "C" fn cratonvm_invoke_static(
+    vm: *mut CratonVm,
+    class: *const c_char,
+    method: *const c_char,
+    sig: *const c_char,
+    args: *const CratonValue,
+    n_args: JInt,
+) -> CratonValue {
+    catch_unwind(AssertUnwindSafe(|| {
+        clear_last_error();
+        // SAFETY: `vm` per caller contract.
+        unsafe {
+            with_vm(vm, CratonValue::error(), |h| {
+                // SAFETY: caller contract — these are valid C strings or null.
+                let (class, method, sig) = match unsafe {
+                    (
+                        cstr_or_err(class, "class name"),
+                        cstr_or_err(method, "method name"),
+                        cstr_or_err(sig, "method signature"),
+                    )
+                } {
+                    (Some(c), Some(m), Some(s)) => (c, m, s),
+                    _ => return CratonValue::error(),
+                };
+
+                if n_args < 0 || (n_args > 0 && args.is_null()) {
+                    set_last_error("cratonvm_invoke_static: bad args array");
+                    return CratonValue::error();
+                }
+                let in_args: &[CratonValue] = if n_args == 0 {
+                    &[]
+                } else {
+                    // SAFETY: checked `args` non-null and `n_args > 0` above.
+                    unsafe { std::slice::from_raw_parts(args, n_args as usize) }
+                };
+                let values: Vec<Value> = in_args.iter().map(|v| v.to_value()).collect();
+
+                match h.vm.invoke(class, method, sig, &values) {
+                    Ok(Some(v)) => CratonValue::from_value(v),
+                    Ok(None) => CratonValue::void(),
+                    Err(e) => {
+                        set_last_error(describe_failure(&e));
+                        CratonValue::error()
+                    }
+                }
+            })
+        }
+    }))
+    .unwrap_or_else(|_| {
+        set_last_error("cratonvm_invoke_static: panic");
+        CratonValue::error()
+    })
+}
+
+/// Read a `*const c_char` into a `&str`, or set the last error and return None.
+///
+/// # Safety
+/// `p`, when non-null, is a valid NUL-terminated C string.
+unsafe fn cstr_or_err<'a>(p: *const c_char, what: &str) -> Option<&'a str> {
+    if p.is_null() {
+        set_last_error(format!("null {what}"));
+        return None;
+    }
+    // SAFETY: caller contract — `p` is a valid C string.
+    match unsafe { CStr::from_ptr(p) }.to_str() {
+        Ok(s) => Some(s),
+        Err(_) => {
+            set_last_error(format!("{what} is not valid UTF-8"));
+            None
+        }
+    }
+}
+
+/// Human-readable text for a [`MethodCallFailed`]. Internal errors delegate to
+/// `VmError`'s self-describing `Display`; a thrown Java exception is reported
+/// with its throwable handle (reading the throwable's message/class would
+/// require heap-header access owned by another work item, so it is left as a
+/// handle the host can inspect via the JNIEnv table).
+fn describe_failure(e: &MethodCallFailed) -> String {
+    match e {
+        MethodCallFailed::InternalError(err) => err.to_string(),
+        MethodCallFailed::ExceptionThrown(obj) => {
+            format!("java exception thrown (throwable handle=0x{:x})", obj.as_ptr() as u64)
+        }
+    }
+}
+
+// --- new_string ------------------------------------------------------------
+
+/// `CratonRef cratonvm_new_string(CratonVm *vm, const char *utf8)`
+///
+/// Create an interned `java.lang.String` from a UTF-8 C string, returning its
+/// [`CratonRef`] handle (suitable as a `CratonValue` `OBJECT` argument to
+/// [`cratonvm_invoke_static`]). Returns `0` (null handle) on failure (bad VM
+/// handle, null/invalid `utf8`) and sets the thread's last error.
+///
+/// # Safety
+/// `vm` is a handle from [`cratonvm_create`]; `utf8` is a valid NUL-terminated
+/// UTF-8 C string.
+#[no_mangle]
+pub extern "C" fn cratonvm_new_string(vm: *mut CratonVm, utf8: *const c_char) -> CratonRef {
+    catch_unwind(AssertUnwindSafe(|| {
+        clear_last_error();
+        // SAFETY: `vm` per caller contract.
+        unsafe {
+            with_vm(vm, 0u64, |h| {
+                // SAFETY: caller contract — `utf8` is a valid C string or null.
+                let text = match unsafe { cstr_or_err(utf8, "string") } {
+                    Some(s) => s,
+                    None => return 0u64,
+                };
+                // Reuse the VM's interning string constructor (Layer-1
+                // `vm::create_java_string`), the same one the JNIEnv table and
+                // the interpreter use for `ldc` of a literal.
+                let obj = cratonvm_vm::vm::create_java_string(&h.vm.shared, text);
+                handle_from_ref(Some(obj))
+            })
+        }
+    }))
+    .unwrap_or_else(|_| {
+        set_last_error("cratonvm_new_string: panic");
+        0u64
+    })
+}
+
+// --- last_error ------------------------------------------------------------
+
+/// `const char *cratonvm_last_error(CratonVm *vm)`
+///
+/// Return this thread's pending error message as a NUL-terminated C string, or
+/// null if there is none. The `vm` parameter is accepted for API symmetry and
+/// future per-VM scoping but is not dereferenced — the error state is
+/// thread-local (mirroring JNI's per-thread pending exception).
+///
+/// The returned pointer is owned by the library and valid until the next
+/// `cratonvm_*` call on this thread (each entry point clears the error on
+/// entry) or a [`cratonvm_clear_error`] call. The host should copy it if it
+/// needs to outlive that window.
+///
+/// # Safety
+/// `vm` is ignored; any value (including null) is accepted.
+#[no_mangle]
+pub extern "C" fn cratonvm_last_error(_vm: *mut CratonVm) -> *const c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        LAST_ERROR.with(|e| match e.borrow().as_ref() {
+            Some(c) => c.as_ptr(),
+            None => std::ptr::null(),
+        })
+    }))
+    .unwrap_or(std::ptr::null())
+}
+
+/// `void cratonvm_clear_error(CratonVm *vm)`
+///
+/// Clear this thread's pending error (invalidating any pointer previously
+/// returned by [`cratonvm_last_error`]). `vm` is ignored (thread-local state).
+///
+/// # Safety
+/// `vm` is ignored; any value (including null) is accepted.
+#[no_mangle]
+pub extern "C" fn cratonvm_clear_error(_vm: *mut CratonVm) {
+    let _ = catch_unwind(AssertUnwindSafe(clear_last_error));
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(unexpected_cfgs)] // `flat_api_live_vm` is an opt-in cfg cargo can't learn from Cargo.toml
 mod tests {
     use super::*;
 
@@ -508,5 +1014,141 @@ mod tests {
             push_classpath(&mut out, "a.jar:b.jar::c.jar");
         }
         assert_eq!(out, vec!["a.jar", "b.jar", "c.jar"]);
+    }
+
+    // -- Layer 2 flat C API ------------------------------------------------
+    //
+    // These exercise the FFI surface without the heavy VM bootstrap where
+    // possible (null-handle handling, last-error round-trip, value
+    // marshalling). One opt-in round-trip test that actually creates a VM is
+    // gated on `--cfg flat_api_live_vm` so the default `cargo test` stays
+    // fast and JDK-independent (mirroring the increment-1 convention of not
+    // booting a VM in the default unit run).
+
+    use std::ffi::CString;
+
+    /// Read the calling thread's last-error C string back into a Rust `String`
+    /// (helper for assertions). Returns `None` when no error is pending.
+    fn last_error_string() -> Option<String> {
+        let p = cratonvm_last_error(std::ptr::null_mut());
+        if p.is_null() {
+            None
+        } else {
+            // SAFETY: `p` is the library-owned C string for this thread.
+            Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+        }
+    }
+
+    #[test]
+    fn craton_value_round_trips_each_tag() {
+        // int / long / float / double / object survive a to_value→from_value
+        // round trip with identical bit content.
+        let cases = [
+            CratonValue { tag: craton_tag::INT, payload: (-42i32) as u32 as u64 },
+            CratonValue { tag: craton_tag::LONG, payload: 0x0123_4567_89ab_cdef },
+            CratonValue { tag: craton_tag::FLOAT, payload: 1.5f32.to_bits() as u64 },
+            CratonValue { tag: craton_tag::DOUBLE, payload: (-2.25f64).to_bits() },
+            CratonValue { tag: craton_tag::OBJECT, payload: 0 }, // null ref
+        ];
+        for c in cases {
+            let v = c.to_value();
+            let back = CratonValue::from_value(v);
+            assert_eq!(back.tag, c.tag, "tag changed for {:?}", c.tag);
+            assert_eq!(back.payload, c.payload, "payload changed for tag {}", c.tag);
+        }
+    }
+
+    #[test]
+    fn null_handle_sets_last_error_and_returns_err() {
+        clear_last_error();
+        // load_class with a null VM handle → JNI_ERR + last error.
+        let name = CString::new("java/lang/Object").unwrap();
+        let mut out: CratonClass = u64::MAX;
+        let rc = cratonvm_load_class(std::ptr::null_mut(), name.as_ptr(), &mut out);
+        assert_eq!(rc, JNI_ERR);
+        assert_eq!(out, u64::MAX, "out_class must be untouched on error");
+        let err = last_error_string().expect("last error should be set for null handle");
+        assert!(err.contains("null"), "unexpected error text: {err}");
+    }
+
+    #[test]
+    fn invoke_static_null_handle_returns_error_value() {
+        clear_last_error();
+        let class = CString::new("java/lang/System").unwrap();
+        let method = CString::new("gc").unwrap();
+        let sig = CString::new("()V").unwrap();
+        let r = cratonvm_invoke_static(
+            std::ptr::null_mut(),
+            class.as_ptr(),
+            method.as_ptr(),
+            sig.as_ptr(),
+            std::ptr::null(),
+            0,
+        );
+        assert_eq!(r.tag, craton_tag::ERROR);
+        assert!(last_error_string().is_some());
+    }
+
+    #[test]
+    fn new_string_null_handle_returns_null_and_sets_error() {
+        clear_last_error();
+        let s = CString::new("hello").unwrap();
+        let h = cratonvm_new_string(std::ptr::null_mut(), s.as_ptr());
+        assert_eq!(h, 0);
+        assert!(last_error_string().is_some());
+    }
+
+    #[test]
+    fn last_error_clear_round_trip() {
+        set_last_error("boom");
+        assert_eq!(last_error_string().as_deref(), Some("boom"));
+        cratonvm_clear_error(std::ptr::null_mut());
+        assert!(last_error_string().is_none());
+    }
+
+    #[test]
+    fn destroy_null_is_noop() {
+        // Must not panic / segfault.
+        cratonvm_destroy(std::ptr::null_mut());
+    }
+
+    // Opt-in live-VM round trip: create → new_string → load_class →
+    // invoke_static → destroy. Gated off the default run because it performs
+    // the full VM bootstrap (and may require a host JDK on the classpath).
+    // Run with: `cargo test -p libcratonvm --lib -- --ignored` is NOT enough
+    // (it still compiles into the default binary); instead build with
+    // `RUSTFLAGS="--cfg flat_api_live_vm"`.
+    #[cfg(flat_api_live_vm)]
+    #[test]
+    fn flat_api_live_round_trip() {
+        clear_last_error();
+        let vm = cratonvm_create(std::ptr::null());
+        assert!(!vm.is_null(), "create failed: {:?}", last_error_string());
+
+        // load a bootstrap class.
+        let name = CString::new("java/lang/System").unwrap();
+        let mut cls: CratonClass = u64::MAX;
+        assert_eq!(cratonvm_load_class(vm, name.as_ptr(), &mut cls), JNI_OK,
+            "load_class failed: {:?}", last_error_string());
+
+        // create a string handle.
+        let text = CString::new("embed").unwrap();
+        let s = cratonvm_new_string(vm, text.as_ptr());
+        assert_ne!(s, 0, "new_string failed: {:?}", last_error_string());
+
+        // invoke a void static (System.gc) with no args.
+        let m = CString::new("gc").unwrap();
+        let sig = CString::new("()V").unwrap();
+        let r = cratonvm_invoke_static(vm, name.as_ptr(), m.as_ptr(), sig.as_ptr(),
+            std::ptr::null(), 0);
+        assert_ne!(r.tag, craton_tag::ERROR, "invoke failed: {:?}", last_error_string());
+
+        // a bogus class name sets the last error.
+        let bad = CString::new("no/such/Class").unwrap();
+        let mut bad_cls: CratonClass = 0;
+        assert_eq!(cratonvm_load_class(vm, bad.as_ptr(), &mut bad_cls), JNI_ERR);
+        assert!(last_error_string().is_some());
+
+        cratonvm_destroy(vm);
     }
 }
