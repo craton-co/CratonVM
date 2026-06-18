@@ -73,24 +73,18 @@ fn ipc_dbg(msg: impl AsRef<str>) {
 pub enum TcpHandle {
     Stream(TcpStream),
     Listener(TcpListener),
-    /// Connect-in-progress — for non-blocking connect we kick off
-    /// an asynchronous connect attempt and stash a `JoinHandle`-equivalent
-    /// here so `finishConnect()` can poll completion.
-    ///
-    /// We model this with a parking_lot Mutex around an `Option<TcpStream>`
-    /// + completion channel so `finishConnect` can block-or-poll without
-    /// dropping the entry.
-    Connecting(ConnectInProgress),
+    /// Non-blocking connect in progress. Holds a **real** OS socket whose
+    /// `connect()` returned `WSAEWOULDBLOCK` / `EINPROGRESS`. Because it is a
+    /// live pollable fd, the selector reports `OP_CONNECT` for it through the
+    /// ordinary write-readiness path (see `tcp_clone_for_selector`) — no
+    /// manual readiness injection. `finishConnect()` reads `SO_ERROR` via
+    /// `nb_connect::poll`. (Earlier waves modelled this with a background
+    /// connect-pool thread + completion channel; that entry had no fd, so the
+    /// selector never reported `OP_CONNECT` → ES `testAsyncRequests` lost the
+    /// request via `CancelledKeyException`.)
+    Connecting(TcpStream),
     /// Closed but kept in the map so callers see -1 / -1 idempotently.
     Closed,
-}
-
-pub struct ConnectInProgress {
-    /// Set to Some(stream) once the worker thread succeeds.
-    /// Set to Err once the worker thread fails.
-    result: parking_lot::Mutex<Option<Result<TcpStream, std::io::Error>>>,
-    /// Bumped to true once the worker terminates.
-    done: std::sync::atomic::AtomicBool,
 }
 
 pub(crate) fn tcp_registry() -> &'static RwLock<HashMap<i32, TcpHandle>> {
@@ -110,6 +104,10 @@ pub(crate) fn tcp_clone_for_selector(
     match regs.get(&id) {
         Some(TcpHandle::Listener(l)) => l.try_clone().ok().map(TcpHandleClone::Listener),
         Some(TcpHandle::Stream(s)) => s.try_clone().ok().map(TcpHandleClone::Stream),
+        // A connect-in-progress socket is a live pollable fd: clone it as a
+        // Stream so the selector polls it for write-readiness and surfaces
+        // OP_CONNECT naturally once the OS completes (or refuses) the connect.
+        Some(TcpHandle::Connecting(s)) => s.try_clone().ok().map(TcpHandleClone::Stream),
         _ => None,
     }
 }
@@ -141,115 +139,6 @@ fn tcp_register(h: TcpHandle) -> i32 {
 fn tcp_remove(id: i32) {
     tcp_registry().write().remove(&id);
     tcp_blocking_state().write().remove(&id);
-}
-
-// ---------------------------------------------------------------------------
-// Connect pool (round-7 HIGH-5)
-// ---------------------------------------------------------------------------
-//
-// `socket_channel::connect` previously fell through to `std::thread::spawn`
-// for the async-connect path, paying one OS-thread creation per call. A
-// microservice with bursty connect traffic (~1k connects/s) saw the
-// per-op overhead dominate. We now route async-connect jobs to a small
-// fixed-size pool whose worker count is `min(available_parallelism, 32)`.
-// Excess jobs queue in the mpsc channel.
-//
-// The pool is lazy-initialised on first use via `OnceLock`, so VMs that
-// never exercise non-blocking connect never pay the pool's startup cost.
-
-struct ConnectJob {
-    id: i32,
-    target: String,
-}
-
-const CONNECT_POOL_MAX_WORKERS: usize = 32;
-
-fn connect_pool_sender() -> &'static std::sync::mpsc::Sender<ConnectJob> {
-    static SENDER: OnceLock<std::sync::mpsc::Sender<ConnectJob>> = OnceLock::new();
-    SENDER.get_or_init(|| {
-        // Bounded by available parallelism but capped — for connect-
-        // storms a moderate worker count is enough; extra threads just
-        // add scheduler pressure.
-        let workers = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4)
-            .min(CONNECT_POOL_MAX_WORKERS)
-            .max(2);
-        let (tx, rx) = std::sync::mpsc::channel::<ConnectJob>();
-        // Multi-consumer over a std mpsc receiver requires a shared
-        // Mutex; jobs are small and rare relative to socket IO, so a
-        // parking_lot Mutex on the receiver is fine.
-        let rx = std::sync::Arc::new(parking_lot::Mutex::new(rx));
-        for w in 0..workers {
-            let rx = std::sync::Arc::clone(&rx);
-            let _ = std::thread::Builder::new()
-                .name(format!("cratonvm-connect-pool-{w}"))
-                .spawn(move || connect_pool_worker(rx));
-        }
-        // Bug 3 / Bug 6 (HIGH round-9 carryover): the pool currently has
-        // no shutdown path — because the `Sender` is held in a `'static
-        // OnceLock`, the channel's `Drop` never runs and the worker
-        // threads block forever in `recv()` waiting on a sender that
-        // won't ever disconnect. On embedded VM teardown (multiple VM
-        // instances in a single process) this leaks `workers` OS
-        // threads per teardown.
-        //
-        // CratonVM today is single-VM-per-process: process exit reaps
-        // the OS threads, so this is documented as a TODO rather than
-        // fixed in-place. The fix is well-understood and minimal:
-        //
-        //   * Replace this `OnceLock<Sender>` with
-        //     `OnceLock<Mutex<Option<Sender>>>`.
-        //   * Add `pub fn shutdown_connect_pool()` that `take()`s the
-        //     Sender. Dropping it closes the mpsc channel; the worker
-        //     `recv()` returns `Err`, the loop breaks, threads exit.
-        //   * Wire the shutdown call into the VM teardown hook used by
-        //     the round-9 graceful-shutdown story.
-        //
-        // We intentionally do NOT make that change in this round —
-        // changing the SENDER type would touch every caller and risk
-        // re-introducing a races with the lazy init. Tracking as:
-        //
-        // TODO(round-11+): wire connect-pool shutdown into VM teardown
-        // for multi-tenant embeddings (Vert.x, WildFly hot-undeploy).
-        tx
-    })
-}
-
-fn connect_pool_worker(
-    rx: std::sync::Arc<parking_lot::Mutex<std::sync::mpsc::Receiver<ConnectJob>>>,
-) {
-    loop {
-        let job = {
-            // Hold the receiver lock only across `recv()` — when a job
-            // arrives we drop the lock immediately so a sibling worker
-            // can pick up the next one in parallel with our connect.
-            let guard = rx.lock();
-            match guard.recv() {
-                Ok(j) => j,
-                Err(_) => return, // channel closed → process shutdown
-            }
-        };
-        // Brief 5-second timeout so a stuck DNS lookup doesn't pin a worker.
-        let res = match job.target.parse::<SocketAddr>() {
-            Ok(addr) => TcpStream::connect_timeout(&addr, Duration::from_secs(5)),
-            Err(_) => TcpStream::connect(&job.target),
-        };
-        let map = tcp_registry().read();
-        if let Some(TcpHandle::Connecting(prog)) = map.get(&job.id) {
-            *prog.result.lock() = Some(res);
-            prog.done
-                .store(true, std::sync::atomic::Ordering::Release);
-            ipc_dbg(format!("connect worker completed id={}", job.id));
-        }
-    }
-}
-
-fn connect_pool_submit(job: ConnectJob) {
-    let id = job.id;
-    if let Err(e) = connect_pool_sender().send(job) {
-        ipc_dbg(format!("connect pool send failed id={id}: {e}"));
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -952,9 +841,9 @@ fn sc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// vet every resolved address against the outbound-host policy, mirroring
 /// `outbound_policy::policy_connect`'s resolution loop. The blocking path
 /// gets this for free via `policy_connect`; the non-blocking path calls
-/// this so its downstream dials (the fast-path connect and the background
-/// `connect_pool_worker`, both of which would otherwise re-run DNS) only
-/// ever target a vetted, already-resolved IP. This closes the DNS-rebind
+/// this so its downstream dial (`nb_connect::start`, which would otherwise
+/// re-run DNS) only targets a vetted, already-resolved IP. This closes the
+/// DNS-rebind
 /// SSRF where a hostname resolves to a link-local cloud-metadata address.
 ///
 /// We re-run `check_outbound` per resolved IP (formatting each as an
@@ -996,23 +885,9 @@ fn resolve_and_vet(target: &str) -> Result<Vec<SocketAddr>, MethodCallFailed> {
 }
 
 /// Inner connect routine. When `allow_block` is true (blocking mode), we
-/// wait for the connection to succeed/fail. In non-blocking mode we kick
-/// off the connect on a background thread and return false immediately;
-/// `finishConnect()` later polls the result.
-/// A connect error that is a definitive "this peer will not answer" result (as
-/// opposed to TimedOut/WouldBlock, which may just be a slow host). For these we
-/// report the failure immediately rather than deferring to the background-connect
-/// pool, whose pending state the selector cannot surface as OP_CONNECT.
-fn is_definitive_connect_failure(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        ErrorKind::ConnectionRefused
-            | ErrorKind::ConnectionReset
-            | ErrorKind::ConnectionAborted
-            | ErrorKind::AddrNotAvailable
-    )
-}
-
+/// wait for the connection to succeed/fail. In non-blocking mode we start a
+/// real non-blocking OS connect and return false immediately (or true if the
+/// OS completed it synchronously); `finishConnect()` later polls the live fd.
 fn sc_connect_inner(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -1066,105 +941,93 @@ fn sc_connect_inner(
     // re-checks every *resolved* SocketAddr. The non-blocking branch must
     // do the same: a `check_outbound(&target)` on the literal `host:port`
     // string only blocks targets that *parse* as a link-local IP — it
-    // does NOT resolve DNS. Since the dials below (`TcpStream::connect`
-    // and the background `connect_pool_worker`) do their own resolution,
-    // a hostname that resolves to `169.254.169.254` would otherwise slip
+    // does NOT resolve DNS. Since `nb_connect::start` below dials a concrete
+    // SocketAddr, a hostname that resolves to `169.254.169.254` would slip
     // through (DNS-rebind SSRF). So we resolve here, vet every resolved
     // IP against the outbound policy, and dial the *vetted* SocketAddr(s)
     // directly — never re-resolving the original hostname downstream.
-    let vetted = resolve_and_vet(&target)?;
+    let mut vetted = resolve_and_vet(&target)?;
+    // Prefer IPv4 addresses first — this matches HotSpot's default resolution
+    // order (`java.net.preferIPv4Stack` semantics) and, critically, the
+    // address CratonVM's `InetAddress.getLoopbackAddress()` hands out for the
+    // synthetic test servers (`127.0.0.1`). Re-resolving a hostname like
+    // `"localhost"` yields BOTH `127.0.0.1` and `::1` in an unspecified order;
+    // a non-blocking connect commits to a single family (a dead loopback
+    // address does not refuse promptly on Windows, so we cannot cheaply probe
+    // which family is live). Ordering IPv4 first makes the dial land on the
+    // family the server actually bound. (Stable partition preserves the
+    // resolver's relative order within each family.)
+    vetted.sort_by_key(|a| if a.is_ipv4() { 0 } else { 1 });
 
-    // Non-blocking path fast-path: for localhost IPC (e.g., Surefire
-    // master-fork channel), a short synchronous dial is more robust than
-    // deferring connect completion to a background thread. We try each
-    // vetted address with the existing 750 ms fast-path timeout
-    // (deliberately shorter than the global 30 s cap — localhost should
-    // answer in milliseconds).
-    let immediate = {
-        let mut last: Option<Result<TcpStream, std::io::Error>> = None;
-        for addr in &vetted {
-            match TcpStream::connect_timeout(addr, Duration::from_millis(750)) {
-                Ok(s) => {
-                    last = Some(Ok(s));
-                    break;
+    // Real non-blocking connect (ES-HANG-02 residual 1). Start a genuine
+    // non-blocking OS connect on the first vetted address and register the
+    // **live pollable socket** in the tcp_registry. `connect()` then returns
+    // immediately — true if the OS completed it synchronously (warm loopback
+    // on some platforms), false (in progress) otherwise. Because the
+    // connecting socket is a real fd, the JDK selector reports `OP_CONNECT`
+    // for it through the ordinary write-readiness path; `finishConnect()`
+    // resolves it via `SO_ERROR`. This eliminates the prior background-pool
+    // model whose fd-less `Connecting` entry caused the Apache-NIO reactor to
+    // lose a request (CancelledKeyException) when its connect deadline fired
+    // before the deferred channel was wired in — and it does so WITHOUT any
+    // manual selector OP_CONNECT injection (which double-fired the connecting
+    // reactor's session request → IllegalStateException).
+    let mut pending: Option<TcpStream> = None;
+    let mut last_err: Option<std::io::Error> = None;
+    for addr in &vetted {
+        match crate::nb_connect::start(addr) {
+            Ok(crate::nb_connect::StartConnect::Connected(stream)) => {
+                let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
+                let id = tcp_register(TcpHandle::Stream(stream));
+                tcp_blocking_state().write().insert(id, false);
+                cf_set(ctx, this, F_REG_ID, Value::Int(id));
+                cf_set(ctx, this, F_CONNECTED, Value::Int(1));
+                cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
+                let host_str = ctx.create_string(&host);
+                cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
+                cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
+                ipc_dbg(format!(
+                    "connect success(nonblocking-immediate) id={id} local_port={local_port}"
+                ));
+                return Ok(true);
+            }
+            Ok(crate::nb_connect::StartConnect::InProgress(stream)) => {
+                // Remember the first in-progress socket but keep scanning the
+                // remaining vetted addresses for one that completes instantly.
+                if pending.is_none() {
+                    pending = Some(stream);
                 }
-                Err(e) => last = Some(Err(e)),
+            }
+            Err(e) => {
+                ipc_dbg(format!("connect start failed addr={addr}: {e}"));
+                last_err = Some(e);
             }
         }
-        last.unwrap_or_else(|| {
-            Err(std::io::Error::new(
-                ErrorKind::AddrNotAvailable,
-                format!("no addresses resolved for {target}"),
-            ))
-        })
-    };
-    match immediate {
-        Ok(stream) => {
-            let _ = stream.set_nonblocking(true);
-            let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
-            let id = tcp_register(TcpHandle::Stream(stream));
-            tcp_blocking_state().write().insert(id, false);
-            cf_set(ctx, this, F_REG_ID, Value::Int(id));
-            cf_set(ctx, this, F_CONNECTED, Value::Int(1));
-            cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
-            let host_str = ctx.create_string(&host);
-            cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
-            cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
-            ipc_dbg(format!(
-                "connect success(nonblocking-fastpath) id={id} local_port={local_port}"
-            ));
-            return Ok(true);
-        }
-        // A non-blocking connect that is DEFINITIVELY refused/reset (a stopped
-        // host on loopback) must fail now, not park in the background-connect
-        // "Connecting" state below — that state has no OS handle the selector can
-        // poll, so an Apache-NIO-reactor client registering OP_CONNECT would wait
-        // forever, time the session request out, and lose the request (the
-        // CancelledKeyException in ES MultipleHosts testAsyncRequests). Surfacing
-        // it makes SocketChannel.connect() throw, so the reactor fails the request
-        // fast and the RestClient retries another node. Only INDETERMINATE errors
-        // (e.g. TimedOut — the host may just be slow) fall through to the pool.
-        // A definitively-refused connect is surfaced now (the peer is dead).
-        // Everything else (incl. a loopback fast-path TIMEOUT — the peer may be
-        // slow OR dead) is deferred to the background pool below, which dials with
-        // its own short loopback bound and whose result the selector surfaces as
-        // OP_CONNECT; that keeps a slow-but-live loopback peer working (it succeeds
-        // via the pool) while a dead one fails fast WITHOUT blocking the caller.
-        Err(e) if is_definitive_connect_failure(&e) => {
-            ipc_dbg(format!("connect refused(nonblocking-fastpath) target={target}: {e}"));
-            return Err(map_err(&target, e));
-        }
-        Err(_) => {}
     }
 
-    // Round-7 HIGH-5 fix: fallback uses a small fixed-size connect
-    // pool instead of `std::thread::spawn` per call.  A microservice
-    // connect-storm previously paid one OS-thread creation per pending
-    // connect; the pool caps that at `CONNECT_POOL_WORKERS` workers
-    // total.  Excess jobs queue in the channel.
-    let progress = ConnectInProgress {
-        result: parking_lot::Mutex::new(None),
-        done: std::sync::atomic::AtomicBool::new(false),
-    };
-    let id = tcp_register(TcpHandle::Connecting(progress));
-    tcp_blocking_state().write().insert(id, false);
+    if let Some(stream) = pending {
+        let id = tcp_register(TcpHandle::Connecting(stream));
+        tcp_blocking_state().write().insert(id, false);
+        cf_set(ctx, this, F_REG_ID, Value::Int(id));
+        let host_str = ctx.create_string(&host);
+        cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
+        cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
+        ipc_dbg(format!("connect pending(nonblocking) id={id}"));
+        return Ok(false);
+    }
 
-    // H3b: hand the pool worker a *resolved, vetted* literal `IP:port`
-    // string (not the original hostname) so its `parse::<SocketAddr>()`
-    // branch succeeds and it never performs a second, unchecked DNS
-    // resolution that could land on a link-local address.
-    let job_target = vetted
-        .first()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|| target.clone());
-    connect_pool_submit(ConnectJob { id, target: job_target });
-
-    cf_set(ctx, this, F_REG_ID, Value::Int(id));
-    let host_str = ctx.create_string(&host);
-    cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
-    cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
-    ipc_dbg(format!("connect pending id={id}"));
-    Ok(false)
+    // Every vetted address failed synchronously (e.g. immediate
+    // ECONNREFUSED on Linux loopback). Surface the error so the caller's
+    // reactor fails the request fast and the RestClient retries another node.
+    Err(map_err(
+        &target,
+        last_err.unwrap_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::AddrNotAvailable,
+                format!("no addresses resolved for {target}"),
+            )
+        }),
+    ))
 }
 
 fn sc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1214,66 +1077,65 @@ fn sc_finish_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         None => return Ok(Some(Value::Int(0))),
     };
 
-    // Check the current state of the registry entry.
-    let res_kind = {
+    // Probe the current state of the registry entry. For a Connecting socket
+    // we poll the **real fd** for write/error readiness + SO_ERROR (no
+    // background worker / completion channel any more).
+    use crate::nb_connect::ConnectPoll;
+    enum Verdict {
+        Connected,           // already a Stream
+        Pending,             // still connecting
+        Promote(i32),        // connecting socket completed → local port
+        Failed(MethodCallFailed),
+        NotConnecting,
+    }
+    let verdict = {
         let map = tcp_registry().read();
         match map.get(&id) {
-            Some(TcpHandle::Stream(_)) => 1,    // already connected
-            Some(TcpHandle::Connecting(p)) => {
-                if p.done.load(std::sync::atomic::Ordering::Acquire) {
-                    2
-                } else {
-                    0
+            Some(TcpHandle::Stream(_)) => Verdict::Connected,
+            Some(TcpHandle::Connecting(s)) => match crate::nb_connect::poll(s) {
+                ConnectPoll::Pending => Verdict::Pending,
+                ConnectPoll::Connected => {
+                    let lp = s.local_addr().map(|a| a.port() as i32).unwrap_or(0);
+                    Verdict::Promote(lp)
                 }
-            }
-            _ => -1,
+                ConnectPoll::Failed(e) => Verdict::Failed(map_err("finishConnect", e)),
+            },
+            _ => Verdict::NotConnecting,
         }
     };
 
-    match res_kind {
-        1 => {
-            // Was connected synchronously already.
+    match verdict {
+        Verdict::Connected => {
             cf_set(ctx, this, F_CONNECTED, Value::Int(1));
             Ok(Some(Value::Int(1)))
         }
-        2 => {
-            // Worker finished — promote the entry.
+        Verdict::Pending => Ok(Some(Value::Int(0))),
+        Verdict::Promote(local_port) => {
+            // Promote Connecting -> Stream in place (the fd is unchanged; we
+            // just reclassify it now that the OS reports the connect done).
             let mut map = tcp_registry().write();
-            let prog = match map.remove(&id) {
-                Some(TcpHandle::Connecting(p)) => p,
-                other => {
-                    // Race: someone else moved it. Put back if so.
-                    if let Some(h) = other {
-                        map.insert(id, h);
-                    }
-                    return Ok(Some(Value::Int(0)));
-                }
-            };
-            let result = prog.result.lock().take();
-            match result {
-                Some(Ok(stream)) => {
-                    let local_port =
-                        stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
-                    // Apply current non-blocking flag.
-                    let nb = !read_blocking_flag(ctx, this);
-                    if nb {
-                        let _ = stream.set_nonblocking(true);
-                    }
+            match map.remove(&id) {
+                Some(TcpHandle::Connecting(stream)) => {
                     map.insert(id, TcpHandle::Stream(stream));
                     drop(map);
                     cf_set(ctx, this, F_CONNECTED, Value::Int(1));
                     cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
                     Ok(Some(Value::Int(1)))
                 }
-                Some(Err(e)) => {
-                    drop(map);
-                    Err(map_err("finishConnect", e))
+                other => {
+                    // Lost a race with close()/another finishConnect — restore.
+                    if let Some(h) = other {
+                        map.insert(id, h);
+                    }
+                    Ok(Some(Value::Int(0)))
                 }
-                None => Ok(Some(Value::Int(0))),
             }
         }
-        0 => Ok(Some(Value::Int(0))),
-        _ => Err(ioex("finishConnect: socket not in connecting state")),
+        Verdict::Failed(e) => {
+            tcp_remove(id);
+            Err(e)
+        }
+        Verdict::NotConnecting => Err(ioex("finishConnect: socket not in connecting state")),
     }
 }
 
