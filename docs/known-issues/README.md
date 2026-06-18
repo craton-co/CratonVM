@@ -147,7 +147,7 @@ spring-bug-04) were left in place.
 | JUnit-platform execution `LoadError` | VM-CORRECTNESS / dispatch | 🔴 **OPEN** — JUnit platform internals; GC-race-adjacent (cf. bug-04) | [spring-bug-10-junit-platform-execution-loaderr.md](spring-bug-10-junit-platform-execution-loaderr.md) |
 | Groovy / scheduler crashes (rc=139) | VM-CRASH | 🟡 **PARTIAL** — Groovy SIGSEGV fixed via the bug-12 HashMap-layout fix; residual = a separate Groovy **hang at BEGIN** (inventory, needs per-cluster trace) | [spring-bug-11-groovy-and-scheduler-crashes.md](spring-bug-11-groovy-and-scheduler-crashes.md) |
 | Mockito `mockStatic` + mock dispatch | VM-CORRECTNESS (Mockito dispatch) | 🔴 **OPEN** — root-caused; High (Mockito pervasive in Kafka suite) | [kafka-bug-B-mockito-mockstatic-mock-dispatch.md](kafka-bug-B-mockito-mockstatic-mock-dispatch.md) |
-| `WeakHashMap` stream infinite hang | VM-HANG | 🔴 **OPEN** — 3-line repro; largest hang cluster in the Kafka suite | [kafka-bug-C-weakhashmap-stream-infinite-hang.md](kafka-bug-C-weakhashmap-stream-infinite-hang.md) |
+| `WeakHashMap` stream infinite hang | VM-HANG → JIT codegen | 🟡 **HANG FIXED** (`1cd0ab26`, JIT ban; verified) — underlying `dup_x1` field-post-increment codegen defect still OPEN | [kafka-bug-C-weakhashmap-stream-infinite-hang.md](kafka-bug-C-weakhashmap-stream-infinite-hang.md) |
 
 > `springsuite-bug-04` and `spring-bug-10` are **Family A** (GC-root-coverage-under-JIT)
 > manifestations seen from the Spring suite — same root cause as A1–A4 above, different

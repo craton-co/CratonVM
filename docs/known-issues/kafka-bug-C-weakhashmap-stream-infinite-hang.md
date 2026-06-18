@@ -6,8 +6,40 @@
 | **Kind** | Hang / infinite loop (TIMEOUT @ 600s) |
 | **Surfaced by** | The whole `org.apache.kafka.clients.consumer.internals.*` TIMEOUT cluster (13+ classes), starting with the trivial `ConsumerRecordsTest` |
 | **CratonVM** | TIMEOUT · **HotSpot** OK |
-| **Status** | OPEN — root-caused with 3-line repro |
-| **Recommendation** | **Fix** — small, well-scoped (WeakHashMap stream/spliterator path); unblocks a large hang cluster |
+| **Status** | ✅ **HANG FIXED** (2026-06-18, dev `1cd0ab26`) via targeted JIT ban — verified. Underlying `dup_x1` codegen defect remains OPEN (general fix). |
+| **Recommendation** | Done (workaround shipped). Follow-up: fix the `dup_x1` field-post-increment codegen so the ban can be lifted. |
+
+## ✅ Resolution (2026-06-18) — it was a JIT miscompile, not a stream/native-masking bug
+
+The original "fix direction" below (native-mask `values()` like the other maps, or
+fix the stream/Sink engine) was **wrong**. Reproduced and bisected on a built VM:
+
+- **JIT-specific:** `--nojit` passes; JIT-on hangs. Not GC-triggered (`-Xmx4g` still
+  hangs) and not invocation-tier-up (`CRATONVM_JIT_THRESHOLD=1000000` still hangs).
+- **The watchdog shows the main thread stuck in *native Rust* code** with the dispatch
+  ring on `ReferenceQueue.poll`/`WeakReference.<init>` — a red herring; the real spin
+  is the JIT'd traversal loop.
+- **Bisected to one method** with `CRATONVM_JIT_BISECT_ONLY=java/util/WeakHashMap` then
+  `CRATONVM_JIT_BISECT_SKIP=...$ValueSpliterator.tryAdvance` → skipping *only* that
+  method makes the repro return (`getFence`/`size`/`expungeStaleEntries` skips do not).
+- **Root cause:** JIT miscompiles `ValueSpliterator.tryAdvance`'s `current = tab[index++]`
+  field-post-increment. Bytecode 60-77 is `aload_0; aload tab; aload_0; dup; getfield
+  index; dup_x1; iconst_1; iadd; putfield index; aaload; putfield current`. The
+  `putfield index` (the `++` store) is effectively dropped under JIT, so the inner
+  `while (index < hi || current != null)` loop never advances `index` past a null table
+  slot and spins forever. It's a **`dup_x1` field-post-increment codegen defect**, the
+  same class as the dup_x family in memory.
+
+**Workaround shipped (`1cd0ab26`):** extend the existing Tomcat-Bug-B WeakHashMap
+*iterator* ban (`skip_list.rs::is_known_miscompile`) to the *spliterator/stream*
+siblings — `Value/Key/EntrySpliterator` × `tryAdvance`/`forEachRemaining` (all share the
+identical `tab[index++]` loop). **Verified:** `WeakHashMap.values()/keySet()/entrySet()
+.stream()` × `sum/count/forEach/collect` all match HotSpot, JIT-on, `rc=0`.
+
+**Still OPEN (follow-up):** the general `dup_x1` field-post-increment miscompile in JIT
+codegen (any `field[index++]`-style loop is at risk). The `CRATONVM_JIT_NO_DUPX` lever is
+unstable on this method (crashes rc=127), so a proper codegen fix in `jit/src` is needed;
+once landed, the six skip-list entries can be lifted (re-run the repro below to confirm).
 
 ## Symptom
 
