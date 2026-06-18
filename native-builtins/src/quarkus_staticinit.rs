@@ -521,13 +521,30 @@ fn native_serialized_application_get_main_class(
     if matches!(field, Value::Object(Some(_))) {
         return Ok(Some(field));
     }
-    // Defensive fallback: if the field was never set (should not happen
-    // when read() ran, but pretend it might for direct construction),
-    // synthesise from the compile-time default so callers never receive
-    // a null and NPE immediately on Class.forName.
-    let fallback = resolve_main_class();
-    let obj = ctx.create_string(&fallback);
-    Ok(Some(Value::Object(Some(obj))))
+    // FAIL LOUD (was: fabricate the compile-time Keycloak main class).
+    //
+    // Previously, when the `mainClass` field was never populated, this
+    // native synthesised `org.keycloak.quarkus.runtime.KeycloakMain` from
+    // `resolve_main_class()` so callers never saw a null. That is a
+    // silent-wrong-result stub: it would launch Keycloak's main for ANY
+    // mis-initialised SerializedApplication, hiding the real defect and
+    // potentially running the wrong application.
+    //
+    // The legitimate path is `native_serialized_application_read`, which
+    // ALWAYS sets `SA_FIELD_MAIN_CLASS` (honouring the `QUARKUS_MAIN_CLASS`
+    // override). Reaching here with an unset field means the SA was
+    // constructed without going through `read()` — an illegal state we
+    // surface honestly rather than papering over with an app-specific
+    // hardcode. The real fix lives in the NIO `DataInputStream.readInt`
+    // pipeline so `read()` can decode the real `quarkus-application.dat`
+    // main class (see the comment on `register_bootstrap_runner`).
+    Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+        message:
+            "SerializedApplication.getMainClass: mainClass was never set (object not produced by \
+             SerializedApplication.read); refusing to fabricate a default main class"
+                .to_string(),
+    }
+    .into())
 }
 
 fn register_runtime_value(registry: &mut NativeMethodRegistry) {
@@ -659,30 +676,62 @@ fn register_datasource_runtime_config(registry: &mut NativeMethodRegistry) {
     registry.set_category(__prev_cat);
 }
 
+/// Register `io.quarkus.runtime.Application` lifecycle hooks.
+///
+/// ## INTENTIONAL COMPATIBILITY SHIM (`Application.start/stop/awaitShutdown`)
+///
+/// These three natives are no-ops (`native_app_lifecycle_no_op`). This is a
+/// deliberate Quarkus-boot compatibility shim, NOT an intrinsic.
+///
+/// **What it works around:** In real Quarkus, `Application` is an abstract
+/// class; `start(String[])` is the synchronized boot entry that drives the
+/// recorded `StartupContext`/`RuntimeValue` replay plan, and `stop()` /
+/// `awaitShutdown()` drive teardown. CratonVM does not yet replay the full
+/// `BytecodeRecorderImpl` event stream that the generated
+/// `ApplicationImpl.<clinit>`/`doStart` would execute, so the real bytecode
+/// for these methods cannot run end-to-end. Without *some* registration,
+/// dispatch to these methods would abort with an unresolved-native /
+/// abstract-method error and the VM could not get past Quarkus bootstrap at
+/// all. The no-ops let `QuarkusEntryPoint` → generated `Main.main` walk
+/// through the lifecycle calls and reach the application's own `main` logic.
+///
+/// **Why we keep it (don't fail loud):** failing loud here breaks Quarkus
+/// boot outright — there is no useful error for the framework to recover
+/// from, only an immediate hard stop during bootstrap. Per the mission
+/// rule, an app-enabling shim whose loud failure breaks a real framework is
+/// kept + documented rather than removed. A debug-gated trace
+/// (`native_app_lifecycle_no_op`) makes the elision observable so it is
+/// never silently mistaken for a fully-functional boot.
+///
+/// **The real fix:** implement the Quarkus static-init/runtime replay so the
+/// generated `ApplicationImpl.doStart`/`doStop` bytecode runs (driving the
+/// recorded `StartupContext` steps), at which point these no-op overrides
+/// must be removed so the real lifecycle executes. Until then, treat a run
+/// that relies on these hooks as "booted far enough to dispatch", not "fully
+/// started".
 fn register_application_lifecycle(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
-    // `Application.start(String[])` and `.stop()` can run their own Java
-    // bytecode; we only register `safeStart`/`start0` style native hooks
-    // that some versions emit when the replay plan can't be fully
-    // reconstructed. These default to no-op (returning normally).
+    // COMPATIBILITY SHIM (see fn doc): override the lifecycle entry points
+    // with observable no-ops so Quarkus bootstrap dispatch does not abort.
+    // These return normally without executing the real replay plan.
     registry.register(
         "io/quarkus/runtime/Application",
         "start",
         "([Ljava/lang/String;)V",
-        native_app_no_op,
+        native_app_lifecycle_no_op,
     );
     registry.register(
         "io/quarkus/runtime/Application",
         "stop",
         "()V",
-        native_app_no_op,
+        native_app_lifecycle_no_op,
     );
     registry.register(
         "io/quarkus/runtime/Application",
         "awaitShutdown",
         "()V",
-        native_app_no_op,
+        native_app_lifecycle_no_op,
     );
     registry.set_category(__prev_cat);
 }
@@ -1113,7 +1162,25 @@ fn native_dsrc_driver(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 // Application lifecycle
 // ---------------------------------------------------------------------------
 
-fn native_app_no_op(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+/// Observable no-op for the `io.quarkus.runtime.Application`
+/// `start`/`stop`/`awaitShutdown` lifecycle entry points.
+///
+/// INTENTIONAL COMPATIBILITY SHIM — see `register_application_lifecycle` for
+/// the full rationale. The real Quarkus replay plan is not executed here; we
+/// only return normally so bootstrap dispatch does not abort. The
+/// debug-gated trace makes the elision visible (set
+/// `RUST_LOG=cratonvm_native_builtins=debug` or filter on this target) so a
+/// run that depends on these hooks is never silently mistaken for a fully
+/// started application.
+fn native_app_lifecycle_no_op(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    tracing::debug!(
+        target: "cratonvm_native_builtins::quarkus",
+        "io.quarkus.runtime.Application lifecycle hook elided (compatibility \
+         shim: real Quarkus replay plan not executed)"
+    );
     Ok(None)
 }
 
@@ -1669,7 +1736,7 @@ mod tests {
     fn t19_3_application_lifecycle_natives_are_graceful_no_ops() {
         reset_supplier_state();
         let mut ctx = mock_ctx();
-        assert!(native_app_no_op(&mut ctx, &[]).unwrap().is_none());
+        assert!(native_app_lifecycle_no_op(&mut ctx, &[]).unwrap().is_none());
     }
 
     #[test]
@@ -1766,26 +1833,28 @@ mod tests {
     }
 
     #[test]
-    fn t19_h3_serialized_application_get_main_class_fallback_on_empty_field() {
+    fn t19_h3_serialized_application_get_main_class_throws_on_empty_field() {
         let mut ctx = mock_ctx();
-        // Build an SA whose main-class field was never populated.
+        // Build an SA whose main-class field was never populated (i.e. it
+        // did NOT come through `read()`). Previously this fabricated the
+        // compile-time Keycloak main; now it must fail loud rather than
+        // silently launch an app-specific default.
         let cid = ctx.ensure_class_initialized(CLS_SERIALIZED_APP).unwrap();
         let sa = ctx.alloc_object(cid, 2);
         // Leave both slots at default (Value::Int(0) from MockNativeContext).
-        let mc = native_serialized_application_get_main_class(
+        let err = native_serialized_application_get_main_class(
             &mut ctx,
             &[Value::Object(Some(sa))],
         )
-        .unwrap()
-        .unwrap();
-        let name = match mc {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => panic!("expected fallback main-class string"),
-        };
-        assert!(
-            name.ends_with("KeycloakMain"),
-            "fallback should be compile-time Keycloak default, got {name}"
-        );
+        .unwrap_err();
+        match err {
+            cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(
+                    cratonvm_types::error::RuntimeError::IllegalStateException { .. },
+                ),
+            ) => {}
+            other => panic!("expected IllegalStateException, got {other:?}"),
+        }
     }
 
     #[test]

@@ -6915,16 +6915,11 @@ pub(crate) fn native_class_get_interfaces(ctx: &mut dyn NativeContext, args: &[V
     if let Value::Object(Some(name_ref)) = ctx.get_field(this, 1) {
         if let Some(name) = ctx.read_string(name_ref) {
             if name == "java/lang/reflect/Proxy$Instance" {
-                let bits = crate::proxy_last_interfaces_bits();
-                if bits != 0 {
-                    // SAFETY: the bits encode the heap pointer of an
-                    // interfaces array allocated by
-                    // `native_proxy_new_instance` and stored on the
-                    // proxy at field 1. The proxy retains the array,
-                    // so it's still live.
-                    let arr_ref = unsafe {
-                        cratonvm_types::ObjectRef::from_raw(bits as *mut u8)
-                    };
+                // bug nb-lib-gckeys §2: read the GC-tracked last-proxy
+                // interfaces array (rooted + remapped by the annotation-proxy
+                // GC hooks) instead of the old raw `AtomicU64` pointer that
+                // was never rooted and could dangle after a moving GC.
+                if let Some(arr_ref) = proxy_last_interfaces() {
                     return Ok(Some(Value::Object(Some(arr_ref))));
                 }
                 // No proxy has been created yet — fall through and
@@ -7202,6 +7197,48 @@ fn annotation_proxy_cache() -> &'static Mutex<FxHashMap<(u32, String), ObjectRef
     C.get_or_init(|| Mutex::new(FxHashMap::default()))
 }
 
+// ---------------------------------------------------------------------------
+// Last-created-proxy interfaces array (Pattern-A fix, bug nb-lib-gckeys §2)
+//
+// `Class.getInterfaces()` on the shared `Proxy$Instance` class mirror returns
+// the most-recently-created proxy's interfaces array (the "last-wins"
+// limitation documented in `native_class_get_interfaces`). The array used to
+// be cached in a raw `AtomicU64` in `lib.rs` (`PROXY_LAST_INTERFACES_BITS`)
+// holding `arr.as_ptr()`, then read back via `ObjectRef::from_raw` here. That
+// raw pointer was NEVER a GC root and NEVER remapped: a moving young GC would
+// relocate (or, if the proxy became unreachable, reclaim) the array, and the
+// next `getInterfaces()` would dereference a stale/dangling address.
+//
+// Fix: hold the array as a real `ObjectRef` in this process-global side-table
+// and fold it into the SAME GC scan / remap hooks that already keep the
+// annotation-proxy cache live (`gc_scan_annotation_proxy_roots` /
+// `gc_update_annotation_proxy_refs`, wired into roots.rs + gc.rs). No new GC
+// wiring is needed — the array is now a tracked root and is repointed after
+// every relocation, so the read below is always valid.
+fn proxy_last_interfaces_cell() -> &'static Mutex<Option<ObjectRef>> {
+    static C: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(None))
+}
+
+/// Record the interfaces array of the most recently created proxy so a later
+/// `Class.getInterfaces()` on the shared `Proxy$Instance` mirror can return it
+/// (GC-tracked — see [`proxy_last_interfaces`]). Called from
+/// `lib.rs::native_proxy_new_instance`.
+pub fn set_proxy_last_interfaces(arr: ObjectRef) {
+    *proxy_last_interfaces_cell()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(arr);
+}
+
+/// Fetch the GC-tracked last-proxy interfaces array, if any. Returns the
+/// CURRENT (post-relocation) `ObjectRef` because the cell is remapped by
+/// [`gc_update_annotation_proxy_refs`].
+pub fn proxy_last_interfaces() -> Option<ObjectRef> {
+    *proxy_last_interfaces_cell()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Build-or-fetch the cached annotation proxy for `ann` as seen on
 /// `queried_class_id`. The cache lock is NEVER held across
 /// `create_annotation_proxy` (which allocates and may trigger a GC whose root
@@ -7237,6 +7274,15 @@ pub fn gc_scan_annotation_proxy_roots(out: &mut Vec<ObjectRef>) {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     out.extend(guard.values().copied());
+    // bug nb-lib-gckeys §2: also root the last-proxy interfaces array so the
+    // shared-mirror `Class.getInterfaces()` fallback never dereferences a
+    // reclaimed/relocated array.
+    if let Some(arr) = *proxy_last_interfaces_cell()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    {
+        out.push(arr);
+    }
 }
 
 /// Post-GC remap for the annotation-proxy cache (companion to
@@ -7254,6 +7300,20 @@ pub fn gc_update_annotation_proxy_refs(pointer_map: &HashMap<usize, usize>) {
         if let Some(&new_addr) = pointer_map.get(&old_addr) {
             debug_assert!(new_addr != 0, "GC pointer map contains null address");
             *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
+    drop(guard);
+    // bug nb-lib-gckeys §2: remap the last-proxy interfaces array alongside
+    // the annotation-proxy cache (it shares this hook). Without the repoint
+    // the shared-mirror `getInterfaces()` would hand back a stale pointer.
+    let mut cell = proxy_last_interfaces_cell()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(arr) = cell.as_mut() {
+        let old_addr = arr.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            *arr = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
         }
     }
 }

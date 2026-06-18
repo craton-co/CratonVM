@@ -432,8 +432,8 @@ pub fn max_tlab_size() -> usize {
 
 /// Round-5 #9 / round-7 #9 — synthetic class id used for `int[]` TLAB
 /// fillers installed at TLAB retire time. Picked from the high-bit
-/// "synthetic VM" class-id range (matches the convention used by
-/// `AUTOBOX_CLASS_ID` = 0xAB00_0000) so it cannot collide with a
+/// "synthetic VM" class-id range (the same kind of reserved sentinel as
+/// `AUTOBOX_CLASS_ID`, now `u32::MAX`) so it cannot collide with a
 /// classloader-issued id.
 pub const TLAB_FILLER_CLASS_ID: cratonvm_types::ClassId =
     cratonvm_types::ClassId::new(0xF111_E700);

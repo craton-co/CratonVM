@@ -81,10 +81,11 @@
 //!   an in-module walker (integrity MAC verified first); PKCS#12 via the
 //!   `p12` crate (PFX MAC verified first).
 //! * **Chain validation.**  [`verify_chain`] walks leaf → intermediates →
-//!   anchor by Subject↔Issuer DN match, verifies each link's RSA
-//!   signature, checks each cert's `[notBefore, notAfter]` validity
-//!   window against wall-clock time, and refuses any leaf with no path to
-//!   a trust anchor.  Fail-closed throughout.
+//!   anchor by Subject↔Issuer DN match, cryptographically verifies each
+//!   link's signature (RSA PKCS#1 v1.5, ECDSA P-256/P-384, or DSA — see
+//!   the bullets above), checks each cert's `[notBefore, notAfter]`
+//!   validity window against wall-clock time, and refuses any leaf with
+//!   no path to a trust anchor.  Fail-closed throughout.
 //!
 //! # Residual gaps — precisely documented (fail-closed for all)
 //!
@@ -261,14 +262,18 @@ pub enum DigestAlg {
 /// embed non-X.509-shaped marker certs.  Production code paths must
 /// supply a real trust store via [`TrustStore::load_default`].
 ///
-/// # TODO(post-orchestrator)
+/// # Cryptographic coverage
 ///
-/// Pub-key signature verification over the authenticated-attributes
-/// blob, and **cryptographic** verification of each chain link's
-/// `signatureAlgorithm`-over-TBS-cert, are still not implemented — see
-/// module-level docs.  Both gaps surface as `None` here (the chain step
-/// returns [`TrustError::NotImplemented`] for unrecognised signature
-/// algorithms, which we treat as failure rather than success).
+/// Pub-key signature verification over the authenticated-attributes blob
+/// (when `enforce_pubkey` is set) and **cryptographic** verification of
+/// each chain link's `signatureAlgorithm`-over-TBS-cert are both
+/// implemented: RSA PKCS#1 v1.5 (SHA-1/256/384/512), ECDSA P-256/P-384
+/// (SHA-1/256/384/512), and DSA (SHA-1/256) — see
+/// [`verify_signature_with_spki`].  Only genuinely-unsupported
+/// curve/key/digest combinations (P-521, Brainpool, explicit
+/// ECParameters, an unusual DSA digest, ...) surface as
+/// [`TrustError::NotImplemented`], which this function maps to `None`
+/// (fail-closed: treated as failure, never success).
 pub fn verify_signer_block(
     signer_block_der: &[u8],
     sf_bytes: &[u8],
@@ -503,7 +508,11 @@ fn parse_signed_data(
                 return Err("SignerInfo signature does not verify against signer public key");
             }
             SigVerify::Unsupported => {
-                return Err("SignerInfo signature algorithm not verifiable (ECDSA/DSA)");
+                // RSA, ECDSA P-256/P-384, and DSA SHA-1/256 are all
+                // verified; this only fires for a curve/digest/key combo
+                // outside that set (P-521, Brainpool, explicit
+                // ECParameters, an unusual DSA digest, ...).  Fail-closed.
+                return Err("SignerInfo signature algorithm not verifiable (unsupported curve/key)");
             }
         }
     }
@@ -1300,9 +1309,12 @@ enum SigVerify {
     Ok,
     /// Signature did not verify against the key.
     Bad,
-    /// The signature algorithm / key type is recognised but not verifiable
-    /// in this build (ECDSA / DSA — see module docs).  Treated as failure
-    /// by all callers (fail-closed).
+    /// The signature algorithm / key type is recognised in the abstract
+    /// but not verifiable in this build — an EC curve we do not carry
+    /// (P-521 / Brainpool / explicit ECParameters), DSA with an unusual
+    /// digest, or a key/algorithm mismatch.  (RSA, ECDSA P-256/P-384, and
+    /// DSA SHA-1/256 are all verified — see module docs.)  Treated as
+    /// failure by all callers (fail-closed).
     Unsupported,
 }
 
@@ -1688,14 +1700,19 @@ fn dsa_verify(spki_der: &[u8], digest_alg: DigestAlg, message: &[u8], sig: &[u8]
 //     DN, then asks [`X509Cert::link_signature_ok`] whether the
 //     `signature` blob ties the child to the parent.
 //
-// **Cryptographic note.**  The link-signature step is now a real RSA
-// PKCS#1 v1.5 verify (SHA-1/256/384/512) against the parent cert's
-// public key — see [`verify_signature_with_spki`].  ECDSA / DSA links
-// are recognised but surface as [`TrustError::NotImplemented`] (no EC
-// point arithmetic reachable; see module-level docs), which
-// [`verify_signer_block`] surfaces as `None`.  That keeps the walk
-// fail-closed for the EC case.  The synthetic `craton-stub-sig`
-// algorithm OID is retained ONLY for the in-process test fixtures.
+// **Cryptographic note.**  The link-signature step is a real public-key
+// verify against the parent cert's public key — see
+// [`verify_signature_with_spki`].  RSA PKCS#1 v1.5 (SHA-1/256/384/512),
+// ECDSA-with-SHA-1/256/384/512 on NIST P-256 / P-384, and DSA (DSS) with
+// SHA-1 / SHA-256 are all fully verified (the EC/DSA paths use the
+// RustCrypto `p256` / `p384` / `dsa` crates, which also re-validate the
+// public point against its curve).  Only genuinely-unsupported
+// combinations (P-521 / Brainpool / explicit ECParameters, DSA with an
+// unusual digest, key/alg mismatch) surface as
+// [`TrustError::NotImplemented`], which [`verify_signer_block`] surfaces
+// as `None` — keeping the walk fail-closed for those residual cases.
+// The synthetic `craton-stub-sig` algorithm OID is retained ONLY for the
+// in-process test fixtures.
 
 use std::sync::OnceLock;
 
@@ -1726,10 +1743,12 @@ pub enum TrustError {
     Cyclic,
     /// The chain is deeper than [`MAX_CHAIN_LEN`].
     TooLong,
-    /// The signature on a chain link uses an algorithm this build
-    /// cannot verify (ECDSA / DSA — no EC point arithmetic reachable).
-    /// RSA PKCS#1 v1.5 links are verified; only EC/DSA land here.  See
-    /// module-level docs.
+    /// The signature on a chain link uses an algorithm/key combination
+    /// this build cannot verify.  RSA PKCS#1 v1.5, ECDSA P-256/P-384, and
+    /// DSA (SHA-1/256) links are all verified; only genuinely-unsupported
+    /// cases land here (EC curves we do not carry — P-521 / Brainpool /
+    /// explicit ECParameters — DSA with an unusual digest, or a key/alg
+    /// mismatch).  See module-level docs.
     NotImplemented,
     /// One of the certs is structurally invalid (wrong tag, truncated
     /// TBSCertificate, missing Subject/Issuer, ...).
@@ -2408,12 +2427,34 @@ impl<'a> X509Cert<'a> {
     ///
     /// * Real RSA PKCS#1 v1.5 (SHA-1/256/384/512) is fully verified
     ///   against `parent.spki_der`.
-    /// * ECDSA / DSA links surface as [`TrustError::NotImplemented`]
-    ///   (no EC point arithmetic reachable — see module docs).  This
-    ///   keeps the chain fail-closed.
-    /// * The synthetic [`OID_STUB_SIG`] path is retained for the
-    ///   in-process test fixtures only.
+    /// * Real ECDSA-with-SHA-1/256/384/512 on NIST P-256 / P-384 and DSA
+    ///   (DSS) with SHA-1 / SHA-256 are fully verified against
+    ///   `parent.spki_der` via the RustCrypto `p256` / `p384` / `dsa`
+    ///   verifiers (see [`verify_signature_with_spki`]).  The EC point /
+    ///   curve-membership check is performed by the verifying-key decoder.
+    /// * Only genuinely-unsupported combinations — EC curves we do not
+    ///   carry (P-521, Brainpool, explicit `ECParameters`), DSA with a
+    ///   non-SHA-1/256 digest, or any other key/algorithm mismatch —
+    ///   surface as [`TrustError::NotImplemented`] (fail-closed).
+    /// * The synthetic [`OID_STUB_SIG`] acceptance path exists ONLY under
+    ///   `cfg(test)` (it is a test backdoor — see the security note in the
+    ///   body).  In a production build it is compiled out, so an
+    ///   `OID_STUB_SIG` cert is an unknown algorithm and surfaces as
+    ///   [`TrustError::NotImplemented`] (fail-closed).
     pub fn link_signature_ok(&self, parent: &X509Cert) -> Result<(), TrustError> {
+        // SECURITY (cert-chain signature bypass): the synthetic
+        // [`OID_STUB_SIG`] acceptance path is an in-process TEST backdoor —
+        // it accepts a link on `signature == SHA-256(tbs || parent.subject_dn)`
+        // with NO real-crypto verification and NO trust-store consultation.
+        // `sig_alg_oid` is an attacker-controllable certificate field, so in a
+        // production build this branch would let a forged chain validate.  It
+        // is therefore compiled out of non-test builds entirely: a real binary
+        // never contains this code.  Under `cfg(test)` it remains available for
+        // the in-crate X.509-shaped fixtures (see the `tests` module).  In
+        // production an `OID_STUB_SIG` cert is an unknown algorithm and falls
+        // through to `verify_signature_with_spki`, which returns `Unsupported`
+        // → `NotImplemented` (fail-closed).
+        #[cfg(test)]
         if self.sig_alg_oid == OID_STUB_SIG {
             // Test-only computation: SHA-256(tbs_der || parent.subject_dn).
             let mut buf = Vec::with_capacity(self.tbs_der.len() + parent.subject_dn.len());
@@ -2701,6 +2742,31 @@ fn check_ca_ext_facts(facts: &CertExtFacts, ca_certs_below: usize) -> Result<(),
     Ok(())
 }
 
+/// SECURITY (cert-chain signature bypass): is `cert` a synthetic
+/// [`OID_STUB_SIG`] test fixture whose dummy validity dates / missing
+/// extensions should be skipped?
+///
+/// In a **production** build this is hard-wired to `false` so the
+/// `OID_STUB_SIG` skip-branches in [`verify_chain`] (which would otherwise
+/// bypass `cert_dates_ok` and the RFC 5280 extension checks on the strength
+/// of the attacker-controllable `signatureAlgorithm` OID) can never be
+/// taken — date and extension validation always apply.  The stub recognition
+/// only exists under `cfg(test)` for the in-crate fixtures.
+#[cfg(test)]
+#[inline]
+fn is_stub_sig_fixture(cert: &X509Cert) -> bool {
+    cert.sig_alg_oid == OID_STUB_SIG
+}
+
+/// Production stub: `OID_STUB_SIG` fixtures do not exist outside tests, so
+/// every cert is treated as a real cert and gets full date / extension
+/// validation.  See the `cfg(test)` variant above for the rationale.
+#[cfg(not(test))]
+#[inline]
+fn is_stub_sig_fixture(_cert: &X509Cert) -> bool {
+    false
+}
+
 /// Walk `leaf` → `intermediates` → `trust_store` building a chain.
 ///
 /// At each step the current cert's `issuer` DN is looked up first
@@ -2710,8 +2776,11 @@ fn check_ca_ext_facts(facts: &CertExtFacts, ca_certs_below: usize) -> Result<(),
 ///
 ///   * Anchor reached — `Ok(())`.
 ///   * No parent for current cert — `Err(NoTrustAnchor)`.
-///   * Bad link signature — `Err(BadSignature)`.
-///   * Real-crypto algorithm — `Err(NotImplemented)`.
+///   * Bad link signature — `Err(BadSignature)`.  RSA, ECDSA P-256/P-384,
+///     and DSA (SHA-1/256) links are all cryptographically verified.
+///   * Unsupported curve/key/digest combination (P-521, Brainpool,
+///     explicit ECParameters, unusual DSA digest, key/alg mismatch) —
+///     `Err(NotImplemented)`.
 ///   * Chain exceeds [`MAX_CHAIN_LEN`] — `Err(TooLong)`.
 ///   * Already-visited cert — `Err(Cyclic)`.
 ///   * RFC 5280 extension violation — `Err(BasicConstraintsViolation)` /
@@ -2722,22 +2791,40 @@ pub fn verify_chain<'a>(
     trust_store: &TrustStore,
 ) -> Result<(), TrustError> {
     let mut current: &'a X509Cert<'a> = leaf;
-    // Track visited Subject DNs by owned bytes — we re-walk through
-    // both leaf-borrowed slices and trust-store-borrowed slices and
-    // mixing those lifetimes inside a `Vec<&[u8]>` is awkward.
-    let mut visited: Vec<Vec<u8>> = Vec::new();
-    visited.push(current.subject_dn.to_vec());
+    // PERF(cl-jarsigner-perf): track visited Subject DNs in a `HashSet` of
+    // borrowed `&'a [u8]` slices for O(1) cycle-detection membership instead
+    // of the former `Vec<Vec<u8>>` + linear `iter().any(...)` scan per step.
+    // The leaf and every intermediate `subject_dn` are `&'a [u8]`, so no
+    // owned copies (`.to_vec()`) are needed — this also drops the per-step
+    // DN allocation. Behavior is unchanged: the set holds exactly the same
+    // Subject DNs that were pushed before, and `insert`-returns-false ⇔ the
+    // old `any(...)` would have matched.
+    let mut visited: std::collections::HashSet<&'a [u8]> = std::collections::HashSet::new();
+    visited.insert(current.subject_dn);
+
+    // PERF(cl-jarsigner-perf): index intermediates by Subject DN for O(1)
+    // parent lookup instead of `intermediates.iter().find(...)` per step.
+    // `entry(...).or_insert(...)` keeps the FIRST occurrence of any duplicate
+    // Subject DN, exactly matching the old `find()` (which returned the first
+    // matching cert in slice order). Lookups below preserve identical result.
+    let mut inter_by_subject: std::collections::HashMap<&'a [u8], &'a X509Cert<'a>> =
+        std::collections::HashMap::with_capacity(intermediates.len());
+    for c in intermediates {
+        inter_by_subject.entry(c.subject_dn).or_insert(c);
+    }
 
     // Leaf validity window must include "now" (skip for the synthetic
     // stub-sig fixtures, whose dummy validity dates aren't real times).
-    if leaf.sig_alg_oid != OID_STUB_SIG && !cert_dates_ok(leaf) {
+    if !is_stub_sig_fixture(leaf) && !cert_dates_ok(leaf) {
         return Err(TrustError::Expired);
     }
 
     // FEAT(jar-signer): RFC 5280 leaf extension checks (KeyUsage /
     // ExtendedKeyUsage / unknown-critical).  Skipped for stub-sig
-    // fixtures (which carry no extensions and aren't real certs).
-    if leaf.sig_alg_oid != OID_STUB_SIG {
+    // fixtures (which carry no extensions and aren't real certs) —
+    // `is_stub_sig_fixture` is hard-`false` in production builds, so the
+    // checks always run there.
+    if !is_stub_sig_fixture(leaf) {
         let facts = extract_ext_facts(leaf.full_der)?;
         check_leaf_ext_facts(&facts)?;
     }
@@ -2749,12 +2836,12 @@ pub fn verify_chain<'a>(
     for _step in 0..MAX_CHAIN_LEN {
         if let Some(anchor) = trust_store.find_anchor_by_subject(current.issuer_dn) {
             let parent = X509Cert::parse(&anchor.der).map_err(|_| TrustError::Malformed)?;
-            if parent.sig_alg_oid != OID_STUB_SIG && !cert_dates_ok(&parent) {
+            if !is_stub_sig_fixture(&parent) && !cert_dates_ok(&parent) {
                 return Err(TrustError::Expired);
             }
             // FEAT(jar-signer): the anchor certifies `current`, so it acts
             // as a CA — enforce BasicConstraints / KeyUsage on it.
-            if parent.sig_alg_oid != OID_STUB_SIG {
+            if !is_stub_sig_fixture(&parent) {
                 let facts = extract_ext_facts(parent.full_der)?;
                 check_ca_ext_facts(&facts, ca_certs_below)?;
             }
@@ -2762,26 +2849,29 @@ pub fn verify_chain<'a>(
             return Ok(());
         }
         // Look up an intermediate whose subject == current.issuer.
-        let next = intermediates
-            .iter()
-            .find(|c| c.subject_dn == current.issuer_dn);
+        // PERF(cl-jarsigner-perf): O(1) indexed lookup (was a linear
+        // `iter().find(...)`); `.copied()` yields the same first-match cert.
+        let next = inter_by_subject.get(current.issuer_dn).copied();
         match next {
             Some(parent) => {
-                if visited.iter().any(|v| v.as_slice() == parent.subject_dn) {
+                // PERF(cl-jarsigner-perf): O(1) set membership (was a linear
+                // `visited.iter().any(...)`); same Cyclic result.
+                if visited.contains(parent.subject_dn) {
                     return Err(TrustError::Cyclic);
                 }
-                if parent.sig_alg_oid != OID_STUB_SIG && !cert_dates_ok(parent) {
+                if !is_stub_sig_fixture(parent) && !cert_dates_ok(parent) {
                     return Err(TrustError::Expired);
                 }
                 // FEAT(jar-signer): `parent` is an intermediate CA that
                 // certifies `current` — enforce CA constraints, counting
                 // the non-self-issued CAs already below it.
-                if parent.sig_alg_oid != OID_STUB_SIG {
+                if !is_stub_sig_fixture(parent) {
                     let facts = extract_ext_facts(parent.full_der)?;
                     check_ca_ext_facts(&facts, ca_certs_below)?;
                 }
                 current.link_signature_ok(parent)?;
-                visited.push(parent.subject_dn.to_vec());
+                // PERF(cl-jarsigner-perf): insert borrowed DN slice (no alloc).
+                visited.insert(parent.subject_dn);
                 // A non-self-issued intermediate adds to the CA count that
                 // the *next* (higher) CA's pathLenConstraint must cover.
                 if !parent.is_self_signed() {
@@ -3593,10 +3683,17 @@ mod tests {
 
     #[test]
     fn task40_real_crypto_algorithm_returns_not_implemented() {
-        // A chain link signed with a real RSA/ECDSA OID (here:
-        // sha256WithRSAEncryption, 1.2.840.113549.1.1.11) must be
-        // rejected as NotImplemented — the conservative placeholder
-        // from acceptance #6.
+        // A chain link whose outer signatureAlgorithm names a real OID
+        // (here sha256WithRSAEncryption, 1.2.840.113549.1.1.11) but whose
+        // *parent* carries a synthetic stub SPKI (the test fixtures use
+        // `OID_STUB_SIG` as the key-algorithm OID, not a real RSA/EC/DSA
+        // key) must be rejected as NotImplemented.  `parse_spki` maps the
+        // unknown key OID to `PublicKey::Other`, which cannot bind to the
+        // RSA verifier → `SigVerify::Unsupported` → `TrustError::
+        // NotImplemented` (fail-closed).  NOTE: RSA/ECDSA/DSA verification
+        // is fully implemented — a link with a *real* key of the matching
+        // family and a bad signature returns `BadSignature` instead; this
+        // case only exercises the unknown-key-type fail-closed path.
         let root_subject_dn = x509_name("RealRoot");
         // Hand-roll a cert whose outer signatureAlgorithm OID is the
         // real PKCS#1 v1.5 RSA-SHA256 identifier.

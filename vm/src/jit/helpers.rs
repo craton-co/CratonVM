@@ -165,6 +165,25 @@ thread_local! {
     /// real `NullPointerException` through the method's exception table.
     static JIT_PENDING_NPE: Cell<bool> = const { Cell::new(false) };
 
+    /// Out-of-band deopt/exception signal (MEDIUM fix: `i64::MIN` sentinel
+    /// collision). The JIT signals exception/deopt to its caller by returning
+    /// `i64::MIN` in RAX, and the interpreter's post-invoke check
+    /// (`vm/src/runtime/interpreter.rs`) treats an `i64::MIN` return as
+    /// "deopt / pending exception — re-run or route". But a method that
+    /// *legitimately* returns `Long.MIN_VALUE` (or a `double`/`float`/`int`
+    /// whose JIT-ABI bit pattern equals `i64::MIN`) would FALSELY trip that
+    /// check, causing a spurious interpreter re-run that double-executes the
+    /// method's side effects.
+    ///
+    /// To disambiguate, every JIT path that produces the `i64::MIN` deopt
+    /// sentinel ALSO sets this flag (via [`set_jit_deopt_pending`]) — both the
+    /// Rust helpers that `return i64::MIN` and the out-of-line stubs emitted in
+    /// `jit/src/x64.rs` (which call a helper that sets it). The interpreter
+    /// reads+clears this flag with [`take_jit_deopt_pending`]: an `i64::MIN`
+    /// return is treated as a real value when the flag is clear, and as a
+    /// deopt/exception signal only when it is set.
+    static JIT_DEOPT_PENDING: Cell<bool> = const { Cell::new(false) };
+
     /// Debug-only reentrancy guard for [`jit_thread_mut`]. Set while a
     /// `&mut JvmThread` handed out by `jit_thread_mut` is considered live, and
     /// cleared when the [`JitThreadGuard`] returned alongside it is dropped.
@@ -451,6 +470,42 @@ pub fn take_jit_pending_npe() -> bool {
 #[inline]
 fn set_jit_pending_npe() {
     JIT_PENDING_NPE.with(|e| e.set(true));
+}
+
+/// Set the out-of-band deopt/exception signal (MEDIUM fix: `i64::MIN` sentinel
+/// collision). MUST be called on EVERY path that produces the `i64::MIN` deopt
+/// sentinel, so the interpreter can tell a genuine deopt/exception apart from a
+/// method that legitimately returns `Long.MIN_VALUE`. Idempotent; cheap.
+///
+/// Crate-public so the out-of-line JIT stubs in `jit/src/x64.rs` can route
+/// through a tiny `extern "C"` helper that sets it (see [`jit_set_deopt_pending`]).
+#[inline]
+pub(crate) fn set_jit_deopt_pending() {
+    JIT_DEOPT_PENDING.with(|e| e.set(true));
+}
+
+/// Read+clear the out-of-band deopt/exception signal. The interpreter's
+/// post-invoke check calls this when it observes an `i64::MIN` return: `true`
+/// means the JIT took the exception/deopt path and the `i64::MIN` is the
+/// sentinel (route/re-run); `false` means `i64::MIN` is a real returned value
+/// and must be pushed verbatim. See [`set_jit_deopt_pending`].
+#[inline]
+pub fn take_jit_deopt_pending() -> bool {
+    JIT_DEOPT_PENDING.with(|e| e.take())
+}
+
+/// `extern "C"` trampoline for the out-of-line deopt/exception stubs emitted in
+/// `jit/src/x64.rs`. Those stubs already `CALL` a helper (e.g. `jit_bastore`,
+/// `jit_throw_aioobe`, the dispatch helper) that sets one of the pending-exception
+/// flags AND `JIT_DEOPT_PENDING` before producing `i64::MIN`. This dedicated,
+/// side-effect-free trampoline lets a stub that does NOT otherwise call such a
+/// helper (or whose helper predates this flag) set the deopt signal with a
+/// single `CALL` and no argument marshalling.
+///
+/// SAFETY: no pointer arguments; only touches a thread-local. Safe to call from
+/// JIT-compiled code at any point before loading the `i64::MIN` sentinel.
+pub extern "C" fn jit_set_deopt_pending() {
+    set_jit_deopt_pending();
 }
 
 /// Obtain an exclusive reference to the JIT thread. Returns `None` if not set,
@@ -1451,6 +1506,13 @@ pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
         // receiver; JZ deopt_npe` guard before the bounds check, so
         // this helper is the second line of defense.
         set_jit_pending_npe();
+        // Out-of-band deopt signal: the x64 `emit_null_check_store_stubs` stub
+        // calls this helper with `array_ptr == 0` and then loads `i64::MIN` as
+        // the method's return value, so flag the deopt to keep the interpreter
+        // from mistaking a legitimate `Long.MIN_VALUE` return for one. (The
+        // interpreter's NPE drain runs first and clears it; this preserves the
+        // "every `i64::MIN` method-return sets the flag" invariant regardless.)
+        set_jit_deopt_pending();
         return;
     }
     // SAFETY: array_ptr is non-null and points to a live array object on the GC heap.
@@ -1587,6 +1649,47 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
         // sentinel, so the interpreter's post-JIT drain surfaces the exception.
         JIT_PENDING_AIOOBE.with(|e| e.set(Some((index, length))));
         return;
+    }
+    // JVMS §aastore covariance check: a non-null element whose runtime type is
+    // NOT assignment-compatible with the array's component type must throw
+    // ArrayStoreException. Mirror the interpreter `aastore` opcode so JIT and
+    // interpreter agree. `aastore_element_assignable` fails open on imprecise
+    // type info, so this is additive (never a false ArrayStoreException) — the
+    // store still proceeds below for null elements and assignable references.
+    if val != 0 {
+        let vm = &*(vm_ptr as *const SharedVm);
+        let array_ref = ObjectRef::from_raw(array_ptr as usize as *mut u8);
+        let value_ref = ObjectRef::from_raw(val as usize as *mut u8);
+        if vm.heap.element_type_of(array_ref) == ArrayElementType::Reference
+            && !crate::runtime::interpreter::aastore_element_assignable(vm, array_ref, value_ref)
+        {
+            // Build a real ArrayStoreException and stash it via the pending-
+            // exception channel; the void return cannot carry the `i64::MIN`
+            // deopt sentinel, so the interpreter's post-JIT-return drain
+            // (`take_jit_pending_exception`) routes it through this method's
+            // exception table. Skip the store (no element written on the
+            // exception path). If we cannot obtain a thread or build the
+            // throwable, fall through and perform the store rather than
+            // corrupting VM state (degrades to the pre-fix behaviour only in
+            // that rare construction-failure case).
+            let elem_cls = vm
+                .class_manager
+                .read()
+                .get_class(vm.heap.class_id_of(value_ref))
+                .map(|c| c.name.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            if let Some((thread, _guard)) = jit_thread_mut() {
+                if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                    vm,
+                    thread,
+                    "java/lang/ArrayStoreException",
+                    Some(&elem_cls),
+                ) {
+                    set_jit_pending_exception(exc);
+                    return;
+                }
+            }
+        }
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * REF_ELEMENT_SIZE) as *mut u64;
     // Task #43 (HIGH soundness, deferred from #25/#26): SATB pre-write
@@ -2376,6 +2479,10 @@ pub unsafe extern "C" fn jit_throw_aioobe(index: i64, length: i64) -> i64 {
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
     JIT_PENDING_AIOOBE.with(|e| e.set(Some((index, length))));
+    // Out-of-band deopt signal: this `i64::MIN` IS the bounds-check stub's
+    // method return value, so flag it as a genuine deopt so the interpreter
+    // doesn't mistake a method legitimately returning `Long.MIN_VALUE` for one.
+    set_jit_deopt_pending();
     i64::MIN // deopt sentinel — interpreter will detect and throw AIOOBE
 }
 
@@ -3907,6 +4014,12 @@ pub unsafe extern "C" fn jit_uncommon_trap(
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
+    // Out-of-band deopt signal: the x64 `emit_deopt_stubs` stub that calls this
+    // helper loads `i64::MIN` into RAX and runs the method epilogue immediately
+    // afterwards, so this trap ALWAYS precedes an `i64::MIN` method return. Flag
+    // it as a genuine deopt so the interpreter doesn't mistake a method
+    // legitimately returning `Long.MIN_VALUE` for one.
+    set_jit_deopt_pending();
     if vm_ptr == 0 {
         return DEOPT_ACTION_REINTERPRET;
     }
@@ -4083,10 +4196,53 @@ mod tests {
     #[test]
     fn jit_bastore_null_sets_pending_npe() {
         let _ = take_jit_pending_npe();
+        let _ = take_jit_deopt_pending();
         // SAFETY: array_ptr is 0 (null); the function takes the null-guard
         // early-return path and never dereferences.
         unsafe { jit_bastore(0, 0, 0) };
         assert!(take_jit_pending_npe(), "bastore(null) must set pending NPE flag");
+    }
+
+    // -----------------------------------------------------------------------
+    // Out-of-band deopt signal (finding 1): i64::MIN sentinel disambiguation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn deopt_pending_set_take_cycle() {
+        let _ = take_jit_deopt_pending(); // clear any prior state
+        assert!(!take_jit_deopt_pending(), "flag must start clear");
+        set_jit_deopt_pending();
+        assert!(take_jit_deopt_pending(), "set then take must observe true");
+        assert!(!take_jit_deopt_pending(), "take must clear the flag");
+    }
+
+    #[test]
+    fn jit_throw_aioobe_sets_deopt_pending() {
+        let _ = take_jit_deopt_pending();
+        let _ = take_jit_pending_aioobe();
+        // SAFETY: only stores into thread-locals; no pointer dereference.
+        let r = unsafe { jit_throw_aioobe(5, 3) };
+        assert_eq!(r, i64::MIN);
+        assert!(
+            take_jit_deopt_pending(),
+            "jit_throw_aioobe must set the out-of-band deopt signal so the \
+             interpreter does not mistake a legitimate Long.MIN_VALUE return"
+        );
+        // also leaves the AIOOBE payload for the interpreter drain
+        assert_eq!(take_jit_pending_aioobe(), Some((5, 3)));
+    }
+
+    #[test]
+    fn jit_bastore_null_sets_deopt_pending() {
+        let _ = take_jit_deopt_pending();
+        let _ = take_jit_pending_npe();
+        // SAFETY: array_ptr is 0 (null); null-guard early return, no deref.
+        unsafe { jit_bastore(0, 0, 0) };
+        assert!(
+            take_jit_deopt_pending(),
+            "bastore(null) (the null-check-store stub path) must set the deopt signal"
+        );
+        let _ = take_jit_pending_npe();
     }
 
     #[test]
@@ -4641,7 +4797,14 @@ mod savebase_watcher {
     static STARTED: AtomicBool = AtomicBool::new(false);
 
     extern "system" {
-        fn GetCurrentProcess() -> isize;
+        // Returns the Win32 pseudo-HANDLE as `*mut c_void` to stay structurally
+        // identical to the `GetCurrentProcess` decl in
+        // `runtime::crash_handler::windows_fault` — same symbol, so
+        // `clashing_extern_declarations` compares the two and warns if they
+        // diverge. The handle is pointer-sized either way; this module treats
+        // handles as `isize` (see `DuplicateHandle` below), so the single call
+        // site casts the result with `as isize`.
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
         fn GetCurrentThread() -> isize;
         fn DuplicateHandle(
             sp: isize,
@@ -4677,7 +4840,7 @@ mod savebase_watcher {
             return;
         }
         let mut h: isize = 0;
-        let proc = GetCurrentProcess();
+        let proc = GetCurrentProcess() as isize;
         DuplicateHandle(
             proc,
             GetCurrentThread(),

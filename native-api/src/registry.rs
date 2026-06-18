@@ -2372,6 +2372,30 @@ pub struct NativeMethodRegistry {
     /// `UriComponentsBuilder.pathSegment`, which dropped the URL path segment
     /// (`ReleaseScheduleTests`).
     drop_real_layout_synthetic: bool,
+    /// PERF (native-ring lazy name map): deferred `cb_ptr -> registrations[idx]`
+    /// index for the native-call ring's `fn-ptr → "class.method desc"` map.
+    ///
+    /// At boot ~3,100 natives are registered. The ring is **off by default**
+    /// (`native_ring::is_enabled()` == false), so eagerly building the name
+    /// string was pure waste: every `register()` paid a `format!` heap
+    /// allocation **plus** a cross-module `name_map()` `Mutex` round-trip for a
+    /// diagnostic that is almost never requested.
+    ///
+    /// We can't simply skip-while-disabled and re-populate later from nothing —
+    /// boot registration happens *before* the watchdog arms recording, so the
+    /// names would be lost (the WF32-fix rationale). But we DON'T need a second
+    /// copy of the parts: the full triple is already persisted in
+    /// `registrations` by the unconditional `registrations.push(...)` below.
+    /// So we only record a cheap `cb_ptr -> index` here (one `FxHashMap` insert,
+    /// no allocation, no cross-module lock), and materialize the actual name
+    /// strings lazily via [`flush_native_ring_names`](Self) when — and only
+    /// when — a diagnostic dump is actually requested (the ring is enabled).
+    ///
+    /// First-write-wins (`entry().or_insert(idx)`) to match the eager path's
+    /// `register_name`/`or_insert_with` semantics: if the same `fn` pointer is
+    /// registered for multiple triples (e.g. compiler function merging), the
+    /// first-seen triple is the resolved name, exactly as before.
+    name_index: FxHashMap<usize, usize>,
 }
 
 impl NativeMethodRegistry {
@@ -2401,6 +2425,12 @@ impl NativeMethodRegistry {
             drop_synthetic_stubs: std::env::var_os("CRATONVM_NO_STUBS")
                 .is_some_and(|v| !v.is_empty()),
             drop_real_layout_synthetic: false,
+            // PERF: deferred native-ring name index. Sized like the other boot
+            // maps so the ~3,100 boot inserts don't rehash/grow.
+            name_index: FxHashMap::with_capacity_and_hasher(
+                BOOT_REGISTRATION_HINT,
+                Default::default(),
+            ),
         }
     }
 
@@ -2606,6 +2636,10 @@ impl NativeMethodRegistry {
             ),
             "NativeMethodRegistry 128-bit hash collision for {class_name}.{method_name}{descriptor} (key={key:?})"
         );
+        // Index of this registration's triple in `registrations`, used below
+        // to back the deferred native-ring name map without a second copy of
+        // the parts (see the `name_index` field doc).
+        let reg_index = self.registrations.len();
         self.registrations.push((
             class_name.into(),
             method_name.into(),
@@ -2629,20 +2663,69 @@ impl NativeMethodRegistry {
         // contract requires.
         let md_key = native_method_hash("", method_name, descriptor);
         self.by_method_desc.entry(md_key).or_insert(callback);
-        // Native-call ring buffer: register pointer→name so the
-        // watchdog can resolve callback pointers back to human-readable
-        // method names.
+        // Native-call ring buffer: associate this callback pointer with its
+        // human-readable `class.method desc` name so a watchdog dump can resolve
+        // raw `fn` pointers back to method names.
         //
-        // WF32-fix: this used to be gated behind `native_ring::is_enabled()`,
-        // but native registration happens during VM boot *before* the
-        // watchdog arms the ring — so by the time recording turns on, every
-        // name was already skipped and the watchdog dump showed only raw
-        // `<unknown cb@0x...>` pointers (useless for diagnosing a native
-        // livelock). The name map is a one-shot ~3,100-entry population at
-        // boot; the cost is a few ms of allocation, paid once, and it makes
-        // the hang dump actually actionable. Always populate it.
-        let triple = format!("{class_name}.{method_name}{descriptor}");
-        crate::native_ring::register_name(callback as usize, &triple);
+        // WF32-fix (history): the name map used to be populated UNCONDITIONALLY
+        // and eagerly here, with a per-`register()` `format!` allocation **plus**
+        // a cross-module `name_map()` `Mutex` round-trip. The reason it wasn't
+        // gated behind `native_ring::is_enabled()` was correctness: boot
+        // registers ~3,100 natives *before* the watchdog arms recording, so a
+        // naive skip-while-disabled lost every name and the dump showed only
+        // useless `<unknown cb@0x...>` pointers.
+        //
+        // PERF FIX: the eager work is now deferred. The default (ring disabled)
+        // path records ONLY a cheap `cb_ptr -> reg_index` entry — no `format!`
+        // heap allocation, no cross-module lock — and the actual name strings
+        // are materialized lazily by `flush_native_ring_names()` if/when a
+        // diagnostic is actually requested (the ring is enabled). Names are NOT
+        // lost: the full triple is already persisted in `registrations[reg_index]`
+        // (pushed unconditionally above), so `flush_native_ring_names()` can
+        // rebuild every name on demand. This preserves the WF32 guarantee while
+        // removing the per-boot-registration `format!` + `Mutex` cost.
+        //
+        // If recording is ALREADY enabled at register time (rare — e.g. a native
+        // registered after the watchdog armed), populate the ring's name map
+        // eagerly so a dump that races registration still resolves the name. The
+        // cheap index is recorded in both cases so a later `flush_*` is complete.
+        // First-write-wins to mirror the prior `register_name`/`or_insert_with`.
+        self.name_index.entry(callback as usize).or_insert(reg_index);
+        if crate::native_ring::is_enabled() {
+            let triple = format!("{class_name}.{method_name}{descriptor}");
+            crate::native_ring::register_name(callback as usize, &triple);
+        }
+    }
+
+    /// Materialize the deferred native-call-ring name map: walk the
+    /// `cb_ptr -> registration-index` index built cheaply at `register()` time
+    /// and publish each `fn-ptr → "class.method desc"` mapping into
+    /// `native_ring`'s name map (idempotent / first-write-wins).
+    ///
+    /// PERF (native-ring lazy name map): this is the lazy counterpart to the
+    /// deferral in `register()`. Boot registration no longer pays a `format!`
+    /// allocation + `Mutex` lock per native for a diagnostic that is off by
+    /// default; instead, the watchdog (or whoever arms the ring) calls this
+    /// ONCE when recording is actually turned on, paying the ~3,100 `format!`
+    /// allocations only then. Calling it is cheap to repeat: `register_name`
+    /// uses `or_insert_with`, so already-published names are left untouched.
+    ///
+    /// CROSS-FILE FOLLOW-UP (out of this file's scope): the ring arm site —
+    /// where `native_ring::enable(true)` is called (per native_ring.rs docs:
+    /// `vm-cli/src/main.rs`, on `--stack-dump-on-timeout=N>0` /
+    /// `CRATONVM_ENABLE_NATIVE_RING=1`) — should call this on the global
+    /// `NativeMethodRegistry` immediately after `enable(true)` so a subsequent
+    /// dump resolves names. Until that wiring lands, names registered while the
+    /// ring was disabled resolve as `<unknown cb@0x...>` in the dump (same
+    /// failure mode the WF32-fix originally addressed, but now opt-in and only
+    /// when the wiring is absent — semantics of registration are unchanged).
+    pub fn flush_native_ring_names(&self) {
+        for (&cb_ptr, &idx) in &self.name_index {
+            if let Some((c, m, d)) = self.registrations.get(idx) {
+                let triple = format!("{c}.{m}{d}");
+                crate::native_ring::register_name(cb_ptr, &triple);
+            }
+        }
     }
 
     /// Look up a native method implementation (zero allocation on the
@@ -3018,6 +3101,48 @@ mod tests {
         assert!(registry.find("java/sql/CallableStatement", "close", "()V").is_some());
         // Original registrations still present.
         assert!(registry.find("java/sql/PreparedStatement", "execute", "()Z").is_some());
+    }
+
+    #[test]
+    fn deferred_native_ring_name_flush_resolves() {
+        // PERF (native-ring lazy name map): with the ring disabled (the test
+        // default), `register()` records only a cheap `cb_ptr -> reg_index`
+        // index and does NOT eagerly publish the name. Registration semantics
+        // are unchanged (`find` works), and `flush_native_ring_names()` then
+        // materializes the name on demand so a diagnostic dump resolves it.
+        //
+        // A dedicated, uniquely-named fn pointer is used so the resolved name
+        // is unambiguous in the process-global (first-write-wins) ring name map.
+        // Distinct, non-trivial body so the compiler cannot merge this with the
+        // module's other `Ok(None)` dummy natives (function merging would alias
+        // the `fn` pointer and make the name lookup ambiguous).
+        fn ring_flush_probe_native(
+            _ctx: &mut dyn NativeContext,
+            args: &[Value],
+        ) -> MethodCallResult {
+            Ok(Some(Value::Int(0x52_49_4e_47 ^ args.len() as i32)))
+        }
+
+        let mut registry = NativeMethodRegistry::new();
+        // Distinctive triple unlikely to be registered elsewhere in the suite.
+        registry.register(
+            "craton/test/RingFlushProbe",
+            "probe",
+            "()V",
+            ring_flush_probe_native,
+        );
+        // Registration semantics preserved: the method is findable regardless
+        // of the deferral.
+        assert!(registry
+            .find("craton/test/RingFlushProbe", "probe", "()V")
+            .is_some());
+
+        // Materialize the deferred names, then the ring can resolve the pointer.
+        registry.flush_native_ring_names();
+        assert_eq!(
+            crate::native_ring::name_of(ring_flush_probe_native as usize).as_deref(),
+            Some("craton/test/RingFlushProbe.probe()V"),
+        );
     }
 
     // -----------------------------------------------------------------------

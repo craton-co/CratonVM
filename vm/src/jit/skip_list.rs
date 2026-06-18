@@ -1483,6 +1483,32 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("java/util/WeakHashMap$Entry", "<init>")
         | ("java/util/WeakHashMap", "getTable")
         | ("java/util/WeakHashMap", "expungeStaleEntries")
+        // kafka-bug-C (2026-06-18) — the *stream/spliterator* sibling of the
+        // Tomcat Bug B iterator ban above. `WeakHashMap.values().stream()`
+        // (e.g. log4j2 `InternalLoggerRegistry` streaming its logger
+        // WeakHashMap during init) hangs forever JIT-on but completes JIT-off;
+        // it is the root cause of the dominant kafka `consumer.internals`
+        // TIMEOUT cluster (`ConsumerRecordsTest` + 13 classes). Bisected
+        // (`CRATONVM_JIT_BISECT_ONLY=java/util/WeakHashMap` +
+        // `CRATONVM_JIT_BISECT_SKIP=...$ValueSpliterator.tryAdvance`) to a single
+        // method: the JIT miscompiles `ValueSpliterator.tryAdvance`'s
+        // `current = tab[index++]` field-post-increment (bytecode 60-77:
+        // `dup_x1; iconst_1; iadd; putfield index` — the `index++` store is
+        // dropped, so the inner `while (index < hi || current != null)` loop
+        // never advances `index` past a null table slot and spins). Skipping
+        // just that method makes the 3-line repro return; `getFence`/`size`/
+        // `expungeStaleEntries` skips do NOT (verified). The same
+        // `current = tab[index++]` loop appears in `forEachRemaining` and in
+        // the Key/Entry spliterators (keySet()/entrySet() streams), so ban the
+        // whole shape pre-emptively. Underlying dup_x1 codegen defect tracked
+        // in docs/known-issues/kafka-bug-C-weakhashmap-stream-infinite-hang.md
+        // for a general fix (the `CRATONVM_JIT_NO_DUPX` lever is unstable here).
+        | ("java/util/WeakHashMap$ValueSpliterator", "tryAdvance")
+        | ("java/util/WeakHashMap$ValueSpliterator", "forEachRemaining")
+        | ("java/util/WeakHashMap$KeySpliterator", "tryAdvance")
+        | ("java/util/WeakHashMap$KeySpliterator", "forEachRemaining")
+        | ("java/util/WeakHashMap$EntrySpliterator", "tryAdvance")
+        | ("java/util/WeakHashMap$EntrySpliterator", "forEachRemaining")
         // Tomcat Bug D (apps/tomcat suite) — `org.apache.catalina.filters.
         // TestRemoteCIDRFilter` SIGSEGVs in JIT mode but completes cleanly with
         // `CRATONVM_DISABLE_JIT=1`. Root cause (CRATONVM_BUGS/BUG-D-*): a JIT

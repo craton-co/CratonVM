@@ -955,21 +955,77 @@ pub fn verify_instruction(
             // pre-Java-7 classes compiled without a StackMapTable (e.g.
             // picocli 4.x's `toCommandLine` helper).
             if method_name == "<init>" {
-                // For UninitializedThis, replace with the current class
-                // (this.<init> chained to super(); `this` is still of the
-                // current class, not the superclass being invoked).
-                // For Uninitialized(n), replace with the method owner
-                // (which matches the `new` site's class).
-                let replacement_class: Option<Arc<str>> = match &receiver {
-                    VType::UninitializedThis => Some(Arc::from(current_class_name)),
-                    VType::Uninitialized(_) => resolve_method_owner_name_and_type(cp, *index)
-                        .map(|(o, _, _)| Arc::from(o.as_str())),
-                    _ => None,
-                };
-                if let Some(cls) = replacement_class {
-                    let replacement = VType::ObjectRef(cls);
-                    let to_replace = receiver.clone();
-                    replace_vtype_in_frame(frame, &to_replace, &replacement);
+                // JVMS §4.10.1.9 (invokespecial <init>): the objectref MUST
+                // be an *uninitialized* type — either `uninitializedThis` or
+                // `uninitialized(offset)`. Calling `<init>` on an already
+                // initialized reference (ObjectRef/ArrayRef), on `Null`, or on
+                // a non-reference is a verification error: a sound verifier
+                // must reject it (otherwise a class could re-run a constructor
+                // on a fully-built object, or invoke `<init>` on a wrong type).
+                //
+                // After the call the spec replaces *all* occurrences of the
+                // uninitialized type — in both locals and stack — with the
+                // initialized class type:
+                //   - For `uninitializedThis`, the initialized type is the
+                //     current class (`this.<init>` chains to `super()`; `this`
+                //     is still the current class, not the superclass owner).
+                //     The declaring class of the invoked `<init>` must be the
+                //     current class (this-delegating `this(...)`) or its direct
+                //     superclass (`super(...)`).
+                //   - For `uninitialized(offset)`, the initialized type is the
+                //     method owner, which must match the class named by the
+                //     `new` at `offset` (we resolve it from the method ref).
+                match &receiver {
+                    VType::UninitializedThis => {
+                        // The invoked constructor's owner must be either the
+                        // current class or its (direct) superclass. We can only
+                        // prove the relationship via the hierarchy: accept if
+                        // the owner == current class, or current class is a
+                        // subclass of the owner (i.e. owner is an ancestor —
+                        // for a well-formed class the `super()` target is the
+                        // direct superclass).
+                        if let Some((owner, _, _)) =
+                            resolve_method_owner_name_and_type(cp, *index)
+                        {
+                            let ok = owner == current_class_name
+                                || hierarchy.is_subclass(current_class_name, &owner);
+                            if !ok {
+                                return Err(verify_err(&format!(
+                                    "invokespecial <init>: uninitializedThis receiver requires \
+                                     the constructor owner to be the current class \
+                                     ({current_class_name}) or its superclass, found {owner}"
+                                )));
+                            }
+                        }
+                        let replacement =
+                            VType::ObjectRef(Arc::from(current_class_name));
+                        replace_vtype_in_frame(frame, &receiver, &replacement);
+                    }
+                    VType::Uninitialized(_) => {
+                        // The initialized type is the constructor's declaring
+                        // class (which the bytecode's `new` site created).
+                        let owner = resolve_method_owner_name_and_type(cp, *index)
+                            .map(|(o, _, _)| o);
+                        let cls: Arc<str> = match owner {
+                            Some(o) => Arc::from(o.as_str()),
+                            None => {
+                                return Err(verify_err(
+                                    "invokespecial <init>: cannot resolve constructor owner class",
+                                ));
+                            }
+                        };
+                        let replacement = VType::ObjectRef(cls);
+                        let to_replace = receiver.clone();
+                        replace_vtype_in_frame(frame, &to_replace, &replacement);
+                    }
+                    // Already-initialized reference, Null, or any non-uninitialized
+                    // type is not a legal receiver for `<init>` — reject.
+                    other => {
+                        return Err(verify_err(&format!(
+                            "invokespecial <init>: receiver must be an uninitialized object \
+                             (uninitializedThis or uninitialized(offset)), found {other:?}"
+                        )));
+                    }
                 }
             }
             // Push return type
@@ -2015,5 +2071,107 @@ mod tests {
         let result =
             verify_instruction(&Instruction::Areturn, 0, &mut frame, &cp, "Test", "test", "()V", &h);
         assert!(result.is_err(), "areturn in a void method must fail");
+    }
+
+    /// Build a constant pool whose entry #6 is a `MethodReference` to
+    /// `java/lang/Object.<init>()V`, for `invokespecial <init>` tests.
+    fn init_cp() -> ConstantPool {
+        ConstantPool::new(vec![
+            ConstantPoolEntry::Tombstone,                            // 0
+            ConstantPoolEntry::Utf8("java/lang/Object".into()),      // 1
+            ConstantPoolEntry::ClassReference { name_index: 1 },     // 2
+            ConstantPoolEntry::Utf8("<init>".into()),                // 3
+            ConstantPoolEntry::Utf8("()V".into()),                   // 4
+            ConstantPoolEntry::NameAndType {
+                name_index: 3,
+                descriptor_index: 4,
+            }, // 5
+            ConstantPoolEntry::MethodReference {
+                class_index: 2,
+                name_and_type_index: 5,
+            }, // 6
+        ])
+    }
+
+    #[test]
+    fn invokespecial_init_on_initialized_ref_rejected() {
+        // JVMS §4.10.1.9: `<init>` may only be invoked on an *uninitialized*
+        // receiver. An already-initialized ObjectRef must be rejected.
+        let cp = init_cp();
+        let h = MockHierarchy;
+        let mut frame = make_frame(1, 4);
+        frame
+            .push(VType::ObjectRef(Arc::from("java/lang/Object")))
+            .unwrap();
+
+        let result = verify_instruction(
+            &Instruction::Invokespecial(6),
+            0,
+            &mut frame,
+            &cp,
+            "Test",
+            "test",
+            "()V",
+            &h,
+        );
+        assert!(
+            result.is_err(),
+            "invokespecial <init> on an initialized ObjectRef must fail verification"
+        );
+    }
+
+    #[test]
+    fn invokespecial_init_on_null_rejected() {
+        // `Null` is a reference but not an uninitialized object — reject.
+        let cp = init_cp();
+        let h = MockHierarchy;
+        let mut frame = make_frame(1, 4);
+        frame.push(VType::Null).unwrap();
+
+        let result = verify_instruction(
+            &Instruction::Invokespecial(6),
+            0,
+            &mut frame,
+            &cp,
+            "Test",
+            "test",
+            "()V",
+            &h,
+        );
+        assert!(
+            result.is_err(),
+            "invokespecial <init> on Null must fail verification"
+        );
+    }
+
+    #[test]
+    fn invokespecial_init_on_uninitialized_initializes_slot() {
+        // A `Uninitialized(offset)` receiver is legal; after the call every
+        // aliased copy of that uninitialized type becomes the owner ObjectRef.
+        let cp = init_cp();
+        let h = MockHierarchy;
+        let mut frame = make_frame(1, 4);
+        // local 0 aliases the same uninitialized object (as if `dup`'d into it)
+        frame.locals[0] = VType::Uninitialized(0);
+        frame.push(VType::Uninitialized(0)).unwrap();
+
+        verify_instruction(
+            &Instruction::Invokespecial(6),
+            0,
+            &mut frame,
+            &cp,
+            "Test",
+            "test",
+            "()V",
+            &h,
+        )
+        .expect("invokespecial <init> on an uninitialized receiver must verify");
+
+        // The receiver was popped; the aliased local must now be initialized.
+        assert_eq!(
+            frame.locals[0],
+            VType::ObjectRef(Arc::from("java/lang/Object")),
+            "uninitialized slot must be replaced with the initialized owner type"
+        );
     }
 }

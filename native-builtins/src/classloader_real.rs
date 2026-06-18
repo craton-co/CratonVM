@@ -436,7 +436,17 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // ClassLoader.findLoadedClass(String) — check if class is already loaded
+    // ClassLoader.findLoadedClass(String) — check if a class is ALREADY
+    // loaded; per the JVM spec this MUST NOT trigger loading. The previous
+    // impl called `ctx.load_class(&internal)`, which loaded any
+    // classpath-resolvable class as a side effect and then reported it as
+    // loaded — so `findLoadedClass("not.yet.Loaded")` returned non-null
+    // where HotSpot returns null. That broke Spring's `assertClassNotLoaded`
+    // (type-filter / classpath-scanning tests: `AnnotationTypeFilterTests`,
+    // `AssignableTypeFilterTests`, … — bug-06 family 3), which scans class
+    // *bytes* via ASM without loading and then asserts the class was not
+    // loaded. Use a no-load lookup of the loaded-class set instead (matches
+    // the synthetic-mode `cl_find_loaded_class` handler and HotSpot).
     r.register(
         cl,
         "findLoadedClass",
@@ -448,9 +458,9 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
             };
             let class_name = ctx.read_string(class_name_obj).unwrap_or_default();
             let internal = class_name.replace('.', "/");
-            match ctx.load_class(&internal) {
-                Ok(Some(mirror)) => Ok(Some(mirror)),
-                _ => Ok(Some(Value::Object(None))),
+            match ctx.class_id_by_name(&internal) {
+                Some(cid) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid))))),
+                None => Ok(Some(Value::Object(None))),
             }
         },
     );

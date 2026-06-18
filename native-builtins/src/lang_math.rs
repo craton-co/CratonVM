@@ -1442,21 +1442,77 @@ pub(crate) fn native_math_rint(_ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Double(v.round_ties_even())))
 }
 
+/// JDK 9+ Math.round(double) semantics (JDK-6430675).
+///
+/// The naive `floor(v + 0.5)` is WRONG for the largest value just below 0.5:
+/// `0.49999999999999994 + 0.5` rounds up to exactly `1.0` in IEEE-754, so the
+/// naive form returns 1 instead of the correct 0. OpenJDK fixed this by
+/// computing the round-half-up result directly from the significand bits, which
+/// avoids the spurious add. We mirror that exact algorithm so half-way and
+/// just-below-half cases match HotSpot bit-for-bit.
+#[inline]
+fn round_double(a: f64) -> i64 {
+    // Layout constants for IEEE-754 binary64.
+    const SIGNIFICAND_WIDTH: i64 = 53; // 52 stored bits + implicit leading 1
+    const EXP_BIAS: i64 = 1023;
+    const EXP_BIT_MASK: u64 = 0x7FF0_0000_0000_0000;
+    const SIGNIF_BIT_MASK: u64 = 0x000F_FFFF_FFFF_FFFF;
+
+    let long_bits = a.to_bits();
+    let biased_exp = ((long_bits & EXP_BIT_MASK) >> (SIGNIFICAND_WIDTH - 1)) as i64;
+    let shift = (SIGNIFICAND_WIDTH - 2 + EXP_BIAS) - biased_exp;
+    if (shift & -64) == 0 {
+        // `a` is finite with 2^-64 <= ulp(a) < 1, i.e. shift in 0..=63.
+        let mut r = ((long_bits & SIGNIF_BIT_MASK) | (SIGNIF_BIT_MASK + 1)) as i64;
+        if (long_bits as i64) < 0 {
+            r = -r;
+        }
+        ((r >> shift) + 1) >> 1
+    } else {
+        // `a` is already integral (|a| >= 2^52), or +/-0, infinity, or NaN.
+        // `as i64` is a saturating/NaN->0 cast, matching the JDK's clamping
+        // semantics for out-of-range and NaN inputs.
+        a as i64
+    }
+}
+
 #[inline]
 pub(crate) fn native_math_round_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    // Java Math.round(double) returns long, uses floor(v + 0.5)
-    if v.is_nan() {
-        Ok(Some(Value::Long(0)))
-    } else if v >= i64::MAX as f64 {
-        Ok(Some(Value::Long(i64::MAX)))
-    } else if v <= i64::MIN as f64 {
-        Ok(Some(Value::Long(i64::MIN)))
+    // Java Math.round(double) returns long. Use the bit-exact JDK 9+ algorithm
+    // (round_double) instead of floor(v + 0.5), which mis-rounds the largest
+    // value just below 0.5 (round(0.49999999999999994) must be 0, not 1).
+    Ok(Some(Value::Long(round_double(v))))
+}
+
+/// JDK 9+ Math.round(float) semantics (JDK-6430675). Same bit-exact
+/// round-half-up algorithm as `round_double`, but for IEEE-754 binary32, so the
+/// largest float just below 0.5f rounds to 0 (not 1).
+#[inline]
+fn round_float(a: f32) -> i32 {
+    // Layout constants for IEEE-754 binary32.
+    const SIGNIFICAND_WIDTH: i32 = 24; // 23 stored bits + implicit leading 1
+    const EXP_BIAS: i32 = 127;
+    const EXP_BIT_MASK: u32 = 0x7F80_0000;
+    const SIGNIF_BIT_MASK: u32 = 0x007F_FFFF;
+
+    let int_bits = a.to_bits();
+    let biased_exp = ((int_bits & EXP_BIT_MASK) >> (SIGNIFICAND_WIDTH - 1)) as i32;
+    let shift = (SIGNIFICAND_WIDTH - 2 + EXP_BIAS) - biased_exp;
+    if (shift & -32) == 0 {
+        // `a` is finite with 2^-32 <= ulp(a) < 1, i.e. shift in 0..=31.
+        let mut r = ((int_bits & SIGNIF_BIT_MASK) | (SIGNIF_BIT_MASK + 1)) as i32;
+        if (int_bits as i32) < 0 {
+            r = -r;
+        }
+        ((r >> shift) + 1) >> 1
     } else {
-        Ok(Some(Value::Long((v + 0.5).floor() as i64)))
+        // `a` is already integral (|a| >= 2^23), or +/-0, infinity, or NaN.
+        // `as i32` is a saturating/NaN->0 cast, matching the JDK's clamping.
+        a as i32
     }
 }
 
@@ -1466,16 +1522,10 @@ pub(crate) fn native_math_round_float(_ctx: &mut dyn NativeContext, args: &[Valu
         Some(Value::Float(v)) => *v,
         _ => 0.0,
     };
-    // Java Math.round(float) returns int, uses floor(v + 0.5)
-    if v.is_nan() {
-        Ok(Some(Value::Int(0)))
-    } else if v >= i32::MAX as f32 {
-        Ok(Some(Value::Int(i32::MAX)))
-    } else if v <= i32::MIN as f32 {
-        Ok(Some(Value::Int(i32::MIN)))
-    } else {
-        Ok(Some(Value::Int((v + 0.5f32).floor() as i32)))
-    }
+    // Java Math.round(float) returns int. Use the bit-exact JDK 9+ algorithm
+    // (round_float) instead of floor(v + 0.5f), which mis-rounds the largest
+    // value just below 0.5f.
+    Ok(Some(Value::Int(round_float(v))))
 }
 
 #[inline]
@@ -4174,6 +4224,70 @@ mod tests {
         let mut ctx = mock_ctx();
         let r = native_math_round_float(&mut ctx, &[Value::Float(2.5)]);
         assert_eq!(r.unwrap(), Some(Value::Int(3)));
+    }
+
+    // JDK-6430675: the largest double just below 0.5 must round to 0, NOT 1.
+    // `0.49999999999999994 + 0.5` rounds up to exactly 1.0 in IEEE-754, so the
+    // old floor(v + 0.5) form returned 1. The bit-exact algorithm returns 0.
+    #[test]
+    fn math_round_double_just_below_half() {
+        let mut ctx = mock_ctx();
+        // 0.49999999999999994 == nextDown(0.5).
+        let just_below = 0.49999999999999994_f64;
+        assert!(just_below < 0.5 && just_below + 0.5 == 1.0);
+        let r = native_math_round_double(&mut ctx, &[Value::Double(just_below)]);
+        assert_eq!(r.unwrap(), Some(Value::Long(0)));
+        // Exactly half-way still rounds up (round-half-up).
+        let r = native_math_round_double(&mut ctx, &[Value::Double(0.5)]);
+        assert_eq!(r.unwrap(), Some(Value::Long(1)));
+    }
+
+    #[test]
+    fn math_round_double_negatives_and_specials() {
+        let mut ctx = mock_ctx();
+        let round = |v: f64| match native_math_round_double(&mut mock_ctx(), &[Value::Double(v)]).unwrap() {
+            Some(Value::Long(x)) => x,
+            other => panic!("expected Long, got {other:?}"),
+        };
+        // round(-0.5) == 0 (half-up toward +inf, matching HotSpot).
+        assert_eq!(round(-0.5), 0);
+        // round(-0.50000000000000011) == -1 (just past -0.5).
+        assert_eq!(round(-0.5000000000000001), -1);
+        assert_eq!(round(-2.5), -2);
+        assert_eq!(round(-2.6), -3);
+        assert_eq!(round(2.4), 2);
+        // NaN -> 0, infinities clamp to extremes.
+        assert_eq!(round(f64::NAN), 0);
+        assert_eq!(round(f64::INFINITY), i64::MAX);
+        assert_eq!(round(f64::NEG_INFINITY), i64::MIN);
+        let _ = &mut ctx;
+    }
+
+    // JDK-6430675 (float variant): the largest float just below 0.5f -> 0.
+    #[test]
+    fn math_round_float_just_below_half() {
+        let mut ctx = mock_ctx();
+        // 0.49999997_f32 == nextDown(0.5f).
+        let just_below = 0.49999997_f32;
+        assert!(just_below < 0.5_f32 && just_below + 0.5_f32 == 1.0_f32);
+        let r = native_math_round_float(&mut ctx, &[Value::Float(just_below)]);
+        assert_eq!(r.unwrap(), Some(Value::Int(0)));
+        let r = native_math_round_float(&mut ctx, &[Value::Float(0.5_f32)]);
+        assert_eq!(r.unwrap(), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn math_round_float_negatives_and_specials() {
+        let round = |v: f32| match native_math_round_float(&mut mock_ctx(), &[Value::Float(v)]).unwrap() {
+            Some(Value::Int(x)) => x,
+            other => panic!("expected Int, got {other:?}"),
+        };
+        assert_eq!(round(-0.5_f32), 0);
+        assert_eq!(round(-2.5_f32), -2);
+        assert_eq!(round(-2.6_f32), -3);
+        assert_eq!(round(f32::NAN), 0);
+        assert_eq!(round(f32::INFINITY), i32::MAX);
+        assert_eq!(round(f32::NEG_INFINITY), i32::MIN);
     }
 
     // -----------------------------------------------------------------------

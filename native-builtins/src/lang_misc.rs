@@ -423,7 +423,14 @@ pub(crate) fn native_init_stack_trace_elements(
             .unwrap_or_default();
 
     let cap = ctx.array_length(elements);
-    for (i, (cls_slashed, meth, file, line)) in trace_data.iter().take(cap).enumerate() {
+    // `Throwable.getStackTrace()` requires index 0 = the most-recent (innermost)
+    // frame — the throw site. The stored trace is **outermost-first** (`main`
+    // first): that is the order `capture_stack_trace` documents and the order
+    // the StackWalker / `Reflection.getCallerClass` consumers rely on, so we do
+    // NOT change the capture. Reverse only here, when materialising the
+    // user-facing `StackTraceElement[]`, so it matches the JDK (throw site at
+    // [0], `main` last) instead of being upside-down.
+    for (i, (cls_slashed, meth, file, line)) in trace_data.iter().rev().take(cap).enumerate() {
         let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
         let cls_dotted = match ctx.class_id_by_name(cls_slashed) {
             Some(cid) => crate::lang_class::dotted_class_name(cid, cls_slashed),
@@ -484,10 +491,16 @@ pub(crate) fn native_throwable_get_stack_trace_element(
 
     // Clone the trace entry data to release the immutable borrow on ctx
     // before we need mutable access for object allocation.
-    let entry_data = ctx
-        .get_stack_trace(hash)
-        .and_then(|t| t.get(index as usize))
-        .cloned();
+    // Stored trace is outermost-first; `getStackTraceElement(index)` is
+    // innermost-first (index 0 = throw site), so map to the reversed index.
+    let entry_data = ctx.get_stack_trace(hash).and_then(|t| {
+        let len = t.len();
+        if index >= 0 && (index as usize) < len {
+            t.get(len - 1 - index as usize).cloned()
+        } else {
+            None
+        }
+    });
 
     // Helper: build a StackTraceElement with 4 fields.
     //
@@ -758,7 +771,10 @@ fn throwable_frame_lines(ctx: &mut dyn NativeContext, t: ObjectRef) -> Vec<Strin
     let frames: Vec<(String, String, Option<String>, i32)> = ctx
         .get_stack_trace(hash)
         .map(|tr| {
+            // stored trace is outermost-first; printStackTrace prints the
+            // throw site first, so reverse to innermost-first.
             tr.iter()
+                .rev()
                 .map(|e| {
                     (
                         e.class_name.replace('/', "."),
@@ -954,7 +970,9 @@ pub(crate) fn native_throwable_get_stack_trace_array(
 
     let len = trace_data.len();
     let arr = ctx.new_ref_array(ClassId::new(0), len);
-    for (i, (cls_slashed, meth, file, line)) in trace_data.iter().enumerate() {
+    // stored trace is outermost-first; getStackTrace() wants index 0 = the
+    // throw site (innermost), so fill the array reversed.
+    for (i, (cls_slashed, meth, file, line)) in trace_data.iter().rev().enumerate() {
         let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
         // Reuse the dotted-name cache shared with `Class.getName()` so
         // repeat frames in the same trace (recursion) hit the cached
@@ -1253,7 +1271,52 @@ pub(crate) fn register_phase53_record(r: &mut NativeMethodRegistry) {
             }
             let nf = ctx.object_num_fields(this);
             for i in 0..nf {
-                if ctx.get_field(this, i) != ctx.get_field(*other, i) {
+                let a = ctx.get_field(this, i);
+                let b = ctx.get_field(*other, i);
+                // MED fix: per the JLS record-equality contract (and the
+                // `java.lang.runtime.ObjectMethods` bootstrap HotSpot uses),
+                // reference-typed components are compared with `Objects.equals`
+                // (null-safe `a.equals(b)` via virtual dispatch), NOT by pointer
+                // identity. Two records with equal-but-distinct String/boxed
+                // components must be `equals`. Primitive components compare by
+                // value; `float`/`double` use bitwise (`Float`/`Double.compare`)
+                // semantics to match the generated canonical `equals`.
+                let component_equal = match (&a, &b) {
+                    // Reference components: null-safe virtual `equals`.
+                    (Value::Object(_), _) | (_, Value::Object(_)) => {
+                        match (a, b) {
+                            (Value::Object(None), Value::Object(None)) => true,
+                            (Value::Object(None), _) | (_, Value::Object(None)) => false,
+                            (Value::Object(Some(ra)), Value::Object(Some(rb))) => {
+                                // Identity fast-path, then dispatch `ra.equals(rb)`.
+                                if std::ptr::eq(ra.as_ptr(), rb.as_ptr()) {
+                                    true
+                                } else {
+                                    match ctx.invoke_virtual(
+                                        ra,
+                                        "equals",
+                                        "(Ljava/lang/Object;)Z",
+                                        &[Value::Object(Some(rb))],
+                                    )? {
+                                        Some(Value::Int(v)) => v != 0,
+                                        _ => false,
+                                    }
+                                }
+                            }
+                            // Mismatched kinds (a reference vs. a primitive slot)
+                            // cannot occur for a well-formed record, but treat as
+                            // not-equal rather than mis-comparing.
+                            _ => false,
+                        }
+                    }
+                    // Primitive components: compare by value. `float`/`double`
+                    // use bitwise compare so `NaN==NaN` and `-0.0!=0.0`, matching
+                    // the canonical generated `equals` (Float/Double.compare).
+                    (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+                    (Value::Double(x), Value::Double(y)) => x.to_bits() == y.to_bits(),
+                    _ => a == b,
+                };
+                if !component_equal {
                     return Ok(Some(Value::Int(0)));
                 }
             }
@@ -1268,6 +1331,10 @@ pub(crate) fn register_phase53_record(r: &mut NativeMethodRegistry) {
         let mut hash: i32 = 0;
         for i in 0..nf {
             let v = ctx.get_field(this, i);
+            // MED fix: derive a reference component's contribution from its
+            // virtual `hashCode()` (null -> 0), NOT its pointer address, so the
+            // result is stable across equal-but-distinct components and honours
+            // the record equals/hashCode contract. Primitives hash by value.
             let h = match v {
                 Value::Int(n) => n,
                 Value::Long(n) => (n ^ (n >> 32)) as i32,
@@ -1276,7 +1343,11 @@ pub(crate) fn register_phase53_record(r: &mut NativeMethodRegistry) {
                     let bits = d.to_bits();
                     (bits ^ (bits >> 32)) as i32
                 }
-                Value::Object(Some(r)) => r.as_ptr() as i32,
+                Value::Object(None) => 0,
+                Value::Object(Some(r)) => match ctx.invoke_virtual(r, "hashCode", "()I", &[])? {
+                    Some(Value::Int(hc)) => hc,
+                    _ => ctx.identity_hash_code(r),
+                },
                 _ => 0,
             };
             hash = hash.wrapping_mul(31).wrapping_add(h);

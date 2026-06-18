@@ -79,6 +79,14 @@ pub struct InvariantLoad {
 /// This is structurally similar to `x64::detect_loops` but groups by
 /// header and records the body extent. The two implementations
 /// should converge in a later round.
+///
+/// ANALYSIS-ONLY — NOT WIRED INTO CODEGEN. This pass is descriptive
+/// scaffolding for the (deferred) generic LICM consumer; nothing in
+/// the x64/aarch64 emitter currently calls it, and its output must
+/// not be treated as a hoisting decision. See the module-level
+/// "Status" doc for why hoisting is deferred. Do not assume the
+/// returned `LoopInfo` body extent is exact: it is a conservative
+/// half-open PC interval, not a precise reachable-block set.
 pub fn detect_loops(code: &[u8], code_len: usize) -> Vec<LoopInfo> {
     use std::collections::BTreeMap;
     let mut by_header: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -129,10 +137,13 @@ pub fn detect_loops(code: &[u8], code_len: usize) -> Vec<LoopInfo> {
 /// modified-locals set of the loop body. The modified-locals set is
 /// computed cheaply via a single bytecode scan.
 ///
-/// Consumers should NOT yet act on the returned list — the hoisting
-/// itself requires safepoint and oop-map adjustments not implemented
-/// here. This function exists so that future hoisting passes can be
-/// developed and tested without re-implementing detection.
+/// ANALYSIS-ONLY — NOT WIRED INTO CODEGEN. Consumers must NOT yet act
+/// on the returned list: the hoisting itself requires safepoint and
+/// oop-map adjustments (see module "Status") not implemented here, and
+/// no emitter path currently calls this function. It exists so future
+/// hoisting passes can be developed and tested against detection that
+/// is already validated, without re-implementing it. Treating the
+/// returned candidates as "safe to hoist" today would be incorrect.
 pub fn find_invariant_loads(loop_info: &LoopInfo, code: &[u8]) -> Vec<InvariantLoad> {
     let (start, end) = loop_info.body_blocks;
     if end > code.len() || start >= end {
@@ -253,10 +264,19 @@ fn modified_locals_in_range(code: &[u8], start: usize, end: usize) -> u64 {
     modified
 }
 
-/// Conservative bytecode instruction length. Returns 1 for unknown
-/// opcodes so the scanner cannot underflow; this may slightly
-/// overcount loop bodies for esoteric ops, which only loses
-/// hoisting opportunities (never produces incorrect ones).
+/// Bytecode instruction length in bytes for the opcode at `pc`.
+///
+/// Returns 1 for genuinely-unknown opcodes so the linear scanner
+/// cannot underflow; this may slightly overcount loop bodies for
+/// esoteric ops, which only loses hoisting opportunities (never
+/// produces incorrect ones).
+///
+/// The variable-length `tableswitch`/`lookupswitch` instructions are
+/// decoded precisely (padding + payload). Returning the wrong length
+/// for them is a genuine correctness bug: any caller that advances
+/// `pc += inst_len_at(..)` would land in the middle of the switch
+/// operand bytes and decode padding / jump offsets as opcodes,
+/// desyncing the whole scan for the remainder of the method.
 fn inst_len_at(code: &[u8], pc: usize) -> usize {
     if pc >= code.len() {
         return 1;
@@ -283,10 +303,69 @@ fn inst_len_at(code: &[u8], pc: usize) -> usize {
         // 5-byte: invokedynamic / invokeinterface / multianewarray
         0xb9 | 0xba => 5,
         0xc5 => 4,
-        // tableswitch (0xaa) / lookupswitch (0xab): variable; we
-        // conservatively stop the scan when we hit one — the loop
-        // body computation will not include past it.
-        0xaa | 0xab => 1,
+        // goto_w / jsr_w: 1 opcode + 4-byte offset.
+        0xc8 | 0xc9 => 5,
+        // tableswitch (0xaa): 1 opcode byte, then 0..=3 padding bytes
+        // aligning the next byte to a 4-byte boundary *relative to the
+        // start of the code array* (the method's first bytecode is
+        // offset 0), then defaultbyte (4) + low (4) + high (4), then
+        // (high - low + 1) jump offsets of 4 bytes each.
+        0xaa => {
+            // First operand byte sits at the next 4-aligned offset.
+            let base = (pc + 1 + 3) & !3;
+            // Need low at base+4..base+8 and high at base+8..base+12.
+            let high_end = base + 12;
+            if high_end > code.len() {
+                // Truncated/garbage — fall back to a 1-byte step so
+                // the scan terminates safely rather than reading OOB.
+                return 1;
+            }
+            let low = i32::from_be_bytes([
+                code[base + 4],
+                code[base + 5],
+                code[base + 6],
+                code[base + 7],
+            ]);
+            let high = i32::from_be_bytes([
+                code[base + 8],
+                code[base + 9],
+                code[base + 10],
+                code[base + 11],
+            ]);
+            // n = high - low + 1 entries. Guard against malformed
+            // (high < low) tables that would make n negative.
+            let n = (high as i64) - (low as i64) + 1;
+            if n < 0 {
+                return 1;
+            }
+            // total = (base - pc) header skip + 12 (default/low/high)
+            //         + n * 4 jump offsets.
+            (base - pc) + 12 + (n as usize) * 4
+        }
+        // lookupswitch (0xab): 1 opcode byte, then 0..=3 padding bytes
+        // aligning to a 4-byte boundary (same rule as tableswitch),
+        // then defaultbyte (4) + npairs (4), then npairs match/offset
+        // pairs of 8 bytes each.
+        0xab => {
+            let base = (pc + 1 + 3) & !3;
+            // Need npairs at base+4..base+8.
+            let npairs_end = base + 8;
+            if npairs_end > code.len() {
+                return 1;
+            }
+            let npairs = i32::from_be_bytes([
+                code[base + 4],
+                code[base + 5],
+                code[base + 6],
+                code[base + 7],
+            ]);
+            if npairs < 0 {
+                return 1;
+            }
+            // total = (base - pc) header skip + 8 (default/npairs)
+            //         + npairs * 8 (match/offset pairs).
+            (base - pc) + 8 + (npairs as usize) * 8
+        }
         // wide-prefixed instruction; nominal 4 bytes for most
         // (3-byte payload follows), 6 for iinc.
         0xc4 => {
@@ -370,6 +449,89 @@ mod tests {
         assert_eq!(v[1].load_pc, 5);
         assert_eq!(v[1].cp_index, 2);
         assert_eq!(v[1].receiver_local, None);
+    }
+
+    #[test]
+    fn inst_len_tableswitch_padded_and_jumptable() {
+        // Layout (PC shown). tableswitch must align its first operand
+        // byte to a 4-byte boundary relative to code start.
+        //
+        // PC 0: nop                     ; force pc=1 for the switch so
+        //                               ; padding is non-trivial.
+        // PC 1: tableswitch (0xaa)
+        //   pad PC 2,3 (operand byte aligns to PC 4)
+        //   PC 4..8:   default = 0
+        //   PC 8..12:  low     = 0
+        //   PC 12..16: high    = 2   → n = high-low+1 = 3 jump offsets
+        //   PC 16..20: jump[0]
+        //   PC 20..24: jump[1]
+        //   PC 24..28: jump[2]
+        // operand begins at (1+1+3)&!3 = 4, so padding = PC 2,3 (2 bytes).
+        // → instruction spans PC 1..28, i.e. length 27.
+        let mut code: Vec<u8> = Vec::new();
+        code.push(0x00); // PC 0: nop
+        code.push(0xaa); // PC 1: tableswitch opcode
+        // operand begins at (1+1+3)&!3 = 4, so padding = PC 2,3 (2 bytes)
+        code.push(0x00); // PC 2 padding
+        code.push(0x00); // PC 3 padding
+        code.extend_from_slice(&0i32.to_be_bytes()); // PC 4..8 default
+        code.extend_from_slice(&0i32.to_be_bytes()); // PC 8..12 low
+        code.extend_from_slice(&2i32.to_be_bytes()); // PC 12..16 high
+        code.extend_from_slice(&0i32.to_be_bytes()); // PC 16..20 jump[0]
+        code.extend_from_slice(&0i32.to_be_bytes()); // PC 20..24 jump[1]
+        code.extend_from_slice(&0i32.to_be_bytes()); // PC 24..28 jump[2]
+        assert_eq!(code.len(), 28);
+        // Length of the tableswitch at PC 1 must carry the scanner to
+        // PC 28 (end of code): 28 - 1 = 27.
+        assert_eq!(inst_len_at(&code, 1), 27);
+        // And a linear scan from PC 0 lands exactly on the end, never
+        // mis-decoding a padding/offset byte as an opcode.
+        let mut pc = 0;
+        let mut steps = 0;
+        while pc < code.len() {
+            pc += inst_len_at(&code, pc);
+            steps += 1;
+            assert!(steps < 100, "scan failed to terminate (desync)");
+        }
+        assert_eq!(pc, code.len());
+        assert_eq!(steps, 2); // nop, then tableswitch
+    }
+
+    #[test]
+    fn inst_len_lookupswitch_padded_and_pairs() {
+        // PC 0: lookupswitch (0xab)
+        //   operand at (0+1+3)&!3 = 4, so 3 padding bytes at PC 1,2,3
+        //   PC 4..8:   default = 0
+        //   PC 8..12:  npairs  = 2
+        //   PC 12..20: pair[0] (match,offset)
+        //   PC 20..28: pair[1] (match,offset)
+        // → spans PC 0..28, length 28.
+        let mut code: Vec<u8> = Vec::new();
+        code.push(0xab); // PC 0: lookupswitch opcode
+        code.push(0x00); // PC 1 padding
+        code.push(0x00); // PC 2 padding
+        code.push(0x00); // PC 3 padding
+        code.extend_from_slice(&0i32.to_be_bytes()); // PC 4..8 default
+        code.extend_from_slice(&2i32.to_be_bytes()); // PC 8..12 npairs
+        code.extend_from_slice(&1i32.to_be_bytes()); // PC 12..16 match[0]
+        code.extend_from_slice(&0i32.to_be_bytes()); // PC 16..20 offset[0]
+        code.extend_from_slice(&2i32.to_be_bytes()); // PC 20..24 match[1]
+        code.extend_from_slice(&0i32.to_be_bytes()); // PC 24..28 offset[1]
+        assert_eq!(code.len(), 28);
+        assert_eq!(inst_len_at(&code, 0), 28);
+    }
+
+    #[test]
+    fn inst_len_truncated_switch_is_safe() {
+        // A bare tableswitch opcode with no room for the header must
+        // not read out of bounds; it falls back to a 1-byte step.
+        let code: Vec<u8> = vec![0xaa, 0x00, 0x00];
+        assert_eq!(inst_len_at(&code, 0), 1);
+        // Likewise a malformed lookupswitch with negative npairs.
+        let mut bad: Vec<u8> = vec![0xab, 0x00, 0x00, 0x00];
+        bad.extend_from_slice(&0i32.to_be_bytes()); // default
+        bad.extend_from_slice(&(-5i32).to_be_bytes()); // npairs < 0
+        assert_eq!(inst_len_at(&bad, 0), 1);
     }
 
     #[test]

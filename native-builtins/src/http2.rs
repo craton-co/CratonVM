@@ -12,6 +12,7 @@
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::{ObjectRef, Value};
+use cratonvm_types::error::RuntimeError;
 use crate::{native_noop_with_this, obj_arg, alloc_concurrent_synthetic};
 
 use std::io::Write;
@@ -490,6 +491,66 @@ fn extract_uri_parts(ctx: &dyn NativeContext, uri: ObjectRef) -> Option<(String,
 /// Maximum HTTP response body size (10 MB).
 const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024;
 
+/// [VULN fix nb-http2 (2)] Reject any CR, LF, or NUL byte in a value that is
+/// interpolated into the HTTP/1.1 request line or a header field.
+///
+/// `http11_request_impl` builds the request line by directly interpolating the
+/// method, request-target (path) and `Host` value. Without this check an
+/// attacker-controlled value containing `\r\n` could inject extra request lines
+/// or headers (HTTP request splitting / smuggling). The JDK's
+/// `java.net.http`/`HeaderName`/field-value validation rejects these characters
+/// with `IllegalArgumentException`; we mirror that here.
+fn validate_no_crlf(kind: &str, value: &str) -> Result<(), RuntimeError> {
+    for &b in value.as_bytes() {
+        if b == b'\r' || b == b'\n' || b == 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!(
+                    "illegal character in HTTP request {kind}: control byte 0x{b:02x} (CR/LF/NUL not permitted)"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// [HIGH fix nb-http2 (1)] Refuse to silently send a request whose headers or
+/// body would be dropped.
+///
+/// The synthetic `HttpRequest` only retains a header *count* (`REQ_HDR_COUNT`)
+/// and a `REQ_HAS_BODY` flag — the builder discards the actual header
+/// name/value strings and the `BodyPublisher` content, and `BodyPublisher`
+/// itself only stores a length, never the bytes. Therefore the request line
+/// emitted by `http11_request_impl` cannot reproduce caller-supplied headers or
+/// a request body. Rather than transmit a corrupted (header/body-less) request
+/// and pretend it succeeded, we throw `UnsupportedOperationException` so the
+/// caller sees an honest failure. A plain request with no headers and no body
+/// loses nothing and is allowed to proceed.
+///
+/// Full fidelity requires the builder (`HttpRequest$Builder.header`/`POST`/...)
+/// and `BodyPublishers.*` to persist the real header strings and body bytes on
+/// the object — a cross-file change outside this module's scope. See the
+/// cross-file follow-up in the task report.
+fn ensure_no_dropped_payload(ctx: &dyn NativeContext, req: ObjectRef) -> Result<(), RuntimeError> {
+    let hdr_count = match ctx.get_field(req, REQ_HDR_COUNT) {
+        Value::Int(n) => n,
+        _ => 0,
+    };
+    let has_body = match ctx.get_field(req, REQ_HAS_BODY) {
+        Value::Int(n) => n,
+        _ => 0,
+    };
+    if hdr_count > 0 || has_body != 0 {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: format!(
+                "CratonVM HttpClient cannot send requests with custom headers ({hdr_count}) \
+                 or a request body (has_body={has_body}): the synthetic request layout does not \
+                 retain header values or body bytes (would be silently dropped)"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Perform a real HTTP/1.1 request with optional TLS and return (status_code, response_body).
 fn http11_request(host: &str, port: u16, method: &str, path: &str) -> Result<(i32, String), String> {
     http11_request_impl(host, port, method, path, false)
@@ -501,6 +562,16 @@ fn https_request(host: &str, port: u16, method: &str, path: &str) -> Result<(i32
 }
 
 fn http11_request_impl(host: &str, port: u16, method: &str, path: &str, tls: bool) -> Result<(i32, String), String> {
+    // [VULN fix nb-http2 (2)] Defense-in-depth: never write a request line whose
+    // interpolated method/path/host carries CR, LF, or NUL — that would allow
+    // request splitting/smuggling. The native send/sendAsync handlers also
+    // validate (and surface IllegalArgumentException), but guarding here keeps
+    // the actual socket-write path safe for any caller.
+    let has_ctl = |s: &str| s.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n' || b == 0);
+    if has_ctl(method) || has_ctl(path) || has_ctl(host) {
+        return Err("illegal CR/LF/NUL in request line (request-splitting guard)".to_string());
+    }
+
     let addr = format!("{}:{}", host, port);
     let tcp_stream = TcpStream::connect(&addr).map_err(|e| format!("connect: {e}"))?;
     tcp_stream.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
@@ -705,6 +776,16 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
                 _ => port == 443,
             };
 
+            // [HIGH fix nb-http2 (1)] Don't silently drop caller headers/body —
+            // throw UnsupportedOperationException if the request carries either.
+            ensure_no_dropped_payload(ctx, req)?;
+
+            // [VULN fix nb-http2 (2)] Reject CR/LF/NUL in the values that are
+            // interpolated into the request line (request-splitting guard).
+            validate_no_crlf("method", method_str)?;
+            validate_no_crlf("request-target", &path)?;
+            validate_no_crlf("Host header", &host)?;
+
             // Perform real HTTP request (with TLS for HTTPS)
             let result = if use_tls {
                 https_request(&host, port, method_str, &path)
@@ -718,7 +799,11 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
                     // Store body string on a dedicated field — we use RESP_HAS_PREV (3)
                     // as body_obj since it's unused for real responses
                     ctx.set_field(resp, RESP_BODY_OBJ, Value::Object(Some(body_str)));
-                    let _hdrs = alloc_http_headers(ctx, 0, 0, 0);
+                    // NOTE [nb-http2 (1)]: response headers are not parsed/attached here.
+                    // The synthetic `HttpHeaders` layout (3 ints) cannot hold real
+                    // name/value pairs, so `HttpResponse.headers()` still fabricates a
+                    // fixed header set. Faithful response-header parsing requires
+                    // extending the HttpHeaders representation (cross-method follow-up).
                     Ok(Some(Value::Object(Some(resp))))
                 }
                 Err(_e) => {
@@ -776,6 +861,12 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(s)) => ctx.read_string(s).as_deref() == Some("https"),
                 _ => port == 443,
             };
+            // [HIGH fix nb-http2 (1)] Don't silently drop caller headers/body.
+            ensure_no_dropped_payload(ctx, req)?;
+            // [VULN fix nb-http2 (2)] Reject CR/LF/NUL in request-line values.
+            validate_no_crlf("method", method_str)?;
+            validate_no_crlf("request-target", &path)?;
+            validate_no_crlf("Host header", &host)?;
             let result = if use_tls {
                 https_request(&host, port, method_str, &path)
             } else {
@@ -2373,6 +2464,29 @@ mod http2_tests {
         assert_eq!(method_idx_to_name(METHOD_PATCH),   "PATCH");
         assert_eq!(method_idx_to_name(METHOD_OPTIONS), "OPTIONS");
         assert_eq!(method_idx_to_name(99),             "GET"); // unknown defaults to GET
+    }
+
+    // [VULN fix nb-http2 (2)] CR/LF/NUL request-splitting guard.
+    #[test]
+    fn test_validate_no_crlf_accepts_clean_values() {
+        assert!(validate_no_crlf("method", "GET").is_ok());
+        assert!(validate_no_crlf("request-target", "/path?a=b&c=d").is_ok());
+        assert!(validate_no_crlf("Host header", "example.com:8443").is_ok());
+        assert!(validate_no_crlf("request-target", "").is_ok());
+    }
+
+    #[test]
+    fn test_validate_no_crlf_rejects_cr_lf_nul() {
+        // A request-target carrying CRLF + an injected header must be rejected.
+        let split = "/path\r\nX-Injected: evil";
+        let err = validate_no_crlf("request-target", split).unwrap_err();
+        assert!(matches!(err, RuntimeError::IllegalArgumentException { .. }));
+
+        assert!(validate_no_crlf("Host header", "evil\rhost").is_err());
+        assert!(validate_no_crlf("Host header", "evil\nhost").is_err());
+        assert!(validate_no_crlf("method", "GET\0").is_err());
+        // Bare LF (header smuggling against lenient parsers) is rejected too.
+        assert!(validate_no_crlf("method", "GE\nT").is_err());
     }
 
     #[test]

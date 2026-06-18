@@ -48,12 +48,23 @@ const REPORT_CAP: usize = 12;
 #[cfg(windows)]
 fn probe_readable(a: usize) -> bool {
     // Minimal VirtualQuery binding — confirm the page is committed+readable.
+    //
+    // This declaration MUST stay byte-for-byte structurally identical to the
+    // one in `crash_handler::windows_fault` (same field types/order, same
+    // pointer types, same explicit `_pad`). Both declare the same `VirtualQuery`
+    // symbol, so Rust's `clashing_extern_declarations` lint compares the two and
+    // warns if they diverge. The explicit `_pad: u16` is the real Win32
+    // MEMORY_BASIC_INFORMATION alignment slot before the 8-aligned `region_size`
+    // (the compiler inserts it implicitly either way; making it explicit here
+    // keeps the two declarations structurally equal so the lint stays quiet and
+    // the layouts can never silently drift apart).
     #[repr(C)]
     struct MemoryBasicInformation {
-        base_address: *mut u8,
-        allocation_base: *mut u8,
+        base_address: *mut core::ffi::c_void,
+        allocation_base: *mut core::ffi::c_void,
         allocation_protect: u32,
         partition_id: u16,
+        _pad: u16,
         region_size: usize,
         state: u32,
         protect: u32,
@@ -61,7 +72,7 @@ fn probe_readable(a: usize) -> bool {
     }
     extern "system" {
         fn VirtualQuery(
-            lp_address: *const u8,
+            lp_address: *const core::ffi::c_void,
             lp_buffer: *mut MemoryBasicInformation,
             dw_length: usize,
         ) -> usize;
@@ -74,7 +85,7 @@ fn probe_readable(a: usize) -> bool {
     // is plain-old-data filled by the kernel on success.
     let n = unsafe {
         VirtualQuery(
-            a as *const u8,
+            a as *const core::ffi::c_void,
             mbi.as_mut_ptr(),
             std::mem::size_of::<MemoryBasicInformation>(),
         )

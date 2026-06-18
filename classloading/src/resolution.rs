@@ -41,7 +41,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use crate::fx_hash::{fx_hashmap_with_capacity, FxHashMap};
@@ -579,6 +579,63 @@ pub enum ResolvedMember {
 /// `Arc<str>` keys allow producers to clone the constant-pool-interned
 /// strings (refcount bump, no allocation) instead of copying the bytes
 /// — matches the round-3 `Arc<str>` CP work.
+/// Maximum number of distinct `(ClassId, name, descriptor)` triples the
+/// [`LinkResolver`] cache retains before the CLOCK sweep evicts cold
+/// entries (PERF: bound the cache).
+///
+/// Sizing rationale: the cache only holds *reflective* resolutions —
+/// the (class, name, descriptor) triples that go through
+/// `Class.getDeclaredMethod`, JNI `Get{Method,Field}ID`, Spring's
+/// `ReflectionUtils.findMethod`, ByteBuddy/Hibernate proxy scans, etc.
+/// A large Spring Boot / Wildfly cold start touches on the order of a
+/// few-thousand distinct hot triples (the same ~20-50k probes collapse
+/// onto a much smaller working set). 16 384 entries comfortably covers
+/// that working set so the steady-state hit rate is unchanged, while
+/// capping worst-case memory at ~16k * (tuple + value) ≈ a few MB even
+/// for pathological apps that reflect over tens of thousands of
+/// distinct members. Each entry is small (two `Arc<str>` clones — shared
+/// refcount bumps, not byte copies — plus a `ClassId` and a tagged enum).
+const CACHE_CAP: usize = 16 * 1024;
+
+/// Number of entries to *try* to reclaim each time the cap is hit. We
+/// sweep in a batch rather than evicting a single entry per insert so
+/// the amortised cost of the CLOCK pass is spread across many inserts
+/// (one O(n) sweep buys ~`CACHE_EVICT_BATCH` cheap inserts before the
+/// next sweep). 1/8 of the cap keeps the table comfortably below the cap
+/// without thrashing.
+const CACHE_EVICT_BATCH: usize = CACHE_CAP / 8;
+
+/// One stored cache entry: the resolved member plus a CLOCK
+/// "recently used" reference bit.
+///
+/// PERF: the bit is an `AtomicBool` so a cache **hit** can mark the
+/// entry as recently-used through the shared read guard (`Relaxed`
+/// store) without upgrading to the write lock — the read-lock fast path
+/// stays a hash + key compare + one relaxed store. The CLOCK eviction
+/// sweep (write side, runs only when the cap is reached) gives every
+/// marked entry a second chance: it clears set bits and evicts entries
+/// whose bit is already clear. This approximates LRU at O(1) amortised
+/// cost without per-hit LRU bookkeeping.
+struct CachedEntry {
+    value: ResolvedMember,
+    /// CLOCK reference bit. Set on every hit (relaxed), cleared by the
+    /// eviction sweep. `Relaxed` is sufficient: the bit is a pure
+    /// eviction heuristic and never gates correctness — a missed or
+    /// stale read at worst evicts a still-warm entry, which only forces
+    /// a recompute on the next probe (semantically identical to a miss).
+    used: AtomicBool,
+}
+
+impl CachedEntry {
+    #[inline]
+    fn new(value: ResolvedMember) -> Self {
+        // Born with the bit SET so a freshly-inserted entry survives the
+        // immediately-following sweep (it is by definition the most
+        // recently used).
+        Self { value, used: AtomicBool::new(true) }
+    }
+}
+
 pub struct LinkResolver {
     /// hashbrown `HashMap` (not std) so we get stable `raw_entry_mut`
     /// for borrow-free probes. Round 8 audit fix (CRIT): the old
@@ -586,8 +643,12 @@ pub struct LinkResolver {
     /// `Arc<str>` forced every probe (even a cache **hit**) to bump
     /// two Arc refcounts to build the lookup tuple — defeating the
     /// dedupe win on the hot Spring `findMethod` loop.
+    ///
+    /// PERF (bounded cache): the value is a [`CachedEntry`] carrying a
+    /// CLOCK reference bit so the table can be capped at [`CACHE_CAP`]
+    /// without per-hit LRU bookkeeping. See [`Self::evict_clock`].
     cache: parking_lot::RwLock<
-        hashbrown::HashMap<(ClassId, Arc<str>, Arc<str>), ResolvedMember, crate::fx_hash::FxBuildHasher>,
+        hashbrown::HashMap<(ClassId, Arc<str>, Arc<str>), CachedEntry, crate::fx_hash::FxBuildHasher>,
     >,
 }
 
@@ -647,7 +708,17 @@ impl LinkResolver {
                     && k_name.as_ref() == name
                     && k_desc.as_ref() == descriptor
             })
-            .map(|(_, v)| v.clone())
+            .map(|(_, entry)| {
+                // PERF (CLOCK): mark recently-used through the shared read
+                // guard with a relaxed store — no write-lock upgrade, so
+                // the hit path stays a hash + key compare + one atomic
+                // store. Skip the store if already set to avoid needless
+                // cache-line dirtying under read-heavy contention.
+                if !entry.used.load(Ordering::Relaxed) {
+                    entry.used.store(true, Ordering::Relaxed);
+                }
+                entry.value.clone()
+            })
     }
 
     /// Populate (or overwrite) a cache entry. Takes the write lock for
@@ -660,9 +731,64 @@ impl LinkResolver {
         descriptor: Arc<str>,
         resolved: ResolvedMember,
     ) {
-        self.cache
-            .write()
-            .insert((class_id, name, descriptor), resolved);
+        let mut guard = self.cache.write();
+        // PERF (bounded cache): keep the table under the cap. We sweep
+        // *before* inserting so the fresh entry (which `CachedEntry::new`
+        // marks used) is never the one evicted, and a single insert that
+        // crosses the threshold can't leave us permanently over-cap.
+        if guard.len() >= CACHE_CAP {
+            Self::evict_clock(&mut guard);
+        }
+        guard.insert((class_id, name, descriptor), CachedEntry::new(resolved));
+    }
+
+    /// CLOCK / second-chance eviction sweep (PERF: bound the cache).
+    ///
+    /// Runs under the write lock when the table hits [`CACHE_CAP`].
+    /// First pass: drop entries whose reference bit is clear (cold since
+    /// the last sweep) and clear the bit on the survivors (their "second
+    /// chance"). This approximates LRU without per-hit ordering
+    /// bookkeeping. If a single pass didn't reclaim enough — possible
+    /// when almost everything was touched since the last sweep — a
+    /// second `retain` drops now-clear entries until we're back under
+    /// the target. Correctness is unaffected: eviction only removes
+    /// cached answers, and a later probe simply re-walks and re-inserts
+    /// (identical to a cold miss).
+    fn evict_clock(
+        map: &mut hashbrown::HashMap<
+            (ClassId, Arc<str>, Arc<str>),
+            CachedEntry,
+            crate::fx_hash::FxBuildHasher,
+        >,
+    ) {
+        let target = CACHE_CAP.saturating_sub(CACHE_EVICT_BATCH);
+        // Pass 1: second-chance. Evict clear-bit entries; clear the bit
+        // on the rest.
+        map.retain(|_, entry| {
+            // `get_mut`-style access: we hold `&mut entry`, so a plain
+            // load/store is fine (no other thread can race us under the
+            // write lock).
+            if *entry.used.get_mut() {
+                *entry.used.get_mut() = false;
+                true
+            } else {
+                false
+            }
+        });
+        // Pass 2 (rare): everything survived pass 1 because all bits were
+        // set. Their bits are now clear, so a second sweep reclaims down
+        // to the target.
+        if map.len() > target {
+            let mut to_drop = map.len() - target;
+            map.retain(|_, entry| {
+                if to_drop > 0 && !*entry.used.get_mut() {
+                    to_drop -= 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
     }
 
     /// Round 8 audit fix (CRIT #2): caller-friendly "get-or-compute"
@@ -717,11 +843,19 @@ impl LinkResolver {
                     && k_name.as_ref() == name_arc.as_ref()
                     && k_desc.as_ref() == desc_arc.as_ref()
             })
-            .map(|(_, v)| v.clone());
+            .map(|(_, entry)| {
+                // Mark the race-winner used too (we just "hit" it).
+                entry.used.store(true, Ordering::Relaxed);
+                entry.value.clone()
+            });
         if let Some(existing) = race_winner {
             return existing;
         }
-        guard.insert((class_id, name_arc, desc_arc), resolved.clone());
+        // PERF (bounded cache): same cap enforcement as `insert`.
+        if guard.len() >= CACHE_CAP {
+            Self::evict_clock(&mut guard);
+        }
+        guard.insert((class_id, name_arc, desc_arc), CachedEntry::new(resolved.clone()));
         resolved
     }
 
@@ -826,11 +960,11 @@ impl LinkResolver {
     /// invalidates this cache in lockstep.
     pub fn invalidate_class(&self, class_id: ClassId) {
         let mut guard = self.cache.write();
-        guard.retain(|(key_class, _, _), resolved| {
+        guard.retain(|(key_class, _, _), entry| {
             if *key_class == class_id {
                 return false;
             }
-            match resolved {
+            match &entry.value {
                 ResolvedMember::Method { declaring_class_id, .. }
                 | ResolvedMember::Field { declaring_class_id, .. } => {
                     *declaring_class_id != class_id
@@ -1673,5 +1807,57 @@ mod tests {
             other => panic!("expected Method, got {other:?}"),
         }
         assert_eq!(resolver.len(), 1);
+    }
+
+    /// PERF (bounded cache): the cache must stay at or under [`CACHE_CAP`]
+    /// no matter how many distinct triples are inserted, and a hot entry
+    /// (kept warm via `get`) must survive the CLOCK eviction sweep.
+    #[test]
+    fn link_resolver_cache_is_bounded() {
+        let resolver = LinkResolver::new();
+        let desc: Arc<str> = Arc::from("()V");
+
+        // Insert a "hot" entry and keep touching it so its CLOCK bit
+        // stays set across sweeps.
+        let hot_class = ClassId::new(1);
+        let hot_name: Arc<str> = Arc::from("hot");
+        resolver.insert(
+            hot_class,
+            hot_name.clone(),
+            desc.clone(),
+            ResolvedMember::Method { declaring_class_id: hot_class, index: 0 },
+        );
+
+        // Flood the cache with far more than CACHE_CAP distinct triples,
+        // re-touching the hot entry between batches.
+        for i in 0..(CACHE_CAP * 3) {
+            // Use ClassId values that never collide with `hot_class`.
+            let cid = ClassId::new((i as u32) + 2);
+            let name: Arc<str> = Arc::from(format!("m{i}"));
+            resolver.insert(
+                cid,
+                name,
+                desc.clone(),
+                ResolvedMember::Method { declaring_class_id: cid, index: i as u32 },
+            );
+            if i % 64 == 0 {
+                // Keep the hot entry's reference bit set.
+                let _ = resolver.get(hot_class, &hot_name, &desc);
+            }
+        }
+
+        // Hard bound: never exceeds the cap.
+        assert!(
+            resolver.len() <= CACHE_CAP,
+            "cache size {} exceeded cap {}",
+            resolver.len(),
+            CACHE_CAP
+        );
+
+        // The continuously-touched hot entry survived all the sweeps.
+        assert!(
+            resolver.get(hot_class, &hot_name, &desc).is_some(),
+            "hot entry was evicted despite being kept warm"
+        );
     }
 }

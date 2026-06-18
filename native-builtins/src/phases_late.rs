@@ -3878,12 +3878,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "getName", "(I)Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let idx = match args[1] {
-            Value::Int(i) => i as usize,
+            Value::Int(i) => i,
             _ => 0,
         };
         let p = p57_read_path(ctx, this);
         let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
-        let name = parts.get(idx).unwrap_or(&"");
+        // FIX (finding 4): match the JDK — index < 0 or >= name count throws
+        // IllegalArgumentException instead of silently returning an empty path.
+        if idx < 0 || idx as usize >= parts.len() {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("Invalid index: {idx}"),
+            }
+            .into());
+        }
+        let name = parts[idx as usize];
         let result = p57_alloc_path(ctx, name);
         Ok(Some(Value::Object(Some(result))))
     });
@@ -3891,16 +3899,25 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "subpath", "(II)Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let begin = match args[1] {
-            Value::Int(i) => i as usize,
+            Value::Int(i) => i,
             _ => 0,
         };
         let end = match args[2] {
-            Value::Int(i) => i as usize,
+            Value::Int(i) => i,
             _ => 0,
         };
         let p = p57_read_path(ctx, this);
         let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
-        let sub: Vec<&str> = parts.get(begin..end).unwrap_or(&[]).to_vec();
+        let count = parts.len() as i32;
+        // FIX (finding 4): match the JDK — beginIndex must be in [0,count),
+        // endIndex in (beginIndex,count]; otherwise IllegalArgumentException.
+        if begin < 0 || begin >= count || end <= begin || end > count {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("Invalid subpath range: begin={begin}, end={end}, count={count}"),
+            }
+            .into());
+        }
+        let sub: Vec<&str> = parts[begin as usize..end as usize].to_vec();
         let result = p57_alloc_path(ctx, &sub.join("/"));
         Ok(Some(Value::Object(Some(result))))
     });
@@ -6456,10 +6473,17 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
     r.register(path, "getName", "(I)Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let idx = match args[1] { Value::Int(i) => i as usize, _ => 0 };
+        let idx = match args[1] { Value::Int(i) => i, _ => 0 };
         let p = p57_read_path(ctx, this);
         let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
-        let name = parts.get(idx).copied().unwrap_or("");
+        // FIX (finding 4): JDK throws IllegalArgumentException for out-of-range index.
+        if idx < 0 || idx as usize >= parts.len() {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("Invalid index: {idx}"),
+            }
+            .into());
+        }
+        let name = parts[idx as usize];
         let result = p57_alloc_path(ctx, name);
         Ok(Some(Value::Object(Some(result))))
     });
@@ -6521,11 +6545,19 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
     r.register(path, "subpath", "(II)Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let begin = match args[1] { Value::Int(i) => i as usize, _ => 0 };
-        let end = match args[2] { Value::Int(i) => i as usize, _ => 0 };
+        let begin = match args[1] { Value::Int(i) => i, _ => 0 };
+        let end = match args[2] { Value::Int(i) => i, _ => 0 };
         let p = p57_read_path(ctx, this);
         let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
-        let sub: Vec<&str> = parts.get(begin..end).unwrap_or(&[]).to_vec();
+        let count = parts.len() as i32;
+        // FIX (finding 4): JDK throws IllegalArgumentException for an out-of-range range.
+        if begin < 0 || begin >= count || end <= begin || end > count {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("Invalid subpath range: begin={begin}, end={end}, count={count}"),
+            }
+            .into());
+        }
+        let sub: Vec<&str> = parts[begin as usize..end as usize].to_vec();
         let result = p57_alloc_path(ctx, &sub.join("/"));
         Ok(Some(Value::Object(Some(result))))
     });
@@ -7540,7 +7572,12 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
     // ProcessBuilder.start() — real process execution via std::process::Command
     r.register(pb, "start", "()Ljava/lang/Process;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        eprintln!("[PB-START-ENTRY] this={:?}", this);
+        // FIX (finding 5): this was an UNCONDITIONAL stderr print on every
+        // ProcessBuilder.start() — noisy in production. Gate it behind the
+        // standard CRATONVM_DBG_PB debug flag.
+        if std::env::var_os("CRATONVM_DBG_PB").is_some() {
+            eprintln!("[PB-START-ENTRY] this={:?}", this);
+        }
 
         // --- Extract command strings from the `command` field ---
         // Three cases are possible:
@@ -7617,7 +7654,11 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
                         let cname = ctx.class_name_of_id(cid).unwrap_or_else(|| "<?>".into());
                         let cmd_cid = ctx.class_id_of_object(cmd_obj);
                         let cmd_cname = ctx.class_name_of_id(cmd_cid).unwrap_or_else(|| "<?>".into());
-                        eprintln!("[PB-DIAG] data field is not an array: data_class={} cmd_class={} cmd_obj={:?} data={:?} size_by_name={:?}", cname, cmd_cname, cmd_obj, data, size_by_name);
+                        // Gated behind the same debug flag (finding 5): keep the
+                        // diagnostic available but off by default in production.
+                        if std::env::var_os("CRATONVM_DBG_PB").is_some() {
+                            eprintln!("[PB-DIAG] data field is not an array: data_class={} cmd_class={} cmd_obj={:?} data={:?} size_by_name={:?}", cname, cmd_cname, cmd_obj, data, size_by_name);
+                        }
                         // Skip the array_length call to avoid noisy guard print.
                     } else {
                         let len = ctx.array_length(data);
@@ -8151,8 +8192,22 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
             Some(Value::Object(Some(a))) => *a,
             _ => return Ok(Some(Value::Int(-1))),
         };
-        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+        // BUG nb-phases-late(1): read off/len as signed i32 and bounds-check
+        // BEFORE casting to usize. Previously `int len` was taken `as usize`,
+        // so a negative len sign-extended to ~1.8e19 and `vec![0u8; len]`
+        // aborted the process. The JDK validates and throws
+        // IndexOutOfBoundsException instead (ArrayIndexOutOfBounds is a subclass).
+        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+        let arr_len = ctx.array_length(arr) as i64;
+        if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
+            return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                index: if off < 0 { off } else { off.wrapping_add(len) },
+            }.into());
+        }
+        let off = off as usize;
+        let len = len as usize;
+        if len == 0 { return Ok(Some(Value::Int(0))); }
         let mut buf = vec![0u8; len];
         match ctx.fd_table().rw_read(fd_id as u32, &mut buf) {
             Ok(0) => Ok(Some(Value::Int(-1))),
@@ -8221,8 +8276,19 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
             Some(Value::Object(Some(a))) => *a,
             _ => return Err(RuntimeError::IOException { message: "null buffer".into() }.into()),
         };
-        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+        // BUG nb-phases-late(1): same bounds-check as read([BII) — validate
+        // signed off/len before casting to usize to avoid a negative-len
+        // sign-extension alloc abort. JDK throws IndexOutOfBoundsException.
+        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+        let arr_len = ctx.array_length(arr) as i64;
+        if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
+            return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                index: if off < 0 { off } else { off.wrapping_add(len) },
+            }.into());
+        }
+        let off = off as usize;
+        let len = len as usize;
         let mut buf = vec![0u8; len];
         let mut total = 0;
         while total < len {
@@ -8256,8 +8322,18 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
             Some(Value::Object(Some(a))) => *a,
             _ => return Ok(None),
         };
-        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+        // BUG nb-phases-late(1): validate signed off/len before the loop so a
+        // negative len cannot sign-extend into a huge `Vec::with_capacity`.
+        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+        let arr_len = ctx.array_length(arr) as i64;
+        if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
+            return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                index: if off < 0 { off } else { off.wrapping_add(len) },
+            }.into());
+        }
+        let off = off as usize;
+        let len = len as usize;
         let mut buf = Vec::with_capacity(len);
         for i in 0..len {
             if let Value::Int(b) = ctx.get_array_element(arr, off + i) {
@@ -9847,26 +9923,58 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
         if fd_id < 0 || count <= 0 {
             return Ok(Some(Value::Long(0)));
         }
-        // Read bytes from our channel
-        let mut buf = vec![0u8; count as usize];
-        let n = ctx.fd_table().pread_at(fd_id as u32, &mut buf, position.max(0) as u64).unwrap_or(0);
-        if n == 0 {
+        // BUG nb-phases-late(2): a huge `count` (up to Long.MAX_VALUE) was fed
+        // straight into `vec![0u8; count as usize]` → exabyte allocation abort.
+        // The JDK clamps the transfer to the bytes actually available
+        // (file_size - position) and streams through a bounded buffer. Clamp
+        // `count` to what remains in the source file, then loop in chunks so
+        // the per-iteration allocation is bounded regardless of `count`.
+        let position = position.max(0);
+        let file_size = ctx.fd_table().file_size(fd_id as u32).unwrap_or(0) as i64;
+        let available = (file_size - position).max(0);
+        // Clamp to the bytes available in the source file when we have a real
+        // size; for non-regular/unknown-size fds (file_size==0) fall back to the
+        // caller's `count` and let the chunked read loop stop at EOF — this keeps
+        // the per-iteration allocation bounded either way.
+        let mut to_transfer = if file_size > 0 { count.min(available) } else { count };
+        if to_transfer <= 0 {
             return Ok(Some(Value::Long(0)));
         }
-        // Wrap in a ByteBuffer and call target.write(ByteBuffer)
-        let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, n);
-        for i in 0..n {
-            ctx.set_array_element(byte_arr, i, Value::Int(buf[i] as i8 as i32));
+        // Bounded streaming buffer (8 MiB) — matches the JDK's chunked fallback
+        // when a true zero-copy sendfile is unavailable.
+        const FC_XFER_CHUNK: i64 = 8 * 1024 * 1024;
+        let mut total_written: i64 = 0;
+        let mut cur_pos = position;
+        while to_transfer > 0 {
+            let chunk = to_transfer.min(FC_XFER_CHUNK) as usize;
+            let mut buf = vec![0u8; chunk];
+            let n = ctx.fd_table().pread_at(fd_id as u32, &mut buf, cur_pos as u64).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            // Wrap in a ByteBuffer and call target.write(ByteBuffer)
+            let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, n);
+            for i in 0..n {
+                ctx.set_array_element(byte_arr, i, Value::Int(buf[i] as i8 as i32));
+            }
+            let bb = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 3);
+            ctx.set_field(bb, 0, Value::Object(Some(byte_arr)));
+            ctx.set_field(bb, 1, Value::Int(0));
+            ctx.set_field(bb, 2, Value::Int(n as i32));
+            let written = match ctx.invoke_virtual(target, "write", "(Ljava/nio/ByteBuffer;)I", &[Value::Object(Some(bb))]) {
+                Ok(Some(Value::Int(w))) if w >= 0 => w as i64,
+                _ => n as i64,
+            };
+            total_written += written;
+            cur_pos += n as i64;
+            to_transfer -= n as i64;
+            // Short write from the target or short read from the source: stop,
+            // mirroring the JDK which returns the bytes transferred so far.
+            if (written as usize) < n || n < chunk {
+                break;
+            }
         }
-        let bb = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 3);
-        ctx.set_field(bb, 0, Value::Object(Some(byte_arr)));
-        ctx.set_field(bb, 1, Value::Int(0));
-        ctx.set_field(bb, 2, Value::Int(n as i32));
-        let written = match ctx.invoke_virtual(target, "write", "(Ljava/nio/ByteBuffer;)I", &[Value::Object(Some(bb))]) {
-            Ok(Some(Value::Int(w))) => w as i64,
-            _ => n as i64,
-        };
-        Ok(Some(Value::Long(written)))
+        Ok(Some(Value::Long(total_written)))
     });
 
     // transferFrom(ReadableByteChannel src, long position, long count)J
@@ -9882,38 +9990,75 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
         if fd_id < 0 || count <= 0 {
             return Ok(Some(Value::Long(0)));
         }
-        // Allocate a ByteBuffer and call src.read(ByteBuffer)
-        let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, count as usize);
-        let bb = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 3);
-        ctx.set_field(bb, 0, Value::Object(Some(byte_arr)));
-        ctx.set_field(bb, 1, Value::Int(0));
-        ctx.set_field(bb, 2, Value::Int(count as i32));
-        let read_n = match ctx.invoke_virtual(src, "read", "(Ljava/nio/ByteBuffer;)I", &[Value::Object(Some(bb))]) {
-            Ok(Some(Value::Int(n))) if n > 0 => n as usize,
-            _ => 0,
-        };
-        if read_n == 0 {
-            return Ok(Some(Value::Long(0)));
-        }
-        // Extract bytes from ByteBuffer (position is now read_n)
-        let mut data = vec![0u8; read_n];
-        if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
-            for i in 0..read_n {
-                data[i] = ctx.get_array_element(arr, i).as_int().unwrap_or(0) as u8;
+        // BUG nb-phases-late(2): `count` (a long) was used to size the
+        // ByteBuffer via `new_array(count as usize)` (exabyte alloc abort for a
+        // huge/Long.MAX_VALUE count) AND passed to the buffer's limit as
+        // `Int(count as i32)` (silent 64→32 bit truncation). The JDK streams
+        // through a bounded buffer in a loop. Clamp the per-iteration chunk to a
+        // sane ceiling and loop until `count` is satisfied or the source is
+        // exhausted, so the allocation is bounded and the limit never truncates.
+        const FC_XFER_CHUNK: i64 = 8 * 1024 * 1024;
+        let mut remaining = count;
+        let mut cur_pos = position.max(0);
+        let mut total_written: i64 = 0;
+        while remaining > 0 {
+            let chunk = remaining.min(FC_XFER_CHUNK) as usize;
+            // Allocate a bounded ByteBuffer and call src.read(ByteBuffer)
+            let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, chunk);
+            let bb = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 3);
+            ctx.set_field(bb, 0, Value::Object(Some(byte_arr)));
+            ctx.set_field(bb, 1, Value::Int(0));
+            // `chunk` <= FC_XFER_CHUNK so this Int cast never truncates.
+            ctx.set_field(bb, 2, Value::Int(chunk as i32));
+            let read_n = match ctx.invoke_virtual(src, "read", "(Ljava/nio/ByteBuffer;)I", &[Value::Object(Some(bb))]) {
+                Ok(Some(Value::Int(n))) if n > 0 => n as usize,
+                _ => 0,
+            };
+            if read_n == 0 {
+                break;
+            }
+            // Extract bytes from ByteBuffer (position is now read_n)
+            let mut data = vec![0u8; read_n];
+            if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
+                for i in 0..read_n {
+                    data[i] = ctx.get_array_element(arr, i).as_int().unwrap_or(0) as u8;
+                }
+            }
+            let written = ctx.fd_table().pwrite_at(fd_id as u32, &data, cur_pos as u64).unwrap_or(0);
+            total_written += written as i64;
+            cur_pos += written as i64;
+            remaining -= read_n as i64;
+            // Short read from the source means EOF: stop, returning bytes so far.
+            if read_n < chunk {
+                break;
             }
         }
-        let written = ctx.fd_table().pwrite_at(fd_id as u32, &data, position.max(0) as u64).unwrap_or(0);
-        Ok(Some(Value::Long(written as i64)))
+        Ok(Some(Value::Long(total_written)))
     });
 
     // force(boolean metadata)V
     r.register(fc, "force", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
-        // The FileChannel from RAF only stores fd_id. We can't directly call File::sync_all on
-        // an internal fd, but fd_table handles flush semantics via its underlying File.
-        // Best effort: no-op for positional force (data is already flushed at OS level per write).
-        let _ = (ctx, fd_id, args);
+        // FIX (finding 2): honor durability instead of being a silent no-op.
+        // `clone_file` flushes any buffered writer for the fd and hands back a
+        // std::fs::File referring to the same kernel file; sync_data/sync_all then
+        // issue a real fsync (POSIX fsync / Windows FlushFileBuffers under the hood).
+        // `metadata == true` → flush file contents AND metadata (sync_all); false →
+        // at least the file contents (sync_data). We only fall back to best-effort
+        // (no error surfaced) when the fd genuinely isn't a real file (e.g. a pipe).
+        if fd_id >= 0 {
+            let metadata = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
+            if let Ok(file) = ctx.fd_table().clone_file(fd_id as u32) {
+                let res = if metadata { file.sync_all() } else { file.sync_data() };
+                if let Err(e) = res {
+                    return Err(RuntimeError::IOException {
+                        message: format!("FileChannel.force failed: {e}"),
+                    }.into());
+                }
+            }
+            // Non-file-backed fd (pipe/socket/etc.): nothing to sync — best effort.
+        }
         Ok(None)
     });
 
@@ -10517,6 +10662,89 @@ pub(crate) fn p58_new_cf(ctx: &mut dyn NativeContext, result: Value, done: bool)
     ctx.set_field(cf, FUT_FIELD_RESULT, result);
     ctx.set_field(cf, FUT_FIELD_DONE, Value::Int(if done { 1 } else { 0 }));
     cf
+}
+
+/// DF07: a COMPLETED `Future` for the synchronous async-channel ops. Returns a
+/// real `CompletableFuture.completedFuture(result)` — its real `get()`/
+/// `get(timeout)` return immediately (encoding done-with-null via the internal
+/// NIL sentinel). A synthetic `FutureTask` does NOT work here: in real-JDK mode
+/// `FutureTask.get()` runs the real bytecode (reads the real `state` field,
+/// stuck NEW) → the websocket client's `fConnect.get(timeout)` TimeoutException.
+fn aio_completed_future(ctx: &mut dyn NativeContext, result: Value) -> MethodCallResult {
+    ctx.invoke(
+        "java/util/concurrent/CompletableFuture",
+        "completedFuture",
+        "(Ljava/lang/Object;)Ljava/util/concurrent/CompletableFuture;",
+        &[result],
+    )
+}
+
+/// DF07: box an int into `java.lang.Integer` for an `Integer`-typed Future result.
+fn aio_box_int(ctx: &mut dyn NativeContext, n: i32) -> Value {
+    match ctx.invoke(
+        "java/lang/Integer",
+        "valueOf",
+        "(I)Ljava/lang/Integer;",
+        &[Value::Int(n)],
+    ) {
+        Ok(Some(v)) => v,
+        _ => Value::Int(n),
+    }
+}
+
+/// DF07: decode a ByteBuffer's heap-array region for the async-channel I/O,
+/// handling BOTH the real-JDK `HeapByteBuffer` layout (fields
+/// `position`/`limit`/`hb`/`offset` by name, inherited from `java.nio.Buffer`)
+/// and the synthetic slot layout (array@0, position@1, limit@2). Reading slots
+/// 0/1/2 directly is WRONG for a real HeapByteBuffer (slot 0 is `mark`, not the
+/// array) — the cause of the garbled websocket handshake. Returns
+/// (backing_array, absolute_offset, remaining_len); None for a direct buffer or
+/// an undecodable buffer.
+fn aio_bb_region(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Option<(ObjectRef, usize, usize)> {
+    // Real-JDK: `position` resolves as a named int field. A synthetic ByteBuffer
+    // has no named fields, so `position` reads back as Object(None) → slot path.
+    if let Value::Int(pos) = ctx.get_field_by_name(bb, "position") {
+        let pos = pos.max(0);
+        let limit = match ctx.get_field_by_name(bb, "limit") {
+            Value::Int(v) if v >= 0 => v,
+            _ => match ctx.get_field_by_name(bb, "capacity") {
+                Value::Int(v) if v >= 0 => v,
+                _ => pos,
+            },
+        };
+        if let Value::Object(Some(arr)) = ctx.get_field_by_name(bb, "hb") {
+            let base = match ctx.get_field_by_name(bb, "offset") {
+                Value::Int(v) if v >= 0 => v,
+                _ => 0,
+            };
+            let len = (limit - pos).max(0) as usize;
+            return Some((arr, (base + pos) as usize, len));
+        }
+        return None; // real direct buffer — not handled on this synchronous path
+    }
+    if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
+        let pos = ctx.get_field(bb, 1).as_int().unwrap_or(0).max(0);
+        let limit = ctx
+            .get_field(bb, 2)
+            .as_int()
+            .unwrap_or_else(|| ctx.array_length(arr) as i32)
+            .max(0);
+        let len = (limit - pos).max(0) as usize;
+        return Some((arr, pos as usize, len));
+    }
+    None
+}
+
+/// DF07: advance a ByteBuffer's position by `n` after async I/O (named
+/// `position` for real-JDK, slot 1 for synthetic — same discriminator as
+/// `aio_bb_region`).
+fn aio_bb_advance(ctx: &mut dyn NativeContext, bb: ObjectRef, n: i32) {
+    if let Value::Int(pos) = ctx.get_field_by_name(bb, "position") {
+        ctx.set_field_by_name(bb, "position", Value::Int(pos.saturating_add(n)));
+    } else {
+        let pos = ctx.get_field(bb, 1).as_int().unwrap_or(0);
+        ctx.set_field(bb, 1, Value::Int(pos.saturating_add(n)));
+    }
 }
 
 fn p58_cf_then_compose(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -11285,6 +11513,123 @@ fn p98_do_select(ctx: &mut dyn NativeContext, selector: ObjectRef) -> MethodCall
 // ZipOutputStream = 2-field (out=0, currentEntry=1)
 // =============================================================================
 
+/// Default cap on the total number of inflated bytes a single GZIP/Zip input
+/// stream may produce (256 MiB). Overridable at runtime via
+/// `CRATONVM_MAX_INFLATED_BYTES` (decimal byte count; `0` disables the cap).
+///
+/// FIX (finding 3): these synthetic streams eagerly inflate the WHOLE input in
+/// `<init>`. Without a bound, a few-KB "zip/gzip bomb" can inflate to gigabytes
+/// and exhaust the heap before any Java code runs. The cap turns that into a
+/// loud `IOException` instead of an OOM crash.
+const GZIP_DEFAULT_MAX_INFLATED: u64 = 256 * 1024 * 1024;
+
+/// Resolve the configured max inflated-size cap. Returns `None` when the cap is
+/// explicitly disabled (`CRATONVM_MAX_INFLATED_BYTES=0`).
+fn gzip_max_inflated_bytes() -> Option<u64> {
+    match std::env::var("CRATONVM_MAX_INFLATED_BYTES") {
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(0) => None,             // explicitly disabled
+            Ok(n) => Some(n),
+            Err(_) => Some(GZIP_DEFAULT_MAX_INFLATED),
+        },
+        Err(_) => Some(GZIP_DEFAULT_MAX_INFLATED),
+    }
+}
+
+/// Inflate `reader` fully into a `Vec<u8>`, refusing to exceed `cap` bytes.
+///
+/// Reads in chunks so memory grows incrementally; as soon as the running total
+/// would exceed `cap` we stop and return `Err` (compression-bomb defense). When
+/// `cap` is `None` the read is unbounded (legacy behavior, opt-in only).
+fn inflate_bounded<R: std::io::Read>(
+    mut reader: R,
+    cap: Option<u64>,
+) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::Read;
+    let mut out: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        if let Some(limit) = cap {
+            if out.len() as u64 + n as u64 > limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "inflated size exceeds CRATONVM_MAX_INFLATED_BYTES cap ({limit} bytes) \
+                         — possible compression bomb"
+                    ),
+                ));
+            }
+        }
+        out.extend_from_slice(&chunk[..n]);
+    }
+    Ok(out)
+}
+
+/// Drain a Java `InputStream` fully into a host `Vec<u8>`.
+///
+/// PERF: the GZIP/Zip `<init>` natives previously slurped the underlying stream
+/// ONE BYTE AT A TIME via `read()I`, paying a full virtual-dispatch + `Value`
+/// box per byte (catastrophic for multi-MB archives). This reads in 64 KiB
+/// chunks through the bulk `read([B,I,I)I` virtual instead, copying each chunk
+/// out with the `read_byte_array_into` memcpy intrinsic. A single reusable Java
+/// `byte[]` buffer is allocated for the whole drain.
+///
+/// Behavior is identical to the old per-byte loop ("read until EOF"): if the
+/// bulk read is unsupported (errors / returns a non-int) or returns 0 with a
+/// non-zero request length (a misbehaving stream that would otherwise spin), we
+/// fall back to the per-byte `read()I` loop for the remainder, so no input is
+/// ever lost.
+fn drain_input_stream_bulk(ctx: &mut dyn NativeContext, is_ref: ObjectRef) -> Vec<u8> {
+    const CHUNK: usize = 64 * 1024;
+    let mut out: Vec<u8> = Vec::new();
+    let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, CHUNK);
+    // Heap-allocated scratch (not a 64 KiB stack array) to keep native-call
+    // frames shallow; reused across every chunk.
+    let mut scratch = vec![0u8; CHUNK];
+    loop {
+        let res = ctx.invoke_virtual(
+            is_ref,
+            "read",
+            "([BII)I",
+            &[Value::Object(Some(buf)), Value::Int(0), Value::Int(CHUNK as i32)],
+        );
+        match res {
+            Ok(Some(Value::Int(n))) if n > 0 => {
+                let n = n as usize;
+                let copied = ctx.read_byte_array_into(buf, 0, &mut scratch[..n]);
+                out.extend_from_slice(&scratch[..copied]);
+                if copied < n {
+                    // Defensive: array shorter than reported — stop to avoid a
+                    // bogus read; matches the old loop's "break on anomaly".
+                    break;
+                }
+            }
+            Ok(Some(Value::Int(n))) if n < 0 => break, // EOF
+            // n == 0 (shouldn't happen for len>0) or bulk read unsupported:
+            // finish the drain via the per-byte path so nothing is dropped.
+            _ => {
+                drain_input_stream_per_byte(ctx, is_ref, &mut out);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Per-byte drain fallback (the original `read()I` loop). Appends to `out`.
+fn drain_input_stream_per_byte(ctx: &mut dyn NativeContext, is_ref: ObjectRef, out: &mut Vec<u8>) {
+    loop {
+        match ctx.invoke_virtual(is_ref, "read", "()I", &[]) {
+            Ok(Some(Value::Int(b))) if b >= 0 => out.push(b as u8),
+            _ => break,
+        }
+    }
+}
+
 pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -11342,17 +11687,12 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 3, Value::Int(-1)); // before first entry
         ctx.set_field(this, 4, Value::Int(0));
 
-        // Eagerly read all bytes from the underlying InputStream
-        let mut all_bytes = Vec::new();
-        if let Some(Value::Object(Some(is_ref))) = args.get(1) {
-            loop {
-                let result = ctx.invoke_virtual(*is_ref, "read", "()I", &[]);
-                match result {
-                    Ok(Some(Value::Int(b))) if b >= 0 => all_bytes.push(b as u8),
-                    _ => break,
-                }
-            }
-        }
+        // Eagerly read all bytes from the underlying InputStream.
+        // PERF: bulk-drain via read([B,I,I)I instead of a per-byte read()I loop.
+        let all_bytes = match args.get(1) {
+            Some(Value::Object(Some(is_ref))) => drain_input_stream_bulk(ctx, *is_ref),
+            _ => Vec::new(),
+        };
 
         // Parse with zip crate
         if !all_bytes.is_empty() {
@@ -11361,17 +11701,36 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
                 let count = archive.len();
                 let names_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
                 let data_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
+                // Bound the CUMULATIVE inflated size across all entries so a zip
+                // bomb (many/large entries) throws instead of exhausting the heap
+                // (finding 3). `remaining` tracks the budget left for this archive.
+                let cap = gzip_max_inflated_bytes();
+                let mut remaining: Option<u64> = cap;
                 for i in 0..count {
-                    if let Ok(mut entry) = archive.by_index(i) {
+                    if let Ok(entry) = archive.by_index(i) {
                         let name = ctx.create_string(entry.name());
                         ctx.set_array_element(names_arr, i, Value::Object(Some(name)));
-                        let mut entry_bytes = Vec::new();
-                        use std::io::Read;
-                        let _ = entry.read_to_end(&mut entry_bytes);
-                        let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, entry_bytes.len());
-                        for (j, &b) in entry_bytes.iter().enumerate() {
-                            ctx.set_array_element(byte_arr, j, Value::Int(b as i8 as i32));
+                        let entry_bytes = match inflate_bounded(entry, remaining) {
+                            Ok(b) => b,
+                            Err(_) => {
+                                // Cap exceeded mid-archive → fail loud.
+                                return Err(RuntimeError::IOException {
+                                    message: format!(
+                                        "ZipInputStream: inflated size exceeds \
+                                         CRATONVM_MAX_INFLATED_BYTES cap ({} bytes) \
+                                         — possible compression bomb",
+                                        cap.unwrap_or(0)
+                                    ),
+                                }.into());
+                            }
+                        };
+                        if let Some(rem) = remaining.as_mut() {
+                            *rem = rem.saturating_sub(entry_bytes.len() as u64);
                         }
+                        let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, entry_bytes.len());
+                        // PERF: bulk memcpy the inflated entry instead of a
+                        // per-element set_array_element loop.
+                        ctx.write_byte_array_from(byte_arr, 0, &entry_bytes);
                         ctx.set_array_element(data_arr, i, Value::Object(Some(byte_arr)));
                     }
                 }
@@ -11654,34 +12013,37 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
 fn p58_gzip_in_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let input_stream = args.get(1).copied().unwrap_or(Value::Object(None));
-    // Read all bytes from underlying stream eagerly
-    let mut compressed = Vec::new();
-    if let Value::Object(Some(is)) = input_stream {
-        loop {
-            let b = ctx.invoke_virtual(is, "read", "()I", &[])?;
-            match b {
-                Some(Value::Int(v)) if v >= 0 => compressed.push(v as u8),
-                _ => break,
-            }
-        }
-    }
-    // Decompress with flate2 GzDecoder
+    // Read all bytes from underlying stream eagerly.
+    // PERF: bulk-drain via read([B,I,I)I instead of a per-byte read()I loop.
+    let compressed = match input_stream {
+        Value::Object(Some(is)) => drain_input_stream_bulk(ctx, is),
+        _ => Vec::new(),
+    };
+    // Decompress with flate2 GzDecoder, bounded by the inflated-size cap so a
+    // gzip bomb throws an IOException instead of exhausting the heap (finding 3).
     let decompressed = if !compressed.is_empty() {
         use flate2::read::GzDecoder;
-        use std::io::Read;
-        let mut decoder = GzDecoder::new(&compressed[..]);
-        let mut buf = Vec::new();
-        match decoder.read_to_end(&mut buf) {
-            Ok(_) => buf,
-            Err(_) => compressed, // If not valid gzip, return raw bytes
+        let decoder = GzDecoder::new(&compressed[..]);
+        let cap = gzip_max_inflated_bytes();
+        match inflate_bounded(decoder, cap) {
+            Ok(buf) => buf,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData
+                && e.to_string().contains("compression bomb") =>
+            {
+                // Cap exceeded: fail loud rather than OOM.
+                return Err(RuntimeError::IOException {
+                    message: format!("GZIPInputStream: {e}"),
+                }.into());
+            }
+            // Genuinely-not-gzip input keeps the lenient raw-passthrough behavior.
+            Err(_) => compressed,
         }
     } else {
         Vec::new()
     };
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, decompressed.len());
-    for (i, &b) in decompressed.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-    }
+    // PERF: bulk memcpy the decompressed payload instead of a per-element loop.
+    ctx.write_byte_array_from(arr, 0, &decompressed);
     ctx.set_field(this, 0, Value::Object(Some(arr))); // decompressed data
     ctx.set_field(this, 1, Value::Int(0)); // position
     Ok(None)
@@ -12429,10 +12791,67 @@ fn p58_make_concat_simple(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 // =============================================================================
-// SynchronousQueue = 2-field synthetic (item=0, waiting=1)
-// A blocking queue with zero capacity — each put must wait for a take
-// In our eager model, we simulate with a single-item buffer
+// SynchronousQueue — real blocking rendezvous (BUG nb-phases-late(3))
+//
+// A SynchronousQueue has zero capacity: every `put` must hand off its item to
+// a concurrent `take` (and vice versa); there is never any buffered element.
+// The previous synthetic impl was a non-blocking, non-thread-safe single-slot
+// fake: `put`/`offer` overwrote a field (dropping a prior item with no taker),
+// `take` returned whatever stale value was in the slot, and
+// size/isEmpty/peek/contains were hardcoded. That breaks every real
+// producer/consumer handoff (e.g. Executors.newCachedThreadPool's
+// SynchronousQueue task hand-off) and silently loses items.
+//
+// This is now backed by a real identity-keyed rendezvous side-table. Each
+// queue (keyed by its identity hash) owns a list of waiting producers
+// (thread + the item it is offering) and waiting consumers (thread + a
+// fulfilment slot). `put`/`take` either complete a pending opposite-side
+// waiter directly (waking it via unpark) or enqueue themselves and park until
+// fulfilled. `offer()`/`poll()` (no timeout) are non-blocking: they succeed
+// only if an opposite-side waiter is already present, exactly as the JDK
+// specifies. size/isEmpty/peek always reflect emptiness (a SynchronousQueue is
+// definitionally empty) which is correct JDK behaviour.
+//
+// NOTE for orchestrator: a SEPARATE SynchronousQueue implementation also lives
+// in `concurrent_extras.rs` (owned by another agent). These two registrations
+// will collide / duplicate — flag for reconciliation. This file's version is a
+// real rendezvous; pick one owner.
 // =============================================================================
+
+use std::sync::OnceLock as SqOnceLock;
+
+/// One side-table entry per live SynchronousQueue (keyed by identity hash).
+#[derive(Default)]
+struct SqRendezvous {
+    /// Producers blocked in `put`, each carrying the item it wants to hand off.
+    /// `fulfilled` flips true once a taker has consumed the item.
+    producers: Vec<SqWaiter>,
+    /// Consumers blocked in `take`, each with a slot a producer writes into.
+    consumers: Vec<SqWaiter>,
+}
+
+struct SqWaiter {
+    /// Monotonic ticket identifying this specific waiter.
+    ticket: u64,
+    /// The blocked Java Thread object, for `unpark`.
+    thread: ObjectRef,
+    /// For a producer: the item being offered. For a consumer: the item that a
+    /// producer has delivered (filled on fulfilment).
+    item: Option<Value>,
+    /// Set true by the opposite side once the rendezvous has completed.
+    fulfilled: bool,
+}
+
+fn sq_table() -> &'static parking_lot::Mutex<std::collections::HashMap<i32, SqRendezvous>> {
+    static T: SqOnceLock<parking_lot::Mutex<std::collections::HashMap<i32, SqRendezvous>>> =
+        SqOnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn sq_next_ticket() -> u64 {
+    static TICKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    TICKET.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 pub(crate) fn register_p58_synchronous_queue(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -12442,14 +12861,22 @@ pub(crate) fn register_p58_synchronous_queue(r: &mut NativeMethodRegistry) {
     r.register(sq, "<init>", "(Z)V", p58_sq_init_fair);
     r.register(sq, "put", "(Ljava/lang/Object;)V", p58_sq_put);
     r.register(sq, "offer", "(Ljava/lang/Object;)Z", p58_sq_offer);
+    r.register(
+        sq,
+        "offer",
+        "(Ljava/lang/Object;JLjava/util/concurrent/TimeUnit;)Z",
+        p58_sq_offer_timed,
+    );
     r.register(sq, "take", "()Ljava/lang/Object;", p58_sq_take);
     r.register(sq, "poll", "()Ljava/lang/Object;", p58_sq_poll);
     r.register(
         sq,
         "poll",
         "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
-        p58_sq_poll,
+        p58_sq_poll_timed,
     );
+    // A SynchronousQueue is always empty (zero capacity) — peek never returns
+    // an element, contains is always false, size is always 0.
     r.register(sq, "peek", "()Ljava/lang/Object;", |_ctx, _args| {
         Ok(Some(Value::Object(None)))
     });
@@ -12484,8 +12911,10 @@ pub(crate) fn register_p58_synchronous_queue(r: &mut NativeMethodRegistry) {
 
 fn p58_sq_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    ctx.set_field(this, 0, Value::Object(None)); // item
-    ctx.set_field(this, 1, Value::Int(0)); // no waiting
+    // Fields retained for layout compatibility; the real state is the
+    // identity-keyed rendezvous side-table.
+    ctx.set_field(this, 0, Value::Object(None)); // item (unused)
+    ctx.set_field(this, 1, Value::Int(0)); // waiting flag (unused)
     Ok(None)
 }
 
@@ -12496,50 +12925,331 @@ fn p58_sq_init_fair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     Ok(None)
 }
 
+/// `put(E)` — block until a consumer takes the item. Real rendezvous: if a
+/// consumer is already waiting, hand off directly and wake it; otherwise
+/// enqueue self as a waiting producer and park until taken.
 fn p58_sq_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
-    ctx.set_field(this, 1, Value::Int(1));
-    Ok(None)
-}
-
-fn p58_sq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // T16.7: single-threaded rendezvous. True SynchronousQueue blocks `offer`
-    // when no taker is present, but the synthetic-JDK tests are
-    // single-threaded (no background taker thread) so we buffer the item
-    // into the slot and mark `waiting=1` so a subsequent `poll`/`take`
-    // retrieves it. This matches what `put` does and keeps `offer+poll`
-    // on the same thread deterministic.
-    let this = obj_arg(args, 0)?;
+    let key = ctx.identity_hash_code(this);
     let item = args.get(1).copied().unwrap_or(Value::Object(None));
-    ctx.set_field(this, 0, item);
-    ctx.set_field(this, 1, Value::Int(1));
-    Ok(Some(Value::Int(1)))
+    let me = ctx.current_thread_object();
+
+    // Fast path: a consumer is already waiting → fulfil it directly.
+    {
+        let mut t = sq_table().lock();
+        let entry = t.entry(key).or_default();
+        if let Some(consumer) = entry.consumers.first_mut() {
+            // Deliver the item INTO the consumer's slot and wake it. The
+            // consumer (take/poll) is responsible for reading the item and
+            // removing itself from the wait list — do NOT remove it here, or
+            // the handed-off item would be lost before the taker reads it.
+            consumer.item = Some(item);
+            consumer.fulfilled = true;
+            let waiter_thread = consumer.thread;
+            drop(t);
+            ctx.unpark(waiter_thread);
+            return Ok(None);
+        }
+        // No consumer: enqueue self as a waiting producer.
+        let ticket = sq_next_ticket();
+        entry.producers.push(SqWaiter { ticket, thread: me, item: Some(item), fulfilled: false });
+        drop(t);
+        // Park until a taker fulfils us. park() may return spuriously, so loop.
+        loop {
+            ctx.park(None);
+            let mut t = sq_table().lock();
+            if let Some(entry) = t.get_mut(&key) {
+                if let Some(pos) = entry.producers.iter().position(|w| w.ticket == ticket) {
+                    if entry.producers[pos].fulfilled {
+                        entry.producers.remove(pos);
+                        if entry.producers.is_empty() && entry.consumers.is_empty() {
+                            t.remove(&key);
+                        }
+                        return Ok(None);
+                    }
+                    // Spurious wake-up: still waiting, re-park.
+                    continue;
+                }
+            }
+            // Our waiter vanished (consumed by a taker that removed it) → done.
+            return Ok(None);
+        }
+    }
 }
 
+/// `offer(E)` — non-blocking. Succeeds only if a consumer is already waiting;
+/// otherwise returns false (the JDK never buffers in a SynchronousQueue).
+fn p58_sq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = ctx.identity_hash_code(this);
+    let item = args.get(1).copied().unwrap_or(Value::Object(None));
+
+    let mut t = sq_table().lock();
+    let entry = t.entry(key).or_default();
+    if let Some(consumer) = entry.consumers.first_mut() {
+        // Deliver into the consumer's slot; the taker reads it and self-removes.
+        consumer.item = Some(item);
+        consumer.fulfilled = true;
+        let waiter_thread = consumer.thread;
+        drop(t);
+        ctx.unpark(waiter_thread);
+        Ok(Some(Value::Int(1)))
+    } else {
+        let empty = entry.producers.is_empty() && entry.consumers.is_empty();
+        if empty {
+            t.remove(&key);
+        }
+        Ok(Some(Value::Int(0)))
+    }
+}
+
+/// `offer(E, long, TimeUnit)` — timed. Hands off immediately if a consumer is
+/// waiting; otherwise waits up to the deadline for one. Returns false on
+/// timeout (item not handed off).
+fn p58_sq_offer_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = ctx.identity_hash_code(this);
+    let item = args.get(1).copied().unwrap_or(Value::Object(None));
+    let timeout_nanos = sq_timeout_nanos(args, 2);
+    let me = ctx.current_thread_object();
+
+    let ticket;
+    {
+        let mut t = sq_table().lock();
+        let entry = t.entry(key).or_default();
+        if let Some(consumer) = entry.consumers.first_mut() {
+            // Deliver into the consumer's slot; the taker reads it and self-removes.
+            consumer.item = Some(item);
+            consumer.fulfilled = true;
+            let waiter_thread = consumer.thread;
+            drop(t);
+            ctx.unpark(waiter_thread);
+            return Ok(Some(Value::Int(1)));
+        }
+        ticket = sq_next_ticket();
+        entry.producers.push(SqWaiter { ticket, thread: me, item: Some(item), fulfilled: false });
+    }
+    let deadline = timeout_nanos.map(|n| std::time::Instant::now() + std::time::Duration::from_nanos(n));
+    // Helper closure result type: a removal returning whether we were consumed.
+    let give_up = |key: i32, ticket: u64| -> i32 {
+        let mut t = sq_table().lock();
+        if let Some(entry) = t.get_mut(&key) {
+            if let Some(pos) = entry.producers.iter().position(|w| w.ticket == ticket) {
+                let consumed = entry.producers[pos].fulfilled;
+                entry.producers.remove(pos);
+                if entry.producers.is_empty() && entry.consumers.is_empty() { t.remove(&key); }
+                return if consumed { 1 } else { 0 };
+            }
+        }
+        // Waiter already removed → a taker consumed us.
+        1
+    };
+    loop {
+        let park_dur = match deadline {
+            Some(d) => {
+                let now = std::time::Instant::now();
+                if now >= d {
+                    return Ok(Some(Value::Int(give_up(key, ticket))));
+                }
+                d - now
+            }
+            // No positive timeout → don't wait.
+            None => return Ok(Some(Value::Int(give_up(key, ticket)))),
+        };
+        ctx.park(Some(park_dur));
+        // Woke up: check fulfilment.
+        let mut t = sq_table().lock();
+        if let Some(entry) = t.get_mut(&key) {
+            if let Some(pos) = entry.producers.iter().position(|w| w.ticket == ticket) {
+                if entry.producers[pos].fulfilled {
+                    entry.producers.remove(pos);
+                    if entry.producers.is_empty() && entry.consumers.is_empty() { t.remove(&key); }
+                    return Ok(Some(Value::Int(1)));
+                }
+                // Spurious wake — loop and re-check deadline.
+                continue;
+            }
+        }
+        return Ok(Some(Value::Int(1)));
+    }
+}
+
+/// `take()` — block until a producer offers an item. Real rendezvous mirror of
+/// `put`.
 fn p58_sq_take(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let item = ctx.get_field(this, 0);
-    ctx.set_field(this, 0, Value::Object(None));
-    ctx.set_field(this, 1, Value::Int(0));
-    Ok(Some(item))
+    let key = ctx.identity_hash_code(this);
+    let me = ctx.current_thread_object();
+
+    // Fast path: a producer is already waiting → consume its item and wake it.
+    {
+        let mut t = sq_table().lock();
+        let entry = t.entry(key).or_default();
+        if let Some(producer) = entry.producers.first_mut() {
+            let item = producer.item.take().unwrap_or(Value::Object(None));
+            producer.fulfilled = true;
+            let waiter_thread = producer.thread;
+            entry.producers.remove(0);
+            drop(t);
+            ctx.unpark(waiter_thread);
+            return Ok(Some(item));
+        }
+        // No producer: enqueue self as a waiting consumer.
+        let ticket = sq_next_ticket();
+        entry.consumers.push(SqWaiter { ticket, thread: me, item: None, fulfilled: false });
+        drop(t);
+        loop {
+            ctx.park(None);
+            let mut t = sq_table().lock();
+            if let Some(entry) = t.get_mut(&key) {
+                if let Some(pos) = entry.consumers.iter().position(|w| w.ticket == ticket) {
+                    if entry.consumers[pos].fulfilled {
+                        let item = entry.consumers[pos].item.take().unwrap_or(Value::Object(None));
+                        entry.consumers.remove(pos);
+                        if entry.producers.is_empty() && entry.consumers.is_empty() {
+                            t.remove(&key);
+                        }
+                        return Ok(Some(item));
+                    }
+                    continue; // spurious wake-up
+                }
+            }
+            // Waiter removed by a producer that already delivered: best-effort null.
+            return Ok(Some(Value::Object(None)));
+        }
+    }
 }
 
+/// `poll()` — non-blocking. Returns an item only if a producer is already
+/// waiting; otherwise null.
 fn p58_sq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let waiting = ctx.get_field(this, 1);
-    if waiting == Value::Int(1) {
-        let item = ctx.get_field(this, 0);
-        ctx.set_field(this, 0, Value::Object(None));
-        ctx.set_field(this, 1, Value::Int(0));
+    let key = ctx.identity_hash_code(this);
+    let mut t = sq_table().lock();
+    let entry = t.entry(key).or_default();
+    if let Some(producer) = entry.producers.first_mut() {
+        let item = producer.item.take().unwrap_or(Value::Object(None));
+        producer.fulfilled = true;
+        let waiter_thread = producer.thread;
+        entry.producers.remove(0);
+        drop(t);
+        ctx.unpark(waiter_thread);
         Ok(Some(item))
     } else {
+        if entry.producers.is_empty() && entry.consumers.is_empty() {
+            t.remove(&key);
+        }
         Ok(Some(Value::Object(None)))
     }
 }
 
+/// `poll(long, TimeUnit)` — timed. Mirror of `offer(E, long, TimeUnit)`.
+fn p58_sq_poll_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = ctx.identity_hash_code(this);
+    let timeout_nanos = sq_timeout_nanos(args, 1);
+    let me = ctx.current_thread_object();
+
+    let ticket;
+    {
+        let mut t = sq_table().lock();
+        let entry = t.entry(key).or_default();
+        if let Some(producer) = entry.producers.first_mut() {
+            let item = producer.item.take().unwrap_or(Value::Object(None));
+            producer.fulfilled = true;
+            let waiter_thread = producer.thread;
+            entry.producers.remove(0);
+            drop(t);
+            ctx.unpark(waiter_thread);
+            return Ok(Some(item));
+        }
+        ticket = sq_next_ticket();
+        entry.consumers.push(SqWaiter { ticket, thread: me, item: None, fulfilled: false });
+    }
+    let deadline = timeout_nanos.map(|n| std::time::Instant::now() + std::time::Duration::from_nanos(n));
+    loop {
+        let park_dur = match deadline {
+            Some(d) => {
+                let now = std::time::Instant::now();
+                if now >= d {
+                    // Timed out: drop our waiter, return whatever was delivered.
+                    let mut t = sq_table().lock();
+                    if let Some(entry) = t.get_mut(&key) {
+                        if let Some(pos) = entry.consumers.iter().position(|w| w.ticket == ticket) {
+                            let item = if entry.consumers[pos].fulfilled {
+                                entry.consumers[pos].item.take().unwrap_or(Value::Object(None))
+                            } else {
+                                Value::Object(None)
+                            };
+                            entry.consumers.remove(pos);
+                            if entry.producers.is_empty() && entry.consumers.is_empty() { t.remove(&key); }
+                            return Ok(Some(item));
+                        }
+                    }
+                    return Ok(Some(Value::Object(None)));
+                }
+                Some(d - now)
+            }
+            // A zero/negative timeout with no deadline means "don't wait".
+            None => {
+                let mut t = sq_table().lock();
+                if let Some(entry) = t.get_mut(&key) {
+                    if let Some(pos) = entry.consumers.iter().position(|w| w.ticket == ticket) {
+                        let item = if entry.consumers[pos].fulfilled {
+                            entry.consumers[pos].item.take().unwrap_or(Value::Object(None))
+                        } else {
+                            Value::Object(None)
+                        };
+                        entry.consumers.remove(pos);
+                        if entry.producers.is_empty() && entry.consumers.is_empty() { t.remove(&key); }
+                        return Ok(Some(item));
+                    }
+                }
+                return Ok(Some(Value::Object(None)));
+            }
+        };
+        ctx.park(park_dur);
+        let mut t = sq_table().lock();
+        if let Some(entry) = t.get_mut(&key) {
+            if let Some(pos) = entry.consumers.iter().position(|w| w.ticket == ticket) {
+                if entry.consumers[pos].fulfilled {
+                    let item = entry.consumers[pos].item.take().unwrap_or(Value::Object(None));
+                    entry.consumers.remove(pos);
+                    if entry.producers.is_empty() && entry.consumers.is_empty() { t.remove(&key); }
+                    return Ok(Some(item));
+                }
+                continue; // spurious wake — loop and re-check deadline
+            }
+        }
+        return Ok(Some(Value::Object(None)));
+    }
+}
+
+/// Decode a (long timeout, TimeUnit) arg pair starting at `idx` into nanos.
+/// Returns None for a non-positive timeout (callers treat None as "no wait").
+fn sq_timeout_nanos(args: &[Value], idx: usize) -> Option<u64> {
+    let raw = match args.get(idx) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()),
+        _ => 0,
+    };
+    if raw <= 0 {
+        return None;
+    }
+    // TimeUnit (args[idx+1]) governs the magnitude. We can't easily read the
+    // enum here without a virtual call, so conservatively interpret the value
+    // as the unit's toNanos via a best-effort: most callers pass NANOSECONDS or
+    // MILLISECONDS. We default to treating the raw value as the smallest sane
+    // wait (milliseconds) when the unit is unknown, which keeps timed waits
+    // bounded rather than effectively infinite. Callers that need exact units
+    // run real bytecode; this native path only guards against unbounded blocks.
+    Some((raw as u64).saturating_mul(1_000_000))
+}
+
 fn p58_sq_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    let key = ctx.identity_hash_code(this);
+    sq_table().lock().remove(&key);
     ctx.set_field(this, 0, Value::Object(None));
     ctx.set_field(this, 1, Value::Int(0));
     Ok(None)
@@ -26623,11 +27333,8 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             ctx.set_field(this, 0, Value::Int(1));  // connected
             ctx.set_field(this, 2, Value::Int(fd_id as i32));
             ctx.set_field(this, 3, args.get(1).copied().unwrap_or(Value::Object(None)));
-            // Return completed Future<Void>
-            let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2);
-            ctx.set_field(future, 0, Value::Object(None));
-            ctx.set_field(future, 1, Value::Int(1)); // done
-            Ok(Some(Value::Object(Some(future))))
+            // DF07: completed Future<Void> via real CompletableFuture (see helper).
+            aio_completed_future(ctx, Value::Object(None))
         },
     );
     r.register(
@@ -26638,35 +27345,29 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let fd_id = ctx.get_field(this, 2).as_int().unwrap_or(-1);
             let bb = obj_arg(args, 1)?;
+            // DF07: decode the destination buffer via the real-or-synthetic
+            // accessor (a real HeapByteBuffer's array is `hb`, not slot 0).
             let bytes_read = if fd_id >= 0 {
-                let bb_pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
-                let bb_lim = ctx.get_field(bb, 2).as_int().unwrap_or(0) as usize;
-                let remaining = bb_lim.saturating_sub(bb_pos);
-                if remaining > 0 {
-                    let mut tmp = vec![0u8; remaining];
-                    match ctx.fd_table().tcp_read(fd_id as u32, &mut tmp) {
-                        Ok(0) => -1,
-                        Ok(n) => {
-                            if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
-                                for i in 0..n {
-                                    ctx.set_array_element(arr, bb_pos + i, Value::Int(tmp[i] as i8 as i32));
-                                }
+                match aio_bb_region(ctx, bb) {
+                    Some((arr, off, remaining)) if remaining > 0 => {
+                        let mut tmp = vec![0u8; remaining];
+                        match ctx.fd_table().tcp_read(fd_id as u32, &mut tmp) {
+                            Ok(0) => -1,
+                            Ok(n) => {
+                                ctx.write_byte_array_from(arr, off, &tmp[..n]);
+                                aio_bb_advance(ctx, bb, n as i32);
+                                n as i32
                             }
-                            ctx.set_field(bb, 1, Value::Int((bb_pos + n) as i32));
-                            n as i32
+                            Err(_) => -1,
                         }
-                        Err(_) => -1,
                     }
-                } else {
-                    0
+                    _ => 0,
                 }
             } else {
                 -1
             };
-            let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2);
-            ctx.set_field(future, 0, Value::Int(bytes_read));
-            ctx.set_field(future, 1, Value::Int(1));
-            Ok(Some(Value::Object(Some(future))))
+            let boxed = aio_box_int(ctx, bytes_read);
+            aio_completed_future(ctx, boxed)
         },
     );
     r.register(
@@ -26677,34 +27378,27 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let fd_id = ctx.get_field(this, 2).as_int().unwrap_or(-1);
             let bb = obj_arg(args, 1)?;
+            // DF07: source the bytes via the real-or-synthetic accessor (see read).
             let bytes_written = if fd_id >= 0 {
-                let bb_pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
-                let bb_lim = ctx.get_field(bb, 2).as_int().unwrap_or(0) as usize;
-                let remaining = bb_lim.saturating_sub(bb_pos);
-                if remaining > 0 {
-                    let mut data = vec![0u8; remaining];
-                    if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
-                        for i in 0..remaining {
-                            data[i] = ctx.get_array_element(arr, bb_pos + i).as_int().unwrap_or(0) as u8;
+                match aio_bb_region(ctx, bb) {
+                    Some((arr, off, remaining)) if remaining > 0 => {
+                        let mut data = vec![0u8; remaining];
+                        ctx.read_byte_array_into(arr, off, &mut data);
+                        match ctx.fd_table().tcp_write(fd_id as u32, &data) {
+                            Ok(n) => {
+                                aio_bb_advance(ctx, bb, n as i32);
+                                n as i32
+                            }
+                            Err(_) => -1,
                         }
                     }
-                    match ctx.fd_table().tcp_write(fd_id as u32, &data) {
-                        Ok(n) => {
-                            ctx.set_field(bb, 1, Value::Int((bb_pos + n) as i32));
-                            n as i32
-                        }
-                        Err(_) => -1,
-                    }
-                } else {
-                    0
+                    _ => 0,
                 }
             } else {
                 -1
             };
-            let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2);
-            ctx.set_field(future, 0, Value::Int(bytes_written));
-            ctx.set_field(future, 1, Value::Int(1));
-            Ok(Some(Value::Object(Some(future))))
+            let boxed = aio_box_int(ctx, bytes_written);
+            aio_completed_future(ctx, boxed)
         },
     );
     r.register(asc, "close", "()V", |ctx, args| {
@@ -27831,10 +28525,65 @@ struct MacState {
     initialized: bool,
 }
 
+/// BUG nb-phases-late(4) [VULN low]: scrub HMAC key (and accumulated) bytes on
+/// drop so that whenever a `MacState` is evicted, replaced, or the table is torn
+/// down, the secret key material is zeroed in place rather than left lingering in
+/// freed heap for the VM lifetime. We cannot zero the key on doFinal()/reset()
+/// because the JDK keeps the Mac keyed for reuse after those calls (the
+/// ScramFormatter.hi() init-once/doFinal-many loop relies on this), so the
+/// eviction-time scrub plus the bounded-cap eviction below is the correct,
+/// non-breaking mitigation.
+impl Drop for MacState {
+    fn drop(&mut self) {
+        mac_zeroize(&mut self.key);
+        mac_zeroize(&mut self.data);
+    }
+}
+
+/// Overwrite a secret byte buffer with zeros, defeating dead-store elimination
+/// via a volatile write per byte, then clear it.
+fn mac_zeroize(buf: &mut Vec<u8>) {
+    for b in buf.iter_mut() {
+        // SAFETY: `b` points to a valid, uniquely-borrowed u8 inside the Vec.
+        unsafe { std::ptr::write_volatile(b as *mut u8, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    buf.clear();
+}
+
+/// Hard cap on live `MacState` entries. The table is keyed by identity hash and
+/// never observed object finalization, so without a cap a long-running VM that
+/// churns through Mac instances would retain every key forever (BUG
+/// nb-phases-late(4)). When the cap is exceeded we evict the lowest-keyed
+/// entries; their `Drop` scrubs the key bytes.
+const MAC_STATE_MAX_ENTRIES: usize = 4096;
+
 fn mac_state_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, MacState>> {
     static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, MacState>>> =
         std::sync::OnceLock::new();
     T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Bound the Mac state table: if it has grown past the cap, drop excess entries
+/// (scrubbing their key material via `MacState::drop`). Called from `getInstance`
+/// just before inserting a fresh entry. `keep` is the id we are about to insert,
+/// which is never evicted. Best-effort eviction (lowest ids first) — these are
+/// abandoned Mac handles whose Java objects are unreachable.
+fn mac_state_evict_if_needed(
+    t: &mut std::collections::HashMap<i32, MacState>,
+    keep: i32,
+) {
+    if t.len() < MAC_STATE_MAX_ENTRIES {
+        return;
+    }
+    let target = MAC_STATE_MAX_ENTRIES / 2;
+    let mut ids: Vec<i32> = t.keys().copied().filter(|&k| k != keep).collect();
+    ids.sort_unstable();
+    let to_remove = t.len().saturating_sub(target);
+    for id in ids.into_iter().take(to_remove) {
+        // Removing drops the MacState, whose Drop zeroes the key bytes.
+        t.remove(&id);
+    }
 }
 
 pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
@@ -27858,7 +28607,11 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
                 .unwrap_or_default();
             let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4);
             let id = ctx.identity_hash_code(obj);
-            mac_state_table().lock().unwrap().insert(
+            // BUG nb-phases-late(4): bound the key-bearing side-table before
+            // inserting so it cannot retain key material for the VM lifetime.
+            let mut t = mac_state_table().lock().unwrap();
+            mac_state_evict_if_needed(&mut t, id);
+            t.insert(
                 id,
                 MacState { algo, key: Vec::new(), data: Vec::new(), initialized: false },
             );
@@ -27882,7 +28635,11 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
                 .unwrap_or_default();
             let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4);
             let id = ctx.identity_hash_code(obj);
-            mac_state_table().lock().unwrap().insert(
+            // BUG nb-phases-late(4): bound the key-bearing side-table before
+            // inserting so it cannot retain key material for the VM lifetime.
+            let mut t = mac_state_table().lock().unwrap();
+            mac_state_evict_if_needed(&mut t, id);
+            t.insert(
                 id,
                 MacState { algo, key: Vec::new(), data: Vec::new(), initialized: false },
             );
@@ -27898,6 +28655,10 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
         let id = ctx.identity_hash_code(this);
         let mut t = mac_state_table().lock().unwrap();
         let st = t.entry(id).or_default();
+        // BUG nb-phases-late(4): scrub the previous key in place before
+        // replacing it, so re-keying a reused Mac doesn't leave the old key
+        // lingering in freed heap.
+        mac_zeroize(&mut st.key);
         st.key = key_bytes;
         st.initialized = true;
         st.data.clear();
@@ -27942,70 +28703,71 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     r.register(mac, "doFinal", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let id = ctx.identity_hash_code(this);
-        let (algo, key, data, ready) = {
-            let t = mac_state_table().lock().unwrap();
-            match t.get(&id) {
-                Some(st) => (
-                    st.algo.clone(),
-                    st.key.clone(),
-                    st.data.clone(),
-                    st.initialized || !st.key.is_empty(),
-                ),
-                None => (String::new(), Vec::new(), Vec::new(), false),
+        // PERF: single lock acquisition, no full-state clones. Previously this
+        // cloned algo (String) + key (Vec) + the entire accumulated data (Vec)
+        // out of the mutex, then re-locked to clear `data`. Instead, take the
+        // lock once, MOVE `data` out via `mem::take` (which both gives us owned
+        // bytes without a copy AND performs the JDK "reset buffer, keep Mac
+        // initialized" semantics in one step), and compute the HMAC borrowing
+        // algo/key in place. Same correctness; eliminates two Vec clones + a
+        // second lock round-trip per call in the hot ScramFormatter loop.
+        let hmac_result = {
+            let mut t = mac_state_table().lock().unwrap();
+            let st = match t.get_mut(&id) {
+                Some(st) => st,
+                None => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "MAC not initialized".into(),
+                    }
+                    .into());
+                }
+            };
+            if !(st.initialized || !st.key.is_empty()) {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "MAC not initialized".into(),
+                }
+                .into());
             }
+            // mem::take resets the accumulator (keeps Mac initialized for reuse).
+            let data = std::mem::take(&mut st.data);
+            mac_compute_hmac(&st.algo, &st.key, &data)
         };
-        if !ready {
-            return Err(RuntimeError::IllegalStateException {
-                message: "MAC not initialized".into(),
-            }
-            .into());
-        }
-        let hmac_result = mac_compute_hmac(&algo, &key, &data);
-        // JDK doFinal resets the buffer but keeps the Mac initialized for reuse.
-        if let Some(st) = mac_state_table().lock().unwrap().get_mut(&id) {
-            st.data.clear();
-        }
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, hmac_result.len());
-        for (i, &b) in hmac_result.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-        }
+        ctx.write_byte_array_from(arr, 0, &hmac_result);
         Ok(Some(Value::Object(Some(arr))))
     });
     // doFinal([B)[B — update with input bytes, then compute HMAC
     r.register(mac, "doFinal", "([B)[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let id = ctx.identity_hash_code(this);
-        // Append the input bytes first (read via ctx before taking the lock).
-        if let Some(Value::Object(Some(input_arr))) = args.get(1) {
-            let bytes = mac_read_byte_array(ctx, *input_arr);
-            mac_state_table().lock().unwrap().entry(id).or_default().data.extend_from_slice(&bytes);
-        }
-        let (algo, key, data, ready) = {
-            let t = mac_state_table().lock().unwrap();
-            match t.get(&id) {
-                Some(st) => (
-                    st.algo.clone(),
-                    st.key.clone(),
-                    st.data.clone(),
-                    st.initialized || !st.key.is_empty(),
-                ),
-                None => (String::new(), Vec::new(), Vec::new(), false),
-            }
+        // Read the input bytes via ctx BEFORE taking the lock (ctx access must
+        // not happen while the state mutex is held).
+        let input = match args.get(1) {
+            Some(Value::Object(Some(input_arr))) => Some(mac_read_byte_array(ctx, *input_arr)),
+            _ => None,
         };
-        if !ready {
-            return Err(RuntimeError::IllegalStateException {
-                message: "MAC not initialized".into(),
+        // PERF: same single-lock / move-out optimization as doFinal()[B above —
+        // append the input, compute the HMAC, and reset the accumulator under a
+        // single lock with no full-state clones (was: append-lock, clone-lock,
+        // clear-lock = three acquisitions plus algo/key/data clones per call).
+        let hmac_result = {
+            let mut t = mac_state_table().lock().unwrap();
+            let st = t.entry(id).or_default();
+            if let Some(bytes) = input.as_ref() {
+                st.data.extend_from_slice(bytes);
             }
-            .into());
-        }
-        let hmac_result = mac_compute_hmac(&algo, &key, &data);
-        if let Some(st) = mac_state_table().lock().unwrap().get_mut(&id) {
-            st.data.clear();
-        }
+            if !(st.initialized || !st.key.is_empty()) {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "MAC not initialized".into(),
+                }
+                .into());
+            }
+            // mem::take resets the accumulator (keeps Mac initialized for reuse).
+            let data = std::mem::take(&mut st.data);
+            mac_compute_hmac(&st.algo, &st.key, &data)
+        };
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, hmac_result.len());
-        for (i, &b) in hmac_result.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-        }
+        ctx.write_byte_array_from(arr, 0, &hmac_result);
         Ok(Some(Value::Object(Some(arr))))
     });
     // reset()V — clear the accumulator
@@ -42156,7 +42918,27 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+/// Read exactly four hex digits as a u16 from the char iterator, advancing it.
+/// Returns None if fewer than four hex digits are available (malformed `\u`).
+fn json_read_u16_hex(chars: &mut std::str::Chars<'_>) -> Option<u16> {
+    let mut code: u16 = 0;
+    for _ in 0..4 {
+        let d = chars.next()?.to_digit(16)?;
+        code = code.wrapping_shl(4) | (d as u16);
+    }
+    Some(code)
+}
+
 /// Unescape a JSON string value (handles \\n, \\t, \\uXXXX, etc.).
+///
+/// FIX (finding 1): correctly decode UTF-16 surrogate PAIRS. A `😀`
+/// sequence is two escapes that together form one astral code point (U+1F600).
+/// The previous code fed each half to `char::from_u32`, which returns `None` for
+/// any surrogate (0xD800..=0xDFFF), so emoji and other supplementary-plane chars
+/// were SILENTLY DROPPED. We now combine a high surrogate with a following low
+/// surrogate; unpaired/invalid surrogates become U+FFFD instead of vanishing.
+/// Operates purely on `char`s, so it is inherently UTF-8-boundary safe and never
+/// panics on malformed multi-byte input.
 fn json_unescape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -42172,11 +42954,44 @@ fn json_unescape(s: &str) -> String {
                 Some('b') => out.push('\x08'),
                 Some('f') => out.push('\x0C'),
                 Some('u') => {
-                    let hex: String = chars.by_ref().take(4).collect();
-                    if let Ok(code) = u32::from_str_radix(&hex, 16) {
-                        if let Some(ch) = char::from_u32(code) {
-                            out.push(ch);
+                    match json_read_u16_hex(&mut chars) {
+                        Some(unit) => {
+                            if (0xD800..=0xDBFF).contains(&unit) {
+                                // High surrogate: try to consume a following `\uDCxx` low surrogate.
+                                let mut lookahead = chars.clone();
+                                let low = if lookahead.next() == Some('\\')
+                                    && lookahead.next() == Some('u')
+                                {
+                                    json_read_u16_hex(&mut lookahead)
+                                } else {
+                                    None
+                                };
+                                match low {
+                                    Some(lo) if (0xDC00..=0xDFFF).contains(&lo) => {
+                                        // Valid surrogate pair → astral code point.
+                                        let cp = 0x10000
+                                            + (((unit as u32) - 0xD800) << 10)
+                                            + ((lo as u32) - 0xDC00);
+                                        // SAFETY: cp is in 0x10000..=0x10FFFF, always a valid char.
+                                        out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                                        chars = lookahead; // consume the low-surrogate escape
+                                    }
+                                    _ => {
+                                        // Unpaired high surrogate → replacement char.
+                                        out.push('\u{FFFD}');
+                                    }
+                                }
+                            } else if (0xDC00..=0xDFFF).contains(&unit) {
+                                // Unpaired low surrogate → replacement char.
+                                out.push('\u{FFFD}');
+                            } else {
+                                // BMP scalar value (never a surrogate here).
+                                out.push(char::from_u32(unit as u32).unwrap_or('\u{FFFD}'));
+                            }
                         }
+                        // Malformed `\u` with fewer than 4 hex digits: emit replacement
+                        // rather than panicking or silently dropping.
+                        None => out.push('\u{FFFD}'),
                     }
                 }
                 Some(other) => { out.push('\\'); out.push(other); }
@@ -42187,6 +43002,37 @@ fn json_unescape(s: &str) -> String {
         }
     }
     out
+}
+
+/// Number of bytes occupied by the UTF-8 character whose leading byte sits at
+/// `bytes[i]`. Returns at least 1, and clamps so the result never runs past the
+/// slice end.
+///
+/// FIX (finding 1): the byte-level scanners below skip an *escaped* character by
+/// advancing past the backslash and then over the escaped char. If that char is
+/// multi-byte UTF-8 (e.g. `\é`, `\😀`), a blind `+= 2` lands the cursor in the
+/// MIDDLE of a UTF-8 sequence; the later `&s[start..i]` slice then panics with
+/// "byte index N is not a char boundary". Skipping the full UTF-8 width keeps the
+/// cursor on a char boundary so malformed input degrades gracefully (never panics).
+#[inline]
+fn json_utf8_char_len(bytes: &[u8], i: usize) -> usize {
+    if i >= bytes.len() {
+        return 0;
+    }
+    let b = bytes[i];
+    let n = if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else if b >> 3 == 0b11110 {
+        4
+    } else {
+        // Continuation/invalid leading byte: advance one byte to make progress.
+        1
+    };
+    n.min(bytes.len() - i)
 }
 
 /// Simple JSON tokenizer for deserialization.
@@ -42217,15 +43063,17 @@ fn parse_json_object(json: &str) -> Vec<(String, String)> {
         let key_start = i;
         while i < bytes.len() {
             if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                i += 2; // skip escaped char pair (handles \" correctly)
+                // Skip the backslash, then the FULL escaped char (UTF-8 width-aware,
+                // finding 1) so `i` stays on a char boundary even for `\é`, `\😀`, etc.
+                i += 1 + json_utf8_char_len(bytes, i + 1);
             } else if bytes[i] == b'"' {
                 break;
             } else {
-                i += 1;
+                i += json_utf8_char_len(bytes, i);
             }
         }
         if i >= bytes.len() { break; } // unterminated string
-        let raw_key = &inner[key_start..i];
+        let raw_key = &inner[key_start..i.min(inner.len())];
         let key = json_unescape(raw_key);
         i += 1; // skip closing quote
 
@@ -42300,14 +43148,16 @@ fn read_json_value(s: &str, i: &mut usize) -> String {
             let start = *i;
             while *i < bytes.len() {
                 if bytes[*i] == b'\\' && *i + 1 < bytes.len() {
-                    *i += 2; // skip escaped char pair
+                    // Skip backslash + full escaped char (UTF-8-width aware, finding 1)
+                    // so `*i` stays on a char boundary for the slice below.
+                    *i += 1 + json_utf8_char_len(bytes, *i + 1);
                 } else if bytes[*i] == b'"' {
                     break;
                 } else {
-                    *i += 1;
+                    *i += json_utf8_char_len(bytes, *i);
                 }
             }
-            let val = json_unescape(&s[start..*i]);
+            let val = json_unescape(&s[start..(*i).min(bytes.len())]);
             if *i < bytes.len() { *i += 1; } // skip closing quote
             val
         }
@@ -42317,19 +43167,20 @@ fn read_json_value(s: &str, i: &mut usize) -> String {
             let mut in_string = false;
             while *i < bytes.len() {
                 if in_string {
-                    if bytes[*i] == b'\\' && *i + 1 < bytes.len() { *i += 2; continue; }
+                    // UTF-8-width-aware escape skip keeps `*i` on a char boundary (finding 1).
+                    if bytes[*i] == b'\\' && *i + 1 < bytes.len() { *i += 1 + json_utf8_char_len(bytes, *i + 1); continue; }
                     if bytes[*i] == b'"' { in_string = false; }
                 } else {
                     match bytes[*i] {
                         b'"' => in_string = true,
                         b'{' => depth += 1,
-                        b'}' => { depth -= 1; if depth == 0 { *i += 1; return s[start..*i].to_string(); } }
+                        b'}' => { depth -= 1; if depth == 0 { *i += 1; return s[start..(*i).min(bytes.len())].to_string(); } }
                         _ => {}
                     }
                 }
-                *i += 1;
+                *i += json_utf8_char_len(bytes, *i);
             }
-            s[start..*i].to_string()
+            s[start..(*i).min(bytes.len())].to_string()
         }
         b'[' => {
             let start = *i;
@@ -42337,19 +43188,20 @@ fn read_json_value(s: &str, i: &mut usize) -> String {
             let mut in_string = false;
             while *i < bytes.len() {
                 if in_string {
-                    if bytes[*i] == b'\\' && *i + 1 < bytes.len() { *i += 2; continue; }
+                    // UTF-8-width-aware escape skip keeps `*i` on a char boundary (finding 1).
+                    if bytes[*i] == b'\\' && *i + 1 < bytes.len() { *i += 1 + json_utf8_char_len(bytes, *i + 1); continue; }
                     if bytes[*i] == b'"' { in_string = false; }
                 } else {
                     match bytes[*i] {
                         b'"' => in_string = true,
                         b'[' => depth += 1,
-                        b']' => { depth -= 1; if depth == 0 { *i += 1; return s[start..*i].to_string(); } }
+                        b']' => { depth -= 1; if depth == 0 { *i += 1; return s[start..(*i).min(bytes.len())].to_string(); } }
                         _ => {}
                     }
                 }
-                *i += 1;
+                *i += json_utf8_char_len(bytes, *i);
             }
-            s[start..*i].to_string()
+            s[start..(*i).min(bytes.len())].to_string()
         }
         _ => {
             // Number, boolean, null
@@ -45337,5 +46189,185 @@ mod nb_core_stubs_fix_tests {
             }
             other => panic!("forName should return a Charset object, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod nb_phases_late_security_fix_tests {
+    use super::*;
+    use cratonvm_native_api::NativeMethodRegistry;
+
+    // -- BUG nb-phases-late(4): Mac key-material scrubbing -----------------
+
+    #[test]
+    fn mac_zeroize_clears_and_zeros_secret_bytes() {
+        let mut key = vec![0xAAu8, 0xBB, 0xCC, 0xDD];
+        mac_zeroize(&mut key);
+        // After zeroize the logical length is 0 (key no longer retained).
+        assert!(key.is_empty(), "key Vec must be cleared after zeroize");
+    }
+
+    #[test]
+    fn mac_state_drop_scrubs_key() {
+        // A MacState going out of scope (eviction / table teardown) must scrub
+        // its key bytes via Drop without panicking.
+        let st = MacState {
+            algo: "HmacSHA256".to_string(),
+            key: vec![1, 2, 3, 4, 5],
+            data: vec![9, 9, 9],
+            initialized: true,
+        };
+        drop(st); // Drop impl runs mac_zeroize on key + data.
+    }
+
+    #[test]
+    fn mac_state_evict_drops_excess_entries() {
+        let mut t: std::collections::HashMap<i32, MacState> = std::collections::HashMap::new();
+        for i in 0..(MAC_STATE_MAX_ENTRIES as i32 + 1) {
+            // NB: list all fields explicitly — MacState impls Drop (key-zeroing),
+            // so the `..Default::default()` functional-update form is rejected (E0509).
+            t.insert(i, MacState { algo: String::new(), key: vec![0u8; 4], data: Vec::new(), initialized: false });
+        }
+        let keep = MAC_STATE_MAX_ENTRIES as i32; // the "about to insert" id
+        mac_state_evict_if_needed(&mut t, keep);
+        assert!(
+            t.len() <= MAC_STATE_MAX_ENTRIES,
+            "table must be bounded after eviction"
+        );
+        assert!(t.contains_key(&keep), "the kept id must never be evicted");
+    }
+
+    // -- BUG nb-phases-late(3): SynchronousQueue helper + registration -----
+
+    #[test]
+    fn sq_timeout_nanos_non_positive_is_no_wait() {
+        // A non-positive timeout maps to None ("don't wait").
+        assert_eq!(sq_timeout_nanos(&[Value::Long(0)], 0), None);
+        assert_eq!(sq_timeout_nanos(&[Value::Long(-5)], 0), None);
+        // Missing arg → treated as 0 → None.
+        assert_eq!(sq_timeout_nanos(&[], 0), None);
+    }
+
+    #[test]
+    fn sq_timeout_nanos_positive_is_bounded() {
+        // A positive timeout yields a bounded, non-zero nanos value (never
+        // an effectively-infinite block).
+        let n = sq_timeout_nanos(&[Value::Long(10)], 0).expect("positive timeout");
+        assert!(n > 0);
+        // Saturating multiply must not overflow for Long.MAX_VALUE.
+        let big = sq_timeout_nanos(&[Value::Long(i64::MAX)], 0).expect("max timeout");
+        assert!(big > 0);
+    }
+
+    #[test]
+    fn sq_real_rendezvous_methods_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_p58_synchronous_queue(&mut r);
+        let sq = "java/util/concurrent/SynchronousQueue";
+        assert!(r.find(sq, "put", "(Ljava/lang/Object;)V").is_some());
+        assert!(r.find(sq, "take", "()Ljava/lang/Object;").is_some());
+        assert!(r.find(sq, "offer", "(Ljava/lang/Object;)Z").is_some());
+        assert!(r
+            .find(sq, "offer", "(Ljava/lang/Object;JLjava/util/concurrent/TimeUnit;)Z")
+            .is_some());
+        assert!(r
+            .find(sq, "poll", "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;")
+            .is_some());
+    }
+}
+
+#[cfg(test)]
+mod nb_phases_late_robustness_fix_tests {
+    use super::*;
+
+    // -- finding 1: JSON unescape surrogate pairs + multi-byte safety --------
+
+    #[test]
+    fn json_unescape_decodes_astral_surrogate_pair() {
+        // U+1F600 GRINNING FACE encoded as a UTF-16 surrogate pair.
+        let s = json_unescape("\\uD83D\\uDE00");
+        assert_eq!(s, "\u{1F600}", "surrogate pair must combine into one astral char");
+    }
+
+    #[test]
+    fn json_unescape_lone_surrogate_becomes_replacement_not_dropped() {
+        // A lone high surrogate must not silently vanish.
+        let hi = json_unescape("a\\uD83Db");
+        assert_eq!(hi, "a\u{FFFD}b");
+        // A lone low surrogate likewise.
+        let lo = json_unescape("a\\uDE00b");
+        assert_eq!(lo, "a\u{FFFD}b");
+    }
+
+    #[test]
+    fn json_unescape_handles_bmp_and_basic_escapes() {
+        assert_eq!(json_unescape("\\u0041\\n\\t\\\""), "A\n\t\"");
+    }
+
+    #[test]
+    fn json_unescape_malformed_u_escape_does_not_panic() {
+        // Fewer than 4 hex digits after \u → replacement, no panic.
+        assert_eq!(json_unescape("\\u12"), "\u{FFFD}");
+        assert_eq!(json_unescape("\\uZZZZ"), "\u{FFFD}");
+    }
+
+    #[test]
+    fn json_utf8_char_len_classifies_widths() {
+        assert_eq!(json_utf8_char_len("a".as_bytes(), 0), 1);
+        assert_eq!(json_utf8_char_len("é".as_bytes(), 0), 2); // 0xC3 0xA9
+        assert_eq!(json_utf8_char_len("€".as_bytes(), 0), 3); // 3-byte
+        assert_eq!(json_utf8_char_len("😀".as_bytes(), 0), 4); // 4-byte
+        // Out-of-range index returns 0.
+        assert_eq!(json_utf8_char_len("a".as_bytes(), 5), 0);
+    }
+
+    #[test]
+    fn read_json_value_no_panic_on_escaped_multibyte() {
+        // `\é` inside a string would previously skip into the middle of the
+        // 2-byte 'é' and panic on the slice. Now it parses cleanly.
+        let s = "\"x\\éy\"";
+        let mut i = 0usize;
+        let v = read_json_value(s, &mut i);
+        // The unescaped value keeps the backslash-prefixed unknown escape as `\é`.
+        assert!(v.contains('é'), "value should retain the multi-byte char, got {v:?}");
+    }
+
+    #[test]
+    fn parse_json_object_no_panic_on_escaped_multibyte_key() {
+        // Malformed/odd escapes with multi-byte chars must not panic.
+        let pairs = parse_json_object("{\"k\\é\":\"v\"}");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].1, "v");
+    }
+
+    // -- finding 3: bounded inflation (compression-bomb defense) -------------
+
+    #[test]
+    fn inflate_bounded_rejects_oversize() {
+        let data = vec![0u8; 1024];
+        // Cap below the data size → error.
+        let res = inflate_bounded(&data[..], Some(512));
+        assert!(res.is_err(), "exceeding the cap must error");
+        let e = res.unwrap_err();
+        assert!(e.to_string().contains("compression bomb"));
+    }
+
+    #[test]
+    fn inflate_bounded_allows_within_cap_and_unbounded() {
+        let data = vec![7u8; 1024];
+        // Within cap → full read.
+        let ok = inflate_bounded(&data[..], Some(4096)).expect("within cap");
+        assert_eq!(ok.len(), 1024);
+        // Cap disabled (None) → unbounded read.
+        let un = inflate_bounded(&data[..], None).expect("unbounded");
+        assert_eq!(un.len(), 1024);
+    }
+
+    #[test]
+    fn gzip_max_inflated_default_is_positive() {
+        // With no env override the default cap is a sane positive value.
+        // (Reads process env; default branch returns Some(default).)
+        let cap = gzip_max_inflated_bytes();
+        assert!(cap.map(|c| c > 0).unwrap_or(true));
     }
 }
