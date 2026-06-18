@@ -5652,6 +5652,122 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
     })
 }
 
+/// Build a real `com.sun.net.httpserver.Headers` (a `HashMap<String,List<String>>`
+/// subclass) and populate it via its real `add` bytecode, so the Java
+/// `HttpHandler` sees a fully-functional Map (`entrySet`/`get`/`getFirst` all
+/// work). Verified byte-identical to HotSpot incl. header-name normalisation.
+fn re10_build_headers(
+    ctx: &mut dyn NativeContext,
+    entries: &[(String, String)],
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    let hdrs = match ctx.new_object_initialized("com/sun/net/httpserver/Headers", "()V", &[])? {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Err(ioex("Headers <init> failed")),
+    };
+    for (k, v) in entries {
+        let ks = ctx.create_string(k);
+        let vs = ctx.create_string(v);
+        let _ = ctx.invoke(
+            "com/sun/net/httpserver/Headers",
+            "add",
+            "(Ljava/lang/String;Ljava/lang/String;)V",
+            &[
+                Value::Object(Some(hdrs)),
+                Value::Object(Some(ks)),
+                Value::Object(Some(vs)),
+            ],
+        );
+    }
+    Ok(hdrs)
+}
+
+/// Read a real `Map<String,List<String>>` (the response Headers the handler
+/// populated) into flat (name, value) pairs via its polymorphic
+/// `entrySet().iterator()` — the same layout-agnostic walk the collections
+/// crate uses for unmodelled maps.
+fn re10_read_headers(ctx: &mut dyn NativeContext, map: ObjectRef) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let set = match ctx.invoke(
+        "java/util/Map",
+        "entrySet",
+        "()Ljava/util/Set;",
+        &[Value::Object(Some(map))],
+    ) {
+        Ok(Some(Value::Object(Some(s)))) => s,
+        _ => return out,
+    };
+    let it = match ctx.invoke(
+        "java/util/Set",
+        "iterator",
+        "()Ljava/util/Iterator;",
+        &[Value::Object(Some(set))],
+    ) {
+        Ok(Some(Value::Object(Some(i)))) => i,
+        _ => return out,
+    };
+    loop {
+        let has = matches!(
+            ctx.invoke(
+                "java/util/Iterator",
+                "hasNext",
+                "()Z",
+                &[Value::Object(Some(it))]
+            ),
+            Ok(Some(Value::Int(1)))
+        );
+        if !has {
+            break;
+        }
+        let entry = match ctx.invoke(
+            "java/util/Iterator",
+            "next",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(it))],
+        ) {
+            Ok(Some(Value::Object(Some(e)))) => e,
+            _ => break,
+        };
+        let key = match ctx.invoke(
+            "java/util/Map$Entry",
+            "getKey",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(entry))],
+        ) {
+            Ok(Some(Value::Object(Some(k)))) => ctx.read_string(k).unwrap_or_default(),
+            _ => continue,
+        };
+        let val_list = match ctx.invoke(
+            "java/util/Map$Entry",
+            "getValue",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(entry))],
+        ) {
+            Ok(Some(Value::Object(Some(l)))) => l,
+            _ => continue,
+        };
+        let n = match ctx.invoke(
+            "java/util/List",
+            "size",
+            "()I",
+            &[Value::Object(Some(val_list))],
+        ) {
+            Ok(Some(Value::Int(n))) => n,
+            _ => 0,
+        };
+        for i in 0..n {
+            if let Ok(Some(Value::Object(Some(s)))) = ctx.invoke(
+                "java/util/List",
+                "get",
+                "(I)Ljava/lang/Object;",
+                &[Value::Object(Some(val_list)), Value::Int(i)],
+            ) {
+                out.push((key.clone(), ctx.read_string(s).unwrap_or_default()));
+            }
+        }
+    }
+    out
+}
+
 fn re10_dispatch_pending(
     ctx: &mut dyn NativeContext,
     server_id: i32,
@@ -5684,13 +5800,12 @@ fn re10_dispatch_pending(
                 let u = ctx.create_string(&req.uri);
                 ctx.set_field(ex, 0, Value::Object(Some(m)));
                 ctx.set_field(ex, 1, Value::Object(Some(u)));
-                let rh = ctx.new_ref_array(ClassId::new(0), req.headers.len().max(1));
-                for (i, (k, v)) in req.headers.iter().enumerate() {
-                    let s = ctx.create_string(&format!("{k}: {v}"));
-                    ctx.set_array_element(rh, i, Value::Object(Some(s)));
-                }
+                // Request + response headers are REAL `Headers` (HashMap subclass)
+                // objects so the handler's `entrySet()`/`put()`/`getFirst()` run
+                // real bytecode. The synthetic Headers had no Map methods.
+                let rh = re10_build_headers(ctx, &req.headers)?;
                 ctx.set_field(ex, 2, Value::Object(Some(rh)));
-                let rsph = ctx.new_ref_array(ClassId::new(0), 32);
+                let rsph = re10_build_headers(ctx, &[])?;
                 ctx.set_field(ex, 3, Value::Object(Some(rsph)));
                 let body_arr = new_java_byte_array(ctx, &req.body);
                 ctx.set_field(ex, 4, Value::Object(Some(body_arr)));
@@ -5719,26 +5834,15 @@ fn re10_dispatch_pending(
                         }
                     }
                 }
-                let mut resp_headers = Vec::new();
-                if let Value::Object(Some(rh)) = ctx.get_field(ex, 3) {
-                    let n = ctx.array_length(rh);
-                    for i in 0..n {
-                        if let Value::Object(Some(s)) = ctx.get_array_element(rh, i) {
-                            let line = ctx.read_string(s).unwrap_or_default();
-                            if let Some(colon) = line.find(':') {
-                                resp_headers.push((
-                                    line[..colon].trim().to_string(),
-                                    line[colon + 1..].trim().to_string(),
-                                ));
-                            }
-                        }
-                    }
-                }
+                let resp_headers = match ctx.get_field(ex, 3) {
+                    Value::Object(Some(rh)) => re10_read_headers(ctx, rh),
+                    _ => Vec::new(),
+                };
                 (status, body_bytes, resp_headers)
             }
             None => (404, b"Not Found".to_vec(), Vec::new()),
         };
-        let mut stream = req.stream;
+        let stream = req.stream;
         let mut resp = Vec::with_capacity(128 + body_bytes.len());
         use std::io::Write as _;
         let _ = write!(&mut resp, "HTTP/1.1 {status} {}\r\n", http_reason(status));
@@ -5754,11 +5858,138 @@ fn re10_dispatch_pending(
         }
         resp.extend_from_slice(b"Connection: close\r\n\r\n");
         resp.extend_from_slice(&body_bytes);
-        let _ = stream.write_all(&resp);
-        let _ = stream.flush();
-        let _ = stream.shutdown(std::net::Shutdown::Both);
+        // Write the response and close on a short-lived I/O thread (pure socket
+        // work, no VM context needed) so the dispatcher returns immediately to
+        // serve the next queued request instead of blocking on the per-connection
+        // lingering close.
+        re10_send_response(stream, resp);
     }
     Ok(drained)
+}
+
+/// Write a fully-formed HTTP response to `stream` and close it gracefully on a
+/// detached thread. The close is a *lingering* close: send FIN (`shutdown(Write)`)
+/// then drain the read side until the peer closes (EOF) before dropping the
+/// socket. This avoids the Windows RST-on-close that resets a peer still reading
+/// the response (a non-blocking Apache NIO reactor surfaced this as
+/// "connection reset" / os error 10053); a bare `shutdown(Both)` discards unread
+/// bytes and is RST-prone, while no drain at all races the OS close against the
+/// client's read.
+fn re10_send_response(mut stream: TcpStream, resp: Vec<u8>) {
+    let _ = std::thread::Builder::new()
+        .name("cratonvm-httpserver-resp".to_string())
+        .spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let _ = stream.write_all(&resp);
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut drain = [0u8; 512];
+            loop {
+                match stream.read(&mut drain) {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+}
+
+/// Synthetic Runnable whose `run()` drives the per-server HTTP dispatch loop on
+/// a real VM thread. Field 0 holds the `server_id`.
+const HS_LOOP_CLASS: &str = "CratonVM$HttpServerLoop";
+
+// Requested field count for the worker `java/lang/Thread`. The VM may hand back
+// the real-JDK layout (more fields) instead — `Thread.<init>` handles both.
+const HS_THREAD_NUM_FIELDS: usize = 5;
+
+/// Build a daemon VM thread whose `run()` is `re10_serve_loop_run` for
+/// `server_id`, and start it via the VM's real thread machinery. The thread
+/// exits when the server's `running` flag clears (stop()).
+fn re10_spawn_dispatcher(
+    ctx: &mut dyn NativeContext,
+    server_id: i32,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    let runner = alloc_concurrent_synthetic(ctx, HS_LOOP_CLASS, 1);
+    ctx.set_field(runner, 0, Value::Int(server_id));
+
+    let worker = alloc_concurrent_synthetic(ctx, "java/lang/Thread", HS_THREAD_NUM_FIELDS);
+    let name = ctx.create_string(&format!("cratonvm-httpserver-dispatch-{server_id}"));
+    // Populate the worker Thread via the registered
+    // `Thread.<init>(ThreadGroup, Runnable, String)` native. This stores the
+    // runnable the right way for BOTH layouts: slot 3 (`target`) on a synthetic
+    // <=8-field Thread, or `holder:FieldHolder.task` on a real-JDK Thread — which
+    // is what `Thread.run()` actually reads. Setting `target` by name on a
+    // real-JDK Thread does NOT work (no top-level `target` field; the runnable
+    // lives in the FieldHolder), which is why the loop never started before.
+    let _ = ctx.invoke(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;)V",
+        &[
+            Value::Object(Some(worker)),
+            Value::Object(None),
+            Value::Object(Some(runner)),
+            Value::Object(Some(name)),
+        ],
+    );
+    // Best-effort: if the VM has no thread registry (e.g. test mocks) the
+    // start is a no-op; start()/stop() still drain the queue as a fallback.
+    let res = ctx.thread_start(worker);
+    if std::env::var_os("CRATONVM_DBG_HTTPSRV").is_some() {
+        eprintln!(
+            "[HTTPSRV] spawn_dispatcher server={server_id} num_fields={} thread_start_ok={}",
+            ctx.object_num_fields(worker),
+            res.is_ok()
+        );
+    }
+    Ok(())
+}
+
+/// `CratonVM$HttpServerLoop.run()` — runs on a dedicated VM thread. Drains the
+/// inbound request queue and dispatches each request through the real Java
+/// `HttpHandler`, then idles (in a GC-blocked region) until more arrive. Exits
+/// when the server's `running` flag clears.
+fn re10_serve_loop_run(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let server_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+    let dbg = std::env::var_os("CRATONVM_DBG_HTTPSRV").is_some();
+    if dbg {
+        eprintln!("[HTTPSRV] serve_loop ENTER server={server_id}");
+    }
+    if server_id < 0 {
+        return Ok(None);
+    }
+    let mut iters: u64 = 0;
+    loop {
+        let running = server_registry()
+            .lock()
+            .get(&server_id)
+            .map(|s| s.running.load(Ordering::SeqCst))
+            .unwrap_or(false);
+        if !running {
+            if dbg {
+                eprintln!("[HTTPSRV] serve_loop EXIT server={server_id} (not running) iters={iters}");
+            }
+            break;
+        }
+        // Dispatch runs Java bytecode (the handler) which cooperates with
+        // safepoints normally — only the idle wait needs a blocking region.
+        let drained = re10_dispatch_pending(ctx, server_id)?;
+        if dbg && (drained > 0 || iters % 500 == 0) {
+            eprintln!("[HTTPSRV] serve_loop server={server_id} iter={iters} drained={drained}");
+        }
+        iters += 1;
+        if drained == 0 {
+            ctx.begin_blocking_region();
+            std::thread::sleep(Duration::from_millis(2));
+            ctx.end_blocking_region();
+        }
+    }
+    Ok(None)
 }
 
 fn http_reason(code: i32) -> &'static str {
@@ -5833,6 +6064,9 @@ fn re10_start_server(server_id: i32) -> std::io::Result<()> {
 fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     let hs = "com/sun/net/httpserver/HttpServer";
 
+    // VM-thread dispatch loop runner (see re10_spawn_dispatcher).
+    r.register(HS_LOOP_CLASS, "run", "()V", re10_serve_loop_run);
+
     r.register(
         hs,
         "create",
@@ -5874,7 +6108,14 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
         }
         re10_start_server(id).map_err(|e| ioex(format!("HttpServer start: {e}")))?;
         ctx.set_field(this, HS_STARTED, Value::Int(1));
-        re10_dispatch_pending(ctx, id)?;
+        // The OS accept thread (re10_start_server) only parses requests into the
+        // queue — it has no VM context and cannot invoke the Java `HttpHandler`.
+        // Spawn a dedicated VM thread whose `run()` drains that queue and
+        // dispatches each request on a thread that CAN run Java bytecode. Without
+        // this, requests were only dispatched on `start()`/`stop()`, so a client
+        // that blocks waiting for a response (e.g. the ES `RestClient*IntegTests`)
+        // deadlocks against the embedded server. See ES-HANG-02.
+        re10_spawn_dispatcher(ctx, id)?;
         Ok(None)
     });
 
@@ -5940,16 +6181,16 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
         ctx.set_field(uri, 0, s);
         Ok(Some(Value::Object(Some(uri))))
     });
+    // Request/response headers are stored on the exchange as REAL
+    // `com.sun.net.httpserver.Headers` (see re10_dispatch_pending) — return them
+    // directly so the handler operates on a live Map.
     r.register(
         hex,
         "getResponseHeaders",
         "()Lcom/sun/net/httpserver/Headers;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let rh = ctx.get_field(this, 3);
-            let h = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/Headers", 1);
-            ctx.set_field(h, 0, rh);
-            Ok(Some(Value::Object(Some(h))))
+            Ok(Some(ctx.get_field(this, 3)))
         },
     );
     r.register(
@@ -5958,10 +6199,7 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
         "()Lcom/sun/net/httpserver/Headers;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let rh = ctx.get_field(this, 2);
-            let h = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/Headers", 1);
-            ctx.set_field(h, 0, rh);
-            Ok(Some(Value::Object(Some(h))))
+            Ok(Some(ctx.get_field(this, 2)))
         },
     );
     r.register(hex, "getRequestBody", "()Ljava/io/InputStream;", |ctx, args| {
@@ -6004,6 +6242,31 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
         let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
         let data = java_byte_array_to_vec(ctx, buf, off, len)?;
+        let chunk = new_java_byte_array(ctx, &data);
+        if let Value::Object(Some(chunks)) = ctx.get_field(owner, 6) {
+            let cap = ctx.array_length(chunks);
+            for i in 0..cap {
+                if let Value::Object(None) = ctx.get_array_element(chunks, i) {
+                    ctx.set_array_element(chunks, i, Value::Object(Some(chunk)));
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(None)
+    });
+    // `OutputStream.write(byte[])` — the synthetic ResponseBody does not inherit
+    // the real OutputStream default (no superclass bytecode), so register the
+    // overload explicitly. Delegates to the same append-a-chunk logic as
+    // write([BII) over the whole array.
+    r.register(rb, "write", "([B)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let owner = match ctx.get_field(this, 0) {
+            Value::Object(Some(o)) => o,
+            _ => return Err(ioex("ResponseBody has no exchange")),
+        };
+        let buf = obj_arg(args, 1)?;
+        let len = ctx.array_length(buf) as i32;
+        let data = java_byte_array_to_vec(ctx, buf, 0, len)?;
         let chunk = new_java_byte_array(ctx, &data);
         if let Value::Object(Some(chunks)) = ctx.get_field(owner, 6) {
             let cap = ctx.array_length(chunks);

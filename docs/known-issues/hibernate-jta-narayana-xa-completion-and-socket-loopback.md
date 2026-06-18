@@ -19,7 +19,15 @@ JTA-platform tests crash with `process-died rc=1` (sometimes via `System.exit`);
 with no `@@RESULT`. HotSpot (JDK 25) passes all of them. Representative classes:
 `actionqueue.JtaCustomAfterCompletionTest`, `connections.AggressiveReleaseTest`,
 `connections.CurrentSessionConnectionTest`, `idgen.foreign.ForeignGeneratorJtaTest`,
-`interceptor.InterceptorJtaTransactionTest`, plus more `*Jta*` / transaction tests.
+`interceptor.InterceptorJtaTransactionTest`, plus more `*Jta*` / transaction tests. In the shard logs the
+last line is either `linkage error: no class def found: com/arjuna/ats/arjuna/coordinator/TxControl` or
+`[cratonvm] System.exit(0) called — process terminating`; both stem from the same `TxControl.<clinit>`
+NPE below (once `<clinit>` fails the class is poisoned and every later use throws `NoClassDefFoundError`).
+
+> **Consolidation note (2026-06-18):** this doc is the single source for the Hibernate JTA cluster.
+> The former `hibernate-jta-txcontrol-getinetaddress-per-class-report.md` (HIB-DEV-02) described the
+> *same* cluster from the per-class angle and has been folded in here (its unique
+> `InetAddress.getLocalHost()` IPv4-vs-IPv6 detail is in Layer 0 below).
 
 ---
 
@@ -43,6 +51,13 @@ the phase-53 object-field listener id, because the synthetic `ServerSocket` surf
 ~6 registration sites (see [`reference_server_socket_gap`] memory) — with a wildcard fallback so the caller
 never gets `null`. Verified: `new ServerSocket(0,50,localhost).getInetAddress()` → `127.0.0.1` (was `null`);
 `TxControl.<clinit>` no longer throws.
+
+> **Red-herring ruled out (folded in from HIB-DEV-02):** the first theory blamed `InetAddress.getLocalHost()`,
+> because CratonVM returns an IPv6 link-local (`VICTOR-PC/fe80::…`) where HotSpot returns IPv4
+> (`Victor-PC/192.168.1.5`). That is a real difference but **not** the null source — the null is
+> `ServerSocket.getInetAddress()` (above), not `InetAddress`. Standalone repro of the crash:
+> `.cratonvm-suite/TxCtl.java` (`Class.forName("com.arjuna.ats.arjuna.coordinator.TxControl")` →
+> `ExceptionInInitializerError`); socket-null repro: `.cratonvm-suite/jsonrepro/SSRepro.java`.
 
 This is a correct, broadly-useful fix (any `ServerSocket.getInetAddress()` caller benefits), but it only
 removes the **crash** — it exposes the layers below, turning the JTA cluster from a fast `rc=1` crash into a

@@ -15,7 +15,7 @@ apps/
 **/*.jar
 **/*.tar.gz
 apps/**/*.tar.gz
-test-infra/
+
 
 # Compiled Java bytecode — stray probe/repro .class files must not be committed.
 # NOTE: .class files in test_classes/ and demo/ are intentional test fixtures
