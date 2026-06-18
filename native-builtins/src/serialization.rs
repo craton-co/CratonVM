@@ -892,6 +892,25 @@ pub(crate) fn reset_serialization_globals() {
     handle_registry().lock().unwrap_or_else(|e| e.into_inner()).clear();
     // PERF: clear via the helper so `ois_filter_state_count` is reset too.
     filter_state_clear_all();
+    // Clear the per-stream and process-wide JEP-290 filters too, so leftover
+    // filter installs from a prior test can never bleed into the next one
+    // (the synthetic read-path now consults these globals — see C3).
+    ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *process_serial_filter().lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Test-only serialization guard. The (de)serialization machinery keeps its
+/// buffers, handle registry, and JEP-290 filter state in process-global
+/// `Mutex`-protected maps. cargo runs unit tests in parallel by default, so a
+/// test that calls `reset_serialization_globals()` (which clears those *global*
+/// maps) can wipe a concurrently-running test's buffer/filter mid-read. Every
+/// test that touches the global serialization state acquires this guard first
+/// so those tests run serially with respect to one another. (Poisoning is
+/// ignored — a panicked test must not wedge the rest.)
+#[cfg(test)]
+pub(crate) fn serialization_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 // ---------------------------------------------------------------------------
@@ -5136,6 +5155,7 @@ mod serialization_tests {
 
     #[test]
     fn jep290_synthetic_path_rejects_filtered_class() {
+        let _serial_guard = super::serialization_test_guard();
         // SECURITY regression (JEP-290 filter bypass, CRITICAL): a per-stream
         // reject rule installed for a gadget class must trip the sticky flag
         // when the synthetic read-path evaluates it, and a benign class in the
@@ -5173,6 +5193,7 @@ mod serialization_tests {
 
     #[test]
     fn longstring_oversized_length_does_not_overallocate() {
+        let _serial_guard = super::serialization_test_guard();
         // SECURITY regression (deserialization DoS, HIGH): `ois_buf_read`
         // must never honour a hostile length past the bytes actually in the
         // buffer. We register a tiny buffer and ask for a near-`usize::MAX`
@@ -5600,6 +5621,7 @@ mod marshal_tests {
 
     #[test]
     fn primitive_and_string_and_nested_object_roundtrip() {
+        let _serial_guard = super::serialization_test_guard();
         let (mut ctx, point, holder) = setup();
 
         // Build a Point(3, 4) and a Holder(7, "hi", point).
@@ -5651,6 +5673,7 @@ mod marshal_tests {
 
     #[test]
     fn non_serializable_object_is_rejected() {
+        let _serial_guard = super::serialization_test_guard();
         let mut ctx = MockNativeContext::new();
         let _object = ctx.ensure_class_initialized("java/lang/Object").unwrap();
         let _serializable = ctx.ensure_class_initialized("java/io/Serializable").unwrap();
@@ -5674,6 +5697,7 @@ mod marshal_tests {
 
     #[test]
     fn cycle_writes_back_reference_not_infinite() {
+        let _serial_guard = super::serialization_test_guard();
         // Holder.p points at a Point, and we make a self-cycle:
         // h.p = h (re-using the same slot just to force a back-ref).
         let (mut ctx, _point, holder) = setup();
@@ -5716,6 +5740,7 @@ mod marshal_tests {
 
     #[test]
     fn int_array_field_roundtrip() {
+        let _serial_guard = super::serialization_test_guard();
         let mut ctx = MockNativeContext::new();
         let _object = ctx.ensure_class_initialized("java/lang/Object").unwrap();
         let serializable = ctx.ensure_class_initialized("java/io/Serializable").unwrap();

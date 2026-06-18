@@ -2066,6 +2066,19 @@ fn ct_eq_bytes(a: &[u8], b: &[u8]) -> u8 {
     !ct_is_nonzero_u8(diff)
 }
 
+/// Widen a byte selector mask (`0x00` or `0xFF`) to a full-width `usize` mask
+/// (`0` or `usize::MAX`) for branch-free conditional index selection.
+///
+/// This replaces the earlier `(mask as u64).wrapping_neg()` idiom, which was a
+/// BUG: for `mask == 0xFF` it produced `0xFF..FF01` (only the low byte negated),
+/// not all-ones, so `index & widen(mask)` corrupted the recorded separator /
+/// marker index. We sign-extend the byte instead: `0xFF as i8 = -1` → all-ones,
+/// `0x00 as i8 = 0` → zero.
+#[inline(always)]
+fn ct_mask_usize(mask: u8) -> usize {
+    (mask as i8 as isize) as usize
+}
+
 /// EME-PKCS1-v1_5 decode: strip `00 02 || PS || 00` and return `M`.
 ///
 /// nb-crypto-impl VULN(1): rewritten to be constant-time in the padding
@@ -2094,7 +2107,7 @@ fn rsa_pkcs1_type2_unpad(em: &[u8]) -> Result<Vec<u8>, String> {
         // first-zero = is_zero & !found
         let first = is_zero & !found;
         // conditionally record the index for the first zero only
-        sep |= (i as u64 & (first as u64).wrapping_neg()) as usize;
+        sep |= i & ct_mask_usize(first);
         found |= is_zero;
     }
     // A valid separator must exist (found) and leave PS >= 8 bytes, i.e. the
@@ -2197,7 +2210,7 @@ fn rsa_oaep_unpad(pad: RsaCipherPadding, em: &[u8]) -> Result<Vec<u8>, String> {
         // Marker is the first 0x01 while still in the PS region (!found_one).
         let marker_here = is_one & !found_one;
         // Record message start = index just after the marker (only the first).
-        msg_start |= ((j as u64 + 1) & (marker_here as u64).wrapping_neg()) as usize;
+        msg_start |= (j + 1) & ct_mask_usize(marker_here);
         // Before the marker, every byte must be 0x00 (and not the marker).
         // active = bytes we are still scrutinising as PS (before any marker).
         let active = !found_one;
