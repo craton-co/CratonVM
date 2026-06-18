@@ -11065,6 +11065,18 @@ fn register_int_stream_natives(r: &mut NativeMethodRegistry) {
         native_int_stream_of,
     );
     r.register(c, "sum", "()I", native_int_stream_sum);
+    r.register(
+        c,
+        "reduce",
+        "(ILjava/util/function/IntBinaryOperator;)I",
+        native_int_stream_reduce_seeded,
+    );
+    r.register(
+        c,
+        "reduce",
+        "(Ljava/util/function/IntBinaryOperator;)Ljava/util/OptionalInt;",
+        native_int_stream_reduce,
+    );
     r.register(c, "count", "()J", native_int_stream_count);
     r.register(c, "min", "()Ljava/util/OptionalInt;", native_int_stream_min);
     r.register(c, "max", "()Ljava/util/OptionalInt;", native_int_stream_max);
@@ -11222,6 +11234,160 @@ fn native_int_stream_sum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => acc,
     });
     Ok(Some(Value::Int(sum)))
+}
+
+// IntStream/LongStream `reduce` terminal ops. The synthetic primitive-stream
+// impl previously registered only sum/min/max/etc., so a call to `reduce`
+// resolved to the abstract interface method (no Code attribute) and raised
+// `AbstractMethodError`. These fold the materialized primitives through the
+// supplied binary operator, mirroring the JDK's `reduce` semantics and the
+// object-`Stream.reduce` impl. The accumulator's `Optional*` box is created
+// only after the fold so no heap ref is held across the user-callback
+// `invoke_virtual` (which can trigger GC).
+
+fn native_int_stream_reduce_seeded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // int reduce(int identity, IntBinaryOperator op)
+    let identity = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(identity))),
+    };
+    let op = match args.get(2) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(identity))),
+    };
+    let elements = int_stream_elements(ctx, this);
+    let mut acc = identity;
+    for elem in &elements {
+        let e = match elem {
+            Value::Int(i) => *i,
+            _ => continue,
+        };
+        let r = ctx.invoke_virtual(op, "applyAsInt", "(II)I", &[Value::Int(acc), Value::Int(e)])?;
+        acc = match r {
+            Some(Value::Int(i)) => i,
+            _ => acc,
+        };
+    }
+    Ok(Some(Value::Int(acc)))
+}
+
+fn native_int_stream_reduce(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // OptionalInt reduce(IntBinaryOperator op)
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let o = make_opt_prim(ctx, "java/util/OptionalInt", None);
+            return Ok(Some(Value::Object(Some(o))));
+        }
+    };
+    let op = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let o = make_opt_prim(ctx, "java/util/OptionalInt", None);
+            return Ok(Some(Value::Object(Some(o))));
+        }
+    };
+    let elements = int_stream_elements(ctx, this);
+    let mut acc: Option<i32> = None;
+    for elem in &elements {
+        let e = match elem {
+            Value::Int(i) => *i,
+            _ => continue,
+        };
+        acc = Some(match acc {
+            None => e,
+            Some(a) => {
+                let r = ctx.invoke_virtual(op, "applyAsInt", "(II)I", &[Value::Int(a), Value::Int(e)])?;
+                match r {
+                    Some(Value::Int(i)) => i,
+                    _ => a,
+                }
+            }
+        });
+    }
+    let opt = make_opt_prim(ctx, "java/util/OptionalInt", None);
+    if let Some(a) = acc {
+        set_opt_prim_value(ctx, opt, Value::Int(a));
+    }
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+fn native_long_stream_reduce_seeded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // long reduce(long identity, LongBinaryOperator op)
+    let identity = match args.get(1) {
+        Some(Value::Long(l)) => *l,
+        Some(Value::Int(i)) => *i as i64,
+        _ => 0,
+    };
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Long(identity))),
+    };
+    let op = match args.get(2) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Long(identity))),
+    };
+    let elements = stream_elements(ctx, this);
+    let mut acc = identity;
+    for elem in &elements {
+        let e = match elem {
+            Value::Long(l) => *l,
+            Value::Int(i) => *i as i64,
+            _ => continue,
+        };
+        let r = ctx.invoke_virtual(op, "applyAsLong", "(JJ)J", &[Value::Long(acc), Value::Long(e)])?;
+        acc = match r {
+            Some(Value::Long(l)) => l,
+            _ => acc,
+        };
+    }
+    Ok(Some(Value::Long(acc)))
+}
+
+fn native_long_stream_reduce(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // OptionalLong reduce(LongBinaryOperator op)
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let o = make_opt_prim(ctx, "java/util/OptionalLong", None);
+            return Ok(Some(Value::Object(Some(o))));
+        }
+    };
+    let op = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let o = make_opt_prim(ctx, "java/util/OptionalLong", None);
+            return Ok(Some(Value::Object(Some(o))));
+        }
+    };
+    let elements = stream_elements(ctx, this);
+    let mut acc: Option<i64> = None;
+    for elem in &elements {
+        let e = match elem {
+            Value::Long(l) => *l,
+            Value::Int(i) => *i as i64,
+            _ => continue,
+        };
+        acc = Some(match acc {
+            None => e,
+            Some(a) => {
+                let r = ctx.invoke_virtual(op, "applyAsLong", "(JJ)J", &[Value::Long(a), Value::Long(e)])?;
+                match r {
+                    Some(Value::Long(l)) => l,
+                    _ => a,
+                }
+            }
+        });
+    }
+    let opt = make_opt_prim(ctx, "java/util/OptionalLong", None);
+    if let Some(a) = acc {
+        set_opt_prim_value(ctx, opt, Value::Long(a));
+    }
+    Ok(Some(Value::Object(Some(opt))))
 }
 
 fn native_int_stream_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -11540,6 +11706,18 @@ fn register_long_stream_natives(r: &mut NativeMethodRegistry) {
         native_long_stream_range_closed,
     );
     r.register(c, "sum", "()J", native_long_stream_sum);
+    r.register(
+        c,
+        "reduce",
+        "(JLjava/util/function/LongBinaryOperator;)J",
+        native_long_stream_reduce_seeded,
+    );
+    r.register(
+        c,
+        "reduce",
+        "(Ljava/util/function/LongBinaryOperator;)Ljava/util/OptionalLong;",
+        native_long_stream_reduce,
+    );
     r.register(c, "count", "()J", native_long_stream_count);
     r.register(
         c,
@@ -20336,6 +20514,199 @@ fn tm_make_entry(ctx: &mut dyn NativeContext, key: Value, value: Value) -> Objec
     entry
 }
 
+/// Build a `Map.Entry` for the array-backed slot pair at logical index `i`
+/// (key at `i*2`, value at `i*2+1`). Shared by the relative-`*Entry` natives.
+fn tm_array_entry(ctx: &mut dyn NativeContext, data: ObjectRef, i: usize) -> Value {
+    let k = ctx.get_array_element(data, i * 2);
+    let v = ctx.get_array_element(data, i * 2 + 1);
+    Value::Object(Some(tm_make_entry(ctx, k, v)))
+}
+
+// The relative-navigation `*Entry` natives. TreeMap exposes `higherKey`/
+// `lowerKey`/`floorKey`/`ceilingKey` (key-only, above) plus their `*Entry`
+// counterparts that return a `Map.Entry`. These mirror the key versions
+// exactly, projecting the resolved slot to an entry instead of a bare key.
+// `NavigableMap`/`UnmodifiableMap` route here too (registration below).
+
+// ceilingEntry: entry for the smallest key >= given key
+fn native_tm_ceiling_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    tm_materialize_deser_array(ctx, this);
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    if tm_is_fast_mode(ctx, this) {
+        if let Some(tk) = tree_key_from_value(ctx, &key) {
+            let res = tm_fast_with(ctx, this, |bt| {
+                bt.range(tk..).next().map(|(k, v)| (k.clone(), *v))
+            });
+            return Ok(Some(match res {
+                Some((tk, v)) => {
+                    let k = tree_key_to_value(ctx, &tk);
+                    Value::Object(Some(tm_make_entry(ctx, k, v)))
+                }
+                None => Value::Object(None),
+            }));
+        }
+        return Ok(Some(Value::Object(None)));
+    }
+    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+        Ok(idx) => Ok(Some(tm_array_entry(ctx, data, idx))),
+        Err(pos) => {
+            if pos < size as usize {
+                Ok(Some(tm_array_entry(ctx, data, pos)))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        }
+    }
+}
+
+// floorEntry: entry for the largest key <= given key
+fn native_tm_floor_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    tm_materialize_deser_array(ctx, this);
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    if tm_is_fast_mode(ctx, this) {
+        if let Some(tk) = tree_key_from_value(ctx, &key) {
+            let res = tm_fast_with(ctx, this, |bt| {
+                bt.range(..=tk).next_back().map(|(k, v)| (k.clone(), *v))
+            });
+            return Ok(Some(match res {
+                Some((tk, v)) => {
+                    let k = tree_key_to_value(ctx, &tk);
+                    Value::Object(Some(tm_make_entry(ctx, k, v)))
+                }
+                None => Value::Object(None),
+            }));
+        }
+        return Ok(Some(Value::Object(None)));
+    }
+    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+        Ok(idx) => Ok(Some(tm_array_entry(ctx, data, idx))),
+        Err(pos) => {
+            if pos > 0 {
+                Ok(Some(tm_array_entry(ctx, data, pos - 1)))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        }
+    }
+}
+
+// higherEntry: entry for the smallest key strictly > given key
+fn native_tm_higher_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    tm_materialize_deser_array(ctx, this);
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    if tm_is_fast_mode(ctx, this) {
+        if let Some(tk) = tree_key_from_value(ctx, &key) {
+            use std::ops::Bound;
+            let res = tm_fast_with(ctx, this, |bt| {
+                bt.range((Bound::Excluded(tk), Bound::Unbounded))
+                    .next()
+                    .map(|(k, v)| (k.clone(), *v))
+            });
+            return Ok(Some(match res {
+                Some((tk, v)) => {
+                    let k = tree_key_to_value(ctx, &tk);
+                    Value::Object(Some(tm_make_entry(ctx, k, v)))
+                }
+                None => Value::Object(None),
+            }));
+        }
+        return Ok(Some(Value::Object(None)));
+    }
+    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+        Ok(idx) => {
+            let next = idx + 1;
+            if next < size as usize {
+                Ok(Some(tm_array_entry(ctx, data, next)))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        }
+        Err(pos) => {
+            if pos < size as usize {
+                Ok(Some(tm_array_entry(ctx, data, pos)))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        }
+    }
+}
+
+// lowerEntry: entry for the largest key strictly < given key
+fn native_tm_lower_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    tm_materialize_deser_array(ctx, this);
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    if tm_is_fast_mode(ctx, this) {
+        if let Some(tk) = tree_key_from_value(ctx, &key) {
+            use std::ops::Bound;
+            let res = tm_fast_with(ctx, this, |bt| {
+                bt.range((Bound::Unbounded, Bound::Excluded(tk)))
+                    .next_back()
+                    .map(|(k, v)| (k.clone(), *v))
+            });
+            return Ok(Some(match res {
+                Some((tk, v)) => {
+                    let k = tree_key_to_value(ctx, &tk);
+                    Value::Object(Some(tm_make_entry(ctx, k, v)))
+                }
+                None => Value::Object(None),
+            }));
+        }
+        return Ok(Some(Value::Object(None)));
+    }
+    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    match tm_binary_search(ctx, data, size, &comparator, &key)? {
+        Ok(idx) => {
+            if idx > 0 {
+                Ok(Some(tm_array_entry(ctx, data, idx - 1)))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        }
+        Err(pos) => {
+            if pos > 0 {
+                Ok(Some(tm_array_entry(ctx, data, pos - 1)))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        }
+    }
+}
+
 fn native_tm_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -21756,6 +22127,30 @@ fn register_tree_map_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         c,
+        "ceilingEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        native_tm_ceiling_entry,
+    );
+    registry.register(
+        c,
+        "floorEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        native_tm_floor_entry,
+    );
+    registry.register(
+        c,
+        "higherEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        native_tm_higher_entry,
+    );
+    registry.register(
+        c,
+        "lowerEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        native_tm_lower_entry,
+    );
+    registry.register(
+        c,
         "firstEntry",
         "()Ljava/util/Map$Entry;",
         native_tm_first_entry,
@@ -21901,6 +22296,30 @@ fn register_tree_map_natives(registry: &mut NativeMethodRegistry) {
         "lowerKey",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         native_tm_lower_key,
+    );
+    registry.register(
+        nm,
+        "ceilingEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        native_tm_ceiling_entry,
+    );
+    registry.register(
+        nm,
+        "floorEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        native_tm_floor_entry,
+    );
+    registry.register(
+        nm,
+        "higherEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        native_tm_higher_entry,
+    );
+    registry.register(
+        nm,
+        "lowerEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        native_tm_lower_entry,
     );
     registry.register(
         nm,
@@ -24384,6 +24803,61 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
             "(Ljava/util/function/Predicate;)Z",
             native_unmod_throw,
         );
+        // NavigableMap / SortedMap read-only views. `cratonvm/internal/
+        // UnmodifiableMap` is synthetic (no real bytecode), so any nav method
+        // not registered here raises NoSuchMethodError when a wrapped TreeMap /
+        // NavigableMap is navigated — e.g. `unmodifiableNavigableMap(tm)
+        // .higherEntry(k)`. Each simply forwards to the backing map (which has
+        // the full nav surface registered above), preserving read-only-ness;
+        // the mutating poll* variants stay unregistered/throwing.
+        r.register(c, "firstKey", "()Ljava/lang/Object;", |ctx, args| {
+            unmod_delegate(ctx, args, "firstKey", "()Ljava/lang/Object;")
+        });
+        r.register(c, "lastKey", "()Ljava/lang/Object;", |ctx, args| {
+            unmod_delegate(ctx, args, "lastKey", "()Ljava/lang/Object;")
+        });
+        for m in ["ceilingKey", "floorKey", "higherKey", "lowerKey"] {
+            let desc = "(Ljava/lang/Object;)Ljava/lang/Object;";
+            let cb: cratonvm_native_api::NativeCallback = match m {
+                "ceilingKey" => |ctx, args| {
+                    unmod_delegate(ctx, args, "ceilingKey", "(Ljava/lang/Object;)Ljava/lang/Object;")
+                },
+                "floorKey" => |ctx, args| {
+                    unmod_delegate(ctx, args, "floorKey", "(Ljava/lang/Object;)Ljava/lang/Object;")
+                },
+                "higherKey" => |ctx, args| {
+                    unmod_delegate(ctx, args, "higherKey", "(Ljava/lang/Object;)Ljava/lang/Object;")
+                },
+                _ => |ctx, args| {
+                    unmod_delegate(ctx, args, "lowerKey", "(Ljava/lang/Object;)Ljava/lang/Object;")
+                },
+            };
+            r.register(c, m, desc, cb);
+        }
+        r.register(c, "firstEntry", "()Ljava/util/Map$Entry;", |ctx, args| {
+            unmod_delegate(ctx, args, "firstEntry", "()Ljava/util/Map$Entry;")
+        });
+        r.register(c, "lastEntry", "()Ljava/util/Map$Entry;", |ctx, args| {
+            unmod_delegate(ctx, args, "lastEntry", "()Ljava/util/Map$Entry;")
+        });
+        for m in ["ceilingEntry", "floorEntry", "higherEntry", "lowerEntry"] {
+            let desc = "(Ljava/lang/Object;)Ljava/util/Map$Entry;";
+            let cb: cratonvm_native_api::NativeCallback = match m {
+                "ceilingEntry" => |ctx, args| {
+                    unmod_delegate(ctx, args, "ceilingEntry", "(Ljava/lang/Object;)Ljava/util/Map$Entry;")
+                },
+                "floorEntry" => |ctx, args| {
+                    unmod_delegate(ctx, args, "floorEntry", "(Ljava/lang/Object;)Ljava/util/Map$Entry;")
+                },
+                "higherEntry" => |ctx, args| {
+                    unmod_delegate(ctx, args, "higherEntry", "(Ljava/lang/Object;)Ljava/util/Map$Entry;")
+                },
+                _ => |ctx, args| {
+                    unmod_delegate(ctx, args, "lowerEntry", "(Ljava/lang/Object;)Ljava/util/Map$Entry;")
+                },
+            };
+            r.register(c, m, desc, cb);
+        }
     }
 
     // ---- UnmodifiableList — adds positional reads + list mutators ---------
