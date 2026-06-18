@@ -3931,6 +3931,24 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         }
         native_thread_start0(ctx, args)
     });
+    // Thread.getState()/threadState(): real-JDK bytecode reads
+    // holder.threadStatus, which the VM never advances past 0 → getState()
+    // wrongly reports NEW even for finished threads, tripping strict
+    // thread-leak detectors (ES RestClient's randomizedtesting suite). Compute
+    // the state from the VM thread registry and return the canonical
+    // Thread$State enum constant. (Synthetic-JDK keeps its own override.)
+    registry.register(
+        "java/lang/Thread",
+        "getState",
+        "()Ljava/lang/Thread$State;",
+        crate::lang_system::native_thread_get_state,
+    );
+    registry.register(
+        "java/lang/Thread",
+        "threadState",
+        "()Ljava/lang/Thread$State;",
+        crate::lang_system::native_thread_get_state,
+    );
     // Thread.run: synthetic-JDK reads slot 3 = target. Real-JDK Thread.run
     // reads `holder.task` from FieldHolder. For real-JDK we resolve the
     // `target` field by name so we invoke the user's Runnable correctly.

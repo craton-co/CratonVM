@@ -1072,6 +1072,21 @@ pub trait NativeContext {
     /// Check if the target thread (identified by Java Thread object) is alive.
     fn thread_is_alive(&self, thread_obj: ObjectRef) -> bool;
 
+    /// Coarse run-state of the target thread, derived from the VM thread
+    /// registry (the authoritative liveness source). Returns:
+    ///   * `0` — NEW: the thread was never started (no registry entry).
+    ///   * `1` — RUNNABLE: started and still alive.
+    ///   * `2` — TERMINATED: started and has since finished.
+    ///
+    /// Used to back `Thread.getState()` in real-JDK mode, where the JDK
+    /// bytecode reads `holder.threadStatus` — a field the VM does not keep
+    /// updated, so `getState()` would otherwise always report `NEW` (even for
+    /// finished threads), tripping strict thread-leak detectors. The default
+    /// returns `0`.
+    fn thread_run_state(&self, _thread_obj: ObjectRef) -> u8 {
+        0
+    }
+
     /// Get the Java Thread object for the current thread.
     fn current_thread_object(&mut self) -> ObjectRef;
 

@@ -3622,6 +3622,31 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
+    fn thread_run_state(&self, thread_obj: ObjectRef) -> u8 {
+        // Resolve the thread's registry id (synthetic stores it at field 2;
+        // real-JDK threads are looked up by object identity). The registry
+        // RETAINS dead threads' entries (mark_dead only flips `alive`), so a
+        // present-but-not-alive entry is TERMINATED, while a missing entry is a
+        // thread that was never started (NEW).
+        let tid = match self.shared.heap.get_field(thread_obj, 2) {
+            Value::Long(id) => Some(ThreadId(id as u64)),
+            _ => self
+                .shared
+                .thread_registry
+                .find_thread_id_by_thread_obj(thread_obj),
+        };
+        match tid {
+            None => 0, // NEW — never started
+            Some(id) => {
+                if self.shared.thread_registry.is_alive(id) {
+                    1 // RUNNABLE
+                } else {
+                    2 // TERMINATED
+                }
+            }
+        }
+    }
+
     fn current_thread_object(&mut self) -> ObjectRef {
         if let Some(obj) = self.thread.java_thread_obj {
             return obj;

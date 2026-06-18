@@ -510,6 +510,36 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
     Ok(None)
 }
 
+/// `Thread.getState()` / `Thread.threadState()` for real-JDK mode.
+///
+/// The JDK bytecode computes the state from `holder.threadStatus`, but the VM
+/// never advances that field past 0 (NEW) — so the real bytecode reports NEW
+/// for every thread, including ones that have finished. Strict thread-leak
+/// detectors (randomizedtesting's `ThreadLeakControl`, used by the Elasticsearch
+/// RestClient suite) then see a finished worker as a live NEW thread and fail
+/// with a spurious `ThreadLeakError`. We compute the state from the
+/// authoritative VM thread registry instead and return the **canonical**
+/// `Thread$State` enum constant (callers compare it with `==`).
+pub(crate) fn native_thread_get_state(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let name = match ctx.thread_run_state(this) {
+        1 => "RUNNABLE",
+        2 => "TERMINATED",
+        _ => "NEW",
+    };
+    let cid = match ctx.ensure_class_initialized("java/lang/Thread$State") {
+        Ok(c) => c,
+        Err(_) => return Ok(Some(Value::Object(None))),
+    };
+    if let Some(idx) = ctx.static_field_index_by_name(cid, name) {
+        return Ok(Some(ctx.get_static_field(cid, idx)));
+    }
+    Ok(Some(Value::Object(None)))
+}
+
 pub(crate) fn native_thread_is_alive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
