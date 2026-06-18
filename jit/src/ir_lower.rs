@@ -598,16 +598,25 @@ impl<'a> Lowerer<'a> {
                 self.load_to_rcx(self.slot_of(node.inputs[1]));
                 // CMP EAX, ECX
                 self.buf.emit(&[0x39, 0xC8]);
-                // SETcc AL
+                // SETcc AL — three bytes: `0F 9x C0`.
                 //
                 // BUG FIX [jit-irlower #1]: `x64_cc()` returns the *near-Jcc*
                 // second byte (0x84..=0x8F, i.e. `0F 8x`). The SETcc second
                 // byte is the Jcc value PLUS 0x10 (0x94..=0x9F, i.e. `0F 9x`),
                 // NOT minus. The old `- 0x10` produced `0F 7x` (MMX
-                // PCMPEQB/etc.), which never sets AL — RAX was left untouched
-                // so every Op::Cmp returned garbage. Use `+ 0x10`.
-                self.buf.emit(&[0x0F, cc.x64_cc() + 0x10]); // SETcc = 0x0F 0x9x
-                                                            // MOVZX EAX, AL
+                // PCMPEQB/etc.), which never sets AL. Use `+ 0x10`.
+                //
+                // BUG FIX [jit-irlower #3]: the ModRM byte (`0xC0`, selecting
+                // AL) was MISSING — only `0F 9x` was emitted. SETcc is a
+                // /digit form and REQUIRES a ModRM operand byte; without it the
+                // instruction stream desynced (the following `0F B6` MOVZX got
+                // partly consumed as SETcc's ModRM) and AL/RAX were never
+                // written, so RAX kept the first operand loaded above. That is
+                // why `Op::Cmp` returned an input (`a`) instead of the 0/1
+                // boolean, and why a Cmp feeding an `If` branched on `a` and
+                // always took the else edge. Emit the full `0F 9x C0`.
+                self.buf.emit(&[0x0F, cc.x64_cc() + 0x10, 0xC0]); // SETcc AL
+                                                                  // MOVZX EAX, AL
                 self.buf.emit(&[0x0F, 0xB6, 0xC0]);
                 self.store_rax(slot);
             }
@@ -1218,20 +1227,17 @@ mod tests {
         assert_eq!(result, 42, "6 * 7 = 42");
     }
 
-    // ── Regression: BUG FIX [jit-irlower #1] — Op::Cmp SETcc ─────────────
+    // ── Regression: BUG FIX [jit-irlower #1 + #3] — Op::Cmp SETcc ────────
     //
     // Hand-build a single-block graph whose Return value is a bare
     // `Op::Cmp(Lt)`, so the SETcc store is the only thing producing the
-    // result. With the old `cc.x64_cc() - 0x10` the second opcode byte was
-    // 0x7C (a short Jcc / not a SETcc), leaving RAX untouched and returning
-    // garbage. With the fix (`+ 0x10` → 0x9C = SETL) the boolean is correct.
+    // result. Two bugs had to be fixed: #1 the opcode (`+ 0x10` → `0F 9C` =
+    // SETL, not the old `- 0x10` MMX byte), and #3 the MISSING ModRM byte —
+    // SETcc is a /digit form, so `0F 9C` without `0xC0` desynced the stream
+    // (the next `0F B6` MOVZX was partly consumed as the ModRM) and AL/RAX
+    // were never written, so the Cmp returned the first operand (`a`) instead
+    // of the 0/1 boolean. With `0F 9C C0` the boolean is correct.
     #[test]
-    #[ignore = "experimental IR-lowering path (default-off, gated): Op::Cmp \
-                value still reaches Return via the wrong frame slot (returns an \
-                input, not the 0/1 boolean). The SETcc encoding fix landed; the \
-                residual slot-allocation/Return-wiring bug in this default-off \
-                codegen path is tracked separately and does not affect the \
-                production interpreter/x64 JIT."]
     fn test_lower_cmp_lt_setcc() {
         use crate::ir::{CmpOp, Graph, IrType, Op, NO_NODE};
 
@@ -1274,16 +1280,14 @@ mod tests {
     // javac lowers the ternary to a compare-and-branch joined by a phi:
     //   iload_0; iload_1; if_icmpge else; iconst_1; goto end;
     //   else: iconst_0; end: ireturn
-    // This exercises BOTH fixes end-to-end: the `Op::Cmp(Ge)` feeding the
-    // `If` (#1) and the edge-split parallel copy that materialises the phi
-    // value 1/0 at each branch edge (#2). Before #2 the phi read an
-    // uninitialised frame slot and returned garbage.
+    // This exercises the fixes end-to-end: the `Op::Cmp(Ge)` feeding the `If`
+    // (#1 + #3 SETcc) and the edge-split parallel copy that materialises the
+    // phi value 1/0 at each branch edge (#2). The earlier "always resolves to
+    // the else value" symptom was a downstream effect of the SETcc desync (#3):
+    // the `If` branched on the first operand instead of the comparison, so it
+    // always took the same edge. With the SETcc ModRM fix the phi/branch path
+    // is correct.
     #[test]
-    #[ignore = "experimental IR-lowering path (default-off, gated): the phi \
-                edge-split parallel copy is not yet fully materialised, so the \
-                ternary resolves to the else value. Tracked as a follow-up on \
-                the dormant IR optimizer (see docs/internal/feature-designs/\
-                activate-ir-optimizer.md); does not affect the production JIT."]
     fn test_lower_ternary_lt_phi() {
         // PCs:
         //  0: iload_0      1a
@@ -1306,5 +1310,56 @@ mod tests {
         assert_eq!(r_false, 0, "7 < 3 → 0");
         let r_eq = unsafe { method.try_call(&[5, 5]).expect("test JIT call") };
         assert_eq!(r_eq, 0, "5 == 5, not < → 0");
+    }
+
+    // ── Regression: the canonical production SIGSEGV shape — a pure,
+    // call-free branchy predicate (e.g. `Modifier.isStatic`). Before the
+    // SETcc ModRM fix (#3) this exact shape emitted a stray `SETcc [rdi]`
+    // (write through a near-null base) → SIGSEGV, which is why
+    // `jit/src/lib.rs` declined branchy call-free methods from the IR path.
+    #[test]
+    fn test_lower_and_predicate_isstatic_shape() {
+        // static boolean f(int m) { return (m & 8) != 0; }
+        //  0: iload_0     1a
+        //  1: bipush 8    10 08
+        //  3: iand        7e
+        //  4: ifeq 11     99 00 07   (m&8 == 0 → pc 11)
+        //  7: iconst_1    04
+        //  8: goto 12     a7 00 04
+        // 11: iconst_0    03
+        // 12: ireturn     ac
+        let code = [
+            0x1a, 0x10, 0x08, 0x7e, 0x99, 0x00, 0x07, 0x04, 0xa7, 0x00, 0x04, 0x03, 0xac, 0, 0,
+        ];
+        let cm = compile_via_ir(&code, 13, 1, 1).expect("branchy predicate compiles via IR");
+        let f = |m: i64| unsafe { cm.try_call(&[m]).expect("call") };
+        assert_eq!(f(8), 1, "8 & 8 != 0 → true");
+        assert_eq!(f(0), 0, "0 & 8 == 0 → false");
+        assert_eq!(f(7), 0, "7 & 8 == 0 → false");
+        assert_eq!(f(15), 1, "15 & 8 != 0 → true");
+    }
+
+    // ── Regression: a phi that merges non-constant operand values (param a
+    // vs param b) across the two branch edges, not just 0/1 constants —
+    // exercises the edge-split parallel copy with live values.
+    #[test]
+    fn test_lower_max_phi_merges_params() {
+        // int max(int a, int b) { return a >= b ? a : b; }
+        //  0: iload_0     1a
+        //  1: iload_1     1b
+        //  2: if_icmplt 9 a1 00 07   (a < b → pc 9, return b)
+        //  5: iload_0     1a
+        //  6: goto 10     a7 00 04
+        //  9: iload_1     1b
+        // 10: ireturn     ac
+        let code = [
+            0x1a, 0x1b, 0xa1, 0x00, 0x07, 0x1a, 0xa7, 0x00, 0x04, 0x1b, 0xac, 0, 0,
+        ];
+        let cm = compile_via_ir(&code, 11, 2, 2).expect("max compiles via IR");
+        let max = |a: i64, b: i64| unsafe { cm.try_call(&[a, b]).expect("call") };
+        assert_eq!(max(3, 7), 7, "max(3,7)=7");
+        assert_eq!(max(7, 3), 7, "max(7,3)=7");
+        assert_eq!(max(5, 5), 5, "max(5,5)=5");
+        assert_eq!(max(-2, -9), -2, "max(-2,-9)=-2");
     }
 }
