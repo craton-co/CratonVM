@@ -1165,6 +1165,31 @@ pub(crate) fn uri_parse_authority(authority: &str) -> (Option<String>, Option<St
     (userinfo, host, port)
 }
 
+/// Match `java.net.URI`'s server-based host acceptance for the cases keycloak's
+/// validators care about: a dotted-decimal that LOOKS like IPv4 must be a valid
+/// IPv4 (4 octets, each 0-255) or the host is rejected (null). IPv6 literals
+/// (`[...]`) and reg-names (anything not pure digits+dots) are accepted.
+fn uri_host_is_valid(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+    if host.starts_with('[') {
+        return true; // IPv6 literal
+    }
+    let looks_ipv4 = host.contains('.')
+        && host
+            .split('.')
+            .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()));
+    if looks_ipv4 {
+        let segs: Vec<&str> = host.split('.').collect();
+        return segs.len() == 4
+            && segs
+                .iter()
+                .all(|s| s.parse::<u32>().map(|n| n <= 255).unwrap_or(false));
+    }
+    true // reg-name
+}
+
 /// RFC 3986 §5.2 — resolve a reference against a base URI string.
 fn uri_resolve_ref(base: &str, reference: &str) -> String {
     if reference.is_empty() {
@@ -1398,22 +1423,34 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
     // getHost() → host field (1) or parsed from the raw authority.
     r.register(uri, "getHost", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // Parse the host out of the raw authority FIRST — `native_uri_init`
+        // populates the synthetic host slot inconsistently (empty for
+        // "http://proxy1:8080", but the whole "my-example.com?auth.this" for a
+        // URL with a query), so the raw string is the authoritative source.
+        // (keycloak ProxyMappings host=null, and HostnameV2/ResourceIndicator
+        // URL validation where getHost wrongly included the query.)
+        let raw = uri_raw_string(ctx, this);
+        let (_, auth_opt, _, _, _) = uri_split(&raw);
+        if let Some(auth) = auth_opt {
+            // The raw string HAS an authority section — it is authoritative, even
+            // when empty (`file:///p`, `http://?q` → null host) or when the host
+            // is a malformed IPv4 literal. java.net.URI's server-based parser
+            // returns null for those; matching it makes keycloak's URL validators
+            // reject them (HostnameV2 `192.196.0.5555`, `?my-example.com`).
+            let (_, host_opt, _) = uri_parse_authority(&auth);
+            let host = match host_opt {
+                Some(h) if uri_host_is_valid(&h) => Value::Object(Some(ctx.create_string(&h))),
+                _ => Value::Object(None),
+            };
+            return Ok(Some(host));
+        }
+        // No authority section in the raw string → fall back to an explicit host
+        // slot set during construction.
         if let Value::Object(Some(s)) = ctx.get_field(this, 1) {
             if let Some(v) = ctx.read_string(s) {
                 if !v.is_empty() {
                     return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
                 }
-            }
-        }
-        // Fallback (like getScheme/getPath/getQuery): parse the host out of the
-        // raw authority. `URI.create("http://proxy1:8080")` never populated the
-        // host slot, so getHost() returned null and getPort() returned 0 —
-        // keycloak ProxyMappings.valueOf -> new HttpHost(null,...) "Host name may
-        // not be null" (all 16 ProxyMappingsTest cases).
-        let raw = uri_raw_string(ctx, this);
-        if let (_, Some(auth), _, _, _) = uri_split(&raw) {
-            if let (_, Some(host), _) = uri_parse_authority(&auth) {
-                return Ok(Some(Value::Object(Some(ctx.create_string(&host)))));
             }
         }
         Ok(Some(Value::Object(None)))
@@ -1477,24 +1514,60 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(None)))
     });
 
-    // getFragment() → `fragment` field by name (slot-order safe), else parse
-    // the raw string after '#'. Reading raw slot 5 returned the wrong field
-    // for a real-JDK-constructed URI (the unregistered 5-arg ctor runs
-    // bytecode with a different field layout than the synthetic `make_uri`
-    // one), so a null fragment surfaced as the string "null" — Hadoop's
-    // `Path.toString()` then emitted a spurious trailing "#null".
+    // getFragment() → the (decoded) fragment after '#', parsed from the raw
+    // string. The previous `fragment` field-by-name read was unreliable: for a
+    // `new URI(string)` (native_uri_init) URL it collided with the host/SSP slot
+    // and returned e.g. "something" as the fragment of "https://something"
+    // (keycloak ResourceIndicator/HostnameV2 URL validation: getFragment()!=null
+    // wrongly rejected valid URLs). Parsing the raw string is authoritative for
+    // both synthetic and real-JDK-constructed URIs and also yields the correct
+    // null for a missing fragment (no spurious "#null").
     r.register(uri, "getFragment", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "fragment") {
-            if let Some(v) = ctx.read_string(s) {
-                return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+        let raw = uri_raw_string(ctx, this);
+        match raw.find('#') {
+            Some(i) => {
+                let decoded = uri_percent_decode(&raw[i + 1..]);
+                Ok(Some(Value::Object(Some(ctx.create_string(&decoded)))))
             }
+            None => Ok(Some(Value::Object(None))),
         }
+    });
+
+    // getRawFragment() → raw (undecoded) fragment after '#', else null.
+    r.register(uri, "getRawFragment", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
         let raw = uri_raw_string(ctx, this);
         match raw.find('#') {
             Some(i) => Ok(Some(Value::Object(Some(ctx.create_string(&raw[i + 1..]))))),
             None => Ok(Some(Value::Object(None))),
         }
+    });
+
+    // getRawQuery() → raw (undecoded) query between '?' and '#', else null.
+    // Was unregistered (real bytecode read a mis-populated field → null).
+    r.register(uri, "getRawQuery", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let raw = uri_raw_string(ctx, this);
+        let before_frag = raw.split('#').next().unwrap_or(&raw);
+        match before_frag.find('?') {
+            Some(i) => Ok(Some(Value::Object(Some(
+                ctx.create_string(&before_frag[i + 1..]),
+            )))),
+            None => Ok(Some(Value::Object(None))),
+        }
+    });
+
+    // getRawUserInfo() → raw (undecoded) userinfo from the authority, else null.
+    r.register(uri, "getRawUserInfo", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let raw = uri_raw_string(ctx, this);
+        if let (_, Some(auth), _, _, _) = uri_split(&raw) {
+            if let (Some(ui), _, _) = uri_parse_authority(&auth) {
+                return Ok(Some(Value::Object(Some(ctx.create_string(&ui)))));
+            }
+        }
+        Ok(Some(Value::Object(None)))
     });
 
     // isAbsolute() → true if scheme is non-null
