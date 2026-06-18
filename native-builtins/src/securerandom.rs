@@ -373,6 +373,22 @@ pub(crate) fn native_random_next_int_bound(
         _ => 1,
     };
     if bound <= 0 {
+        // CRATONVM_DBG_NEXTINT=1 — dump the Java caller chain when a
+        // `Random.nextInt(bound<=0)` is about to throw. The thrown IAE is
+        // created in Rust (not via an `athrow` bytecode), so CRATONVM_DBG_ATHROW
+        // only catches the downstream rethrow, not this origin. Used to locate
+        // the empty-collection / zero-count divergence in Elasticsearch /
+        // Lucene test-framework `@BeforeClass` setup (RandomPicks.randomFrom).
+        if std::env::var("CRATONVM_DBG_NEXTINT").is_ok() {
+            eprintln!("NEXTINT-BAD bound={bound} caller-chain (inner→outer):");
+            let frames = ctx.capture_stack_trace(0);
+            for f in frames.iter().rev().take(20) {
+                eprintln!(
+                    "  NEXTINT-STK {}.{} line={} bci={}",
+                    f.class_name, f.method_name, f.line_number, f.byte_code_index
+                );
+            }
+        }
         return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: "bound must be positive".to_string(),
         }
