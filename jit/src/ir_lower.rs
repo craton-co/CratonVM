@@ -6,9 +6,25 @@
 //! Walks the scheduled basic blocks, emits native instructions for each
 //! IR node, and patches forward branches.
 
-use super::ir::{Graph, IrType, NodeId, Op, NO_NODE};
+use std::collections::HashMap;
+
+use super::ir::{Graph, IrType, NodeId, Op, SafepointSnapshot, NO_NODE};
 use super::ir_schedule::Schedule;
 use super::{CompiledMethod, ExecutableBuffer};
+use crate::deopt::{
+    ir_deopt_entry, DeoptAction, DeoptReason, DeoptimizationPoint, FrameState, FrameValue,
+};
+
+// Argument registers for the deopt trampoline's call to `ir_deopt_entry`
+// (`fn(point, rbp)`), per platform ABI.
+#[cfg(target_os = "windows")]
+const DEOPT_ARG0: u8 = 1; // RCX
+#[cfg(target_os = "windows")]
+const DEOPT_ARG1: u8 = 2; // RDX
+#[cfg(not(target_os = "windows"))]
+const DEOPT_ARG0: u8 = 7; // RDI
+#[cfg(not(target_os = "windows"))]
+const DEOPT_ARG1: u8 = 6; // RSI
 
 // x86-64 register constants
 #[allow(dead_code)]
@@ -38,6 +54,17 @@ struct Lowerer<'a> {
     _num_locals: usize,
     /// Frame size (aligned).
     frame_size: i32,
+    /// real-frame-deopt: bytecode pc → earliest native code offset emitted
+    /// for that bci. Populated as nodes are lowered; used to anchor each
+    /// safepoint snapshot to a native offset for `DeoptimizationPoint`.
+    bci_native: HashMap<usize, usize>,
+    /// real-frame-deopt: native offsets of `JMP rel32` instructions emitted by
+    /// failed guards that must be patched to jump to the shared deopt stub.
+    deopt_stub_patches: Vec<usize>,
+    /// real-frame-deopt: boxed deopt points whose stable addresses are baked
+    /// as imm64 into guard code. Moved into the `CompiledMethod` so the code's
+    /// raw pointers stay valid for the method's (retained) lifetime.
+    deopt_boxes: Vec<Box<DeoptimizationPoint>>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -73,6 +100,9 @@ impl<'a> Lowerer<'a> {
             num_params,
             _num_locals: num_locals,
             frame_size,
+            bci_native: HashMap::new(),
+            deopt_stub_patches: Vec::new(),
+            deopt_boxes: Vec::new(),
         }
     }
 
@@ -318,6 +348,23 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// MOV reg, imm64 (REX.W [+ REX.B for r8–r15]).
+    fn emit_mov_reg_imm64(&mut self, reg: u8, val: u64) {
+        let rex = 0x48 | if reg >= 8 { 0x01 } else { 0 }; // REX.W (+REX.B)
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0xB8 + (reg & 7));
+        self.buf.emit(&val.to_le_bytes());
+    }
+
+    /// MOV reg, RBP (REX.W [+ REX.B]).
+    fn emit_mov_reg_rbp(&mut self, reg: u8) {
+        let rex = 0x48 | if reg >= 8 { 0x01 } else { 0 }; // REX.W (+REX.B for r/m)
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0x89);
+        // ModRM: mod=11, reg=RBP(5), r/m=reg → 0xC0 | (5<<3) | (reg&7)
+        self.buf.emit_byte(0xE8 | (reg & 7));
+    }
+
     // ── Node lowering ────────────────────────────────────────────────
 
     fn lower_block(&mut self, block_idx: usize) {
@@ -351,6 +398,22 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_data_node(&mut self, id: NodeId) {
+        // real-frame-deopt: anchor the node's bytecode pc to the earliest
+        // native offset emitted for it, so safepoint snapshots can be keyed
+        // by native offset. `self.graph` is a `&'a Graph`, so reading
+        // `bytecode_pc` here does not borrow `self`.
+        if let Some(pc) = self.graph.nodes[id as usize].bytecode_pc {
+            let here = self.buf.pos();
+            self.bci_native
+                .entry(pc)
+                .and_modify(|e| {
+                    if here < *e {
+                        *e = here;
+                    }
+                })
+                .or_insert(here);
+        }
+
         let node = &self.graph.nodes[id as usize];
         match &node.op {
             Op::Const(val) => {
@@ -556,6 +619,49 @@ impl<'a> Lowerer<'a> {
                 // [jit-irlower #2]) just before each predecessor's branch
                 // to this phi's merge block. Nothing to emit here.
             }
+            Op::Guard { bci } => {
+                // real-frame-deopt step 3: a speculative guard. If `cond`
+                // (inputs[1]) is zero, transfer to the shared deopt stub which
+                // reconstructs the interpreter frame for `bci` and returns the
+                // deopt sentinel; otherwise fall through.
+                let bci = *bci;
+                let cond_slot = self.slot_of(node.inputs[1]);
+
+                // Build + box the deopt point for this guard (stable address,
+                // baked below). The point's frame state comes from the safepoint
+                // snapshot recorded for `bci` during IR building.
+                let frame_state = self.resolve_frame_state_for_bci(bci);
+                let point = Box::new(DeoptimizationPoint {
+                    native_offset: self.buf.pos() as u32,
+                    bci: bci as u32,
+                    reason: DeoptReason::UncommonTrap,
+                    action: DeoptAction::Reinterpret,
+                    speculation_id: 0,
+                    frame_state,
+                });
+                let point_ptr = point.as_ref() as *const DeoptimizationPoint as u64;
+                self.deopt_boxes.push(point);
+
+                // cond → RAX; TEST EAX, EAX
+                self.load_to_rax(cond_slot);
+                self.buf.emit(&[0x85, 0xC0]);
+                // JNZ continue (skip deopt when cond != 0): 0F 85 rel32
+                self.buf.emit(&[0x0F, 0x85]);
+                let jnz_patch = self.buf.pos();
+                self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                // Deopt path: load the point pointer into arg0, JMP to stub.
+                self.emit_mov_reg_imm64(DEOPT_ARG0, point_ptr);
+                self.buf.emit_byte(0xE9); // JMP rel32 → deopt stub
+                let jmp_patch = self.buf.pos();
+                self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                self.deopt_stub_patches.push(jmp_patch);
+                // continue: patch the JNZ to here (fall-through past the deopt).
+                let cont = self.buf.pos();
+                let rel = cont as i32 - (jnz_patch as i32 + 4);
+                self.buf
+                    .try_patch_i32(jnz_patch, rel)
+                    .expect("guard JNZ patch in-bounds");
+            }
             // Control and meta nodes — skip
             Op::Start | Op::Return | Op::If | Op::Merge | Op::Region | Op::Proj(_) | Op::Dead => {}
             // Unhandled — skip (bail in ir_compatible prevents reaching here)
@@ -647,6 +753,148 @@ impl<'a> Lowerer<'a> {
                 .expect("codegen patch in-bounds");
         }
     }
+
+    // ── Deopt frame-state resolution (real-frame-deopt step 2) ───────────
+
+    /// Resolve the machine location of a single IR value into a `FrameValue`.
+    ///
+    /// This naive single-scratch lowerer spills every node result to a frame
+    /// slot (`node_slot`), so a live SSA value is found either as a constant
+    /// (encoded directly) or at a frame spill slot — never in a register.
+    /// That is exactly the cleanest first cut for deopt: every non-constant
+    /// resolves to a `StackSlot`, and the VM reads it from the native stack.
+    ///
+    /// Convention: `StackSlot(off)` is read by the VM as `*(rbp + off)`
+    /// (matching `deopt.rs`). The lowerer stores results at `[rbp - slot]`
+    /// with `slot > 0`, so we encode the *negative* offset here.
+    fn frame_value_for(&self, node_id: NodeId) -> FrameValue {
+        if node_id == NO_NODE {
+            return FrameValue::Undefined;
+        }
+        let node = &self.graph.nodes[node_id as usize];
+        match node.op {
+            // Integer / long constants need no machine location.
+            Op::Const(v) => FrameValue::Int(v),
+            // Float / double constant bits.
+            Op::ConstF(bits) => FrameValue::Float(bits),
+            Op::Param(idx) => {
+                // The prologue stored param `idx` at `[rbp - (idx+1)*8]`. If
+                // the Param node was also scheduled it has its own spill slot
+                // holding the same value; prefer that, else the prologue slot.
+                let slot = self.node_slot[node_id as usize];
+                let off = if slot != 0 {
+                    slot
+                } else {
+                    ((idx as i32) + 1) * 8
+                };
+                FrameValue::StackSlot(-off)
+            }
+            _ => {
+                let slot = self.node_slot[node_id as usize];
+                if slot != 0 {
+                    FrameValue::StackSlot(-slot)
+                } else {
+                    // No machine location assigned (unscheduled / dead in this
+                    // naive lowerer). A real resolver would never see this for
+                    // a value that is live at the safepoint; first-cut fallback.
+                    FrameValue::Undefined
+                }
+            }
+        }
+    }
+
+    /// Resolve the `FrameState` for `bci` from its recorded safepoint
+    /// snapshot. Falls back to an empty frame if no snapshot exists (e.g. a
+    /// hand-built graph that did not register one) — the resume bci is still
+    /// carried so the deopt is well-formed.
+    fn resolve_frame_state_for_bci(&self, bci: usize) -> FrameState {
+        match self.graph.safepoints.iter().find(|s| s.bci == bci) {
+            Some(sp) => self.resolve_frame_state(sp),
+            None => FrameState {
+                method_key: String::new(),
+                bci: bci as u32,
+                locals: Vec::new(),
+                stack: Vec::new(),
+                monitors: Vec::new(),
+                caller: None,
+            },
+        }
+    }
+
+    /// Emit the single shared deopt stub (if any guard jumps to it) and patch
+    /// every guard's `JMP` to it. The stub expects the failing guard's
+    /// `DeoptimizationPoint` pointer already in `DEOPT_ARG0`; it loads `rbp`
+    /// into `DEOPT_ARG1`, calls `ir_deopt_entry`, and returns its result (the
+    /// `i64::MIN` deopt sentinel) via the normal epilogue.
+    fn emit_deopt_stub(&mut self) {
+        if self.deopt_stub_patches.is_empty() {
+            return;
+        }
+        let stub_off = self.buf.pos();
+        // mov arg1, rbp
+        self.emit_mov_reg_rbp(DEOPT_ARG1);
+        // mov rax, ir_deopt_entry ; call rax
+        let fn_addr = ir_deopt_entry as *const () as u64;
+        self.emit_mov_reg_imm64(RAX, fn_addr);
+        self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+        // Epilogue (RAX holds the sentinel returned by ir_deopt_entry).
+        self.buf.emit(&[0x48, 0x81, 0xC4]); // add rsp, frame_size
+        self.buf.emit(&self.frame_size.to_le_bytes());
+        self.buf.emit_byte(0x5D); // pop rbp
+        self.buf.emit_byte(0xC3); // ret
+
+        let patches = std::mem::take(&mut self.deopt_stub_patches);
+        for p in patches {
+            let rel = stub_off as i32 - (p as i32 + 4);
+            self.buf
+                .try_patch_i32(p, rel)
+                .expect("deopt JMP patch in-bounds");
+        }
+    }
+
+    /// Build the interpreter `FrameState` for one safepoint snapshot.
+    ///
+    /// `method_key` is left to the VM caller to fill (the lowerer does not
+    /// know it); deopt resume keys on the running `CompiledMethod`, not this
+    /// string. It is recorded empty here.
+    fn resolve_frame_state(&self, sp: &SafepointSnapshot) -> FrameState {
+        FrameState {
+            method_key: String::new(),
+            bci: sp.bci as u32,
+            locals: sp.locals.iter().map(|&n| self.frame_value_for(n)).collect(),
+            stack: sp.stack.iter().map(|&n| self.frame_value_for(n)).collect(),
+            monitors: Vec::new(),
+            caller: None,
+        }
+    }
+
+    /// Resolve every recorded safepoint snapshot into a `DeoptimizationPoint`,
+    /// keyed by the native offset of its bci. Returns them sorted+deduped by
+    /// `native_offset` so [`CompiledMethod::find_deopt_point`] can binary
+    /// search. Snapshots whose bci emitted no machine code are skipped.
+    fn build_deopt_points(&self) -> Vec<DeoptimizationPoint> {
+        let mut points: Vec<DeoptimizationPoint> = Vec::with_capacity(self.graph.safepoints.len());
+        for sp in &self.graph.safepoints {
+            let native_offset = match self.bci_native.get(&sp.bci) {
+                Some(&off) => off as u32,
+                // bci produced no node / no machine code — nothing to anchor.
+                None => continue,
+            };
+            points.push(DeoptimizationPoint {
+                native_offset,
+                bci: sp.bci as u32,
+                // No speculation yet — these are plain resume points (step 2,
+                // emit-and-discard). A real guard (step 3) sets its own reason.
+                reason: DeoptReason::TransferToInterpreter,
+                action: DeoptAction::Reinterpret,
+                speculation_id: 0,
+                frame_state: self.resolve_frame_state(sp),
+            });
+        }
+        points.sort_by_key(|p| p.native_offset);
+        points.dedup_by_key(|p| p.native_offset);
+        points
+    }
 }
 
 // ── Public entry point ───────────────────────────────────────────────
@@ -715,12 +963,25 @@ pub fn lower(
         lowerer.lower_block(block_idx);
     }
 
+    // real-frame-deopt (step 3): emit the shared deopt stub after the method
+    // body so failed guards can jump to it, then patch in-method branches.
+    lowerer.emit_deopt_stub();
+
     lowerer.patch_branches();
+
+    // real-frame-deopt (step 2): resolve recorded safepoint snapshots into
+    // native-offset-keyed DeoptimizationPoints before the buffer is consumed.
+    // Emit-and-discard: nothing reads these yet, so codegen is unchanged.
+    let deopt_points = lowerer.build_deopt_points();
+    let deopt_boxes = std::mem::take(&mut lowerer.deopt_boxes);
 
     let buf = lowerer.buf;
     let _code_size = buf.pos();
 
-    Some(CompiledMethod::new(buf))
+    let mut cm = CompiledMethod::new(buf);
+    cm.deopt_points = deopt_points;
+    cm._deopt_point_boxes = deopt_boxes;
+    Some(cm)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -743,6 +1004,135 @@ mod tests {
         ir_optimize::optimize(&mut graph);
         let schedule = ir_schedule::schedule(&graph);
         lower(&graph, &schedule, num_params, num_locals)
+    }
+
+    /// Build → schedule → lower WITHOUT the optimizer, so safepoint NodeIds
+    /// stay stable (DCE/GVN safepoint preservation is a later concern; the
+    /// emit-and-discard points are validated on the un-optimized graph).
+    fn compile_via_ir_no_opt(
+        code: &[u8],
+        code_len: usize,
+        num_params: usize,
+        num_locals: usize,
+    ) -> CompiledMethod {
+        let builder = IrBuilder::new(num_params, num_locals);
+        let graph = builder.build(code, code_len).expect("IR build");
+        let schedule = ir_schedule::schedule(&graph);
+        lower(&graph, &schedule, num_params, num_locals).expect("lower")
+    }
+
+    // ── real-frame-deopt step 2: deopt points + lookup ───────────────────
+
+    #[test]
+    fn test_deopt_points_resolve_consts_and_slots() {
+        use crate::deopt::FrameValue;
+        // iconst_5; iconst_3; iadd; iconst_2; imul; ireturn
+        //   pc0       pc1      pc2    pc3       pc4    pc5
+        // Only the Add (pc2) and Mul (pc4) are data nodes carrying a
+        // bytecode_pc, so exactly those two bcis anchor a deopt point.
+        let code = [0x08, 0x06, 0x60, 0x05, 0x68, 0xac, 0, 0];
+        let cm = compile_via_ir_no_opt(&code, 6, 0, 0);
+
+        assert_eq!(cm.deopt_points.len(), 2, "deopt points for bci 2 and 4");
+        // Sorted ascending by native_offset (emission order pc2 < pc4).
+        assert!(cm.deopt_points[0].native_offset <= cm.deopt_points[1].native_offset);
+
+        let p2 = cm.deopt_points.iter().find(|p| p.bci == 2).unwrap();
+        // Before iadd: the two constants 5 and 3 are on the stack, encoded
+        // directly (no machine location needed).
+        assert_eq!(
+            p2.frame_state.stack,
+            vec![FrameValue::Int(5), FrameValue::Int(3)],
+        );
+
+        let p4 = cm.deopt_points.iter().find(|p| p.bci == 4).unwrap();
+        // Before imul: [Add result, const 2]. The Add lives in a spill slot;
+        // the constant is encoded directly.
+        assert_eq!(p4.frame_state.stack.len(), 2);
+        assert!(matches!(p4.frame_state.stack[0], FrameValue::StackSlot(off) if off < 0));
+        assert_eq!(p4.frame_state.stack[1], FrameValue::Int(2));
+
+        // Lookup roundtrip: a real native offset hits, a bogus one misses.
+        let off = p2.native_offset;
+        assert!(cm.find_deopt_point(off).is_some());
+        assert_eq!(cm.find_deopt_point(off).unwrap().bci, 2);
+        assert!(cm.find_deopt_point(off + 9999).is_none());
+    }
+
+    // ── real-frame-deopt step 3: route one guard end-to-end ──────────────
+
+    #[test]
+    fn test_guard_deopt_reconstructs_live_frame() {
+        use crate::deopt::{take_last_deopt, FrameValue};
+        use crate::ir::SafepointSnapshot;
+
+        // Hand-build: i64 f(i64 cond, i64 val) {
+        //     guard(cond != 0) [bci 5];   // deopt if cond == 0
+        //     return val;
+        // }
+        // Node layout mirrors IrBuilder::new.
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let _mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let cond = graph.add(Op::Param(0), IrType::Int, vec![start], None);
+        let val = graph.add(Op::Param(1), IrType::Int, vec![start], None);
+        let _guard = graph.add(Op::Guard { bci: 5 }, IrType::Void, vec![ctrl, cond], None);
+        let ret = graph.add(Op::Return, IrType::Void, vec![ctrl, val], None);
+        graph.exit = ret;
+
+        // Safepoint at the guard's bci: locals = [cond, val], empty stack.
+        graph.safepoints.push(SafepointSnapshot {
+            bci: 5,
+            locals: vec![cond, val],
+            stack: vec![],
+        });
+
+        let schedule = ir_schedule::schedule(&graph);
+        let method = lower(&graph, &schedule, 2, 2).expect("lower guarded method");
+
+        // Guard passes (cond != 0): normal return of `val`.
+        let _ = take_last_deopt(); // clear any stale state
+        let ok = unsafe { method.try_call(&[1, 777]).expect("call (guard ok)") };
+        assert_eq!(ok, 777, "guard passes → returns val");
+        assert!(take_last_deopt().is_none(), "no deopt when guard passes");
+
+        // Guard fails (cond == 0): deopt sentinel returned, frame reconstructed
+        // from the LIVE machine frame — locals resolved to the actual argument
+        // values sitting in their spill slots.
+        let sentinel = unsafe { method.try_call(&[0, 777]).expect("call (guard fail)") };
+        assert_eq!(sentinel, i64::MIN, "guard fails → deopt sentinel");
+        let frame = take_last_deopt().expect("deopt reconstructed a frame");
+        assert_eq!(frame.bci, 5, "resumes at the guard's bci");
+        assert_eq!(
+            frame.locals,
+            vec![FrameValue::Int(0), FrameValue::Int(777)],
+            "locals read back from the live native frame",
+        );
+        assert!(frame.stack.is_empty());
+        assert!(frame.caller_frames.is_empty());
+    }
+
+    #[test]
+    fn test_deopt_points_params_use_slots() {
+        use crate::deopt::FrameValue;
+        // int f(int a, int b) { return a + b; } — iload_0;iload_1;iadd;ireturn
+        let code = [0x1a, 0x1b, 0x60, 0xac, 0, 0];
+        let cm = compile_via_ir_no_opt(&code, 4, 2, 2);
+        // The Add (pc2) is the only bci with a data node → one deopt point.
+        let p = cm.deopt_points.iter().find(|p| p.bci == 2).unwrap();
+        // locals = [a, b], both live params → frame slots (negative off).
+        assert_eq!(p.frame_state.locals.len(), 2);
+        for v in &p.frame_state.locals {
+            assert!(matches!(v, FrameValue::StackSlot(off) if *off < 0));
+        }
+        // stack at pc2 = [a, b] (same param values).
+        assert_eq!(p.frame_state.stack.len(), 2);
     }
 
     #[test]
@@ -835,6 +1225,7 @@ mod tests {
             nodes: Vec::new(),
             entry: 0,
             exit: NO_NODE,
+            safepoints: Vec::new(),
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);

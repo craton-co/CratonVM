@@ -829,6 +829,13 @@ pub struct CompiledMethod {
     /// Deoptimization points: native code offsets where deopt can occur.
     /// Used by the deopt framework to reconstruct interpreter state.
     pub deopt_points: Vec<deopt::DeoptimizationPoint>,
+    /// real-frame-deopt: boxed deopt points whose addresses are baked as
+    /// imm64 into the guard/deopt-trampoline machine code. JIT code holds raw
+    /// pointers into these boxes, so — like `_jit_invoke_infos` — they must
+    /// outlive the (retained) code; `Drop` leaks them alongside the other
+    /// code-referenced metadata. Stable heap addresses (`Box`) are required:
+    /// the `deopt_points` Vec above can realloc, these boxes never move.
+    pub _deopt_point_boxes: Vec<Box<deopt::DeoptimizationPoint>>,
     /// NEW-12: precise oop maps indexed by native PC offset.
     ///
     /// Each entry records the frame-slot offsets (relative to RBP)
@@ -928,6 +935,9 @@ impl Drop for CompiledMethod {
             std::mem::forget(std::mem::take(&mut self._jit_invoke_infos));
             std::mem::forget(std::mem::take(&mut self._jit_mic_slots));
             std::mem::forget(std::mem::take(&mut self._jit_pic_slots));
+            // Deopt-point boxes are referenced by baked imm64 pointers in the
+            // (retained) guard/trampoline code; leak them too.
+            std::mem::forget(std::mem::take(&mut self._deopt_point_boxes));
             return;
         }
         // FREE mode: purge any cached OSR trampolines that point into this
@@ -983,6 +993,7 @@ impl CompiledMethod {
             has_dispatch: false,
             inlined_methods: Vec::new(),
             deopt_points: Vec::new(),
+            _deopt_point_boxes: Vec::new(),
             oop_maps: Vec::new(),
             // Start unverified: the production codegen path moves a
             // fully-built vector into `oop_maps` wholesale (bypassing
@@ -1027,6 +1038,7 @@ impl CompiledMethod {
             has_dispatch: false,
             inlined_methods: Vec::new(),
             deopt_points: Vec::new(),
+            _deopt_point_boxes: Vec::new(),
             oop_maps: Vec::new(),
             // Start unverified: the production codegen path moves a
             // fully-built vector into `oop_maps` wholesale (bypassing
@@ -1117,6 +1129,36 @@ impl CompiledMethod {
     /// falls back to the conservative scan for its active frame.
     pub fn has_precise_oop_maps(&self) -> bool {
         !self.oop_maps.is_empty()
+    }
+
+    /// real-frame-deopt: locate the deopt point for an exact native PC offset.
+    ///
+    /// Returns `Some(&DeoptimizationPoint)` when the compiled method has a
+    /// deopt site exactly at `native_offset` (e.g. the trap branch a failed
+    /// guard jumps from), or `None` otherwise. The VM deopt entry calls this
+    /// with `faulting_pc - entry_ptr` to recover the `FrameState` it must
+    /// reconstruct.
+    ///
+    /// `deopt_points` is emitted by the lowerer in ascending `native_offset`
+    /// order (it walks blocks/bytecode in address order), so this is an
+    /// O(log n) binary search with a debug-time sortedness check. If a future
+    /// emitter pushes out of order, the `debug_assert` fires in tests and the
+    /// release path degrades to a possibly-missed lookup (→ conservative
+    /// whole-method re-run), never to unsafety.
+    pub fn find_deopt_point(&self, native_offset: u32) -> Option<&deopt::DeoptimizationPoint> {
+        debug_assert!(
+            self.deopt_points
+                .windows(2)
+                .all(|w| w[0].native_offset <= w[1].native_offset),
+            "deopt_points must be sorted by native_offset for binary search",
+        );
+        match self
+            .deopt_points
+            .binary_search_by_key(&native_offset, |p| p.native_offset)
+        {
+            Ok(idx) => Some(&self.deopt_points[idx]),
+            Err(_) => None,
+        }
     }
 
     /// Whether this method requires a SharedVm pointer as its hidden first argument.
@@ -5994,6 +6036,7 @@ mod tests {
             nodes: Vec::new(),
             entry: 0,
             exit: 0,
+            safepoints: Vec::new(),
         };
         let start = g.add(ir::Op::Start, ir::IrType::Void, vec![], None);
         let c = g.add(ir::Op::Const(42), ir::IrType::Int, vec![], None);
@@ -6022,6 +6065,7 @@ mod tests {
             nodes: Vec::new(),
             entry: 0,
             exit: 0,
+            safepoints: Vec::new(),
         };
         let start = g.add(ir::Op::Start, ir::IrType::Void, vec![], None);
         let alloc = g.add(
