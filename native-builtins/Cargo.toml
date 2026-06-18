@@ -66,6 +66,16 @@ rustls-pki-types = "1"
 rustls-native-certs = "0.8"
 rusqlite = { version = "0.31", features = ["bundled"] }
 flate2 = "1"
+# Kafka third-party compression JNI shims (compression_native.rs): the Apache
+# Kafka record codecs use snappy-java (`org.xerial.snappy.SnappyNative`, block
+# format) and zstd-jni (`com.github.luben.zstd.*`, streaming format). We back
+# the snappy block natives with the pure-Rust `snap` crate and the zstd
+# streaming natives with `zstd` (bundled libzstd, byte-compatible with
+# zstd-jni's libzstd, so frames written by one decode with the other). Both
+# mirror the established `flate2`-backed Inflater/Deflater approach in
+# `zip_real.rs`.
+snap = "1"
+zstd = "0.13"
 # Round-12 follow-up to round-8 cross-cutting Bug 3: now on workspace 2.x
 # alongside `native-io`. The migration from 0.6 → 2.x switched every
 # `start_file` call site to `SimpleFileOptions` (the un-generic write

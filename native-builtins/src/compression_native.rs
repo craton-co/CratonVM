@@ -1,0 +1,733 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
+//! Native shims for the third-party compression JNI used by Apache Kafka's
+//! record codecs.
+//!
+//! Kafka's `org.apache.kafka.common.compress` codecs delegate to two native
+//! libraries that the VM does not otherwise back:
+//!
+//!  * **snappy-java** (`org.xerial.snappy.SnappyNative`) — the canonical Snappy
+//!    *block* format. `SnappyInputStream`/`SnappyOutputStream` do their stream
+//!    framing in pure Java and call the native layer only for per-block
+//!    `rawCompress`/`rawUncompress`/`maxCompressedLength`/`uncompressedLength`.
+//!    We back those with the pure-Rust `snap` crate, whose `snap::raw` format is
+//!    the same canonical Snappy block format, so the Java framing round-trips.
+//!
+//!  * **zstd-jni** (`com.github.luben.zstd.*`) — the zstd *streaming* format.
+//!    `ZstdOutputStreamNoFinalizer`/`ZstdInputStreamNoFinalizer` keep a single
+//!    `CStream`/`DStream` context across many `write`/`read` calls and drive it
+//!    through `compressStream`/`flushStream`/`endStream`/`decompressStream`.
+//!    The JNI contract is a direct mirror of libzstd's `ZSTD_compressStream2`/
+//!    `ZSTD_decompressStream`: each native reads the `srcPos`/`dstPos` instance
+//!    fields as the in/out buffer cursors, advances the contexts, and writes the
+//!    fields back. We replicate exactly that against `zstd_safe::CCtx`/`DCtx`
+//!    (bundled libzstd — byte-compatible with zstd-jni's libzstd, so a frame
+//!    produced by one decodes with the other). Because the contract tracks
+//!    libzstd rather than any zstd-jni internal, it is version-stable.
+//!
+//! Native libraries load as no-ops in this VM (`System.load` succeeds without a
+//! real .so/.dll), so the only thing missing is the native method bodies; the
+//! Java loader/stream classes run unchanged once these are registered. Mirrors
+//! the `flate2`-backed Inflater/Deflater approach in [`crate::zip_real`].
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ObjectRef, Value};
+
+use zstd::zstd_safe::zstd_sys::ZSTD_EndDirective;
+use zstd::zstd_safe::{self, CCtx, CParameter, DCtx, InBuffer, OutBuffer, ResetDirective};
+
+// ---------------------------------------------------------------------------
+// Argument / value / field helpers
+// ---------------------------------------------------------------------------
+
+fn arg_long(args: &[Value], idx: usize) -> i64 {
+    match args.get(idx) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => 0,
+    }
+}
+
+fn arg_int(args: &[Value], idx: usize) -> i32 {
+    match args.get(idx) {
+        Some(Value::Int(v)) => *v,
+        Some(Value::Long(v)) => *v as i32,
+        _ => 0,
+    }
+}
+
+fn arg_obj(args: &[Value], idx: usize) -> Option<ObjectRef> {
+    match args.get(idx) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    }
+}
+
+/// Read `byte[]`-array bytes in `[off, off+len)`, clamped to the array bounds.
+fn read_bytes(ctx: &dyn NativeContext, arr: Option<ObjectRef>, off: usize, len: usize) -> Vec<u8> {
+    match arr {
+        Some(a) => {
+            let total = ctx.array_length(a);
+            let begin = off.min(total);
+            let end = off.saturating_add(len).min(total);
+            let mut buf = vec![0u8; end - begin];
+            if !buf.is_empty() {
+                ctx.read_byte_array_into(a, begin, &mut buf);
+            }
+            buf
+        }
+        None => Vec::new(),
+    }
+}
+
+fn get_long_field(ctx: &dyn NativeContext, obj: ObjectRef, name: &str) -> i64 {
+    match ctx.get_field_by_name(obj, name) {
+        Value::Long(v) => v,
+        Value::Int(v) => v as i64,
+        _ => 0,
+    }
+}
+
+fn set_long_field(ctx: &dyn NativeContext, obj: ObjectRef, name: &str, v: i64) {
+    ctx.set_field_by_name(obj, name, Value::Long(v));
+}
+
+fn next_handle() -> i64 {
+    static COUNTER: AtomicI64 = AtomicI64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+// ===========================================================================
+// snappy-java — org.xerial.snappy.SnappyNative (block format)
+// ===========================================================================
+//
+// SnappyNative is an *instance* implementation of SnappyApi, so every method
+// receives the receiver as args[0]; the declared parameters start at args[1].
+
+fn snappy_native_library_version(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // The loader compares this against the expected version; any well-formed
+    // "x.y.z" satisfies the check.
+    Ok(Some(Value::Object(Some(ctx.create_string("1.1.10")))))
+}
+
+fn snappy_max_compressed_length(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let n = arg_int(args, 1).max(0) as usize;
+    Ok(Some(Value::Int(snap::raw::max_compress_len(n) as i32)))
+}
+
+fn snappy_uncompressed_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // int uncompressedLength(Object input, int offset, int length)
+    let off = arg_int(args, 2).max(0) as usize;
+    let len = arg_int(args, 3).max(0) as usize;
+    let input = read_bytes(ctx, arg_obj(args, 1), off, len);
+    match snap::raw::decompress_len(&input) {
+        Ok(n) => Ok(Some(Value::Int(n as i32))),
+        Err(e) => Err(RuntimeError::IOException {
+            message: format!("snappy uncompressedLength: {e}"),
+        }
+        .into()),
+    }
+}
+
+fn snappy_raw_compress(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // int rawCompress(Object input, int inOff, int inLen, Object output, int outOff)
+    let in_off = arg_int(args, 2).max(0) as usize;
+    let in_len = arg_int(args, 3).max(0) as usize;
+    let out_off = arg_int(args, 5).max(0) as usize;
+    let input = read_bytes(ctx, arg_obj(args, 1), in_off, in_len);
+
+    let mut out = vec![0u8; snap::raw::max_compress_len(input.len())];
+    let n = match snap::raw::Encoder::new().compress(&input, &mut out) {
+        Ok(n) => n,
+        Err(e) => {
+            return Err(RuntimeError::IOException {
+                message: format!("snappy rawCompress: {e}"),
+            }
+            .into());
+        }
+    };
+    if let Some(o) = arg_obj(args, 4) {
+        ctx.write_byte_array_from(o, out_off, &out[..n]);
+    }
+    Ok(Some(Value::Int(n as i32)))
+}
+
+fn snappy_raw_uncompress(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // int rawUncompress(Object input, int inOff, int inLen, Object output, int outOff)
+    let in_off = arg_int(args, 2).max(0) as usize;
+    let in_len = arg_int(args, 3).max(0) as usize;
+    let out_off = arg_int(args, 5).max(0) as usize;
+    let input = read_bytes(ctx, arg_obj(args, 1), in_off, in_len);
+
+    let dlen = match snap::raw::decompress_len(&input) {
+        Ok(n) => n,
+        Err(e) => {
+            return Err(RuntimeError::IOException {
+                message: format!("snappy rawUncompress (len): {e}"),
+            }
+            .into());
+        }
+    };
+    let mut out = vec![0u8; dlen];
+    let n = match snap::raw::Decoder::new().decompress(&input, &mut out) {
+        Ok(n) => n,
+        Err(e) => {
+            return Err(RuntimeError::IOException {
+                message: format!("snappy rawUncompress: {e}"),
+            }
+            .into());
+        }
+    };
+    if let Some(o) = arg_obj(args, 4) {
+        ctx.write_byte_array_from(o, out_off, &out[..n]);
+    }
+    Ok(Some(Value::Int(n as i32)))
+}
+
+fn snappy_is_valid_compressed_buffer(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // boolean isValidCompressedBuffer(Object input, int offset, int length)
+    let off = arg_int(args, 2).max(0) as usize;
+    let len = arg_int(args, 3).max(0) as usize;
+    let input = read_bytes(ctx, arg_obj(args, 1), off, len);
+    let valid = snap::raw::decompress_len(&input).is_ok();
+    Ok(Some(Value::Int(i32::from(valid))))
+}
+
+fn snappy_array_copy(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // void arrayCopy(Object src, int offset, int byteLength, Object dest, int dOffset)
+    // The snappy-java contract: offsets/length are in *bytes* regardless of the
+    // backing array's element type. Kafka only ever passes byte[]s here.
+    let off = arg_int(args, 2).max(0) as usize;
+    let len = arg_int(args, 3).max(0) as usize;
+    let doff = arg_int(args, 5).max(0) as usize;
+    let bytes = read_bytes(ctx, arg_obj(args, 1), off, len);
+    if let Some(dest) = arg_obj(args, 4) {
+        ctx.write_byte_array_from(dest, doff, &bytes);
+    }
+    Ok(None)
+}
+
+// ===========================================================================
+// zstd-jni — com.github.luben.zstd.* (streaming format)
+// ===========================================================================
+//
+// CCtx/DCtx are only ever touched under the global table mutex (one call at a
+// time per handle), so asserting Send for the boxed contexts is sound even
+// though a raw libzstd context is not itself thread-safe to share.
+
+struct CCtxBox(CCtx<'static>);
+// SAFETY: serialized through `cctx_table()`'s Mutex; never aliased across threads.
+unsafe impl Send for CCtxBox {}
+
+struct DCtxBox(DCtx<'static>);
+// SAFETY: serialized through `dctx_table()`'s Mutex; never aliased across threads.
+unsafe impl Send for DCtxBox {}
+
+fn cctx_table() -> &'static Mutex<HashMap<i64, CCtxBox>> {
+    static T: OnceLock<Mutex<HashMap<i64, CCtxBox>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn dctx_table() -> &'static Mutex<HashMap<i64, DCtxBox>> {
+    static T: OnceLock<Mutex<HashMap<i64, DCtxBox>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn zstd_err_name(code: usize) -> String {
+    unsafe {
+        let p = zstd_safe::zstd_sys::ZSTD_getErrorName(code);
+        if p.is_null() {
+            return "zstd error".to_string();
+        }
+        std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+    }
+}
+
+/// Clamp a libzstd "bytes remaining" hint into the `int` the Java side reads.
+fn hint_as_int(remaining: usize) -> i32 {
+    remaining.min(i32::MAX as usize) as i32
+}
+
+// -- compression context lifecycle (createCStream/freeCStream/resetCStream) --
+
+fn zstd_create_cstream(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    match CCtx::try_create() {
+        Some(c) => {
+            let h = next_handle();
+            cctx_table()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(h, CCtxBox(c));
+            Ok(Some(Value::Long(h)))
+        }
+        // 0 → the Java side throws (errMemoryAllocation), the faithful behaviour.
+        None => Ok(Some(Value::Long(0))),
+    }
+}
+
+fn zstd_free_cstream(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let h = arg_long(args, 0);
+    cctx_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&h);
+    Ok(Some(Value::Int(0)))
+}
+
+fn zstd_reset_cstream(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // instance: args[0]=this, args[1]=ctx handle
+    let h = arg_long(args, 1);
+    if let Some(b) = cctx_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(&h)
+    {
+        let _ = b.0.reset(ResetDirective::SessionOnly);
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+/// Shared body for `compressStream`/`flushStream`/`endStream`. `has_input`
+/// distinguishes the data-bearing compress call from the empty-input drain
+/// calls; `end_op` selects continue/flush/end.
+fn zstd_compress_common(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    has_input: bool,
+    end_op: ZSTD_EndDirective,
+) -> MethodCallResult {
+    let this = match arg_obj(args, 0) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let h = arg_long(args, 1);
+    let dst = arg_obj(args, 2);
+    let dst_size = arg_int(args, 3).max(0) as usize;
+
+    let dst_pos = get_long_field(ctx, this, "dstPos").max(0) as usize;
+
+    // Compress reads src[srcPos..srcSize]; flush/end feed an empty input.
+    let (input_bytes, src_pos) = if has_input {
+        let src = arg_obj(args, 4);
+        let src_size = arg_int(args, 5).max(0) as usize;
+        let src_pos = get_long_field(ctx, this, "srcPos").max(0) as usize;
+        (
+            read_bytes(ctx, src, src_pos, src_size.saturating_sub(src_pos)),
+            src_pos,
+        )
+    } else {
+        (Vec::new(), 0)
+    };
+
+    let mut outbuf = vec![0u8; dst_size.saturating_sub(dst_pos)];
+
+    let (consumed, produced, remaining) = {
+        let mut tbl = cctx_table().lock().unwrap_or_else(|e| e.into_inner());
+        let cbox = match tbl.get_mut(&h) {
+            Some(c) => c,
+            None => return Ok(Some(Value::Int(0))),
+        };
+        let mut inb = InBuffer::around(&input_bytes);
+        let mut outb = OutBuffer::around(&mut outbuf[..]);
+        let remaining = match cbox.0.compress_stream2(&mut outb, &mut inb, end_op) {
+            Ok(rem) => rem,
+            Err(code) => {
+                return Err(RuntimeError::IOException {
+                    message: format!("zstd compressStream: {}", zstd_err_name(code)),
+                }
+                .into());
+            }
+        };
+        (inb.pos, outb.pos(), remaining)
+    };
+
+    if produced > 0 {
+        if let Some(d) = dst {
+            ctx.write_byte_array_from(d, dst_pos, &outbuf[..produced]);
+        }
+    }
+    if has_input {
+        set_long_field(ctx, this, "srcPos", (src_pos + consumed) as i64);
+    }
+    set_long_field(ctx, this, "dstPos", (dst_pos + produced) as i64);
+    Ok(Some(Value::Int(hint_as_int(remaining))))
+}
+
+fn zstd_compress_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    zstd_compress_common(ctx, args, true, ZSTD_EndDirective::ZSTD_e_continue)
+}
+
+fn zstd_flush_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    zstd_compress_common(ctx, args, false, ZSTD_EndDirective::ZSTD_e_flush)
+}
+
+fn zstd_end_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    zstd_compress_common(ctx, args, false, ZSTD_EndDirective::ZSTD_e_end)
+}
+
+// -- decompression context lifecycle + stream ------------------------------
+
+fn zstd_create_dstream(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    match DCtx::try_create() {
+        Some(d) => {
+            let h = next_handle();
+            dctx_table()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(h, DCtxBox(d));
+            Ok(Some(Value::Long(h)))
+        }
+        None => Ok(Some(Value::Long(0))),
+    }
+}
+
+fn zstd_free_dstream(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let h = arg_long(args, 0);
+    dctx_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&h);
+    Ok(Some(Value::Int(0)))
+}
+
+fn zstd_init_dstream(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // instance: args[0]=this, args[1]=ctx handle. ZSTD_initDStream == a
+    // session-only reset of the context.
+    let h = arg_long(args, 1);
+    if let Some(b) = dctx_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(&h)
+    {
+        let _ = b.0.reset(ResetDirective::SessionOnly);
+    }
+    // Real initDStream returns the recommended next input size hint (>0).
+    Ok(Some(Value::Int(hint_as_int(unsafe {
+        zstd_safe::zstd_sys::ZSTD_DStreamInSize()
+    }))))
+}
+
+fn zstd_decompress_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // instance: args[0]=this, args[1]=ctx, args[2]=dst, args[3]=dstSize,
+    //           args[4]=src, args[5]=srcSize
+    let this = match arg_obj(args, 0) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let h = arg_long(args, 1);
+    let dst = arg_obj(args, 2);
+    let dst_size = arg_int(args, 3).max(0) as usize;
+    let src = arg_obj(args, 4);
+    let src_size = arg_int(args, 5).max(0) as usize;
+
+    let src_pos = get_long_field(ctx, this, "srcPos").max(0) as usize;
+    let dst_pos = get_long_field(ctx, this, "dstPos").max(0) as usize;
+
+    let input_bytes = read_bytes(ctx, src, src_pos, src_size.saturating_sub(src_pos));
+    let mut outbuf = vec![0u8; dst_size.saturating_sub(dst_pos)];
+
+    let (consumed, produced, remaining) = {
+        let mut tbl = dctx_table().lock().unwrap_or_else(|e| e.into_inner());
+        let dbox = match tbl.get_mut(&h) {
+            Some(d) => d,
+            None => return Ok(Some(Value::Int(0))),
+        };
+        let mut inb = InBuffer::around(&input_bytes);
+        let mut outb = OutBuffer::around(&mut outbuf[..]);
+        let remaining = match dbox.0.decompress_stream(&mut outb, &mut inb) {
+            Ok(rem) => rem,
+            Err(code) => {
+                return Err(RuntimeError::IOException {
+                    message: format!("zstd decompressStream: {}", zstd_err_name(code)),
+                }
+                .into());
+            }
+        };
+        (inb.pos, outb.pos(), remaining)
+    };
+
+    if produced > 0 {
+        if let Some(d) = dst {
+            ctx.write_byte_array_from(d, dst_pos, &outbuf[..produced]);
+        }
+    }
+    set_long_field(ctx, this, "srcPos", (src_pos + consumed) as i64);
+    set_long_field(ctx, this, "dstPos", (dst_pos + produced) as i64);
+    Ok(Some(Value::Int(hint_as_int(remaining))))
+}
+
+// -- Zstd static helpers ---------------------------------------------------
+
+fn zstd_is_error(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let code = arg_long(args, 0) as usize;
+    let is_err = unsafe { zstd_safe::zstd_sys::ZSTD_isError(code) } != 0;
+    Ok(Some(Value::Int(i32::from(is_err))))
+}
+
+fn zstd_get_error_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let code = arg_long(args, 0) as usize;
+    Ok(Some(Value::Object(Some(ctx.create_string(&zstd_err_name(code))))))
+}
+
+fn zstd_get_error_code(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let code = arg_long(args, 0) as usize;
+    let ec = unsafe { zstd_safe::zstd_sys::ZSTD_getErrorCode(code) };
+    Ok(Some(Value::Long(ec as i64)))
+}
+
+fn zstd_compress_bound(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let n = arg_long(args, 0).max(0) as usize;
+    let bound = unsafe { zstd_safe::zstd_sys::ZSTD_compressBound(n) };
+    Ok(Some(Value::Long(bound as i64)))
+}
+
+/// `Zstd.setCompressionLevel(long stream, int level)` — apply to the context so
+/// the produced frame honours the requested level; returns 0 (success).
+fn zstd_set_compression_level(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let h = arg_long(args, 0);
+    let level = arg_int(args, 1);
+    if let Some(b) = cctx_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(&h)
+    {
+        let _ = b.0.set_parameter(CParameter::CompressionLevel(level));
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+pub fn register_compression_natives(r: &mut NativeMethodRegistry) {
+    // --- snappy-java: org.xerial.snappy.SnappyNative (instance methods) ---
+    let sn = "org/xerial/snappy/SnappyNative";
+    r.register(sn, "nativeLibraryVersion", "()Ljava/lang/String;", snappy_native_library_version);
+    r.register(sn, "maxCompressedLength", "(I)I", snappy_max_compressed_length);
+    r.register(sn, "uncompressedLength", "(Ljava/lang/Object;II)I", snappy_uncompressed_length);
+    r.register(sn, "rawCompress", "(Ljava/lang/Object;IILjava/lang/Object;I)I", snappy_raw_compress);
+    r.register(sn, "rawUncompress", "(Ljava/lang/Object;IILjava/lang/Object;I)I", snappy_raw_uncompress);
+    r.register(sn, "isValidCompressedBuffer", "(Ljava/lang/Object;II)Z", snappy_is_valid_compressed_buffer);
+    r.register(sn, "arrayCopy", "(Ljava/lang/Object;IILjava/lang/Object;I)V", snappy_array_copy);
+
+    // --- zstd-jni: streaming compress (ZstdOutputStreamNoFinalizer) ---
+    let zo = "com/github/luben/zstd/ZstdOutputStreamNoFinalizer";
+    r.register(zo, "recommendedCOutSize", "()J", |_c, _a| {
+        Ok(Some(Value::Long(unsafe { zstd_safe::zstd_sys::ZSTD_CStreamOutSize() } as i64)))
+    });
+    r.register(zo, "createCStream", "()J", zstd_create_cstream);
+    r.register(zo, "freeCStream", "(J)I", zstd_free_cstream);
+    r.register(zo, "resetCStream", "(J)I", zstd_reset_cstream);
+    r.register(zo, "compressStream", "(J[BI[BI)I", zstd_compress_stream);
+    r.register(zo, "flushStream", "(J[BI)I", zstd_flush_stream);
+    r.register(zo, "endStream", "(J[BI)I", zstd_end_stream);
+
+    // --- zstd-jni: streaming decompress (ZstdInputStreamNoFinalizer) ---
+    let zi = "com/github/luben/zstd/ZstdInputStreamNoFinalizer";
+    r.register(zi, "recommendedDInSize", "()J", |_c, _a| {
+        Ok(Some(Value::Long(unsafe { zstd_safe::zstd_sys::ZSTD_DStreamInSize() } as i64)))
+    });
+    r.register(zi, "recommendedDOutSize", "()J", |_c, _a| {
+        Ok(Some(Value::Long(unsafe { zstd_safe::zstd_sys::ZSTD_DStreamOutSize() } as i64)))
+    });
+    r.register(zi, "createDStream", "()J", zstd_create_dstream);
+    r.register(zi, "freeDStream", "(J)I", zstd_free_dstream);
+    r.register(zi, "initDStream", "(J)I", zstd_init_dstream);
+    r.register(zi, "decompressStream", "(J[BI[BI)I", zstd_decompress_stream);
+
+    // --- zstd-jni: com.github.luben.zstd.Zstd static helpers ---
+    let z = "com/github/luben/zstd/Zstd";
+    r.register(z, "isError", "(J)Z", zstd_is_error);
+    r.register(z, "getErrorName", "(J)Ljava/lang/String;", zstd_get_error_name);
+    r.register(z, "getErrorCode", "(J)J", zstd_get_error_code);
+    r.register(z, "compressBound", "(J)J", zstd_compress_bound);
+    r.register(z, "defaultCompressionLevel", "()I", |_c, _a| Ok(Some(Value::Int(3))));
+    r.register(z, "minCompressionLevel", "()I", |_c, _a| {
+        Ok(Some(Value::Int(unsafe { zstd_safe::zstd_sys::ZSTD_minCLevel() })))
+    });
+    r.register(z, "maxCompressionLevel", "()I", |_c, _a| {
+        Ok(Some(Value::Int(unsafe { zstd_safe::zstd_sys::ZSTD_maxCLevel() })))
+    });
+
+    // Parameter setters: apply the level (frame-affecting and cheap), no-op the
+    // rest (Kafka's default codec path leaves them at their defaults, and a
+    // 0/"success" return keeps the stream init from throwing). Each returns int.
+    r.register(z, "setCompressionLevel", "(JI)I", zstd_set_compression_level);
+    for name in [
+        "setCompressionChecksums",
+        "setCompressionMagicless",
+        "setCompressionLong",
+        "setCompressionWorkers",
+        "setCompressionOverlapLog",
+        "setCompressionJobSize",
+        "setCompressionTargetLength",
+        "setCompressionMinMatch",
+        "setCompressionSearchLog",
+        "setCompressionChainLog",
+        "setCompressionHashLog",
+        "setCompressionWindowLog",
+        "setCompressionStrategy",
+        "setDecompressionLongMax",
+        "setDecompressionMagicless",
+        "setRefMultipleDDicts",
+        "setValidateSequences",
+        "setSequenceProducerFallback",
+        "setSearchForExternalRepcodes",
+        "setEnableLongDistanceMatching",
+    ] {
+        // (long, int) or (long, boolean) — both are `(JI)I` / `(JZ)I` at the
+        // descriptor level; register both shapes so resolution always hits.
+        r.register(z, name, "(JI)I", |_c, _a| Ok(Some(Value::Int(0))));
+        r.register(z, name, "(JZ)I", |_c, _a| Ok(Some(Value::Int(0))));
+    }
+    // Dictionary loaders (Kafka uses no dictionary): report 0 (success/no dict).
+    r.register(z, "loadDictCompress", "(J[BI)I", |_c, _a| Ok(Some(Value::Int(0))));
+    r.register(z, "loadDictDecompress", "(J[BI)I", |_c, _a| Ok(Some(Value::Int(0))));
+    r.register(z, "loadFastDictCompress", "(JLcom/github/luben/zstd/ZstdDictCompress;)I", |_c, _a| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(z, "loadFastDictDecompress", "(JLcom/github/luben/zstd/ZstdDictDecompress;)I", |_c, _a| {
+        Ok(Some(Value::Int(0)))
+    });
+
+    // Canonical libzstd error-code accessors. These are only consulted on the
+    // error path (which Kafka's round-trip never reaches), but registering them
+    // keeps a corruption-handling test from tripping an UnsatisfiedLinkError.
+    // ZSTD error codes are `(size_t)(-ZSTD_error_xxx)`; as a signed long that is
+    // the negated enum value. The constant for each name lives in
+    // `register_err_const` (the registry takes a `fn` pointer, not a closure
+    // that could capture the value).
+    for name in [
+        "errNoError",
+        "errGeneric",
+        "errPrefixUnknown",
+        "errVersionUnsupported",
+        "errFrameParameterUnsupported",
+        "errFrameParameterWindowTooLarge",
+        "errCorruptionDetected",
+        "errChecksumWrong",
+        "errDictionaryCorrupted",
+        "errDictionaryWrong",
+        "errDictionaryCreationFailed",
+        "errParameterUnsupported",
+        "errParameterOutOfBound",
+        "errTableLogTooLarge",
+        "errMaxSymbolValueTooLarge",
+        "errMaxSymbolValueTooSmall",
+        "errStageWrong",
+        "errInitMissing",
+        "errMemoryAllocation",
+        "errWorkSpaceTooSmall",
+        "errDstSizeTooSmall",
+        "errSrcSizeWrong",
+        "errDstBufferNull",
+    ] {
+        register_err_const(r, z, name);
+    }
+}
+
+/// Register one `Zstd.errXxx()J` accessor returning the canonical negated
+/// libzstd error enum value. Kept as an explicit match so each name maps to a
+/// `fn` pointer (the registry does not accept capturing closures).
+fn register_err_const(r: &mut NativeMethodRegistry, class: &str, name: &str) {
+    let cb: cratonvm_native_api::NativeCallback = match name {
+        "errNoError" => |_c, _a| Ok(Some(Value::Long(0))),
+        "errGeneric" => |_c, _a| Ok(Some(Value::Long(-1))),
+        "errPrefixUnknown" => |_c, _a| Ok(Some(Value::Long(-10))),
+        "errVersionUnsupported" => |_c, _a| Ok(Some(Value::Long(-12))),
+        "errFrameParameterUnsupported" => |_c, _a| Ok(Some(Value::Long(-14))),
+        "errFrameParameterWindowTooLarge" => |_c, _a| Ok(Some(Value::Long(-16))),
+        "errCorruptionDetected" => |_c, _a| Ok(Some(Value::Long(-20))),
+        "errChecksumWrong" => |_c, _a| Ok(Some(Value::Long(-22))),
+        "errDictionaryCorrupted" => |_c, _a| Ok(Some(Value::Long(-30))),
+        "errDictionaryWrong" => |_c, _a| Ok(Some(Value::Long(-32))),
+        "errDictionaryCreationFailed" => |_c, _a| Ok(Some(Value::Long(-34))),
+        "errParameterUnsupported" => |_c, _a| Ok(Some(Value::Long(-40))),
+        "errParameterOutOfBound" => |_c, _a| Ok(Some(Value::Long(-42))),
+        "errTableLogTooLarge" => |_c, _a| Ok(Some(Value::Long(-44))),
+        "errMaxSymbolValueTooLarge" => |_c, _a| Ok(Some(Value::Long(-46))),
+        "errMaxSymbolValueTooSmall" => |_c, _a| Ok(Some(Value::Long(-48))),
+        "errStageWrong" => |_c, _a| Ok(Some(Value::Long(-60))),
+        "errInitMissing" => |_c, _a| Ok(Some(Value::Long(-62))),
+        "errMemoryAllocation" => |_c, _a| Ok(Some(Value::Long(-64))),
+        "errWorkSpaceTooSmall" => |_c, _a| Ok(Some(Value::Long(-66))),
+        "errDstSizeTooSmall" => |_c, _a| Ok(Some(Value::Long(-70))),
+        "errSrcSizeWrong" => |_c, _a| Ok(Some(Value::Long(-72))),
+        "errDstBufferNull" => |_c, _a| Ok(Some(Value::Long(-74))),
+        _ => |_c, _a| Ok(Some(Value::Long(-1))),
+    };
+    r.register(class, name, "()J", cb);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snappy_block_round_trip() {
+        let original = b"the quick brown fox jumps over the lazy dog, repeatedly.....";
+        let mut comp = vec![0u8; snap::raw::max_compress_len(original.len())];
+        let clen = snap::raw::Encoder::new().compress(original, &mut comp).unwrap();
+        let dlen = snap::raw::decompress_len(&comp[..clen]).unwrap();
+        assert_eq!(dlen, original.len());
+        let mut out = vec![0u8; dlen];
+        let n = snap::raw::Decoder::new().decompress(&comp[..clen], &mut out).unwrap();
+        assert_eq!(&out[..n], original);
+    }
+
+    #[test]
+    fn zstd_streaming_round_trip() {
+        // Mirror the JNI contract end-to-end with raw zstd_safe buffers: a
+        // multi-call compress (continue + end) then a single decompress.
+        let original: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+
+        let mut cctx = CCtx::try_create().unwrap();
+        let mut framed = Vec::new();
+        // continue
+        {
+            let mut inb = InBuffer::around(&original);
+            let mut tmp = vec![0u8; unsafe { zstd_safe::zstd_sys::ZSTD_CStreamOutSize() }];
+            let mut outb = OutBuffer::around(&mut tmp[..]);
+            cctx.compress_stream2(&mut outb, &mut inb, ZSTD_EndDirective::ZSTD_e_continue)
+                .unwrap();
+            framed.extend_from_slice(outb.as_slice());
+            assert_eq!(inb.pos, original.len());
+        }
+        // end (drain)
+        loop {
+            let empty: [u8; 0] = [];
+            let mut inb = InBuffer::around(&empty);
+            let mut tmp = vec![0u8; unsafe { zstd_safe::zstd_sys::ZSTD_CStreamOutSize() }];
+            let mut outb = OutBuffer::around(&mut tmp[..]);
+            let rem = cctx
+                .compress_stream2(&mut outb, &mut inb, ZSTD_EndDirective::ZSTD_e_end)
+                .unwrap();
+            framed.extend_from_slice(outb.as_slice());
+            if rem == 0 {
+                break;
+            }
+        }
+
+        let mut dctx = DCtx::try_create().unwrap();
+        let mut restored = Vec::new();
+        let mut inb = InBuffer::around(&framed);
+        while inb.pos < framed.len() {
+            let mut tmp = vec![0u8; unsafe { zstd_safe::zstd_sys::ZSTD_DStreamOutSize() }];
+            let mut outb = OutBuffer::around(&mut tmp[..]);
+            dctx.decompress_stream(&mut outb, &mut inb).unwrap();
+            restored.extend_from_slice(outb.as_slice());
+        }
+        assert_eq!(restored, original);
+    }
+}

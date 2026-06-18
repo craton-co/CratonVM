@@ -483,6 +483,8 @@ pub mod lookup_define;
 pub mod system_bootstrap;
 pub mod boot_loader;
 pub mod zip_real;
+/// Third-party compression JNI shims (snappy-java + zstd-jni) for Kafka codecs.
+pub mod compression_native;
 /// `java.util.zip.CRC32C` native overrides (Castagnoli CRC-32C).
 pub mod zip_crc32c;
 pub mod security_manager;
@@ -1752,6 +1754,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // unconditionally; in synthetic-jdk mode the phase71 overrides run after
     // register_synthetic_overrides and supersede these.
     zip_real::register_zip_real_natives(registry);
+
+    // Kafka third-party compression codecs: snappy-java block natives + zstd-jni
+    // streaming natives (see compression_native.rs). Registered in the same
+    // Bridge category as the zip_real natives above.
+    compression_native::register_compression_natives(registry);
 
     // java.util.zip.CRC32C — Java-method overrides for the Castagnoli CRC-32C.
     // CRC32C has NO native methods in JDK 25 (pure-Java, Unsafe-backed hot
