@@ -16388,6 +16388,41 @@ pub fn try_jit_compile_callee(
 /// Sets `*cache_negative = false` when a `None` return is for a reason that
 /// may change soon (currently: receiver class not loaded yet), so the caller
 /// does not negative-cache it.
+///
+/// ## GC-STW-safety / VM-lock discipline (wire-tiered-manager increment 3)
+///
+/// This function runs both on the mutator (inline JIT-dispatch helpers) AND,
+/// when `CRATONVM_BG_COMPILE` is on, on the GC-neutral `cratonvm-jit-compiler`
+/// worker via [`background_compile_task`]. The worker is an unregistered
+/// `std::thread::Builder` daemon (the G1-MarkComplete precedent): the STW
+/// barrier never waits for it, so concurrent relocation is harmless to it
+/// PROVIDED it holds no VM lock across a blocking op. The fatal failure mode is
+/// indirect: a mutator wanting `class_manager.write()` (class definition) that
+/// blocks behind a read lock the worker is holding across a wait can no longer
+/// reach its safepoint, so a STW initiated by a third thread (whose `expected`
+/// count includes that blocked mutator) never completes.
+///
+/// Lock order and bounded scopes (each VM lock acquire -> read out what is
+/// needed -> DROP -> proceed; never two held simultaneously, never one held
+/// across a blocking call / nested VM-lock acquisition / managed allocation):
+///   1. `class_manager.read()` (`cm`) — bytecode/method metadata extraction
+///      only; explicitly `drop(cm)` BEFORE `jit::try_compile`. The constant-pool
+///      resolver closures handed to `try_compile` re-acquire `class_manager`
+///      read locks TRANSIENTLY, each scoped to a single CP lookup and dropped at
+///      closure return. The one resolver that can BLOCK or take
+///      `class_manager.write()` — `resolve_field_ref` -> `load_class_concurrent`
+///      (per-class-name condvar wait, write-lock class load with <clinit>/GC) —
+///      is invoked by `field_resolver`/`static_field_resolver` BEFORE those
+///      closures take their own `cm` read, so no VM read lock is alive across
+///      that blocking/allocating call.
+///   2. `flight_recorder.lock()` — held only for the single
+///      `emit_compilation_event_arc` call; description + timestamp built first.
+///   3. `jit_cache.write()` — held only for the publishing `put`; the key Arc
+///      is built first. This is the cross-thread publish: a mutator's
+///      `jit_cache` fast-path flips the call site to `Jit` on its next call.
+/// No two of {class_manager, flight_recorder, jit_cache} are ever held at once.
+/// GC itself takes none of these during STW (it scans deposited root snapshots),
+/// so the worker's transient holds only matter via the mutator-stall path above.
 fn try_jit_compile_callee_slow(
     shared: &SharedVm,
     class_name: &str,
@@ -16670,20 +16705,33 @@ fn try_jit_compile_callee_slow(
     let needs_ctx = compiled.needs_context();
     let compile_duration_ns = compile_start.elapsed().as_nanos() as u64; // Cast: duration to u64 nanoseconds
 
-    // Record JFR compilation event
+    // Record JFR compilation event.
+    //
+    // GC-STW-safety / lock-scope discipline (wire-tiered-manager increment 3):
+    // when this runs on the GC-neutral `cratonvm-jit-compiler` worker, the
+    // `shared.flight_recorder.lock()` must be held for the MINIMAL scope and
+    // NEVER across a blocking op or a nested VM-lock acquisition — a mutator
+    // wanting the recorder must not stall behind the worker (which would keep
+    // that mutator off its safepoint and stall a third-thread STW). The
+    // timestamp and the `Arc<str>` description (a Rust-heap alloc, not a managed
+    // GC allocation) are built BEFORE the lock so the guard's live region is
+    // exactly the `emit_compilation_event_arc` call and nothing else. No other
+    // VM lock (`class_manager` / `jit_cache`) is held here — `cm` was dropped at
+    // the `drop(cm)` above, and `jit_cache.write()` is taken AFTER this block.
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64; // Cast: duration to u64 nanoseconds
+    // Round-9 HIGH-5: build the Arc<str> once and hand ownership to the
+    // `_arc` variant instead of letting `emit_compilation_event` reallocate
+    // a fresh Arc from `&str` internally. Built before the lock so the alloc
+    // is outside the `flight_recorder` critical section.
+    let method_desc: Arc<str> = Arc::from(format!(
+        "{}::{}{}",
+        cached.class_name, cached.method_name, cached.method_descriptor
+    ));
     {
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64; // Cast: duration to u64 nanoseconds
         let mut jfr = shared.flight_recorder.lock();
-        // Round-9 HIGH-5: build the Arc<str> once and hand ownership to the
-        // `_arc` variant instead of letting `emit_compilation_event` reallocate
-        // a fresh Arc from `&str` internally.
-        let method_desc: Arc<str> = Arc::from(format!(
-            "{}::{}{}",
-            cached.class_name, cached.method_name, cached.method_descriptor
-        ));
         cratonvm_jfr::builtin::emit_compilation_event_arc(
             &mut jfr,
             method_desc,
@@ -16713,14 +16761,25 @@ fn try_jit_compile_callee_slow(
     // class hit; distinct subclasses recompile at most once each. The compiled
     // code is identical regardless of receiver (it is the resolved method's
     // body), so dispatching it for any receiver of that class is correct.
+    //
+    // GC-STW-safety / lock-scope discipline (wire-tiered-manager increment 3):
+    // this is the "publish" step — on the GC-neutral worker it is the moment a
+    // freshly compiled body becomes visible to mutators (their `jit_cache`
+    // fast-path flips the call site to `Jit` on the next invocation, the
+    // cross-thread analogue of flipping the invoke cache). The
+    // `shared.jit_cache.write()` is held for the MINIMAL scope: the receiver
+    // key `Arc` is built BEFORE the lock, the codegen + every resolver read of
+    // `class_manager` already completed above (no VM lock is live here), and the
+    // guard covers exactly the `put`. Holding nothing else means a mutator
+    // taking `jit_cache.read()` (or `class_manager.write()` to define a class)
+    // never blocks behind the worker, so it always reaches its safepoint and a
+    // concurrent STW completes promptly.
+    let receiver_key: std::sync::Arc<str> = std::sync::Arc::from(class_name);
+    let method_name_key = cached.method_name.clone();
+    let method_desc_key = cached.method_descriptor.clone();
     {
         let mut jit_cache = shared.jit_cache.write();
-        jit_cache.put(
-            std::sync::Arc::from(class_name),
-            cached.method_name.clone(),
-            cached.method_descriptor.clone(),
-            compiled,
-        );
+        jit_cache.put(receiver_key, method_name_key, method_desc_key, compiled);
     }
 
     Some((entry, needs_ctx))
@@ -16756,6 +16815,28 @@ fn try_jit_compile_callee_slow(
 /// A compile miss / bail (native shadow, skip-listed, backend bail, or a dropped
 /// VM) simply returns `0` — the queued flag is still cleared by the worker's
 /// `complete_task`, and a later mutator invocation re-attempts.
+///
+/// ## GC-neutral daemon (wire-tiered-manager increment 3)
+///
+/// This closure body is the entire VM-side surface of the
+/// `cratonvm-jit-compiler` worker, which `jit::tiered::start_background_compiler`
+/// spawns as an UNREGISTERED `std::thread::Builder` daemon — exactly the
+/// G1-MarkComplete / JDWP class of VM-internal thread. It is deliberately NOT a
+/// mutator: it is never `register_with_daemon`'d, never polls a safepoint, never
+/// calls `arrive_and_wait`, and holds NO managed `ObjectRef` across any GC point.
+/// Therefore the STW barrier's `expected` count (driven by
+/// `thread_registry.alive_count()`) never includes it, and concurrent
+/// relocation during a STW is harmless to it. Registering it instead would
+/// WRONGLY add its native Rust stack to the GC root set and make STW wait on a
+/// thread that has no safepoint — neither is wanted.
+///
+/// It captures a `Weak<SharedVm>` (never an `Arc`, so it cannot keep the VM
+/// alive past teardown), upgrades it per task, and NO-OPS when the upgrade fails
+/// (VM dropped) — the same `self_arc.upgrade()` pattern JDWP uses. All VM-lock
+/// scopes it touches are bounded inside `try_jit_compile_callee[_slow]` (see that
+/// function's lock-order contract): nothing is held across the worker's queue
+/// wait (its own `CompilerCore::wake` condvar, no VM lock), across class loading,
+/// or across the JFR / jit_cache publish.
 fn background_compile_task(
     weak_vm: &std::sync::Weak<SharedVm>,
     task: &crate::jit::tiered::CompilationTask,
