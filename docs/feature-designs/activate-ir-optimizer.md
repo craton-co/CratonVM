@@ -248,12 +248,61 @@ Front 2 — the LICM half of Front 2.2 and the write-only widening of DSE
   allocation so it isolates the overwrite property from the new write-only
   phase).
 
-**Not yet done** (still Fronts 2/3 follow-ups): SCEV-driven *unrolling* with a
-real trip-count gate, threading bytecode into `optimize()` so LICM can consult
-`licm_scev_corroborates` as a gate, a real alias oracle so LICM can hoist
-loads past non-aliasing in-loop stores, the array `Store` operand layout for
-array-element overwrite DSE, and guard-surviving scalar replacement (gated on
-`real-frame-deopt.md`). LICM default flip is gated on the soak.
+**Not yet done** (still Fronts 2/3 follow-ups): threading bytecode into
+`optimize()` so LICM can consult `licm_scev_corroborates` as a gate, a real
+alias oracle so LICM can hoist loads past non-aliasing in-loop stores, the array
+`Store` operand layout for array-element overwrite DSE, and guard-surviving
+scalar replacement (gated on `real-frame-deopt.md`). LICM/unroll default flip is
+gated on the soak.
+
+## Increment 3 (full unrolling of small constant-trip counted loops) landed
+
+Status: **landed** on `rm/iropt-unroll`, gated default-OFF behind
+`CRATONVM_JIT_UNROLL`. Implemented graph-level loop unrolling from scratch (the
+IR had no node-cloning machinery) and validated it live against HotSpot.
+
+**What landed** (`jit/src/ir_optimize.rs`, wired into `optimize()` after the
+fixed-point cleanup, before LICM):
+
+- **`unroll`** fully unrolls a single-back-edge, single-block, side-effect-free
+  counted loop whose trip count is a compile-time constant `<= UNROLL_MAX_TRIP`
+  (8). It clones the per-iteration computation once per iteration with the
+  induction variable substituted by its concrete constant and each carried phi
+  by its running value, redirects post-loop uses of each carried phi to its
+  final value, and straight-lines the control. The trailing fixed-point cleanup
+  then folds the concrete induction values, collapsing the loop body to
+  straight-line (often constant) code.
+- **Real loop-shape discovery**: the bytecode→IR builder encodes a javac loop
+  header as an `Op::Merge` with a back-edge (NOT `Op::Region`, which `loop_body`/
+  LICM assume), and wraps the exit `If`'s projections in single-input `Op::Merge`
+  pass-throughs. So unroll first runs **`collapse_trivial_merges`** (forwards
+  single-input Merges to their input) and then accepts a `Region` *or* a
+  back-edge `Merge` as a header, identifying entry vs back-edge by control-
+  reachability (`forward_control_closure`). (LICM, which only looks for
+  `Op::Region`, does not yet fire on these real loops — a known follow-up.)
+- **Soundness** (the per-iteration set is exactly the loop-carried work): the
+  clone set is the variant nodes backward-reachable from each carried phi's
+  back-edge value and the loop condition — this *excludes* post-loop uses. A
+  safety check requires every clone-set node's users to be other clone-set
+  nodes, a carried phi, or the header `If` (results escape only via the phis we
+  redirect). Any Store/Call/alloc/ArrayLength/Guard in the loop, an invariant
+  load pinned to the header, an internal branch, or a non-constant trip ⇒ bail.
+- **Diagnostics**: `CRATONVM_DBG_UNROLL` logs candidate headers, the per-region
+  bail reason, and each successful unroll.
+
+**Tests** — `cargo test -p cratonvm-jit unroll`: a counted reduction folds to
+the known constant (sum 0..5 == 10), trip-cap respected (100 ⇒ no unroll),
+non-zero init/stride (3,5,7,9 == 24).
+
+**Live validation** (debug binary, real JDK 25, vs HotSpot): `UnrollProbe`
+(trip-6 `i*i-1` reduction) and `UnrollProbe2` (four loops — strides +1/+2/-1,
+`Lt`/`Le`/`Gt`, add/mul/sub reductions, trips 5/6/8) both produce **identical
+checksums to HotSpot** with `CRATONVM_JIT_UNROLL=1`, and `[DBG_UNROLL]` confirms
+the loops were actually unrolled. Default (flag off) is byte-for-byte unchanged.
+
+**Next**: partial unrolling (unroll-by-factor with a remainder) for large/
+non-constant trips; unrolling loops with internal branches (clone control);
+re-using the new node-clone approach to make LICM fire on `Merge` headers.
 
 ## Implementation steps (ordered)
 

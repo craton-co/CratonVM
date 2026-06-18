@@ -37,6 +37,25 @@ pub fn optimize(graph: &mut Graph) {
             break;
         }
     }
+    // Full unrolling of small constant-trip counted loops. Default-OFF behind
+    // `CRATONVM_JIT_UNROLL` (Increment 3 of activate-ir-optimizer). Runs after
+    // the fixed-point cleanup so init/stride/bound are already folded to
+    // constants; re-runs the cleanup so the unrolled straight-line code folds
+    // (the concrete induction values collapse the per-iteration computation)
+    // and the retired loop nodes are reclaimed.
+    if unroll_enabled() && unroll(graph) {
+        for _ in 0..8 {
+            let before = graph.live_count();
+            fold_constants(graph);
+            algebraic_simplify(graph);
+            gvn(graph);
+            eliminate_dead_stores(graph);
+            eliminate_dead_nodes(graph);
+            if graph.live_count() == before {
+                break;
+            }
+        }
+    }
     // SCEV-driven loop-invariant code motion. Default-OFF behind
     // `CRATONVM_JIT_LICM` while it soaks (Increment 2 of activate-ir-optimizer).
     // Runs once *after* the fixed-point cleanup so it sees already-folded /
@@ -1426,6 +1445,600 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
     }
 }
 
+// ── Loop unrolling (activate-ir-optimizer increment 3) ───────────────────
+
+/// `true` when `CRATONVM_JIT_UNROLL` is set (cached). Enables full unrolling of
+/// small constant-trip-count counted loops. Default-OFF: experimental — it
+/// soaks behind the gate and is validated live against HotSpot before any flip.
+pub fn unroll_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_JIT_UNROLL").is_some())
+}
+
+/// Only fully unroll loops whose constant trip count is at most this (bounds
+/// code growth; larger counted loops are left rolled).
+const UNROLL_MAX_TRIP: i64 = 8;
+/// Skip loops whose per-iteration computation exceeds this many nodes.
+const UNROLL_MAX_BODY: usize = 48;
+
+fn const_i64(graph: &Graph, id: NodeId) -> Option<i64> {
+    if id == NO_NODE || id as usize >= graph.nodes.len() {
+        return None;
+    }
+    match graph.nodes[id as usize].op {
+        Op::Const(c) => Some(c),
+        _ => None,
+    }
+}
+
+fn eval_cmp_i64(op: CmpOp, x: i64, y: i64) -> bool {
+    match op {
+        CmpOp::Eq => x == y,
+        CmpOp::Ne => x != y,
+        CmpOp::Lt => x < y,
+        CmpOp::Le => x <= y,
+        CmpOp::Gt => x > y,
+        CmpOp::Ge => x >= y,
+    }
+}
+
+/// A recognised constant-trip counted loop suitable for full unrolling.
+struct CountedLoop {
+    iv_phi: NodeId,
+    iv_init: i64,
+    iv_stride: i64,
+    trip: i64,
+    if_node: NodeId,
+    exit_ctrl: NodeId,
+}
+
+/// The single `Op::Proj(which)` user of `node`, or `NO_NODE`.
+fn proj_user(graph: &Graph, node: NodeId, which: u8) -> NodeId {
+    for (id, n) in graph.nodes.iter().enumerate() {
+        if n.op == Op::Proj(which) && n.inputs.first().copied() == Some(node) {
+            return id as NodeId;
+        }
+    }
+    NO_NODE
+}
+
+/// Users map: `users[id]` = nodes that reference `id` as an input.
+fn build_users(graph: &Graph) -> Vec<Vec<NodeId>> {
+    let mut users: Vec<Vec<NodeId>> = vec![Vec::new(); graph.nodes.len()];
+    for (id, node) in graph.nodes.iter().enumerate() {
+        for &inp in &node.inputs {
+            if (inp as usize) < users.len() {
+                users[inp as usize].push(id as NodeId);
+            }
+        }
+    }
+    users
+}
+
+/// Recognise a constant-trip counted loop at `region` (single back-edge
+/// `back_ctrl`). Conservative: `None` on any shape we don't fully model
+/// (non-constant init/stride/bound, induction tested against a non-constant,
+/// multiple header tests, …).
+fn analyze_counted_loop(graph: &Graph, region: NodeId, back_ctrl: NodeId) -> Option<CountedLoop> {
+    let dbg = std::env::var_os("CRATONVM_DBG_UNROLL").is_some();
+    let n = graph.nodes.len();
+    // Induction phi: Phi anchored at `region`, inputs [region, init(Const), next],
+    // next = Add(self, Const) or Add(Const, self).
+    let mut iv: Option<(NodeId, i64, i64)> = None;
+    for id in 0..n {
+        let node = &graph.nodes[id];
+        if node.op != Op::Phi
+            || node.inputs.first().copied() != Some(region)
+            || node.inputs.len() < 3
+        {
+            continue;
+        }
+        let init = match const_i64(graph, node.inputs[1]) {
+            Some(c) => c,
+            None => continue,
+        };
+        let nxt = node.inputs[2];
+        if nxt == NO_NODE || nxt as usize >= n || graph.nodes[nxt as usize].op != Op::Add {
+            continue;
+        }
+        let ni = &graph.nodes[nxt as usize].inputs;
+        if ni.len() != 2 {
+            continue;
+        }
+        let stride = if ni[0] == id as NodeId {
+            const_i64(graph, ni[1])
+        } else if ni[1] == id as NodeId {
+            const_i64(graph, ni[0])
+        } else {
+            None
+        };
+        if let Some(s) = stride {
+            if s != 0 {
+                iv = Some((id as NodeId, init, s));
+                break;
+            }
+        }
+    }
+    let (iv_phi, iv_init, iv_stride) = match iv {
+        Some(v) => v,
+        None => {
+            if dbg {
+                eprintln!("[DBG_UNROLL] region {region}: bail — no constant-stride induction phi");
+            }
+            return None;
+        }
+    };
+
+    // Loop exit test: the single `If` controlled by a node inside the loop. We
+    // accept the header test (`If.ctrl == region`) and the common bottom test
+    // (`If.ctrl` chains back to the region via the back-edge control).
+    let mut if_node = NO_NODE;
+    for id in 0..n {
+        let node = &graph.nodes[id];
+        if node.op != Op::If {
+            continue;
+        }
+        let c = node.inputs.first().copied().unwrap_or(NO_NODE);
+        let in_loop = c == region || c == back_ctrl;
+        if in_loop {
+            if if_node != NO_NODE {
+                if dbg {
+                    eprintln!("[DBG_UNROLL] region {region}: bail — multiple loop tests");
+                }
+                return None;
+            }
+            if_node = id as NodeId;
+        }
+    }
+    if if_node == NO_NODE {
+        if dbg {
+            eprintln!("[DBG_UNROLL] region {region}: bail — no loop exit If (ctrl==region/back_ctrl)");
+        }
+        return None;
+    }
+    let cond = *graph.nodes[if_node as usize].inputs.get(1)?;
+    let op = match graph.nodes.get(cond as usize)?.op {
+        Op::Cmp(o) => o,
+        _ => return None,
+    };
+    let ci = &graph.nodes[cond as usize].inputs;
+    if ci.len() != 2 {
+        return None;
+    }
+    // Compare the induction phi against a constant bound.
+    let (iv_on_left, bound) = if ci[0] == iv_phi {
+        (true, const_i64(graph, ci[1])?)
+    } else if ci[1] == iv_phi {
+        (false, const_i64(graph, ci[0])?)
+    } else {
+        return None;
+    };
+
+    // Which If projection re-enters the loop (the "continue" edge)?
+    if graph.nodes.get(back_ctrl as usize)?.inputs.first().copied() != Some(if_node) {
+        return None;
+    }
+    let back_is_true = match graph.nodes[back_ctrl as usize].op {
+        Op::Proj(0) => true,
+        Op::Proj(1) => false,
+        _ => return None,
+    };
+    let exit_ctrl = proj_user(graph, if_node, if back_is_true { 1 } else { 0 });
+    if exit_ctrl == NO_NODE {
+        return None;
+    }
+
+    // Concrete trip count by simulation (init/stride/bound all constant).
+    let mut i = iv_init;
+    let mut trip = 0i64;
+    loop {
+        let raw = if iv_on_left {
+            eval_cmp_i64(op, i, bound)
+        } else {
+            eval_cmp_i64(op, bound, i)
+        };
+        let cont = if back_is_true { raw } else { !raw };
+        if !cont {
+            break;
+        }
+        i = i.wrapping_add(iv_stride);
+        trip += 1;
+        if trip > UNROLL_MAX_TRIP {
+            return None; // too large / non-terminating within the cap
+        }
+    }
+    Some(CountedLoop { iv_phi, iv_init, iv_stride, trip, if_node, exit_ctrl })
+}
+
+/// Collapse trivial single-input `Op::Merge` nodes (control pass-throughs the
+/// builder emits around branch projections) by forwarding their users to the
+/// single input. Run before loop detection so a loop header and its back-edge
+/// sit adjacent to the `If`/`Proj` nodes (the javac loop shape wraps the If's
+/// projections in single-input Merges).
+fn collapse_trivial_merges(graph: &mut Graph) {
+    loop {
+        let mut changed = false;
+        for id in 0..graph.nodes.len() {
+            if graph.nodes[id].op == Op::Merge && graph.nodes[id].inputs.len() == 1 {
+                let inp = graph.nodes[id].inputs[0];
+                if inp != NO_NODE && inp != id as NodeId {
+                    graph.replace_all_uses(id as NodeId, inp);
+                    graph.kill(id as NodeId);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// Control nodes forward-reachable from `start` (following control-typed users).
+fn forward_control_closure(
+    graph: &Graph,
+    users: &[Vec<NodeId>],
+    start: NodeId,
+) -> FxHashSet<NodeId> {
+    let mut set = FxHashSet::default();
+    let mut work = vec![start];
+    while let Some(c) = work.pop() {
+        for &u in &users[c as usize] {
+            if graph.nodes[u as usize].op.is_control() && set.insert(u) {
+                work.push(u);
+            }
+        }
+    }
+    set
+}
+
+/// Fully unroll small constant-trip counted loops (gated by [`unroll_enabled`]).
+/// Returns `true` if any loop was unrolled.
+///
+/// Soundness model: only a single-back-edge, single-block (no internal control),
+/// side-effect-free (no Store/Call/alloc/Guard; loads only if loop-variant)
+/// counted loop with a constant trip count `<= UNROLL_MAX_TRIP` is transformed.
+/// The per-iteration computation is the set backward-reachable from each carried
+/// phi's back-edge value and the loop condition — this is exactly the
+/// loop-carried work and *excludes* post-loop uses. We clone that set once per
+/// iteration with the induction variable substituted by its concrete constant
+/// and each carried phi by its running value, then redirect post-loop uses of
+/// each carried phi to its final value and straight-line the control. Anything
+/// not matching this shape is left untouched.
+fn unroll(graph: &mut Graph) -> bool {
+    let dbg = std::env::var_os("CRATONVM_DBG_UNROLL").is_some();
+    // Normalize away the single-input Merge wrappers the builder puts around
+    // branch projections, so loop headers/back-edges sit next to their If/Proj.
+    collapse_trivial_merges(graph);
+    // Loop headers: a `Region`, or a `Merge` with a back-edge — the builder emits
+    // `Merge` headers for javac loops. Two control inputs (entry + back-edge).
+    let headers: Vec<NodeId> = (0..graph.nodes.len() as NodeId)
+        .filter(|&i| {
+            matches!(graph.nodes[i as usize].op, Op::Region | Op::Merge)
+                && graph.nodes[i as usize].inputs.len() >= 2
+        })
+        .collect();
+    if dbg {
+        eprintln!("[DBG_UNROLL] {} candidate loop header(s)", headers.len());
+    }
+    let mut changed = false;
+    for region in headers {
+        if !matches!(graph.nodes[region as usize].op, Op::Region | Op::Merge) {
+            continue; // killed by an earlier unroll in this pass
+        }
+        let rin = graph.nodes[region as usize].inputs.clone();
+        if rin.len() != 2 {
+            continue; // single back-edge only
+        }
+        let users = build_users(graph);
+        // Identify the back-edge input (control-reachable from the header) vs the
+        // loop-entry predecessor.
+        let reach = forward_control_closure(graph, &users, region);
+        let back_inputs: Vec<NodeId> = rin
+            .iter()
+            .copied()
+            .filter(|&i| i != NO_NODE && reach.contains(&i))
+            .collect();
+        if back_inputs.len() != 1 {
+            if dbg {
+                eprintln!("[DBG_UNROLL] header {region}: bail — not a single-back-edge loop (back={back_inputs:?})");
+            }
+            continue;
+        }
+        let back_ctrl = back_inputs[0];
+        let entry_pred = rin.iter().copied().find(|&i| i != back_ctrl).unwrap_or(NO_NODE);
+        if entry_pred == NO_NODE {
+            continue;
+        }
+        let info = match analyze_counted_loop(graph, region, back_ctrl) {
+            Some(i) => i,
+            None => continue,
+        };
+
+        // Control simplicity: the loop must be a single block —
+        //   region → if_node → { back_ctrl (re-enter), exit_ctrl (leave) }.
+        // (loop_body is unsuitable here: its pinned sweep cascades control
+        // Projs/Returns that merely *reference* a body node into the set.)
+        let region_ctrl_users: Vec<NodeId> = users[region as usize]
+            .iter()
+            .copied()
+            .filter(|&u| graph.nodes[u as usize].op.is_control())
+            .collect();
+        if region_ctrl_users != [info.if_node] {
+            if dbg {
+                eprintln!("[DBG_UNROLL] region {region}: bail — region control users {region_ctrl_users:?} != [if {}]", info.if_node);
+            }
+            continue;
+        }
+        let mut if_users = users[info.if_node as usize].clone();
+        if_users.sort_unstable();
+        let mut expect_projs = vec![back_ctrl, info.exit_ctrl];
+        expect_projs.sort_unstable();
+        if if_users != expect_projs {
+            if dbg {
+                eprintln!("[DBG_UNROLL] region {region}: bail — if users {if_users:?} != projs {expect_projs:?}");
+            }
+            continue;
+        }
+        let back_ctrl_users: Vec<NodeId> = users[back_ctrl as usize]
+            .iter()
+            .copied()
+            .filter(|&u| graph.nodes[u as usize].op.is_control())
+            .collect();
+        if back_ctrl_users != [region] {
+            if dbg {
+                eprintln!("[DBG_UNROLL] region {region}: bail — back_ctrl control users {back_ctrl_users:?} != [region {region}]");
+            }
+            continue;
+        }
+
+        // Carried phis (anchored at the region), each needs a back-edge value.
+        let mut ok = true;
+        let mut carried: Vec<NodeId> = Vec::new();
+        for id in 0..graph.nodes.len() {
+            let node = &graph.nodes[id];
+            if node.op == Op::Phi && node.inputs.first().copied() == Some(region) {
+                if node.inputs.len() < 3 {
+                    ok = false;
+                    break;
+                }
+                carried.push(id as NodeId);
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let carried_set: FxHashSet<NodeId> = carried.iter().copied().collect();
+
+        // Variance: nodes transitively using a carried phi (forward propagation).
+        let mut variant: FxHashSet<NodeId> = carried_set.clone();
+        let mut vw: Vec<NodeId> = carried.clone();
+        while let Some(c) = vw.pop() {
+            for &u in &users[c as usize] {
+                if variant.insert(u) {
+                    vw.push(u);
+                }
+            }
+        }
+
+        // No side effects in the loop: a Store/Call/alloc/ArrayLength/Guard that
+        // is loop-variant or control-pinned to the loop is a side effect we do
+        // not model → bail.
+        for id in 0..graph.nodes.len() {
+            let op = &graph.nodes[id].op;
+            if matches!(
+                op,
+                Op::Store(_)
+                    | Op::Call
+                    | Op::New { .. }
+                    | Op::NewArray { .. }
+                    | Op::ArrayLength
+                    | Op::Guard { .. }
+            ) {
+                let ctrl = graph.nodes[id].inputs.first().copied().unwrap_or(NO_NODE);
+                if variant.contains(&(id as NodeId)) || ctrl == region || ctrl == back_ctrl {
+                    if dbg {
+                        eprintln!("[DBG_UNROLL] region {region}: bail — loop side effect {:?} (node {id})", graph.nodes[id].op);
+                    }
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+
+        // Per-iteration computation = variant nodes backward-reachable from each
+        // carried phi's back-edge value and the loop condition; stops at carried
+        // phis (substituted) and invariant nodes (shared). Excludes post-loop uses.
+        let cond = graph.nodes[info.if_node as usize].inputs[1];
+        let mut seeds: Vec<NodeId> = vec![cond];
+        for &p in &carried {
+            seeds.push(graph.nodes[p as usize].inputs[2]);
+        }
+        let mut to_clone: FxHashSet<NodeId> = FxHashSet::default();
+        let mut cw = seeds;
+        while let Some(c) = cw.pop() {
+            if c == NO_NODE
+                || c as usize >= graph.nodes.len()
+                || carried_set.contains(&c)
+                || !variant.contains(&c)
+            {
+                continue; // phi (substituted) or invariant (shared)
+            }
+            if graph.nodes[c as usize].op.is_control() {
+                continue;
+            }
+            if to_clone.contains(&c) {
+                continue;
+            }
+            // Only loads and pure arithmetic are clonable.
+            let opc = &graph.nodes[c as usize].op;
+            if !matches!(opc, Op::Load(_)) && !opc.is_pure() {
+                if dbg {
+                    eprintln!("[DBG_UNROLL] region {region}: bail — unclonable body node {opc:?} (node {c})");
+                }
+                ok = false;
+                break;
+            }
+            to_clone.insert(c);
+            for &inp in &graph.nodes[c as usize].inputs {
+                cw.push(inp);
+            }
+        }
+        if !ok {
+            continue;
+        }
+        if to_clone.len() > UNROLL_MAX_BODY {
+            continue;
+        }
+        // Bail on invariant loads pinned to the loop header (we'd have to
+        // re-anchor them); milestone-1 only handles variant (cloned) loads.
+        let mut pinned_invariant_load = false;
+        for id in 0..graph.nodes.len() {
+            if matches!(graph.nodes[id].op, Op::Load(_))
+                && graph.nodes[id].inputs.first().copied() == Some(region)
+                && !to_clone.contains(&(id as NodeId))
+            {
+                pinned_invariant_load = true;
+                break;
+            }
+        }
+        if pinned_invariant_load {
+            if dbg {
+                eprintln!("[DBG_UNROLL] region {region}: bail — invariant load pinned to header");
+            }
+            continue;
+        }
+
+        // Safety: every user of a to-clone node must be another to-clone node, a
+        // carried phi, or the header `If` — i.e. the computation feeds only the
+        // loop (its results escape solely via the carried phis we redirect).
+        let mut escapes = false;
+        for &d in &to_clone {
+            for &u in &users[d as usize] {
+                if !(to_clone.contains(&u) || carried_set.contains(&u) || u == info.if_node) {
+                    escapes = true;
+                    break;
+                }
+            }
+            if escapes {
+                break;
+            }
+        }
+        if escapes {
+            if dbg {
+                eprintln!("[DBG_UNROLL] region {region}: bail — a body value escapes the loop");
+            }
+            continue;
+        }
+
+        // Topological order of the clone set (DAG — carried phis broke cycles).
+        let mut order: Vec<NodeId> = Vec::with_capacity(to_clone.len());
+        let mut state: FxHashMap<NodeId, u8> = FxHashMap::default();
+        let mut stack: Vec<(NodeId, usize)> = Vec::new();
+        for &root in &to_clone {
+            if state.get(&root).copied().unwrap_or(0) == 2 {
+                continue;
+            }
+            stack.push((root, 0));
+            while let Some(&(node, idx)) = stack.last() {
+                state.insert(node, 1);
+                let inputs = &graph.nodes[node as usize].inputs;
+                if idx < inputs.len() {
+                    let inp = inputs[idx];
+                    stack.last_mut().unwrap().1 += 1;
+                    if to_clone.contains(&inp) && state.get(&inp).copied().unwrap_or(0) == 0 {
+                        stack.push((inp, 0));
+                    }
+                } else {
+                    state.insert(node, 2);
+                    order.push(node);
+                    stack.pop();
+                }
+            }
+        }
+
+        // Running value of each carried phi entering the current iteration,
+        // seeded with its preheader (entry) value.
+        let mut cur: FxHashMap<NodeId, NodeId> = FxHashMap::default();
+        for &p in &carried {
+            cur.insert(p, graph.nodes[p as usize].inputs[1]);
+        }
+
+        for t in 0..info.trip {
+            // Substitution for iteration t: region control → preheader; each
+            // carried phi → its running value (the iv's running value is the
+            // concrete constant init + t*stride).
+            let mut subst: FxHashMap<NodeId, NodeId> = FxHashMap::default();
+            subst.insert(region, entry_pred);
+            for (&p, &v) in &cur {
+                subst.insert(p, v);
+            }
+            // Clone the per-iteration computation in topo order.
+            for &d in &order {
+                let (op, ty, pc) = {
+                    let nd = &graph.nodes[d as usize];
+                    (nd.op.clone(), nd.ty, nd.bytecode_pc)
+                };
+                let new_inputs: Vec<NodeId> = graph.nodes[d as usize]
+                    .inputs
+                    .iter()
+                    .map(|&inp| subst.get(&inp).copied().unwrap_or(inp))
+                    .collect();
+                let clone = graph.add(op, ty, new_inputs, pc);
+                subst.insert(d, clone);
+            }
+            // Advance carried phis to their next-iteration values.
+            let mut next: FxHashMap<NodeId, NodeId> = FxHashMap::default();
+            for &p in &carried {
+                if p == info.iv_phi {
+                    let v = info.iv_init.wrapping_add((t + 1).wrapping_mul(info.iv_stride));
+                    let c = graph.add(Op::Const(v), IrType::Int, vec![], None);
+                    next.insert(p, c);
+                } else {
+                    let back_val = graph.nodes[p as usize].inputs[2];
+                    next.insert(p, subst.get(&back_val).copied().unwrap_or(back_val));
+                }
+            }
+            cur = next;
+        }
+
+        // Redirect post-loop uses of each carried phi to its final value, then
+        // straight-line the control and retire the loop skeleton + carried phis.
+        // (`cur` now holds the post-loop value of each phi; for trip == 0 these
+        // are the entry values.)
+        for &p in &carried {
+            let fin = cur.get(&p).copied().unwrap_or(NO_NODE);
+            if fin != NO_NODE && fin != p {
+                graph.replace_all_uses(p, fin);
+            }
+        }
+        graph.replace_all_uses(info.exit_ctrl, entry_pred);
+        graph.kill(region);
+        graph.kill(info.if_node);
+        graph.kill(back_ctrl);
+        graph.kill(info.exit_ctrl);
+        for &p in &carried {
+            graph.kill(p);
+        }
+        for &d in &to_clone {
+            graph.kill(d);
+        }
+        if std::env::var_os("CRATONVM_DBG_UNROLL").is_some() {
+            eprintln!(
+                "[DBG_UNROLL] fully unrolled counted loop (region {region}, trip {}, {} cloned nodes/iter)",
+                info.trip,
+                to_clone.len()
+            );
+        }
+        changed = true;
+    }
+    changed
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1980,6 +2593,88 @@ mod tests {
         // Wire the back-edge control into the region.
         g.nodes[region as usize].inputs.push(back_ctrl);
         (g, region, c0, iv)
+    }
+
+    /// Build a counted reduction loop `for (i=init; i<bound; i+=stride) acc += i;`
+    /// Returns (graph, return_node); the Return's value input is the accumulator
+    /// phi (its post-loop value), its control is the loop-exit projection.
+    fn reduction_loop(init: i64, bound: i64, stride: i64) -> (Graph, NodeId) {
+        let mut g = Graph { nodes: Vec::new(), entry: 0, exit: 0, safepoints: Vec::new() };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        g.entry = start;
+        let c0 = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let _m0 = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let region = g.add(Op::Region, IrType::Control, vec![c0], None);
+        let i_init = g.add(Op::Const(init), IrType::Int, vec![], None);
+        let iv = g.add(Op::Phi, IrType::Int, vec![region, i_init], None);
+        let stride_c = g.add(Op::Const(stride), IrType::Int, vec![], None);
+        let iv_next = g.add(Op::Add, IrType::Int, vec![iv, stride_c], None);
+        g.nodes[iv as usize].inputs.push(iv_next);
+        let s_init = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let acc = g.add(Op::Phi, IrType::Int, vec![region, s_init], None);
+        let acc_next = g.add(Op::Add, IrType::Int, vec![acc, iv], None);
+        g.nodes[acc as usize].inputs.push(acc_next);
+        let bound_c = g.add(Op::Const(bound), IrType::Int, vec![], None);
+        let cond = g.add(Op::Cmp(CmpOp::Lt), IrType::Int, vec![iv, bound_c], None);
+        let if_node = g.add(Op::If, IrType::Control, vec![region, cond], None);
+        let back = g.add(Op::Proj(0), IrType::Control, vec![if_node], None);
+        let exit = g.add(Op::Proj(1), IrType::Control, vec![if_node], None);
+        g.nodes[region as usize].inputs.push(back);
+        let ret = g.add(Op::Return, IrType::Void, vec![exit, acc], None);
+        g.exit = ret;
+        (g, ret)
+    }
+
+    fn fold_pipeline(g: &mut Graph) {
+        for _ in 0..8 {
+            let before = g.live_count();
+            fold_constants(g);
+            algebraic_simplify(g);
+            gvn(g);
+            eliminate_dead_nodes(g);
+            if g.live_count() == before {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn test_unroll_counted_reduction_folds_to_constant() {
+        // for (i=0; i<5; i++) acc += i;  =>  acc == 0+1+2+3+4 == 10
+        let (mut g, ret) = reduction_loop(0, 5, 1);
+        assert!(unroll(&mut g), "a constant-trip counted reduction must unroll");
+        fold_pipeline(&mut g);
+        let val = g.nodes[ret as usize].inputs[1];
+        assert_eq!(
+            g.nodes[val as usize].op,
+            Op::Const(10),
+            "unrolled sum of 0..5 must fold to the constant 10"
+        );
+        assert!(
+            !g.nodes.iter().any(|n| n.op == Op::Region),
+            "no loop region should remain after a full unroll"
+        );
+    }
+
+    #[test]
+    fn test_unroll_respects_trip_cap() {
+        // Trip count 100 exceeds UNROLL_MAX_TRIP → must NOT unroll.
+        let (mut g, _ret) = reduction_loop(0, 100, 1);
+        assert!(!unroll(&mut g), "a loop above the trip cap must not unroll");
+        assert!(
+            g.nodes.iter().any(|n| n.op == Op::Region),
+            "the loop region must remain when unroll bails"
+        );
+    }
+
+    #[test]
+    fn test_unroll_nonzero_init_and_stride() {
+        // for (i=3; i<11; i+=2) acc += i;  =>  i ∈ {3,5,7,9}  =>  sum == 24
+        let (mut g, ret) = reduction_loop(3, 11, 2);
+        assert!(unroll(&mut g), "non-zero init/stride counted loop must unroll");
+        fold_pipeline(&mut g);
+        let val = g.nodes[ret as usize].inputs[1];
+        assert_eq!(g.nodes[val as usize].op, Op::Const(24), "3+5+7+9 == 24");
     }
 
     #[test]
