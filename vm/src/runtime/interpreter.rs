@@ -14065,6 +14065,24 @@ fn execute_invokestatic_cached(
         Some(t) => t.clone(),
         None => return Ok(CachedCallResult::CacheMiss),
     };
+    // JVMTI redefine guard (static): never serve a cached native/intrinsic
+    // SHADOW for a static method whose declaring class an agent has redefined
+    // (e.g. Mockito `mockStatic(X)` woves X's static methods) — evict and
+    // re-resolve so the woven bytecode + advice run. Fast-pathed on
+    // `any_class_redefined`.
+    if crate::classloading::any_class_redefined()
+        && matches!(
+            target,
+            CachedInvokeTarget::Native { .. } | CachedInvokeTarget::Intrinsic { .. }
+        )
+    {
+        if let Ok((mcn, _, _, _)) = resolve_method_ref(shared, caller_class_id, cp_index) {
+            if native_shadow_suppressed_by_redefine(shared, &mcn) {
+                thread.invoke_cache.evict(caller_class_id, cp_index, false);
+                return Ok(CachedCallResult::CacheMiss);
+            }
+        }
+    }
     if crate::runtime::env_cache::modstatic_dbg() {
         if let Ok((mcn, mn, _, _)) = resolve_method_ref(shared, caller_class_id, cp_index) {
             if mn.as_ref() == "initBootModuleLoader" {
@@ -17956,6 +17974,28 @@ fn execute_invokevirtual_cached(
         Some(t) => t.clone(),
         None => return Ok(CachedCallResult::CacheMiss),
     };
+    // JVMTI redefine guard: never serve a cached native/intrinsic SHADOW for a
+    // class an agent has redefined in place — evict the entry and re-resolve
+    // through the slow path, whose gates dispatch the woven bytecode so the
+    // instrumentation advice runs. Without this, the FIRST call resolves to the
+    // woven body (slow path) but the inline cache it populates can still hold a
+    // VirtualNative/Intrinsic shadow that later calls hit directly, silently
+    // bypassing the advice (e.g. mockStatic(X)+mock(X): the stub registers but
+    // subsequent `m.method()` calls return the native default). Cheap
+    // fast-path on the global `any_class_redefined` flag.
+    if crate::classloading::any_class_redefined() {
+        let shadow_cid = match &target {
+            CachedInvokeTarget::VirtualNative { receiver_class_id, .. } => Some(*receiver_class_id),
+            CachedInvokeTarget::Intrinsic { receiver_class_id, .. } => *receiver_class_id,
+            _ => None,
+        };
+        if let Some(cid) = shadow_cid {
+            if shared.class_manager.read().class_redefine_generation(cid) > 0 {
+                thread.invoke_cache.evict(caller_class_id, cp_index, is_special);
+                return Ok(CachedCallResult::CacheMiss);
+            }
+        }
+    }
     // [PB-DIAG] one-shot dump for InfoCmp.getInfoCmp at pc 38
     if std::env::var_os("CRATONVM_DBG_PBSTART").is_some() {
         let cn = thread.frames[frame_idx].class_name();
