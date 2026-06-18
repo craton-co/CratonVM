@@ -76,6 +76,16 @@ flate2 = "1"
 # `zip_real.rs`.
 snap = "1"
 zstd = "0.13"
+# lz4-java (the `at.yawk.lz4` fork Kafka bundles) exposes `net.jpountz.lz4.LZ4JNI`
+# over the canonical LZ4 *block* format. `lz4_flex`'s raw `compress_into`/
+# `decompress_into` are byte-compatible with liblz4's block format (no size
+# prefix), so blocks framed by Kafka's pure-Java `KafkaLZ4Block*Stream` round
+# trip. Pure Rust — no extra C toolchain dependency.
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
+# lz4-java also bundles xxHash (`net.jpountz.xxhash.XXHashJNI`) for the LZ4
+# frame's block/content checksums; `KafkaLZ4Block*Stream` hashes every block
+# with XXH32. `twox-hash` is a reference-compatible pure-Rust xxHash32/64.
+twox-hash = "1.6"
 # Round-12 follow-up to round-8 cross-cutting Bug 3: now on workspace 2.x
 # alongside `native-io`. The migration from 0.6 → 2.x switched every
 # `start_file` call site to `SimpleFileOptions` (the un-generic write
