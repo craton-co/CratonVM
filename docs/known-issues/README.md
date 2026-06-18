@@ -11,6 +11,13 @@ Four of the docs are all manifestations of **one root-cause family** — the
 GC-root manifestations, 1 open standalone bug, 1 latent standalone bug** (the
 other GC-root manifestations are already fixed on `dev`).
 
+That headline covers the original GC-root cluster. The folder also holds the
+**Hibernate** standalone cluster, the **bug-06** Spring reflection/annotation
+families (F5/F6), and — added 2026-06-18 — **7 more open, distinct suite bugs**
+consolidated from the per-suite trackers (see *Consolidated suite bug docs* below).
+Two of those (`springsuite-bug-04`, `spring-bug-10`) are themselves Family A
+manifestations seen from the Spring suite.
+
 ---
 
 ## Family A — GC root coverage under JIT  *(one root cause, four manifestations)*
@@ -121,6 +128,30 @@ clustered ~529 genuine assertion mismatches into 6 families. Families 1–4 are 
 |---|---|---|---|
 | **F5** | Reflection native returns `null` where HotSpot returns a `Class`/`Method` (`getDeclaredMethod on null` ×28). Common paths **verified clean** (`Refl5` == HotSpot); the failing narrow generic/proxy path is not yet attributed to a test. **Do not** touch `synthetic_class_mirror` slot 0 (refuted hypothesis). | 🔴 **OPEN** — needs per-test attribution | [bug06-fam5-reflection-getdeclaredmethod-null.md](bug06-fam5-reflection-getdeclaredmethod-null.md) |
 | **F6** | Spring annotation **synthesis** (`@AliasFor`/`MergedAnnotation`/`MirrorSets`) value mismatches + `AnnotationUtilsTests` aborts with a fixed ~2 GB alloc (reproduces on the pre-fix binary → pre-existing, a wrong size computation, not the `findLoadedClass` fix). | 🔴 **OPEN** — `[[spring-bug-01]]` umbrella | [bug06-fam6-annotation-synthesis-mergedannotation.md](bug06-fam6-annotation-synthesis-mergedannotation.md) |
+
+## Consolidated suite bug docs (open & distinct — copied in 2026-06-18)
+
+Genuine open VM defects pulled in from the suite-specific trackers
+(`spring-suite/crash-reports-2026-06-16/`, `spring-suite/bugs/`,
+`docs/kafka-suite-0617/`) so this folder is the single map. **These are copies** —
+the originals remain in their suite folders (which keep their own numbering). Only
+open, distinct bugs were copied; FIXED docs (bug-03, crash-01/02/03,
+spring-bug-02/03/05/09/12, kafka bug-A) and already-consolidated ones (fam5/6,
+spring-bug-04) were left in place.
+
+| Bug | Category | Status | Doc |
+|---|---|---|---|
+| String constant corrupted → `Object` under load | VM-CORRECTNESS / GC | 🔴 **OPEN** — a **Family A** (GC-root-undercount) manifestation, load-dependent | [springsuite-bug-04-string-constant-corrupted-under-load.md](springsuite-bug-04-string-constant-corrupted-under-load.md) |
+| `MergedAnnotations` hang | VM-HANG | 🔴 **OPEN** — first hang found in the suite; annotation synthesis (cf. bug-06 F6) | [spring-bug-06-mergedannotations-hang.md](spring-bug-06-mergedannotations-hang.md) |
+| Serializable proxy round-trip | VM-CORRECTNESS (proxy + serialization) | 🔴 **OPEN** | [spring-bug-08-serializable-proxy-roundtrip.md](spring-bug-08-serializable-proxy-roundtrip.md) |
+| JUnit-platform execution `LoadError` | VM-CORRECTNESS / dispatch | 🔴 **OPEN** — JUnit platform internals; GC-race-adjacent (cf. bug-04) | [spring-bug-10-junit-platform-execution-loaderr.md](spring-bug-10-junit-platform-execution-loaderr.md) |
+| Groovy / scheduler crashes (rc=139) | VM-CRASH | 🟡 **PARTIAL** — Groovy SIGSEGV fixed via the bug-12 HashMap-layout fix; residual = a separate Groovy **hang at BEGIN** (inventory, needs per-cluster trace) | [spring-bug-11-groovy-and-scheduler-crashes.md](spring-bug-11-groovy-and-scheduler-crashes.md) |
+| Mockito `mockStatic` + mock dispatch | VM-CORRECTNESS (Mockito dispatch) | 🔴 **OPEN** — root-caused; High (Mockito pervasive in Kafka suite) | [kafka-bug-B-mockito-mockstatic-mock-dispatch.md](kafka-bug-B-mockito-mockstatic-mock-dispatch.md) |
+| `WeakHashMap` stream infinite hang | VM-HANG | 🔴 **OPEN** — 3-line repro; largest hang cluster in the Kafka suite | [kafka-bug-C-weakhashmap-stream-infinite-hang.md](kafka-bug-C-weakhashmap-stream-infinite-hang.md) |
+
+> `springsuite-bug-04` and `spring-bug-10` are **Family A** (GC-root-coverage-under-JIT)
+> manifestations seen from the Spring suite — same root cause as A1–A4 above, different
+> entry points. Fixing precise JIT stack roots should clear them; tracked there.
 
 ## The springrepos handoff (mostly fixed)
 
