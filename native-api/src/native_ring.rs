@@ -36,10 +36,13 @@ const RING_SIZE: usize = 64;
 /// (or other diagnostic code) should call `enable(true)` when arming.
 ///
 /// This default of `false` is intentional, not an accidental disable: the
-/// ring is deliberately dormant until the watchdog integration wires it up,
-/// so it imposes no runtime cost in the meantime.
+/// ring is deliberately dormant until a diagnostic is requested, at which
+/// point the recording path imposes no runtime cost.
 ///
-/// TODO: re-arm via `native_ring::enable(true)` when watchdog wires up.
+/// WIRED UP: the CLI arms this via `native_ring::enable(true)` from
+/// `vm-cli/src/main.rs` when `ring_recording_requested` is set
+/// (`--stack-dump-on-timeout=N>0` or `CRATONVM_ENABLE_NATIVE_RING=1`). The
+/// previous "TODO: re-arm" note was stale and has been removed.
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Turn ring-buffer recording on or off. Off by default.
@@ -84,23 +87,81 @@ fn name_map() -> &'static Mutex<FxHashMap<usize, String>> {
     MAP.get_or_init(|| Mutex::new(FxHashMap::default()))
 }
 
+/// Deferred-resolution name map: `cb_ptr → fn() -> String`.
+///
+/// FIX (review STUB/P2, native_ring.rs ~119): boot registers ~3,100 natives
+/// and the eager `register_name` paid a `format!` allocation **plus** a
+/// `Mutex` lock per native at boot for a feature that is OFF by default. We
+/// can't simply skip-while-disabled, because boot registration happens
+/// *before* the watchdog arms recording, so skipped names would be lost and
+/// the eventual dump would show only raw `<unknown cb@0x...>` pointers
+/// (useless for diagnosing a native livelock). Instead, callers can register
+/// a cheap zero-allocation `fn() -> String` resolver (a bare function
+/// pointer, no per-call `String`), and the name is materialized lazily only
+/// when the ring is actually inspected (`name_of` / `dump_to_stderr`).
+fn lazy_name_map() -> &'static Mutex<FxHashMap<usize, fn() -> String>> {
+    static MAP: OnceLock<Mutex<FxHashMap<usize, fn() -> String>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
 /// Resolve a callback pointer back to its registered
 /// `class.method desc` name, if known. Used by diagnostic code (the
 /// dispatch tracer / watchdog) to render the hung native by name.
+///
+/// Checks the eagerly-populated string map first, then falls back to the
+/// deferred resolver map (materializing — and caching — the name on first
+/// use so a repeated dump pays the resolver only once).
 pub fn name_of(cb_ptr: usize) -> Option<String> {
     if cb_ptr == 0 {
         return None;
     }
-    name_map().lock().get(&cb_ptr).cloned()
+    if let Some(s) = name_map().lock().get(&cb_ptr).cloned() {
+        return Some(s);
+    }
+    // Lazy fallback: run the resolver, then promote the result into the
+    // eager map so subsequent lookups (and the watchdog dump) skip it.
+    let resolver = lazy_name_map().lock().get(&cb_ptr).copied();
+    if let Some(f) = resolver {
+        let s = f();
+        name_map().lock().entry(cb_ptr).or_insert_with(|| s.clone());
+        return Some(s);
+    }
+    None
 }
 
-/// Register a callback pointer → name mapping.
+/// Register a callback pointer → name mapping eagerly.
+///
+/// NOTE: this allocates a `String` at the call site. Prefer
+/// [`register_name_lazy`] on the boot hot path (~3,100 natives) so the
+/// name is only materialized if/when a diagnostic dump actually needs it.
 pub fn register_name(cb_ptr: usize, triple: &str) {
     if cb_ptr == 0 {
         return;
     }
     let mut m = name_map().lock();
     m.entry(cb_ptr).or_insert_with(|| triple.to_string());
+}
+
+/// Register a callback pointer → name *resolver* (deferred / lazy).
+///
+/// The resolver is a bare `fn() -> String` (no captured state, no heap
+/// allocation to store), invoked only when [`name_of`] / [`dump_to_stderr`]
+/// actually need the human-readable name. This keeps boot cheap: a single
+/// map insert of a function pointer, with no `format!` allocation per native
+/// while the ring is dormant (the common case).
+///
+/// CROSS-FILE FOLLOW-UP (out of this file's scope): to realize the full boot
+/// win, `NativeMethodRegistry::register` in `native-api/src/registry.rs`
+/// (~2629) should call this with a resolver that formats
+/// `"{class}.{method}{descriptor}"` on demand instead of eagerly building
+/// the `String` and calling [`register_name`]. That requires the registry to
+/// hold the three name parts in a form a `fn` pointer can reach (e.g. via an
+/// interned/indexed table), so it is flagged here rather than edited.
+pub fn register_name_lazy(cb_ptr: usize, resolver: fn() -> String) {
+    if cb_ptr == 0 {
+        return;
+    }
+    lazy_name_map().lock().entry(cb_ptr).or_insert(resolver);
 }
 
 fn now_ms() -> u128 {
@@ -157,25 +218,33 @@ pub fn record_exit(idx: usize) {
 /// while it was on), prints a notice that the ring is empty rather
 /// than nothing — so the watchdog dump is still self-explanatory.
 pub fn dump_to_stderr() {
-    let ring = RING.lock();
-    let names = name_map().lock();
+    // Snapshot the ring under its own lock, then release it *before*
+    // resolving names. Name resolution goes through `name_of`, which locks
+    // the (separate, non-reentrant) name maps internally — so we must NOT
+    // hold any name-map lock here, and we keep the ring lock for the copy
+    // only. FIX (review STUB): names may now live in the lazy resolver map,
+    // so resolve via `name_of` rather than reading `name_map()` directly.
+    let snapshot: Vec<(usize, Entry)> = {
+        let ring = RING.lock();
+        let mut v = Vec::with_capacity(RING_SIZE);
+        for i in 0..RING_SIZE {
+            let idx = (ring.next + i) % RING_SIZE;
+            v.push((i, ring.entries[idx]));
+        }
+        v
+    };
     eprintln!("--- native-call ring buffer (last {RING_SIZE} entries, oldest first) ---");
     if !ENABLED.load(Ordering::Relaxed) {
         eprintln!("  (recording disabled — call native_ring::enable(true) to capture)");
     }
     let now = now_ms();
     let mut any = false;
-    for i in 0..RING_SIZE {
-        let idx = (ring.next + i) % RING_SIZE;
-        let e = ring.entries[idx];
+    for (i, e) in snapshot {
         if e.cb_ptr == 0 {
             continue;
         }
         any = true;
-        let name = names
-            .get(&e.cb_ptr)
-            .cloned()
-            .unwrap_or_else(|| format!("<unknown cb@{:#x}>", e.cb_ptr));
+        let name = name_of(e.cb_ptr).unwrap_or_else(|| format!("<unknown cb@{:#x}>", e.cb_ptr));
         let dur = if e.exit_ms == 0 {
             format!("STILL-IN-NATIVE({}ms ago)", now.saturating_sub(e.enter_ms))
         } else {
@@ -198,4 +267,55 @@ fn thread_id_u64() -> u64 {
         static TID: u64 = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     }
     TID.with(|t| *t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Distinct high sentinel pointers, unlikely to collide with real
+    // registrations in the shared process-global maps.
+    const PTR_EAGER: usize = 0xDEAD_0001;
+    const PTR_LAZY: usize = 0xDEAD_0002;
+
+    #[test]
+    fn eager_register_resolves() {
+        register_name(PTR_EAGER, "java/lang/Foo.bar()V");
+        assert_eq!(
+            name_of(PTR_EAGER).as_deref(),
+            Some("java/lang/Foo.bar()V")
+        );
+    }
+
+    #[test]
+    fn lazy_register_resolves_and_promotes() {
+        // FIX (review STUB): zero-allocation deferred registration. The
+        // resolver runs only when the name is actually needed.
+        fn resolver() -> String {
+            "java/lang/Baz.qux()V".to_string()
+        }
+        register_name_lazy(PTR_LAZY, resolver);
+        // First lookup runs the resolver...
+        assert_eq!(
+            name_of(PTR_LAZY).as_deref(),
+            Some("java/lang/Baz.qux()V")
+        );
+        // ...and promotes the result into the eager map for subsequent hits.
+        assert!(name_map().lock().contains_key(&PTR_LAZY));
+        assert_eq!(
+            name_of(PTR_LAZY).as_deref(),
+            Some("java/lang/Baz.qux()V")
+        );
+    }
+
+    #[test]
+    fn null_ptr_is_ignored() {
+        register_name(0, "should/not/Register.x()V");
+        assert_eq!(name_of(0), None);
+    }
+
+    #[test]
+    fn unknown_ptr_is_none() {
+        assert_eq!(name_of(0x0BAD_BEEF_usize), None);
+    }
 }

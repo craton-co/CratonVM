@@ -15,6 +15,22 @@
 //! | Uncompressed | n/a | n/a | raw 64-bit pointer |
 //! | ZeroBased | 0 | 0 / 3 | `addr >> shift` |
 //! | HeapBased | > 0 | 0 / 3 | `(addr - base) >> shift` |
+//!
+//! # Wiring status
+//!
+//! This module is **implemented but not yet wired into the live heap**. The
+//! encode/decode/`encode_klass`/`decode_klass` surface is complete, tested, and
+//! correct, but the VM currently stores all object/class references as full
+//! 64-bit pointers — nothing in the running heap calls these encoders yet. The
+//! code is therefore *unwired*, not dead or broken: it is a self-contained,
+//! ready-to-wire feature.
+//!
+//! Wiring compressed oops into the live heap is a sizeable feature (narrow-oop
+//! field layout, JIT load/store barriers, GC root re-encoding, klass-pointer
+//! compression in object headers) and is tracked as a separate follow-up. Until
+//! that lands, keep the encodability guard in [`CompressedOops::encode`] correct
+//! so that callers wired in later cannot silently truncate a non-encodable
+//! address into a wrong narrow oop.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -192,6 +208,23 @@ impl CompressedOops {
     /// Encode a 64-bit address into a [`CompressedOop`].
     ///
     /// Returns [`CompressedOop::NULL`] for address 0.
+    ///
+    /// # Encodability guard
+    ///
+    /// The address must lie within the encodable heap range and be aligned to
+    /// the active shift (8-byte aligned when `shift == 3`). Encoding a
+    /// non-encodable address would silently truncate it into the wrong narrow
+    /// oop, so this method guards against that:
+    ///
+    /// * In debug builds a `debug_assert!` fires on a non-encodable / misaligned
+    ///   address, catching wiring bugs at their origin.
+    /// * In release builds it fails safe by returning [`CompressedOop::NULL`]
+    ///   rather than a truncated, wrong-but-plausible narrow oop. NULL can never
+    ///   alias a live object, so a downstream decode lands on address 0 (an
+    ///   obvious fault) instead of silently pointing at an unrelated object.
+    ///
+    /// Use [`CompressedOops::is_encodable`] to check ahead of time when NULL is
+    /// not an acceptable sentinel for the caller.
     #[inline]
     pub fn encode(&self, addr: u64) -> CompressedOop {
         if addr == 0 {
@@ -199,14 +232,40 @@ impl CompressedOops {
         }
         match self.mode {
             CompressedOopsMode::Uncompressed => {
-                // Shouldn't normally be called, but be safe.
+                // Degenerate pass-through: compression is disabled, so there is
+                // no narrow-oop range or shift to validate against. Preserve the
+                // historic "shouldn't normally be called, but be safe" behavior.
                 CompressedOop(addr as u32)
             }
-            CompressedOopsMode::ZeroBased => {
-                CompressedOop((addr >> self.shift) as u32)
-            }
-            CompressedOopsMode::HeapBased => {
-                CompressedOop(((addr - self.base) >> self.shift) as u32)
+            CompressedOopsMode::ZeroBased | CompressedOopsMode::HeapBased => {
+                // Guard: the address must be representable as a narrow oop and
+                // aligned to the shift. Misalignment (low `shift` bits set) is
+                // discarded by `>> shift`, decoding back to a *different*
+                // address — a silent corruption. Out-of-range addresses are
+                // truncated by `as u32`. `is_encodable` covers the range check.
+                let shift_mask = (1u64 << self.shift) - 1;
+                let aligned = (addr & shift_mask) == 0;
+                debug_assert!(
+                    self.is_encodable(addr) && aligned,
+                    "CompressedOops::encode: address {addr:#x} is not encodable \
+                     (mode={:?}, base={:#x}, shift={}) — would silently truncate \
+                     to a wrong narrow oop",
+                    self.mode,
+                    self.base,
+                    self.shift,
+                );
+                if !self.is_encodable(addr) || !aligned {
+                    // Release-build fail-safe: never emit a truncated/wrong
+                    // narrow oop; NULL decodes to an obvious fault at address 0.
+                    return CompressedOop::NULL;
+                }
+                match self.mode {
+                    CompressedOopsMode::ZeroBased => {
+                        CompressedOop((addr >> self.shift) as u32)
+                    }
+                    // HeapBased — `is_encodable` already proved `addr >= base`.
+                    _ => CompressedOop(((addr - self.base) >> self.shift) as u32),
+                }
             }
         }
     }

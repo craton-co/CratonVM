@@ -2038,6 +2038,33 @@ fn register_font_natives(registry: &mut NativeMethodRegistry) {
         }
     }
 
+    // Bug awt-font-image #1: resolve the FontMetrics' full (family, style, size)
+    // so the advance natives below can drive FontMetrics.stringWidth/charWidth/
+    // getMaxAdvance through the SAME shared advance model in `crate::font` that
+    // FontEngine and Graphics2D::draw_string use. Previously these natives used
+    // standalone flat heuristics (size*0.55 etc.) decoupled from the family and
+    // from what the renderer actually draws.
+    fn font_metrics_spec(ctx: &dyn NativeContext, args: &[Value]) -> (String, i32, i32) {
+        let size = font_metrics_size(ctx, args).round().max(1.0) as i32;
+        let this = match get_obj(args, 0) {
+            Some(o) => o,
+            None => return ("Dialog".to_string(), 0, size),
+        };
+        let font = match ctx.get_field_by_name(this, "font") {
+            Value::Object(Some(o)) => o,
+            _ => return ("Dialog".to_string(), 0, size),
+        };
+        let family = match ctx.get_field_by_name(font, "name") {
+            Value::Object(Some(n)) => ctx.read_string(n).unwrap_or_else(|| "Dialog".to_string()),
+            _ => "Dialog".to_string(),
+        };
+        let style = match ctx.get_field_by_name(font, "style") {
+            Value::Int(s) => s,
+            _ => 0,
+        };
+        (family, style, size)
+    }
+
     registry.register("java/awt/FontMetrics", "getAscent", "()I", |ctx, args| {
         int_ok((font_metrics_size(ctx, args) * 0.8).round() as i32)
     });
@@ -2053,19 +2080,24 @@ fn register_font_natives(registry: &mut NativeMethodRegistry) {
     });
     registry.register("java/awt/FontMetrics", "stringWidth", "(Ljava/lang/String;)I", |ctx, args| {
         let text = read_string(ctx, args, 1).unwrap_or_default();
-        let size = font_metrics_size(ctx, args);
-        // Use the character count, not `String::len()` (the UTF-8 byte
-        // length). Byte length grossly over-measures CJK / multibyte text
-        // where a single glyph is 2-4 bytes. The width is still an
-        // approximate heuristic, but at least char-count-correct.
-        let char_count = text.chars().count();
-        int_ok((char_count as f32 * size * 0.55).round() as i32)
+        let (family, style, size) = font_metrics_spec(ctx, args);
+        // Bug awt-font-image #1: sum per-glyph advances from the shared model
+        // (same source of truth as Graphics2D::draw_string), not
+        // char_count * size * 0.55. This is also char-count-correct for CJK /
+        // multibyte text since it iterates `chars()`.
+        int_ok(crate::font::text_advance(&family, style, size, &text).round() as i32)
     });
     registry.register("java/awt/FontMetrics", "charWidth", "(C)I", |ctx, args| {
-        int_ok((font_metrics_size(ctx, args) * 0.55).round() as i32)
+        // arg[1] is the `char` to measure (passed as an int code unit).
+        let ch = char::from_u32(get_int(args, 1) as u32).unwrap_or(' ');
+        let (family, style, size) = font_metrics_spec(ctx, args);
+        int_ok(crate::font::glyph_advance(&family, style, size, ch).round() as i32)
     });
     registry.register("java/awt/FontMetrics", "getMaxAdvance", "()I", |ctx, args| {
-        int_ok(font_metrics_size(ctx, args).round() as i32)
+        // Bug awt-font-image #1: widest per-glyph advance from the shared
+        // model, not the bare point size.
+        let (family, style, size) = font_metrics_spec(ctx, args);
+        int_ok(crate::font::max_glyph_advance(&family, style, size).round() as i32)
     });
 }
 

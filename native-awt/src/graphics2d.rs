@@ -439,26 +439,41 @@ impl Graphics2DState {
             return;
         }
         let color = self.renderer.color();
-        let glyph_w = (self.font.size / 2).max(1);
         let glyph_h = self.font.size;
 
-        let mut cx = x;
+        // Bug awt-font-image #1: advance the pen by the SAME shared per-glyph
+        // advance model that FontMetrics.stringWidth / FontEngine use, so the
+        // headless software render lands each glyph exactly where Swing's text
+        // layout measured it. The block-glyph mark is drawn narrower than the
+        // advance (a real glyph leaves side bearing), but the pen advance —
+        // the thing layout depends on — now matches the metrics by
+        // construction. `cx` is tracked as a float and floored per glyph to
+        // avoid per-character rounding drift accumulating across a long string.
+        let mut pen = x as f64;
         for ch in text.chars() {
-            if ch == ' ' {
-                cx += glyph_w;
-                continue;
-            }
-            if glyph_w >= 3 && glyph_h >= 3 {
-                if ch.is_uppercase() || ch.is_ascii_digit() {
-                    self.renderer.draw_rect(cx, y - glyph_h + 1, glyph_w as u32, glyph_h as u32);
+            let advance = crate::font::glyph_advance(
+                &self.font.family,
+                self.font.style,
+                self.font.size,
+                ch,
+            );
+            let cx = pen.floor() as i32;
+            if ch != ' ' {
+                // Draw the visible mark within the glyph's advance box. Width
+                // is the advance minus a 1px right-side bearing (clamped >= 1).
+                let mark_w = (advance.floor() as i32 - 1).max(1);
+                if mark_w >= 3 && glyph_h >= 3 {
+                    if ch.is_uppercase() || ch.is_ascii_digit() {
+                        self.renderer.draw_rect(cx, y - glyph_h + 1, mark_w as u32, glyph_h as u32);
+                    } else {
+                        let half = glyph_h / 2;
+                        self.renderer.fill_rect(cx, y - half + 1, mark_w as u32, half as u32);
+                    }
                 } else {
-                    let half = glyph_h / 2;
-                    self.renderer.fill_rect(cx, y - half + 1, glyph_w as u32, half as u32);
+                    self.renderer.fill_rect(cx, y - glyph_h + 1, mark_w as u32, glyph_h as u32);
                 }
-            } else {
-                self.renderer.fill_rect(cx, y - glyph_h + 1, glyph_w as u32, glyph_h as u32);
             }
-            cx += glyph_w + 1;
+            pen += advance;
         }
         self.renderer.set_color(color);
     }

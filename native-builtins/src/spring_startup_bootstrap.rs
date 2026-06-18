@@ -3,18 +3,51 @@
 
 //! S-SB: Spring ApplicationStartup bootstrap.
 //!
-//! Spring Boot's `AbstractApplicationContext` has an instance field:
-//!   `private ApplicationStartup applicationStartup = ApplicationStartup.DEFAULT;`
+//! ⚠ INTENTIONAL APP-COMPATIBILITY SHIM — NOT a faithful implementation. ⚠
 //!
-//! `ApplicationStartup.DEFAULT` is a static final field on an interface; its
-//! value is set in `ApplicationStartup.<clinit>` as `new DefaultApplicationStartup()`.
-//! In CratonVM's partial bootstrap, `DefaultApplicationStartup.<clinit>` (which
-//! itself creates a `DefaultStartupStep` singleton) NPEs, gets swallowed, and the
-//! `DEFAULT` field stays null.  Consequently every `AbstractApplicationContext`
-//! instance has `applicationStartup = null`, and the very first call to
-//! `getApplicationStartup().start(name)` crashes with "Cannot invoke start on null".
+//! This module installs a process-global *no-op* `ApplicationStartup` /
+//! `StartupStep` pair so that Spring Boot can boot on CratonVM's partial
+//! bootstrap.  It does NOT implement the real Spring startup-metrics subsystem
+//! (`org.springframework.core.metrics`): every `start()` / `tag()` / `end()`
+//! call is silently discarded.  That is deliberate, and safe, because the
+//! startup-metrics API is purely observability — Spring Boot's lifecycle does
+//! not depend on the recorded steps for correctness.  Apps that *read back*
+//! recorded startup steps (a `BufferingApplicationStartup` + actuator
+//! `startup` endpoint, or a custom `ApplicationStartup` exporter) will see an
+//! empty / inert timeline; that is the documented limitation of this shim.
 //!
-//! Fix strategy:
+//! Why the shim exists (the underlying VM bug it works around):
+//!   Spring Boot's `AbstractApplicationContext` has an instance field:
+//!     `private ApplicationStartup applicationStartup = ApplicationStartup.DEFAULT;`
+//!   `ApplicationStartup.DEFAULT` is a `static final` field on an interface; its
+//!   value is set in `ApplicationStartup.<clinit>` as
+//!   `new DefaultApplicationStartup()`.  In CratonVM's partial bootstrap,
+//!   `DefaultApplicationStartup.<clinit>` (which itself creates a
+//!   `DefaultStartupStep` singleton) NPEs, the error gets swallowed, and the
+//!   `DEFAULT` field stays null.  Consequently every `AbstractApplicationContext`
+//!   instance has `applicationStartup = null`, and the very first call to
+//!   `getApplicationStartup().start(name)` crashes with
+//!   "Cannot invoke start on null".  A loud failure here would abort every
+//!   Spring Boot application before its context can refresh, so we deliberately
+//!   keep the no-op behavior rather than failing loudly (see the no-stubs
+//!   policy carve-out for app-enabling shims).
+//!
+//! THE REAL FIX (so this shim can eventually be deleted):
+//!   Make `DefaultApplicationStartup.<clinit>` succeed under CratonVM's
+//!   bootstrap so the real `ApplicationStartup` subsystem runs.  That requires
+//!   getting the static initializer's `DefaultStartupStep` singleton creation
+//!   to complete without NPE — i.e. fixing whichever underlying VM/bootstrap
+//!   gap currently makes that `<clinit>` throw.  Once the real `<clinit>`
+//!   works, the `getApplicationStartup`/`start`/`tag`/`end` natives below (and
+//!   the `post_clinit_fixup` carrier write) become unnecessary and should be
+//!   removed.
+//!
+//! Visibility: the first time the no-op singleton is materialized, a one-line
+//! warning is emitted when `CRATONVM_DBG_SPRING_STARTUP` is set (see
+//! `warn_shim_first_use`), so the shim's activation is observable in
+//! diagnostics without breaking apps in the default (quiet) build.
+//!
+//! Fix strategy (the shim's moving parts):
 //! 1. Native override for `getApplicationStartup()` in `AbstractApplicationContext`
 //!    that returns a process-global no-op `ApplicationStartup` singleton if the
 //!    field is null (or always, since the bytecode is just a field read anyway).
@@ -45,6 +78,28 @@ fn noop_step() -> &'static Mutex<Option<ObjectRef>> {
     S.get_or_init(|| Mutex::new(None))
 }
 
+/// Debug-gated, one-time visibility hook for the no-op ApplicationStartup
+/// compatibility shim (see the module doc comment).  This does NOT change
+/// runtime behavior — it only emits a single line, exactly once per process,
+/// when `CRATONVM_DBG_SPRING_STARTUP` is set, so the shim's activation is
+/// observable in diagnostics without spamming or breaking apps in the default
+/// (quiet) build.
+fn warn_shim_first_use() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    // First-use guard: only the thread that flips false→true logs.
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if std::env::var_os("CRATONVM_DBG_SPRING_STARTUP").is_some() {
+        tracing::warn!(
+            "[spring-startup-shim] using no-op ApplicationStartup/StartupStep \
+             (DefaultApplicationStartup.<clinit> NPE workaround) — startup \
+             metrics are discarded; real fix = make that <clinit> succeed"
+        );
+    }
+}
+
 /// Get-or-create the global no-op `ApplicationStartup` singleton.
 /// Uses `DefaultApplicationStartup` as the carrier class so virtual dispatch
 /// on `start(String)` hits our registered native override.
@@ -52,6 +107,8 @@ pub fn get_noop_startup(ctx: &mut dyn NativeContext) -> ObjectRef {
     if let Some(obj) = *noop_startup().lock() {
         return obj;
     }
+    // First materialization of the shim — surface it under CRATONVM_DBG_*.
+    warn_shim_first_use();
     // 8 slots — conservative over-allocation for DefaultApplicationStartup's
     // real-JDK field count (it's a simple class with very few fields).
     let obj = crate::alloc_concurrent_synthetic(
@@ -68,6 +125,10 @@ pub fn get_noop_step(ctx: &mut dyn NativeContext) -> ObjectRef {
     if let Some(obj) = *noop_step().lock() {
         return obj;
     }
+    // First materialization of the shim — surface it under CRATONVM_DBG_*.
+    // The process-global guard inside dedups against get_noop_startup, so this
+    // never double-logs regardless of which singleton is created first.
+    warn_shim_first_use();
     // DefaultApplicationStartup$DefaultStartupStep in Spring Framework 5.3.x
     // (used by Spring Boot 2.7.x).  If not found, fall back to allocating a
     // bare java/lang/Object — the methods are all overridden natively anyway.

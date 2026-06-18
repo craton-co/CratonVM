@@ -24,6 +24,53 @@
 // Note: SCEV only needs the (header_pc, back_edge_pc) loop pairs,
 // not the full BasicBlock type. The caller passes these as `&[(usize, usize)]`.
 
+/// The exit comparison that terminates the loop, recorded precisely so
+/// the trip-count computation does not conflate inclusive vs. exclusive
+/// bounds or counting-up vs. counting-down loops.
+///
+/// The JVM `if_icmp*` family branches to the exit target **when the
+/// comparison holds**, so the *loop-continues* condition is its negation.
+/// For the canonical header shape `iload iv; <bound>; if_icmp<op> exit`:
+///
+/// | opcode        | exits when   | loop runs while | bound  | direction  |
+/// |---------------|--------------|-----------------|--------|------------|
+/// | `if_icmpge` Ge | `iv >= bound`| `iv <  bound`   | excl.  | increasing |
+/// | `if_icmpgt` Gt | `iv >  bound`| `iv <= bound`   | incl.  | increasing |
+/// | `if_icmple` Le | `iv <= bound`| `iv >  bound`   | excl.  | decreasing |
+/// | `if_icmplt` Lt | `iv <  bound`| `iv >= bound`   | incl.  | decreasing |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitCmp {
+    /// `if_icmpge` (0xA2): exit when `iv >= bound`; runs while `iv < bound`.
+    Ge,
+    /// `if_icmpgt` (0xA3): exit when `iv > bound`; runs while `iv <= bound`.
+    Gt,
+    /// `if_icmple` (0xA4): exit when `iv <= bound`; runs while `iv > bound`.
+    Le,
+    /// `if_icmplt` (0xA1): exit when `iv < bound`; runs while `iv >= bound`.
+    Lt,
+}
+
+impl ExitCmp {
+    /// Decode the comparison opcode. Returns `None` for opcodes that are
+    /// not one of the four counted-loop exit comparisons.
+    fn from_opcode(op: u8) -> Option<ExitCmp> {
+        match op {
+            0xA1 => Some(ExitCmp::Lt),
+            0xA2 => Some(ExitCmp::Ge),
+            0xA3 => Some(ExitCmp::Gt),
+            0xA4 => Some(ExitCmp::Le),
+            _ => None,
+        }
+    }
+
+    /// `true` when the loop counts **up** (the IV must increase to reach
+    /// the exit). `Ge`/`Gt` exit on the high side, so they expect a
+    /// positive stride.
+    pub fn is_increasing(&self) -> bool {
+        matches!(self, ExitCmp::Ge | ExitCmp::Gt)
+    }
+}
+
 /// A detected induction variable in a loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InductionVar {
@@ -48,24 +95,98 @@ pub struct InductionVar {
     /// Upper bound constant, if the exit condition compares against
     /// a `bipush`/`sipush`/`iconst` immediate.
     pub bound_const: Option<i32>,
+    /// The exact exit comparison opcode (`>=`, `>`, `<=`, `<`), recorded
+    /// so `trip_count` can apply inclusive-vs-exclusive bound and
+    /// increasing-vs-decreasing direction semantics correctly. `None`
+    /// when no recognized exit comparison was found.
+    pub cmp: Option<ExitCmp>,
 }
 
 impl InductionVar {
-    /// Compute the trip count when both init and bound are known
-    /// constants and the stride is positive.
+    /// Compute the exact trip count when both `init` and `bound` are
+    /// known constants and the stride / comparator are consistent.
+    ///
+    /// The previous implementation conflated `if_icmpge` / `if_icmpgt` /
+    /// `if_icmple`: it always assumed an exclusive upper bound with a
+    /// positive stride, giving an off-by-one count for `>` (`Gt`, which
+    /// is *inclusive*) and a wrong direction for `<=` (`Le`, which counts
+    /// *down*). This version dispatches on the recorded [`ExitCmp`] and
+    /// computes the count precisely for each case.
+    ///
+    /// All arithmetic is performed in `i64` (so `i32::MIN`/`i32::MAX`
+    /// init/bound and full-range strides cannot overflow the
+    /// distance computation) and the final ceil-division is guarded so
+    /// the result can never wrap.
     pub fn trip_count(&self) -> Option<usize> {
         let init = self.init? as i64;
         let bound = self.bound_const? as i64;
+        let cmp = self.cmp?;
         let stride = self.stride as i64;
-        if stride <= 0 {
-            return None; // counting down or zero stride
+        if stride == 0 {
+            return None; // zero stride → not a counted loop (would never exit)
         }
-        let trips = (bound - init + stride - 1) / stride;
-        if trips <= 0 {
-            return Some(0);
+
+        // Normalize to: how many steps until the *loop-continues* condition
+        // first becomes false. For each comparator the loop runs while:
+        //   Ge: iv <  bound   (up,   exclusive high bound)
+        //   Gt: iv <= bound   (up,   inclusive high bound)
+        //   Le: iv >  bound   (down, exclusive low  bound)
+        //   Lt: iv >= bound   (down, inclusive low  bound)
+        //
+        // Direction must match the stride sign, otherwise the loop either
+        // never executes the back-edge as a counted loop or diverges; in
+        // those cases we cannot give a static trip count.
+        match cmp {
+            ExitCmp::Ge | ExitCmp::Gt => {
+                // Counting up: stride must be positive.
+                if stride <= 0 {
+                    return None;
+                }
+                // `distance` = number of integer units the IV must travel
+                // past `init` before the exit comparison holds. For the
+                // exclusive bound (`Ge`) the loop stops *at* `bound`; for
+                // the inclusive bound (`Gt`) it stops one unit past, so we
+                // add 1 to the span.
+                //   Ge: trips = ceil((bound - init)        / stride)
+                //   Gt: trips = ceil((bound - init + 1)    / stride)
+                if bound < init {
+                    return Some(0); // already past the bound at entry
+                }
+                // bound - init is non-negative and fits in i64 (both are
+                // i32-ranged). Adding 1 for the inclusive case stays in i64.
+                let span = (bound - init) + if cmp == ExitCmp::Gt { 1 } else { 0 };
+                Some(ceil_div_u(span, stride))
+            }
+            ExitCmp::Le | ExitCmp::Lt => {
+                // Counting down: stride must be negative.
+                if stride >= 0 {
+                    return None;
+                }
+                let mag = -stride; // positive magnitude of the (negative) stride
+                //   Le: runs while iv >  bound → span = init - bound
+                //   Lt: runs while iv >= bound → span = init - bound + 1
+                if init < bound {
+                    return Some(0); // already past the (lower) bound at entry
+                }
+                let span = (init - bound) + if cmp == ExitCmp::Lt { 1 } else { 0 };
+                Some(ceil_div_u(span, mag))
+            }
         }
-        Some(trips as usize)
     }
+}
+
+/// Ceiling division of a non-negative numerator by a positive divisor,
+/// overflow-safe. `num >= 0` and `den > 0` are required by callers; the
+/// `(num + den - 1)` form is avoided so a near-`i64::MAX` numerator can
+/// never overflow.
+fn ceil_div_u(num: i64, den: i64) -> usize {
+    debug_assert!(num >= 0 && den > 0);
+    let q = num / den;
+    let r = num % den;
+    let trips = if r > 0 { q + 1 } else { q };
+    // `trips` is bounded by `num` (den >= 1) and num is non-negative, so
+    // this cast is always valid on the 64-bit targets the JIT supports.
+    trips as usize
 }
 
 /// Analyze bytecode for induction variables in detected loops.
@@ -130,7 +251,8 @@ pub fn analyze_induction_variables(
         //   iload <iv>; iload <bound>; if_icmpge <exit>
         // or:
         //   iload <iv>; sipush <N>; if_icmpge <exit>
-        let (init, bound_local, bound_const) = analyze_loop_exit(code, code_len, header_pc, local);
+        let (init, bound_local, bound_const, cmp) =
+            analyze_loop_exit(code, code_len, header_pc, local);
 
         result.push(InductionVar {
             header_pc,
@@ -140,6 +262,7 @@ pub fn analyze_induction_variables(
             init,
             bound_local,
             bound_const,
+            cmp,
         });
     }
 
@@ -149,15 +272,18 @@ pub fn analyze_induction_variables(
 /// Attempt to extract the loop-exit condition from the header.
 ///
 /// Looks for the pattern:
-///   `iload <iv>` ; `iload <bound>` or `sipush/bipush/iconst <N>` ; `if_icmpge`
+///   `iload <iv>` ; `iload <bound>` or `sipush/bipush/iconst <N>` ;
+///   `if_icmp{lt,ge,gt,le}`
 ///
-/// Returns `(init, bound_local, bound_const)`.
+/// Returns `(init, bound_local, bound_const, cmp)`, where `cmp` is the
+/// precise exit comparator so the trip-count computation does not have
+/// to guess inclusive-vs-exclusive bound or loop direction.
 fn analyze_loop_exit(
     code: &[u8],
     code_len: usize,
     header_pc: usize,
     iv_local: usize,
-) -> (Option<i32>, Option<usize>, Option<i32>) {
+) -> (Option<i32>, Option<usize>, Option<i32>, Option<ExitCmp>) {
     let mut pc = header_pc;
     // Walk forward up to 10 instructions looking for the exit pattern.
     for _ in 0..10 {
@@ -209,15 +335,20 @@ fn analyze_loop_exit(
                     continue;
                 }
             };
-            // Check: is the instruction after the bound a comparison branch?
-            if cmp_pc < code_len && matches!(code[cmp_pc], 0xA2 | 0xA3 | 0xA4) {
-                // if_icmpge / if_icmpgt / if_icmple → exit condition found.
-                return (None, bound_l, bound_c);
+            // Check: is the instruction after the bound a recognized
+            // exit comparison branch? Decode the *exact* opcode so the
+            // trip-count computation can distinguish >=, >, <=, < instead
+            // of lumping them together (the original off-by-one / wrong-
+            // direction bug).
+            if cmp_pc < code_len {
+                if let Some(cmp) = ExitCmp::from_opcode(code[cmp_pc]) {
+                    return (None, bound_l, bound_c, Some(cmp));
+                }
             }
         }
         pc += bytecode_len(code, pc, code_len);
     }
-    (None, None, None)
+    (None, None, None, None)
 }
 
 /// Compute the byte length of the instruction at `pc`.
@@ -365,14 +496,18 @@ mod tests {
         // (iconst_0; istore_1 at PC 0-1, before header at PC 2).
         // When init is supplied externally (e.g. from a caller that
         // knows the local was 0-initialized), trip_count works:
+        assert_eq!(iv.cmp, Some(ExitCmp::Ge)); // if_icmpge decoded precisely
         let mut iv_with_init = iv.clone();
         iv_with_init.init = Some(0);
+        // i = 0; i < 10; i++ → exclusive upper bound, increasing → 10 trips.
         assert_eq!(iv_with_init.trip_count(), Some(10));
     }
 
     #[test]
     fn detect_decrementing_loop() {
-        // iinc 2, -1 → stride = -1, trip_count = None (negative stride)
+        // iload_2; bipush 0; if_icmple exit → exits when iv <= 0, i.e. the
+        // loop runs while iv > 0 (decreasing, exclusive low bound). The
+        // iinc is -1 so stride matches the down direction.
         let code = vec![
             0x1C, // 0: iload_2
             0x10, 0x00, // 1: bipush 0
@@ -386,7 +521,123 @@ mod tests {
         let ivs = analyze_induction_variables(&code, code.len(), &loops);
         assert_eq!(ivs.len(), 1);
         assert_eq!(ivs[0].stride, -1);
-        assert_eq!(ivs[0].trip_count(), None); // negative stride
+        assert_eq!(ivs[0].cmp, Some(ExitCmp::Le)); // if_icmple decoded
+        // init is None (set before the loop) → trip_count unknown.
+        assert_eq!(ivs[0].trip_count(), None);
+        // With a known init, the decreasing-loop count is now computed
+        // correctly (the old code could not handle negative strides at all).
+        let mut with_init = ivs[0].clone();
+        with_init.init = Some(10);
+        // i = 10; i > 0; i-- → 10 trips (exclusive low bound).
+        assert_eq!(with_init.trip_count(), Some(10));
+    }
+
+    /// Build a minimal `InductionVar` for direct `trip_count` unit tests,
+    /// independent of bytecode decoding.
+    fn iv(init: i32, bound: i32, stride: i16, cmp: ExitCmp) -> InductionVar {
+        InductionVar {
+            header_pc: 0,
+            back_edge_pc: 0,
+            local: 0,
+            stride,
+            init: Some(init),
+            bound_local: None,
+            bound_const: Some(bound),
+            cmp: Some(cmp),
+        }
+    }
+
+    #[test]
+    fn trip_count_ge_exclusive_increasing() {
+        // for (i = 0; i < 10; i++)  → if_icmpge, exclusive bound.
+        assert_eq!(iv(0, 10, 1, ExitCmp::Ge).trip_count(), Some(10));
+        // Non-unit stride: i += 3 over [0,10) → 0,3,6,9 → 4 trips.
+        assert_eq!(iv(0, 10, 3, ExitCmp::Ge).trip_count(), Some(4));
+        // Already at/over the bound → zero trips.
+        assert_eq!(iv(10, 10, 1, ExitCmp::Ge).trip_count(), Some(0));
+        assert_eq!(iv(15, 10, 1, ExitCmp::Ge).trip_count(), Some(0));
+        // Wrong direction (negative stride with a high-side exit) → unknown.
+        assert_eq!(iv(0, 10, -1, ExitCmp::Ge).trip_count(), None);
+    }
+
+    #[test]
+    fn trip_count_gt_inclusive_increasing() {
+        // for (i = 0; i <= 10; i++) → if_icmpgt, inclusive bound → 11 trips.
+        assert_eq!(iv(0, 10, 1, ExitCmp::Gt).trip_count(), Some(11));
+        // Inclusive bound is exactly one more trip than the exclusive Ge.
+        assert_eq!(
+            iv(0, 10, 1, ExitCmp::Gt).trip_count().unwrap(),
+            iv(0, 10, 1, ExitCmp::Ge).trip_count().unwrap() + 1
+        );
+        // i += 3 over [0,10] → 0,3,6,9 → 4 trips (10 not hit but bound incl).
+        assert_eq!(iv(0, 10, 3, ExitCmp::Gt).trip_count(), Some(4));
+        // i += 5 over [0,10] → 0,5,10 → 3 trips (the inclusive endpoint runs).
+        assert_eq!(iv(0, 10, 5, ExitCmp::Gt).trip_count(), Some(3));
+    }
+
+    #[test]
+    fn trip_count_le_exclusive_decreasing() {
+        // for (i = 10; i > 0; i--) → if_icmple, exclusive low bound → 10 trips.
+        assert_eq!(iv(10, 0, -1, ExitCmp::Le).trip_count(), Some(10));
+        // i -= 3 over (0,10] → 10,7,4,1 → 4 trips.
+        assert_eq!(iv(10, 0, -3, ExitCmp::Le).trip_count(), Some(4));
+        // Already at/below the low bound → zero trips.
+        assert_eq!(iv(0, 0, -1, ExitCmp::Le).trip_count(), Some(0));
+        // Wrong direction (positive stride with a low-side exit) → unknown.
+        assert_eq!(iv(10, 0, 1, ExitCmp::Le).trip_count(), None);
+    }
+
+    #[test]
+    fn trip_count_lt_inclusive_decreasing() {
+        // for (i = 10; i >= 0; i--) → if_icmplt, inclusive low bound → 11 trips.
+        assert_eq!(iv(10, 0, -1, ExitCmp::Lt).trip_count(), Some(11));
+        // Inclusive bound is exactly one more trip than the exclusive Le.
+        assert_eq!(
+            iv(10, 0, -1, ExitCmp::Lt).trip_count().unwrap(),
+            iv(10, 0, -1, ExitCmp::Le).trip_count().unwrap() + 1
+        );
+        // i -= 4 over [0,10] → 10,6,2 → 3 trips.
+        assert_eq!(iv(10, 0, -4, ExitCmp::Lt).trip_count(), Some(3));
+    }
+
+    #[test]
+    fn trip_count_zero_stride_is_unknown() {
+        // Zero stride never advances → not a counted loop.
+        assert_eq!(iv(0, 10, 0, ExitCmp::Ge).trip_count(), None);
+        assert_eq!(iv(10, 0, 0, ExitCmp::Le).trip_count(), None);
+    }
+
+    #[test]
+    fn trip_count_overflow_guarded() {
+        // Full-range init/bound must not overflow the distance math.
+        // i = i32::MIN; i < i32::MAX; i++ → span = 2^32 - 1, fits in usize
+        // on 64-bit; the i64 arithmetic must not panic or wrap.
+        let span = (i32::MAX as i64) - (i32::MIN as i64); // 4294967295
+        assert_eq!(
+            iv(i32::MIN, i32::MAX, 1, ExitCmp::Ge).trip_count(),
+            Some(span as usize)
+        );
+        // Inclusive variant adds exactly one more trip without overflow.
+        assert_eq!(
+            iv(i32::MIN, i32::MAX, 1, ExitCmp::Gt).trip_count(),
+            Some((span + 1) as usize)
+        );
+        // Large negative stride near i16::MIN must not overflow when negated.
+        // i = i32::MAX; i >= i32::MIN; i -= 32768.
+        let mag = 32768_i64;
+        let expected = ((i32::MAX as i64 - i32::MIN as i64) + 1 + mag - 1) / mag;
+        assert_eq!(
+            iv(i32::MAX, i32::MIN, i16::MIN, ExitCmp::Lt).trip_count(),
+            Some(expected as usize)
+        );
+    }
+
+    #[test]
+    fn trip_count_requires_cmp() {
+        // Missing comparator → cannot compute a trip count.
+        let mut v = iv(0, 10, 1, ExitCmp::Ge);
+        v.cmp = None;
+        assert_eq!(v.trip_count(), None);
     }
 
     #[test]

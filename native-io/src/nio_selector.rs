@@ -1276,6 +1276,15 @@ fn probe_cycle(id: i32) -> Result<i32, MethodCallFailed> {
 ///   * `timeout == 0`       → selectNow: one probe pass, no kernel sleep
 ///   * `0 < timeout < MAX`  → kernel wait up to `timeout` ms
 ///   * `timeout == i64::MAX` → block indefinitely until ready or wakeup
+///
+/// NOTE [nio-selector]: the `timeout == 0 → poll` rule here is the
+/// low-level selectNow contract and is ONLY reached via the dedicated
+/// `selectNow0`/`selectNow` native (`selector_select_now_native`, which
+/// calls `selector_select(id, 0)` directly). The public blocking overloads
+/// `Selector.select(long)` map their own argument 0 to *block indefinitely*
+/// (i64::MAX) up in `selector_select_native` BEFORE reaching this function —
+/// do not "simplify" that translation away or idiomatic `select(0)` event
+/// loops will busy-spin again.
 pub fn selector_select(id: i32, timeout_ms: i64) -> Result<i32, MethodCallFailed> {
     if timeout_ms < 0 {
         return Err(illegal_arg(format!(
@@ -1548,6 +1557,19 @@ fn selector_select_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Int(v)) => *v as i64,
         _ => 0,
     };
+    // BUGFIX [nio-selector]: JDK `Selector.select(long)` contract — a timeout
+    // of 0 means *block indefinitely* until a channel is ready or wakeup()
+    // fires; ONLY `selectNow()` polls. Every public-API blocking overload
+    // (`select0(J)`, `select(J)`, `select(Consumer,long)` via
+    // `lockAndDoSelect`) funnels through this native, so an idiomatic event
+    // loop `while (running) selector.select(0);` was spinning at 100% CPU
+    // because we mapped 0 -> 0ms poll. Translate the public 0 to block-
+    // indefinitely (i64::MAX, which `selector_select` lowers to timeout_c=-1).
+    // The genuine non-blocking probe is preserved on the dedicated
+    // `selectNow0`/`selectNow` path: `selector_select_now_native` calls
+    // `selector_select(id, 0)` DIRECTLY, bypassing this translation, so
+    // `selector_select`'s own `timeout == 0 -> poll` rule still serves it.
+    let timeout = if timeout == 0 { i64::MAX } else { timeout };
     let id = selector_id_from_obj(ctx, obj);
     if id == 0 {
         return Ok(Some(Value::Int(0)));
@@ -2824,6 +2846,31 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(500),
             "pre-wakeup should short-circuit, got {elapsed:?}"
+        );
+        selector_close(id);
+    }
+
+    #[test]
+    fn nio_selector_indefinite_block_path_honors_wakeup() {
+        // BUGFIX [nio-selector] regression: the public `Selector.select(0)`
+        // overload maps argument 0 to *block indefinitely* (i64::MAX) in
+        // `selector_select_native`. The low-level `selector_select` proves
+        // that the indefinite-block path (timeout == i64::MAX → timeout_c -1)
+        // is reachable and is correctly short-circuited by a pre-existing
+        // wakeup — i.e. it blocks until wakeup rather than busy-spinning, the
+        // exact property `select(0)` event loops rely on. (We can't call
+        // `selector_select(id, i64::MAX)` without a prior wakeup here because
+        // it would block the test forever — which is the whole point of the
+        // fix.)
+        let id = selector_open();
+        selector_wakeup(id).unwrap();
+        let start = Instant::now();
+        let r = selector_select(id, i64::MAX).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(r, 0);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "indefinite block must short-circuit on a pending wakeup, got {elapsed:?}"
         );
         selector_close(id);
     }

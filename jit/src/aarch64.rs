@@ -707,6 +707,28 @@ impl Aarch64Emitter {
         self.emit_u32(inst);
     }
 
+    /// LDUR Xt, [Xn, #simm9]  (unscaled signed offset, 64-bit, no writeback).
+    ///
+    /// Bug-fix (ARM64 BUG #1): plain offset load for negative or non-8-aligned
+    /// offsets that fit in the 9-bit signed range (−256..=255). Unlike `ldr_pre`
+    /// this does **not** mutate the base register `Xn`, so it is safe for
+    /// frame-slot reloads addressed off FP/SP. `simm9` is in bytes (unscaled);
+    /// the caller must ensure −256 <= simm9 <= 255.
+    pub fn ldur(&mut self, rt: Reg, rn: Reg, simm9: i16) {
+        // size=11, V=0, opc=01 (LDUR, 64-bit)
+        let inst = ldst_unscaled_imm(0b11, 0, 0b01, simm9, rn, rt.enc());
+        self.emit_u32(inst);
+    }
+
+    /// STUR Xt, [Xn, #simm9]  (unscaled signed offset, 64-bit, no writeback).
+    ///
+    /// Bug-fix (ARM64 BUG #1): plain offset store counterpart to [`ldur`].
+    pub fn stur(&mut self, rt: Reg, rn: Reg, simm9: i16) {
+        // size=11, V=0, opc=00 (STUR, 64-bit)
+        let inst = ldst_unscaled_imm(0b11, 0, 0b00, simm9, rn, rt.enc());
+        self.emit_u32(inst);
+    }
+
     /// LDR Xt, [Xn, #simm]!  (pre-index, 64-bit)
     pub fn ldr_pre(&mut self, rt: Reg, rn: Reg, simm9: i16) {
         let inst = ldst_pre_post(0b11, 0, 0b01, simm9, true, rn, rt.enc());
@@ -1435,6 +1457,31 @@ fn ldst_reg_offset(
         | (rt & 0x1F)
 }
 
+/// Load/store register (unscaled signed immediate — LDUR/STUR).
+/// size(2) 111 V(1) 00 opc(2) 0 imm9(9) 00 Rn(5) Rt(5)
+///
+/// Bug-fix (ARM64 BUG #1, frame-slot corruption): this is the *unscaled*,
+/// *non-writeback* addressing form. Unlike `ldst_pre_post`, the two bits at
+/// positions 11:10 are `00` (not `idx,1`), so the base register `Rn` is **not**
+/// mutated — the access is a plain `[Rn + #simm9]` with no side effect. The
+/// 9-bit signed immediate covers −256..=255 in single-byte units, with **no**
+/// 8-byte alignment requirement (unlike the scaled `ldst_unsigned_imm` form).
+/// This is what frame-slot spills/reloads at negative FP offsets must use.
+fn ldst_unscaled_imm(size: u32, v: u32, opc: u32, simm9: i16, rn: Reg, rt: u32) -> u32 {
+    let imm9 = (simm9 as u32) & 0x1FF;
+    ((size & 0x3) << 30)
+        | (0b111u32 << 27)
+        | ((v & 1) << 26)
+        | (0b00u32 << 24)
+        | ((opc & 0x3) << 22)
+        | (0u32 << 21)
+        | (imm9 << 12)
+        // bits 11:10 = 00 → unscaled, no index/writeback (distinguishes from
+        // the pre/post-index form which sets bit 10).
+        | (rn.enc() << 5)
+        | (rt & 0x1F)
+}
+
 /// Load/store register (pre/post-index).
 /// size(2) 111 V(1) 00 opc(2) 0 imm9(9) idx(1) 1 Rn(5) Rt(5)
 /// idx: 1 = pre-index, 0 = post-index
@@ -1788,6 +1835,30 @@ mod tests {
         assert_eq!((inst >> 10) & 0xFFF, 2); // 16/8=2
         assert_eq!((inst >> 5) & 0x1F, 31); // SP
         assert_eq!(inst & 0x1F, 2); // X2
+    }
+
+    #[test]
+    fn test_ldur_stur_unscaled() {
+        // Bug-fix (ARM64 BUG #1): unscaled, non-writeback offset access.
+        // LDUR X0, [X1, #-8]:
+        //   size=11 V=0 opc=01, imm9=0x1F8 (-8), Rn=1, Rt=0, bits11:10=00
+        //   = 0xF85F8020
+        let mut e = Aarch64Emitter::new();
+        e.ldur(Reg::X0, Reg::X1, -8);
+        assert_eq!(last_inst(&e), 0xF85F_8020);
+
+        // STUR X2, [SP, #-16]:
+        //   size=11 V=0 opc=00, imm9=0x1F0 (-16), Rn=31, Rt=2, bits11:10=00
+        //   = 0xF81F03E2
+        e.stur(Reg::X2, Reg::SP, -16);
+        assert_eq!(last_inst(&e), 0xF81F_03E2);
+
+        // Crucially the unscaled form must NOT set the writeback/index bit
+        // (bit 10) — that bit being 1 would mutate the base register.
+        let inst = last_inst(&e);
+        assert_eq!((inst >> 10) & 0x3, 0b00, "LDUR/STUR must be unscaled (bits 11:10 == 00)");
+        // And it is distinct from the unsigned-offset form (bits 24 == 0).
+        assert_eq!((inst >> 24) & 1, 0, "LDUR/STUR is not the scaled unsigned-offset form");
     }
 
     #[test]

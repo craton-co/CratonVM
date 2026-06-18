@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
-use crate::event::{EventInstance, EventTypeId, EventTypeRegistry, EventValue};
+use crate::event::{EventInstance, EventTypeId, EventTypeRegistry, EventValue, FieldKind};
 use crate::repository::EventRepository;
 
 /// JFR file magic bytes: `FLR\0`
@@ -295,7 +295,34 @@ fn intern_event_strings(pool: &mut StringPool, fields: &[EventValue]) {
 /// compressed-int pool index, instead of the inline UTF-8 form. Unknown
 /// strings (shouldn't happen — pool is pre-populated) fall back to the
 /// inline tag-3 form.
-fn encode_event_value(value: &EventValue, buf: &mut Vec<u8>, pool: Option<&StringPool>) {
+///
+/// `declared` is the field's registry-declared [`FieldKind`] (or `None` when
+/// the caller could not resolve it — e.g. a unit test that hands the writer a
+/// type the registry never knew about). It is consulted *only* for the
+/// [`EventValue::Null`] case, to make Null self-describing on read.
+///
+/// LOW fix (S?, 2026-06-17): previously `Null` always emitted a single `0x00`
+/// byte regardless of the declared field kind. For a `string` field that is
+/// the correct JFR null-string tag and the reader decodes it back to `Null`.
+/// But for a fixed-width numeric/boolean field the reader (`decode_event_value`)
+/// reads 4 (`float`), 8 (`double`) or 1 (`int`/`long`/`boolean`) bytes from the
+/// declared kind — so a 1-byte Null *desynchronised the rest of the chunk*
+/// (`float`/`double` read 3-7 bytes of the *next* field's payload). The
+/// `int`/`long` case happened to consume exactly 1 byte (compressed-long `0`)
+/// so it "worked" but only by accident.
+///
+/// Fix: for a Null in a numeric/boolean field, emit the kind-appropriate
+/// fixed-width zero so the value round-trips *deterministically* to a typed
+/// zero (`Int(0)`/`Long(0)`/`Float(0.0)`/`Double(0.0)`/`Boolean(false)`) and
+/// the reader stays byte-aligned. Null in a `string` field (or when `declared`
+/// is unknown) keeps the canonical 1-byte null-string tag, which the reader
+/// already round-trips to [`EventValue::Null`].
+fn encode_event_value(
+    value: &EventValue,
+    buf: &mut Vec<u8>,
+    pool: Option<&StringPool>,
+    declared: Option<FieldKind>,
+) {
     match value {
         EventValue::Long(v) => write_compressed_long_into(buf, *v),
         EventValue::Int(v) => write_compressed_long_into(buf, *v as i64),
@@ -305,8 +332,32 @@ fn encode_event_value(value: &EventValue, buf: &mut Vec<u8>, pool: Option<&Strin
         EventValue::String(s) => write_string_bytes(buf, s.as_bytes(), pool),
         EventValue::Str(s) => write_string_bytes(buf, s.as_bytes(), pool),
         EventValue::Null => {
-            // JFR null string: encoding type 0
-            buf.push(0);
+            // Self-describing Null: emit the fixed-width zero that the reader
+            // expects for this field's declared kind, so the decode stays
+            // byte-aligned and the value round-trips deterministically.
+            match declared {
+                Some(FieldKind::Int) | Some(FieldKind::Long) => {
+                    // compressed-long 0 (single 0x00 byte) → decodes to 0.
+                    write_compressed_long_into(buf, 0);
+                }
+                Some(FieldKind::Float) => {
+                    // 4 big-endian bytes of 0.0f.
+                    buf.extend_from_slice(&0f32.to_bits().to_be_bytes());
+                }
+                Some(FieldKind::Double) => {
+                    // 8 big-endian bytes of 0.0.
+                    buf.extend_from_slice(&0f64.to_bits().to_be_bytes());
+                }
+                Some(FieldKind::Boolean) => {
+                    buf.push(0);
+                }
+                // string field, the Null wildcard, or unknown declared kind:
+                // canonical JFR null-string tag (encoding type 0). The reader
+                // decodes this back to EventValue::Null for string fields.
+                Some(FieldKind::String) | Some(FieldKind::Null) | None => {
+                    buf.push(0);
+                }
+            }
         }
     }
 }
@@ -345,6 +396,13 @@ fn write_string_bytes(buf: &mut Vec<u8>, bytes: &[u8], pool: Option<&StringPool>
 /// `scratch` only needs to be sized once at the call site (`Vec::with_capacity`
 /// for a typical event payload); the function reuses its existing allocation
 /// across every call.
+///
+/// `field_kinds` is the per-field registry-declared [`FieldKind`] slice for
+/// this event type (looked up once by the caller). It is consulted only to
+/// make [`EventValue::Null`] self-describing on read (see `encode_event_value`).
+/// `None`, or a slice shorter than `fields`, falls back to the canonical
+/// 1-byte null tag for any unmapped Null — which keeps existing behaviour for
+/// callers that cannot resolve the declared kinds (e.g. unit tests).
 fn serialize_event_into<W: Write>(
     scratch: &mut Vec<u8>,
     writer: &mut W,
@@ -355,6 +413,7 @@ fn serialize_event_into<W: Write>(
     fields: &[EventValue],
     pool: Option<&StringPool>,
     chunk_start_time: u64,
+    field_kinds: Option<&[FieldKind]>,
 ) -> io::Result<()> {
     scratch.clear();
     write_compressed_int_into(scratch, type_id.0 as u64);
@@ -367,8 +426,11 @@ fn serialize_event_into<W: Write>(
     let duration = end_time.saturating_sub(start_time);
     write_compressed_long_into(scratch, duration as i64);
     write_compressed_long_into(scratch, thread_id as i64);
-    for field in fields {
-        encode_event_value(field, scratch, pool);
+    for (i, field) in fields.iter().enumerate() {
+        // Resolve the declared kind for field `i`; None when unavailable so
+        // Null falls back to the canonical null tag.
+        let declared = field_kinds.and_then(|k| k.get(i).copied());
+        encode_event_value(field, scratch, pool, declared);
     }
     write_size_prefixed(writer, scratch)
 }
@@ -412,14 +474,38 @@ const CHECKPOINT_TYPE_ID: u64 = 1;
 
 /// Write the metadata section describing all event types directly into `writer`.
 ///
-/// LIMITATION (S3, 2026-06-10): this is a **simplified custom metadata
-/// encoding, not stock JFR binary metadata**. Real JFR stores type/field
-/// descriptors as a binary-encoded, pool-referenced, XML-like structure that
-/// JDK Mission Control (JMC) and the `jfr` CLI parse to fully describe each
-/// event type. The format written here round-trips through *this crate's own*
-/// [`read_events`] reader but is **not loadable by stock JMC / `jfr` as
-/// fully-described types**. It is sufficient for an internal recorder; it caps
-/// external-tool interoperability.
+/// ========================================================================
+/// FORMAT-FIDELITY GAP (S3, 2026-06-10; re-confirmed 2026-06-17)
+/// ========================================================================
+/// **This is a SIMPLIFIED CUSTOM metadata encoding, NOT stock JFR binary
+/// metadata.** Read this before assuming a produced `.jfr` is portable.
+///
+/// Stock JFR stores type/field descriptors as a binary-encoded,
+/// constant-pool-referenced, XML-like element tree (`Metadata` event with a
+/// nested `<class>/<field>/<setting>` structure keyed into the chunk's string
+/// pool) that JDK Mission Control (JMC) and the `jfr` CLI parse to fully
+/// describe every event type. What we emit here instead is a flat,
+/// length-prefixed list of `(type_id, name, categories, description,
+/// fields[(name,type_name,description)], has_thread, has_stacktrace)` records
+/// (see the body below) — a bespoke layout that is **simpler to write and
+/// read but is NOT the stock wire format**.
+///
+/// Consequences:
+///   * **Round-trips through THIS crate's own [`read_events`] reader** — the
+///     writer and reader agree on this layout, and the round-trip tests in
+///     this module exercise it. Do not change one side without the other.
+///   * **NOT loadable by stock JMC / `jfr print` as fully-described types** —
+///     external tools cannot parse this metadata block, so they cannot render
+///     typed event/field views from our files.
+///
+/// FOLLOW-UP (not done here — large, separate task): implement a real
+/// stock-JFR metadata writer (binary element tree + constant-pool string
+/// references) so the produced files are JMC/`jfr`-loadable. That is a pure
+/// format-fidelity upgrade; it does not change which events are captured. The
+/// internal-recorder use case this crate serves does not require it, which is
+/// why the simplified encoding is retained for now. Any such change MUST keep
+/// the in-crate round-trip tests green (or migrate the reader in lockstep).
+/// ========================================================================
 ///
 /// LIMITATION (S2, 2026-06-10): the per-type `has_stacktrace` flag is written
 /// here faithfully (and ~20 built-in types declare `has_stacktrace: true`),
@@ -438,10 +524,12 @@ fn write_metadata_section<W: Write>(
     // The metadata section is itself an event with type_id = METADATA_TYPE_ID.
     // It contains a description of all event types using a simplified encoding.
     //
-    // Real JFR metadata uses a complex XML-like structure stored in binary.
-    // We use a simplified but compatible format: a single metadata event containing
-    // all type descriptors encoded as compressed fields. See the doc comment
-    // above for the JMC-interop (S3) and stack-trace (S2) limitations.
+    // NOTE: this is the bespoke (non-stock) metadata layout. It round-trips
+    // through this crate's own `read_events` reader but is NOT JMC/`jfr`
+    // loadable. See the prominent FORMAT-FIDELITY GAP (S3) block on the
+    // function doc above, plus the stack-trace (S2) limitation. A stock-JFR
+    // metadata writer is a documented follow-up; do not change this layout
+    // without updating the reader and the round-trip tests in lockstep.
 
     let mut body = Vec::with_capacity(1024);
 
@@ -756,6 +844,30 @@ pub fn dump_to_file(
         let mut scratch: Vec<u8> = Vec::with_capacity(256);
         let pool_ref = if string_pool.len() == 0 { None } else { Some(&string_pool) };
 
+        // LOW fix (2026-06-17): precompute the per-type declared FieldKind
+        // vectors once so a Null field in a numeric/boolean slot can emit the
+        // kind-appropriate fixed-width zero (self-describing Null) instead of a
+        // single 0x00 byte that desynchronises the reader. Keyed by type_id;
+        // an unmapped/unknown kind ("string" or unrecognised) leaves the slot
+        // as FieldKind::String so Null keeps the canonical 1-byte null tag.
+        let mut kinds_by_type: FxHashMap<EventTypeId, Vec<FieldKind>> = FxHashMap::default();
+        for event in &chunk_events {
+            kinds_by_type.entry(event.type_id).or_insert_with(|| {
+                registry
+                    .get(event.type_id)
+                    .map(|ty| {
+                        ty.fields
+                            .iter()
+                            .map(|f| {
+                                FieldKind::from_declared(&f.type_name)
+                                    .unwrap_or(FieldKind::String)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            });
+        }
+
         // Round-9 HIGH-4 (2026-05-24): write the globally-sorted merged
         // event stream in one pass. `chunk_events` already holds refs
         // from both the recording's repository and the caller-supplied
@@ -767,6 +879,7 @@ pub fn dump_to_file(
         // half of the JFR_VERSION_MINOR=1 wire-format change. `chunk_start_time`
         // is the true minimum over the serialized set, so no delta underflows.
         for event in &chunk_events {
+            let field_kinds = kinds_by_type.get(&event.type_id).map(|v| v.as_slice());
             serialize_event_into(
                 &mut scratch,
                 &mut writer,
@@ -777,6 +890,7 @@ pub fn dump_to_file(
                 &event.fields,
                 pool_ref,
                 chunk_start_time,
+                field_kinds,
             )?;
         }
 
@@ -1748,6 +1862,110 @@ mod tests {
         let _ = std::fs::remove_dir(&dir);
     }
 
+    /// LOW fix (2026-06-17) regression: a `Null` in a numeric/float/double/
+    /// boolean field followed by MORE fields must NOT desync the chunk. Before
+    /// the fix, Null always emitted a single `0x00` byte, so a `float`/`double`
+    /// Null left the reader 3-7 bytes short and it mis-decoded the *next*
+    /// field's bytes. This test places a Null in every non-last fixed-width
+    /// slot (each followed by a sentinel field) and asserts both the Null
+    /// round-trips to the kind's typed zero AND every following sentinel
+    /// decodes to its written value.
+    #[test]
+    fn test_null_numeric_field_roundtrips_without_desync() {
+        let mut reg = EventTypeRegistry::new();
+        let type_id = reg.register(EventType {
+            id: EventTypeId(0),
+            name: "test.NullFields".into(),
+            category: vec!["Test".into()],
+            description: "Null in non-last fixed-width fields".into(),
+            // Every numeric/bool field is followed by a distinctive sentinel
+            // so a width desync would corrupt the sentinel's decoded value.
+            fields: vec![
+                EventField::new("i", "int", ""),
+                EventField::new("after_i", "int", ""),
+                EventField::new("l", "long", ""),
+                EventField::new("after_l", "int", ""),
+                EventField::new("f", "float", ""),
+                EventField::new("after_f", "int", ""),
+                EventField::new("d", "double", ""),
+                EventField::new("after_d", "int", ""),
+                EventField::new("b", "boolean", ""),
+                EventField::new("after_b", "int", ""),
+                EventField::new("s", "string", ""),
+                EventField::new("after_s", "int", ""),
+            ],
+            has_thread: false,
+            has_stacktrace: false,
+            period: EventPeriod::None,
+            threshold: None,
+        });
+
+        let mut repo = EventRepository::new(10);
+        repo.push(EventInstance {
+            type_id,
+            start_time: 500,
+            end_time: 600,
+            thread_id: 0,
+            fields: smallvec![
+                EventValue::Null,        // i   -> Int(0)
+                EventValue::Int(11),     // after_i
+                EventValue::Null,        // l   -> Long(0)
+                EventValue::Int(22),     // after_l
+                EventValue::Null,        // f   -> Float(0.0)
+                EventValue::Int(33),     // after_f
+                EventValue::Null,        // d   -> Double(0.0)
+                EventValue::Int(44),     // after_d
+                EventValue::Null,        // b   -> Boolean(false)
+                EventValue::Int(55),     // after_b
+                EventValue::Null,        // s   -> Null (string null tag)
+                EventValue::Int(66),     // after_s
+            ],
+        });
+
+        let dir = std::env::temp_dir().join("jfr_test_null_fields");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test_null_fields.jfr");
+
+        dump_to_file(&path, &repo, &reg, 500, 300, Vec::new(), false).unwrap();
+        let events = read_events(&path, &reg).unwrap();
+        assert_eq!(events.len(), 1, "exactly one event round-tripped");
+        let f = &events[0].fields;
+        assert_eq!(f.len(), 12, "all 12 fields decoded — no truncation");
+
+        // The numeric/bool Nulls decode to the declared kind's typed zero.
+        assert!(matches!(f[0], EventValue::Int(0)), "int null -> Int(0): {:?}", f[0]);
+        assert!(matches!(f[2], EventValue::Long(0)), "long null -> Long(0): {:?}", f[2]);
+        assert!(
+            matches!(f[4], EventValue::Float(v) if v == 0.0),
+            "float null -> Float(0.0): {:?}",
+            f[4]
+        );
+        assert!(
+            matches!(f[6], EventValue::Double(v) if v == 0.0),
+            "double null -> Double(0.0): {:?}",
+            f[6]
+        );
+        assert!(
+            matches!(f[8], EventValue::Boolean(false)),
+            "boolean null -> Boolean(false): {:?}",
+            f[8]
+        );
+        // The string Null keeps the canonical null tag and round-trips to Null.
+        assert!(matches!(f[10], EventValue::Null), "string null -> Null: {:?}", f[10]);
+
+        // Every sentinel that FOLLOWS a Null decodes to its written value —
+        // this is the desync canary. Any width mismatch would corrupt these.
+        assert!(matches!(f[1], EventValue::Int(11)), "after_i intact: {:?}", f[1]);
+        assert!(matches!(f[3], EventValue::Int(22)), "after_l intact: {:?}", f[3]);
+        assert!(matches!(f[5], EventValue::Int(33)), "after_f intact: {:?}", f[5]);
+        assert!(matches!(f[7], EventValue::Int(44)), "after_d intact: {:?}", f[7]);
+        assert!(matches!(f[9], EventValue::Int(55)), "after_b intact: {:?}", f[9]);
+        assert!(matches!(f[11], EventValue::Int(66)), "after_s intact: {:?}", f[11]);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
     #[test]
     fn test_dump_with_many_events() {
         let (reg, type_id) = make_registry_with_one_type();
@@ -2042,6 +2260,7 @@ mod tests {
             &[EventValue::Int(42)],
             None,
             0,
+            None,
         )
         .unwrap();
         // Should be non-empty and start with a size prefix

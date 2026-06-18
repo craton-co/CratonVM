@@ -8,6 +8,7 @@
 //! heuristic calculations. Platform backends override these with exact
 //! values from the OS font engine.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -21,12 +22,13 @@ use cratonvm_types::intern_arc;
 
 /// Hard cap on entries in the per-engine font metrics cache.
 ///
-/// Used as a crude safety bound to prevent unbounded growth from a
-/// pathological app that cycles through many distinct (family, style, size)
-/// triples. When the cache reaches this size, the next insertion clears it
-/// entirely — coarse, but it bounds memory at a constant ceiling and
-/// avoids per-lookup eviction bookkeeping. A proper LRU is a follow-up
-/// (would require adding the `lru` crate to workspace deps).
+/// Bounds memory from a pathological app that cycles through many distinct
+/// (family, style, size) triples. Once the cache reaches this size, the next
+/// insertion evicts one entry via a Second-Chance (CLOCK) approximation of
+/// LRU — see [`FontEngine::get_metrics`]. The metrics values are a pure
+/// function of the key ([`FontEngine::compute_metrics`]), so the choice of
+/// eviction victim is a performance property only and never affects the
+/// returned metrics.
 const METRICS_CACHE_CAP: usize = 1024;
 
 // ── Style flags (match java.awt.Font) ────────────────────────────────────
@@ -101,19 +103,26 @@ pub struct FontMetrics {
 /// native font rasterizer. For real rendering, the platform backend
 /// replaces these values with OS-provided measurements.
 pub struct FontEngine {
-    /// Cache: (interned family, style, size) -> metrics.
+    /// Cache: (interned family, style, size) -> (metrics, referenced-bit).
     ///
     /// The family name is interned to an `Arc<str>` so the key carries a
     /// cheap (refcount-bump) clone instead of a fresh `String` allocation
-    /// on every lookup. The cache is bounded by `METRICS_CACHE_CAP` and
-    /// evicts the least-recently-used entry once that cap is reached.
+    /// on every lookup. The cache is bounded by `METRICS_CACHE_CAP`.
     ///
-    /// Each value carries the value of `tick` at its last access; on a hit
-    /// the stored tick is refreshed, and on an at-cap insert the entry with
-    /// the smallest tick (oldest use) is dropped.
-    metrics_cache: FxHashMap<(Arc<str>, i32, i32), (FontMetrics, u64)>,
-    /// Monotonic logical clock used to order cache accesses for LRU eviction.
-    tick: u64,
+    /// PERF (awt-perf #1): eviction was a full `min_by_key` linear scan over
+    /// every entry on every at-cap insert — O(CAP) on a path (`string_width`)
+    /// that runs once per glyph-run in Swing layout. It is now a Second-Chance
+    /// (CLOCK) approximation of LRU: each value carries a `referenced` bit,
+    /// set on insert and refreshed to `true` on every hit. Eviction walks the
+    /// `clock` FIFO below, giving a referenced entry a "second chance" (clear
+    /// its bit and re-queue) and evicting the first entry whose bit is already
+    /// clear. This is amortized O(1) per insert (each second-chance re-queue is
+    /// paid for by a prior access that set the bit) with no per-lookup scan.
+    metrics_cache: FxHashMap<(Arc<str>, i32, i32), (FontMetrics, bool)>,
+    /// CLOCK hand: live cache keys in FIFO order. Holds exactly one entry per
+    /// `metrics_cache` key (so its length is bounded by `METRICS_CACHE_CAP`),
+    /// and is consulted only on at-cap inserts to pick an eviction victim.
+    clock: VecDeque<(Arc<str>, i32, i32)>,
 }
 
 /// Logical font family categories.
@@ -124,11 +133,92 @@ enum FontCategory {
     Monospaced,
 }
 
+// ── Shared advance model (bug awt-font-image #1) ──────────────────────────
+//
+// FontMetrics (natives.rs), FontEngine::{string_width,char_width,
+// compute_metrics} (this file), and Graphics2D::draw_string (graphics2d.rs)
+// previously each carried their OWN width heuristic (char_count*size*0.55,
+// size*0.55, size/2, etc.), so Swing's text layout measured one width while
+// the software renderer advanced the pen by a different one. The functions
+// below are the SINGLE source of truth for per-glyph advance, so measurement
+// and drawing agree by construction. They are deliberately framework-free
+// (no fontdue Font handle, which only the platform backends own) so every
+// in-process caller — including the headless software path — shares them.
+
+/// Resolve the logical category for a family name. Free function (no
+/// `FontEngine` needed) so the shared advance helpers below — and external
+/// callers like `Graphics2D::draw_string` — can categorize a family directly.
+fn category_of(family: &str) -> FontCategory {
+    match FontEngine::get_logical_family(family) {
+        "Monospaced" => FontCategory::Monospaced,
+        "Serif" => FontCategory::Serif,
+        _ => FontCategory::SansSerif,
+    }
+}
+
+/// Per-character advance ratio (× point size), before the bold widening
+/// multiplier. This is the one place per-glyph width is defined; every
+/// width/advance result in the crate is built from it.
+fn char_advance_ratio(cat: FontCategory, ch: char) -> f64 {
+    match cat {
+        // Monospaced: every glyph (including space) advances identically.
+        FontCategory::Monospaced => 0.6,
+        _ => match ch {
+            'i' | 'l' | '!' | '|' | '\'' | ',' | '.' | ':' | ';' | 'j' | 'f' | 't' | 'r' => 0.35,
+            'M' | 'W' | 'm' | 'w' | '@' => 0.80,
+            ' ' => 0.30,
+            // Serif faces run slightly wider than sans for the average glyph.
+            _ => {
+                if matches!(cat, FontCategory::Serif) {
+                    0.58
+                } else {
+                    0.55
+                }
+            }
+        },
+    }
+}
+
+/// Fractional advance width of a single glyph, in pixels. Source of truth
+/// shared by FontMetrics.charWidth, FontEngine::char_width, and
+/// Graphics2D::draw_string's pen advance.
+pub fn glyph_advance(family: &str, style: i32, size: i32, ch: char) -> f64 {
+    let cat = category_of(family);
+    let ratio = char_advance_ratio(cat, ch);
+    let multiplier = if style & BOLD != 0 { 1.05 } else { 1.0 };
+    ratio * size as f64 * multiplier
+}
+
+/// Fractional total advance of a string, in pixels — the exact sum of each
+/// glyph's [`glyph_advance`]. Summing per-glyph (rather than char_count ×
+/// average) keeps this identical to what `draw_string` lays out.
+pub fn text_advance(family: &str, style: i32, size: i32, text: &str) -> f64 {
+    let cat = category_of(family);
+    let multiplier = if style & BOLD != 0 { 1.05 } else { 1.0 };
+    let s = size as f64;
+    text.chars()
+        .map(|ch| char_advance_ratio(cat, ch) * s * multiplier)
+        .sum()
+}
+
+/// Maximum advance of any glyph at this size — the widest per-glyph ratio,
+/// consistent with [`glyph_advance`].
+pub fn max_glyph_advance(family: &str, style: i32, size: i32) -> f64 {
+    let cat = category_of(family);
+    let multiplier = if style & BOLD != 0 { 1.05 } else { 1.0 };
+    // Widest ratio in `char_advance_ratio`: 0.6 for monospaced, 0.80 otherwise.
+    let widest = match cat {
+        FontCategory::Monospaced => 0.6,
+        _ => 0.80,
+    };
+    widest * size as f64 * multiplier
+}
+
 impl FontEngine {
     pub fn new() -> Self {
         FontEngine {
             metrics_cache: FxHashMap::default(),
-            tick: 0,
+            clock: VecDeque::new(),
         }
     }
 
@@ -137,108 +227,74 @@ impl FontEngine {
     /// The family name is interned to a process-global `Arc<str>` so the
     /// cache key avoids a fresh `String` allocation on every lookup. The
     /// cache is bounded by [`METRICS_CACHE_CAP`]; when the bound is reached
-    /// the least-recently-used entry is evicted before insertion.
+    /// one entry is evicted via the Second-Chance (CLOCK) policy described on
+    /// the `metrics_cache` field. (PERF awt-perf #1 — replaced a per-insert
+    /// `min_by_key` linear scan over the whole cache.)
     pub fn get_metrics(&mut self, spec: &FontSpec) -> FontMetrics {
         let family: Arc<str> = intern_arc(&spec.family);
         let key = (Arc::clone(&family), spec.style, spec.size);
 
-        // Bump the logical clock on every access so hits and inserts share a
-        // single monotonic ordering for LRU.
-        self.tick = self.tick.wrapping_add(1);
-        let now = self.tick;
-
         if let Some(entry) = self.metrics_cache.get_mut(&key) {
-            // Hit: refresh last-use so this entry counts as recently used.
-            entry.1 = now;
+            // Hit: set the referenced bit so the CLOCK sweep gives this entry
+            // a second chance before evicting it.
+            entry.1 = true;
             return entry.0;
         }
 
         let m = Self::compute_metrics(spec);
         if self.metrics_cache.len() >= METRICS_CACHE_CAP {
-            // LRU eviction: drop the single entry with the smallest last-use
-            // tick (least recently used). Linear scan, but only on inserts at
-            // cap and avoids the re-warm thrash of clearing wholesale.
-            if let Some(oldest) = self
-                .metrics_cache
-                .iter()
-                .min_by_key(|(_, v)| v.1)
-                .map(|(k, _)| k.clone())
-            {
-                self.metrics_cache.remove(&oldest);
+            // CLOCK eviction: sweep the FIFO. A referenced entry gets a
+            // second chance (clear its bit, re-queue at the back); the first
+            // entry found with a clear bit is evicted. Amortized O(1): a
+            // re-queue only happens for an entry an access marked referenced,
+            // so the total re-queue work is bounded by accesses. The loop
+            // always terminates — once every bit has been cleared by a sweep,
+            // the next candidate has a clear bit and is evicted.
+            while let Some(candidate) = self.clock.pop_front() {
+                match self.metrics_cache.get_mut(&candidate) {
+                    Some(slot) if slot.1 => {
+                        // Referenced: clear and give a second chance.
+                        slot.1 = false;
+                        self.clock.push_back(candidate);
+                    }
+                    Some(_) => {
+                        // Unreferenced: evict.
+                        self.metrics_cache.remove(&candidate);
+                        break;
+                    }
+                    None => {
+                        // Defensive: key already gone (should not happen — the
+                        // clock holds exactly the live keys). Drop the stale
+                        // hand entry and keep sweeping.
+                    }
+                }
             }
         }
-        self.metrics_cache.insert(key, (m, now));
+        // New entries start referenced=false: they take their place in the
+        // FIFO and earn a second chance only once actually re-accessed, which
+        // keeps a one-shot scan from pinning churned-through entries.
+        self.metrics_cache.insert(key.clone(), (m, false));
+        self.clock.push_back(key);
         m
     }
 
-    /// Approximate the total width of a string in pixels.
+    /// Total width of a string in pixels.
+    ///
+    /// Bug awt-font-image #1: this now SUMS per-glyph [`text_advance`] (the
+    /// shared advance model) instead of `char_count × average`, so the value
+    /// matches glyph-by-glyph what `Graphics2D::draw_string` lays out and what
+    /// `FontMetrics.stringWidth` reports.
     pub fn string_width(&mut self, spec: &FontSpec, text: &str) -> i32 {
         if text.is_empty() {
             return 0;
         }
-        // Hoist all per-call lookups out of the per-character path. Each
-        // of these is cheap in isolation but `string_width` is hot in
-        // measure passes during layout, so we compute them exactly once.
-        let cat = Self::categorize(&spec.family);
-        let size = spec.size as f64;
-        let is_bold = spec.is_bold();
-
-        // Heuristic character count. For ASCII text (the common case for
-        // Swing label/menu strings) `str::len` equals the char count and
-        // skips the full UTF-8 iteration that `chars().count()` requires.
-        // Fall back to `chars().count()` for non-ASCII so multi-byte
-        // glyphs aren't over-counted by their byte length.
-        let char_count = if text.is_ascii() {
-            text.len() as i32
-        } else {
-            text.chars().count() as i32
-        };
-
-        match cat {
-            FontCategory::Monospaced => {
-                // Every character has the same advance width.
-                let char_w = (0.6 * size).round() as i32;
-                char_w * char_count
-            }
-            _ => {
-                // Proportional: per-character width varies, but we use
-                // a heuristic average. Narrow chars (i, l, 1) are ~0.3*S,
-                // wide chars (M, W) are ~0.8*S. Average ~ 0.55*S for
-                // sans-serif, slightly wider for serif.
-                let avg = if matches!(cat, FontCategory::Serif) {
-                    0.58 * size
-                } else {
-                    0.55 * size
-                };
-                // Bold glyphs are ~5% wider.
-                let multiplier = if is_bold { 1.05 } else { 1.0 };
-                let total = avg * multiplier * char_count as f64;
-                total.round() as i32
-            }
-        }
+        text_advance(&spec.family, spec.style, spec.size, text).round() as i32
     }
 
-    /// Approximate the advance width of a single character.
+    /// Advance width of a single character, from the shared [`glyph_advance`]
+    /// model (bug awt-font-image #1).
     pub fn char_width(&mut self, spec: &FontSpec, ch: char) -> i32 {
-        let cat = Self::categorize(&spec.family);
-        let size = spec.size as f64;
-
-        match cat {
-            FontCategory::Monospaced => (0.6 * size).round() as i32,
-            _ => {
-                // Rough per-character heuristic.
-                let ratio = match ch {
-                    'i' | 'l' | '!' | '|' | '\'' | ',' | '.' | ':' | ';' | 'j' | 'f'
-                    | 't' | 'r' => 0.35,
-                    'M' | 'W' | 'm' | 'w' | '@' => 0.80,
-                    ' ' => 0.30,
-                    _ => 0.55,
-                };
-                let base = ratio * size;
-                let multiplier = if spec.is_bold() { 1.05 } else { 1.0 };
-                (base * multiplier).round() as i32
-            }
-        }
+        glyph_advance(&spec.family, spec.style, spec.size, ch).round() as i32
     }
 
     /// Map a logical font name to its canonical family.
@@ -273,15 +329,6 @@ impl FontEngine {
 
     // ── Internal helpers ─────────────────────────────────────────────
 
-    fn categorize(family: &str) -> FontCategory {
-        let canonical = Self::get_logical_family(family);
-        match canonical {
-            "Monospaced" => FontCategory::Monospaced,
-            "Serif" => FontCategory::Serif,
-            _ => FontCategory::SansSerif,
-        }
-    }
-
     /// Compute heuristic metrics for a font specification.
     ///
     /// For a font of size S:
@@ -289,7 +336,9 @@ impl FontEngine {
     /// - descent = round(0.20 * S)
     /// - leading = round(0.05 * S)
     /// - height  = ascent + descent + leading
-    /// - max_advance: monospaced = round(0.6*S), proportional = S (upper bound)
+    /// - max_advance = widest per-glyph advance from the shared model
+    ///   ([`max_glyph_advance`]): monospaced = round(0.6*S), proportional =
+    ///   round(0.80*S), each times the bold widening factor.
     fn compute_metrics(spec: &FontSpec) -> FontMetrics {
         let s = spec.size as f64;
         let ascent = (0.80 * s).round() as i32;
@@ -297,11 +346,11 @@ impl FontEngine {
         let leading = (0.05 * s).round() as i32;
         let height = ascent + descent + leading;
 
-        let cat = Self::categorize(&spec.family);
-        let max_advance = match cat {
-            FontCategory::Monospaced => (0.6 * s).round() as i32,
-            _ => spec.size, // upper bound for proportional
-        };
+        // Bug awt-font-image #1: derive max_advance from the SAME shared
+        // advance model as stringWidth/charWidth/draw_string (the widest
+        // per-glyph advance), instead of the decoupled `spec.size` upper bound
+        // that over-stated the proportional case.
+        let max_advance = max_glyph_advance(&spec.family, spec.style, spec.size).round() as i32;
 
         FontMetrics {
             ascent,
@@ -449,33 +498,40 @@ pub struct GlyphBitmap {
 
 /// Process-wide cache of rasterized glyphs.
 ///
-/// Eviction strategy: when the map reaches `cap`, evict the single
-/// least-recently-used entry before inserting the new one. Each map value
-/// carries the value of a monotonic logical clock (`tick`) at its last use;
-/// a hit refreshes that stamp and an at-cap insert drops the entry with the
-/// smallest stamp. The clock lives under the same mutex as the map, so the
-/// bookkeeping is a single integer write on the hot path — far cheaper than
-/// the re-warm thrash of the previous "drop half the map" approach, which
-/// could evict hot glyphs and force redundant re-rasterization.
+/// Eviction strategy: when the map reaches `cap`, evict one entry via a
+/// Second-Chance (CLOCK) approximation of LRU before inserting the new one.
+/// Each map value carries a `referenced` bit, set on insert-access and on
+/// every hit; eviction sweeps the `clock` FIFO, giving a referenced entry a
+/// second chance (clear its bit, re-queue) and evicting the first entry whose
+/// bit is already clear.
+///
+/// PERF (awt-perf #1): the previous policy refreshed a per-entry `tick` and,
+/// on an at-cap insert, picked the victim via a `min_by_key` linear scan over
+/// the WHOLE atlas — O(cap) per insert on the glyph-rasterization hot path
+/// (each keystroke re-measures the visible glyph run). The CLOCK sweep is
+/// amortized O(1) and keeps the same "evict a stale, not a hot, glyph"
+/// behavior without the full scan. The cache lives under the same mutex, so
+/// the hot-path bookkeeping is still a single boolean write.
 pub struct GlyphAtlas {
     cache: Mutex<GlyphCache>,
     cap: usize,
 }
 
-/// Mutex-guarded interior of [`GlyphAtlas`]: the glyph map plus the logical
-/// clock that orders entries for LRU eviction. Each map value pairs the
-/// shared bitmap with the `tick` value at its last access.
+/// Mutex-guarded interior of [`GlyphAtlas`]: the glyph map plus the CLOCK
+/// hand used to order entries for eviction. Each map value pairs the shared
+/// bitmap with a `referenced` bit (set on access, cleared by a CLOCK sweep).
 struct GlyphCache {
-    map: rustc_hash::FxHashMap<GlyphKey, (Arc<GlyphBitmap>, u64)>,
-    /// Monotonic logical clock; bumped on every access (hit or insert).
-    tick: u64,
+    map: rustc_hash::FxHashMap<GlyphKey, (Arc<GlyphBitmap>, bool)>,
+    /// CLOCK hand: live cache keys in FIFO order, exactly one per `map` key
+    /// (so bounded by the atlas `cap`). Consulted only on at-cap inserts.
+    clock: VecDeque<GlyphKey>,
 }
 
 impl GlyphCache {
     fn new() -> Self {
         GlyphCache {
             map: rustc_hash::FxHashMap::default(),
-            tick: 0,
+            clock: VecDeque::new(),
         }
     }
 
@@ -489,6 +545,7 @@ impl GlyphCache {
 
     fn clear(&mut self) {
         self.map.clear();
+        self.clock.clear();
     }
 }
 
@@ -546,15 +603,13 @@ impl GlyphAtlas {
         key: GlyphKey,
         fontdue_font: &fontdue::Font,
     ) -> Arc<GlyphBitmap> {
-        // Hot path: scoped lock, drops before any work. On a hit we also
-        // refresh the entry's last-use tick so it counts as recently used
-        // for LRU ordering.
+        // Hot path: scoped lock, drops before any work. On a hit we set the
+        // referenced bit so the CLOCK sweep gives this glyph a second chance
+        // before eviction.
         {
             let mut cache = self.cache.lock();
-            cache.tick = cache.tick.wrapping_add(1);
-            let now = cache.tick;
             if let Some(entry) = cache.map.get_mut(&key) {
-                entry.1 = now;
+                entry.1 = true;
                 return Arc::clone(&entry.0);
             }
         }
@@ -564,21 +619,36 @@ impl GlyphAtlas {
         // first inserter wins, the rest get the cached entry. This
         // preserves `Arc::ptr_eq` for downstream identity caches.
         let mut cache = self.cache.lock();
-        cache.tick = cache.tick.wrapping_add(1);
-        let now = cache.tick;
 
-        // LRU-evict BEFORE the `entry` lookup. If we are about to insert a new
-        // key and we're already at cap, drop the single least-recently-used
-        // entry (smallest last-use tick) to make room. Linear scan, but only
-        // on at-cap inserts; avoids the re-warm thrash of bulk eviction.
-        if cache.map.len() >= self.cap && !cache.map.contains_key(&key) {
-            if let Some(oldest) = cache
-                .map
-                .iter()
-                .min_by_key(|(_, v)| v.1)
-                .map(|(k, _)| *k)
-            {
-                cache.map.remove(&oldest);
+        // Another thread may have inserted this key while we released the lock
+        // above. Only run the (cap-bounded) eviction sweep and the clock push
+        // when we are genuinely about to add a new key, so the clock stays in
+        // one-to-one correspondence with the map.
+        let is_new = !cache.map.contains_key(&key);
+
+        // CLOCK-evict BEFORE the `entry` insert when we are about to add a new
+        // key at cap. Sweep the FIFO: a referenced entry gets a second chance
+        // (clear its bit, re-queue); the first unreferenced entry is evicted.
+        // Amortized O(1) — replaces the old O(cap) `min_by_key` scan — and
+        // always terminates (one full sweep clears every bit, so the next
+        // candidate is unreferenced).
+        if is_new && cache.map.len() >= self.cap {
+            while let Some(candidate) = cache.clock.pop_front() {
+                match cache.map.get_mut(&candidate) {
+                    Some(slot) if slot.1 => {
+                        slot.1 = false;
+                        cache.clock.push_back(candidate);
+                    }
+                    Some(_) => {
+                        cache.map.remove(&candidate);
+                        break;
+                    }
+                    None => {
+                        // Defensive: key already gone (should not happen — the
+                        // clock mirrors the live keys). Drop the stale hand
+                        // entry and keep sweeping.
+                    }
+                }
             }
         }
 
@@ -596,9 +666,18 @@ impl GlyphAtlas {
                 bearing_y: metrics.ymin,
                 advance: metrics.advance_width,
             });
-            (bitmap, now)
+            // New entries start unreferenced; they earn a second chance only
+            // once actually re-accessed, so a one-shot scan doesn't pin them.
+            (bitmap, false)
         });
-        Arc::clone(&entry.0)
+        let bitmap = Arc::clone(&entry.0);
+        // Record the new key in the clock exactly once (the entry was newly
+        // inserted iff `is_new` held). A racing concurrent insert would have
+        // already pushed it, so we must not push a duplicate.
+        if is_new {
+            cache.clock.push_back(key);
+        }
+        bitmap
     }
 }
 
@@ -659,7 +738,10 @@ mod tests {
         assert_eq!(m.descent, 2);
         assert_eq!(m.leading, 1);
         assert_eq!(m.height, 13);
-        assert_eq!(m.max_advance, 12);
+        // Bug awt-font-image #1: max_advance is the widest per-glyph advance
+        // (0.80 * 12 = 9.6 -> 10), matching the shared advance model, not the
+        // old decoupled `spec.size` upper bound (12).
+        assert_eq!(m.max_advance, 10);
     }
 
     #[test]
@@ -673,6 +755,41 @@ mod tests {
         assert_eq!(m.leading, 1);
         assert_eq!(m.height, 21);
         assert_eq!(m.max_advance, 12);
+    }
+
+    // PERF (awt-perf #1): the CLOCK eviction must keep the metrics cache
+    // bounded at `METRICS_CACHE_CAP`, must keep the `clock` hand in 1:1
+    // correspondence with the map, and must give a recently-used (referenced)
+    // entry a second chance over a cold one.
+    #[test]
+    fn metrics_cache_clock_eviction_bounds_and_protects_hot_entry() {
+        let mut engine = FontEngine::new();
+
+        // A "hot" entry we will keep touching so its referenced bit stays set.
+        let hot = FontSpec::new("SansSerif", PLAIN, 7);
+        let _ = engine.get_metrics(&hot);
+
+        // Overflow the cache well past capacity with distinct (size) keys,
+        // re-touching the hot entry along the way so it earns a second chance.
+        for size in 100..(100 + METRICS_CACHE_CAP as i32 + 50) {
+            let _ = engine.get_metrics(&FontSpec::new("SansSerif", PLAIN, size));
+            let _ = engine.get_metrics(&hot); // refresh referenced bit
+        }
+
+        // Never exceeds the hard cap, and the clock mirrors the map exactly.
+        assert!(engine.metrics_cache.len() <= METRICS_CACHE_CAP);
+        assert_eq!(engine.metrics_cache.len(), engine.clock.len());
+
+        // The continually-touched hot entry survived the churn.
+        let hot_key = (intern_arc(&hot.family), hot.style, hot.size);
+        assert!(
+            engine.metrics_cache.contains_key(&hot_key),
+            "CLOCK must not evict a repeatedly-referenced entry"
+        );
+
+        // Metrics are a pure function of the key, so any value the cache
+        // returns equals a fresh computation — eviction can never change it.
+        assert_eq!(engine.get_metrics(&hot), FontEngine::compute_metrics(&hot));
     }
 
     #[test]
@@ -708,7 +825,9 @@ mod tests {
         let mut engine = FontEngine::new();
         let spec = FontSpec::new("SansSerif", PLAIN, 20);
         let w = engine.string_width(&spec, "Hello");
-        assert_eq!(w, 55);
+        // Bug awt-font-image #1: per-glyph sum, not char_count * average.
+        // H,e,o = 0.55 each; l,l = 0.35 each -> (3*0.55 + 2*0.35) * 20 = 47.
+        assert_eq!(w, 47);
     }
 
     #[test]
@@ -727,6 +846,53 @@ mod tests {
         let wp = engine.string_width(&plain, "Hello World");
         let wb = engine.string_width(&bold, "Hello World");
         assert!(wb > wp, "bold ({}) should be wider than plain ({})", wb, wp);
+    }
+
+    // ── Shared advance model agreement (bug awt-font-image #1) ───────────
+
+    #[test]
+    fn string_width_equals_sum_of_glyph_advances() {
+        // FontMetrics.stringWidth, FontEngine::string_width, and the
+        // Graphics2D::draw_string pen advance must all derive from ONE model.
+        // Here we prove FontEngine::string_width equals round(sum of
+        // per-glyph glyph_advance), i.e. the same arithmetic draw_string runs.
+        let mut engine = FontEngine::new();
+        for (family, style, size, text) in [
+            ("SansSerif", PLAIN, 20, "Hello World"),
+            ("Serif", BOLD, 14, "Mixed Width jiM!"),
+            ("Monospaced", PLAIN, 18, "code()"),
+            ("Dialog", BOLD_ITALIC, 12, "aWl.iM"),
+        ] {
+            let spec = FontSpec::new(family, style, size);
+            let summed: f64 = text
+                .chars()
+                .map(|ch| glyph_advance(family, style, size, ch))
+                .sum();
+            assert_eq!(
+                engine.string_width(&spec, text),
+                summed.round() as i32,
+                "string_width must equal the summed per-glyph advance for {family}/{style}/{size} {text:?}",
+            );
+            // And the convenience aggregate matches the per-glyph sum exactly.
+            assert!(
+                (text_advance(family, style, size, text) - summed).abs() < 1e-9,
+                "text_advance must equal the per-glyph sum",
+            );
+        }
+    }
+
+    #[test]
+    fn max_advance_is_widest_glyph() {
+        // getMaxAdvance must bound every single-glyph advance.
+        let family = "SansSerif";
+        let (style, size) = (PLAIN, 24);
+        let maxa = max_glyph_advance(family, style, size);
+        for ch in "iMWla@. jr".chars() {
+            assert!(
+                glyph_advance(family, style, size, ch) <= maxa + 1e-9,
+                "glyph {ch:?} advance exceeds max_advance {maxa}",
+            );
+        }
     }
 
     #[test]
@@ -887,10 +1053,13 @@ mod tests {
     fn glyph_atlas_clear() {
         let atlas = GlyphAtlas::new(8);
         // Directly poke a bitmap in so we don't need a real fontdue font.
+        // Keep the map<->clock invariant (one clock entry per map key) so the
+        // poke mirrors what `get_or_rasterize` would produce.
         {
             let mut cache = atlas.cache.lock();
+            let key = GlyphKey::new("Dialog", 12, false, false, 'A');
             cache.map.insert(
-                GlyphKey::new("Dialog", 12, false, false, 'A'),
+                key,
                 (
                     Arc::new(GlyphBitmap {
                         alpha: Vec::<u8>::new().into(),
@@ -900,9 +1069,11 @@ mod tests {
                         bearing_y: 0,
                         advance: 0.0,
                     }),
-                    0,
+                    // Referenced bit (CLOCK); value is irrelevant to this test.
+                    false,
                 ),
             );
+            cache.clock.push_back(key);
         }
         assert_eq!(atlas.len(), 1);
         atlas.clear();

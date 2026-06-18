@@ -120,7 +120,40 @@ pub const FIELD_CELL_PAYLOAD64_OFFSET: usize = 8;
 /// array via `set_array_element`, it is automatically wrapped in a 1-field object
 /// with this class ID. On read via `get_array_element`, the wrapper is detected
 /// and the original Value is transparently returned.
-pub const AUTOBOX_CLASS_ID: ClassId = ClassId::new(0xAB00_0000);
+///
+/// # Reserved range (LOW, 2026-06-17)
+///
+/// This is a **reserved sentinel**, not a real loaded class. Real `ClassId`s
+/// are assigned **densely and sequentially from 0** (see
+/// `class_manager::recompute_subclass_layouts`, which iterates
+/// `ClassId::new(idx)` over `0..class_store.len()`), so the only safe sentinel
+/// is one the sequential allocator can never legitimately hand out. The
+/// previous value `0xAB00_0000` (≈2.87 billion) sat in the *middle* of the
+/// `u32` range and would collide with a real class once that many classes were
+/// loaded — an unreserved, theoretically-reachable id. It is now pinned to
+/// `u32::MAX` (`0xFFFF_FFFF`), the single highest id: the allocator would have
+/// to load all 4,294,967,295 lower ids first, so this can never be reached. The
+/// allocation cap below makes that contract a compile-/runtime-checkable
+/// invariant for the upper bound of the dense id space.
+pub const AUTOBOX_CLASS_ID: ClassId = ClassId::new(u32::MAX);
+
+/// Exclusive upper bound on sequentially-assigned (dense, from-0) `ClassId`s.
+///
+/// The class loader assigns ids `0, 1, 2, …`; this is the first value it must
+/// never reach so that [`AUTOBOX_CLASS_ID`] (and any future high-range reserved
+/// sentinel) stays distinct. Callers that mint a sequential id should
+/// `debug_assert!(next_id < MAX_SEQUENTIAL_CLASS_ID)` at the allocation site so
+/// the reservation fails loud rather than silently colliding. Kept here next to
+/// the reservation it protects; the allocator lives in the `classloading`
+/// crate (out of this file's edit scope) — see the residual note in the fix
+/// report to wire the assert in at `class_manager`'s id-minting site.
+pub const MAX_SEQUENTIAL_CLASS_ID: u32 = u32::MAX;
+
+// Reservation guard: AUTOBOX_CLASS_ID must sit at (or above) the cap that
+// sequential allocation can never reach, so it can never alias a real,
+// densely-assigned class id. `ClassId::as_u32` is not a `const fn`, so this is
+// pinned at test time rather than compile time (see
+// `autobox_class_id_is_reserved` in the tests module below).
 
 /// Byte offset of the `array_length` field within `ObjectHeader`.
 /// Derived from the `#[repr(C)]` layout: ClassId(4) + kind(1) + element_type(1) + padding(2) + identity_hash_code(4) = 12.
@@ -682,7 +715,21 @@ mod tests {
 
     #[test]
     fn autobox_class_id_constant() {
-        assert_eq!(AUTOBOX_CLASS_ID.as_u32(), 0xAB00_0000);
+        // LOW (2026-06-17): moved from the unreserved mid-range 0xAB00_0000
+        // to u32::MAX so it can never collide with a sequentially-assigned id.
+        assert_eq!(AUTOBOX_CLASS_ID.as_u32(), u32::MAX);
+    }
+
+    /// LOW (2026-06-17): the auto-box sentinel must live outside the dense,
+    /// from-0 sequential `ClassId` allocation range so it can never alias a
+    /// real loaded class. Pins the reservation invariant that the (non-const)
+    /// compile-time assert cannot express.
+    #[test]
+    fn autobox_class_id_is_reserved() {
+        assert!(
+            AUTOBOX_CLASS_ID.as_u32() >= MAX_SEQUENTIAL_CLASS_ID,
+            "AUTOBOX_CLASS_ID must be outside the sequential allocation range"
+        );
     }
 
     // -- ObjectHeader for array --

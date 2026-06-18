@@ -2828,12 +2828,32 @@ fn http_decode_chunked(mut data: &[u8]) -> std::io::Result<Vec<u8>> {
         let size_str = std::str::from_utf8(&data[..nl])
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let size_str = size_str.split(';').next().unwrap_or("0").trim();
+        // FIX(net-phase-e #1): parse the hex chunk-length defensively.
+        // `usize::from_str_radix` itself errors (not panics) on numeric
+        // overflow, but a crafted-but-in-range giant size still drove
+        // `n + 2` to overflow (panic in debug builds) and `&data[..n]`
+        // to slice out of range (panic). Reject empty/non-hex sizes, and
+        // cap the chunk at a sane maximum so the subsequent arithmetic and
+        // slicing can never overflow or wrap — on any violation return a
+        // protocol error instead of panicking.
+        const MAX_CHUNK: usize = 64 * 1024 * 1024; // 64 MiB hard cap per chunk
+        if size_str.is_empty() || !size_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bad chunk size",
+            ));
+        }
         let n = usize::from_str_radix(size_str, 16)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size"))?;
+            .ok()
+            .filter(|&n| n <= MAX_CHUNK)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "chunk size too large")
+            })?;
         data = &data[nl + 2..];
         if n == 0 {
             break;
         }
+        // `n <= MAX_CHUNK` guarantees `n + 2` cannot overflow `usize`.
         if data.len() < n + 2 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -3663,60 +3683,29 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // semantically equivalent but entirely inside our VM infrastructure.
     // -----------------------------------------------------------------------
     // -----------------------------------------------------------------------
-    // Spring `ConfigurationClassEnhancer.enhance(Class, ClassLoader)`
+    // (REMOVED) Spring `ConfigurationClassEnhancer.enhance(Class, ClassLoader)`
+    // identity-bypass shim.
     //
-    // Spring uses CGLIB to subclass every `@Configuration`-annotated class so
-    // that calls between `@Bean` methods return shared bean instances rather
-    // than fresh ones.  CGLIB's `Enhancer.createClass()` exercises a large
-    // bytecode-generation + ClassLoader.defineClass pipeline that is
-    // currently incomplete in this VM and throws a bare
-    // `IllegalStateException` (no message) deep inside.  The exception
-    // surfaces in `ConfigurationClassPostProcessor.enhanceConfigurationClasses`
-    // as:
-    //   IllegalStateException: Cannot load configuration class: <name>
-    //   Caused by: IllegalStateException
-    // SportMe hits this on `RedisHttpSessionConfiguration`.
+    // FIX(net-phase-e #2): this used to register an identity-bypass that
+    // returned the @Configuration class unchanged, disabling CGLIB @Bean
+    // interception (a silent-wrong-result stub: inter-@Bean-method calls
+    // returned fresh instances instead of the shared singleton).
     //
-    // Pragmatic workaround: return the original class unchanged so Spring
-    // skips enhancement.  Inter-@Bean-method calls won't be intercepted, but
-    // that is the same trade-off Spring makes for `@Configuration(proxyBeanMethods = false)`
-    // and lets the application advance past container bootstrap.
+    // The REAL CGLIB @Configuration enhancement is now implemented in
+    // `cglib_enhancer.rs` (`cce_enhance` / `register_cglib_enhancer`), which
+    // emits a genuine EnhancedConfiguration subclass and intercepts @Bean
+    // methods. That registration runs in `lib.rs::register_net_natives`
+    // AFTER `net_phase_e::register_phase_e_networking` and re-registers the
+    // identical method triple
+    //   org/springframework/context/annotation/ConfigurationClassEnhancer
+    //   .enhance(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/lang/Class;
+    // Registry semantics silently overwrite on duplicate triples
+    // (native-api registry), so this bypass was already DEAD CODE —
+    // unconditionally clobbered by the real enhancer. Removing it eliminates
+    // the misleading stub; the live behavior is unchanged (real path wins).
+    // Do not re-add a bypass here: if the real enhancer needs work, fix it in
+    // `cglib_enhancer.rs`.
     // -----------------------------------------------------------------------
-    r.register(
-        "org/springframework/context/annotation/ConfigurationClassEnhancer",
-        "enhance",
-        "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/lang/Class;",
-        |_ctx, args| {
-            // invokevirtual: args[0] = receiver (ConfigurationClassEnhancer), args[1] =
-            // config Class, args[2] = ClassLoader. Returning args.first() was the receiver
-            // mis-typed as Class → AbstractBeanDefinition.getBeanClassName CCE.
-            let cls = match args.get(1).cloned() {
-                Some(v) => v,
-                None => return Err(iae("ConfigurationClassEnhancer.enhance: missing class arg")),
-            };
-            // JNI / invoke bridges may pass the config Class as `Value::Long`;
-            // return a proper reference so the caller's `astore`/`if_acmpeq`
-            // sequence does not retain an unrooted jlong handle (Letsgo AV).
-            let cls = match cls {
-                cratonvm_types::Value::Long(bits) => {
-                    if let Some(p) =
-                        cratonvm_types::jlong_bits_as_aligned_object_ptr(bits as u64)
-                    {
-                        cratonvm_types::Value::Object(Some(unsafe {
-                            cratonvm_types::ObjectRef::from_raw(p as *mut u8)
-                        }))
-                    } else {
-                        cratonvm_types::Value::Object(None)
-                    }
-                }
-                other => other,
-            };
-            if spring_dbg_enabled() {
-                eprintln!("[CCE-DBG] ConfigurationClassEnhancer.enhance -> bypass (return original class)");
-            }
-            Ok(Some(cls))
-        },
-    );
 
     // -----------------------------------------------------------------------
     // (REMOVED) AbstractBeanDefinition.getResolvedAutowireMode() override.
@@ -3752,8 +3741,10 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // In real-JDK mode under CratonVM the `@Autowired` setter on
     // `RedisHttpSessionConfiguration.setRedisConnectionFactory(ObjectProvider,
     // ObjectProvider)` is not being invoked (multi-arg ObjectProvider setter
-    // injection on a @Configuration class whose CGLIB enhancement was bypassed
-    // — see `ConfigurationClassEnhancer.enhance` shim above).  The
+    // injection on a @Configuration class — the CGLIB enhancement is now
+    // performed by the real enhancer in `cglib_enhancer.rs`; the former
+    // identity-bypass shim here was removed, see the "(REMOVED)
+    // ConfigurationClassEnhancer.enhance" note above).  The
     // RedisOperationsSessionRepository @Bean factory method then ends up
     // calling `RedisTemplate.afterPropertiesSet()` with a null connection
     // factory and Spring throws `IllegalStateException:
@@ -5480,18 +5471,77 @@ fn request_queue() -> &'static Mutex<HashMap<i32, Vec<PendingRequest>>> {
     INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// VULN-FIX [nb-net-phase-e]: configurable upper bound on the size of an inbound
+/// HTTP request body for the embedded com.sun.net.httpserver. Previously
+/// `parse_http_request` read up to the client-supplied `Content-Length` with NO
+/// upper bound, allowing a remote peer to exhaust process memory (DoS) by
+/// advertising (and streaming) an enormous body. We now cap the accepted body
+/// and reject anything larger with a 413 response.
+///
+/// The cap is read once from `CRATONVM_HTTP_MAX_BODY` (bytes); it defaults to
+/// 8 MiB, which is comfortably larger than any normal request the test suite
+/// issues while still bounding worst-case allocation. A value of 0 or an
+/// unparseable value falls back to the default.
+fn http_max_request_body() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        const DEFAULT: usize = 8 * 1024 * 1024; // 8 MiB
+        std::env::var("CRATONVM_HTTP_MAX_BODY")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT)
+    })
+}
+
+/// VULN-FIX [nb-net-phase-e]: best-effort write of a fixed minimal HTTP response
+/// to a peer we are about to reject (e.g. 413 for an oversized body, 400 for a
+/// malformed/duplicate Content-Length). Used so that the parse path can refuse a
+/// request cheaply without allocating its body and still tell the client why.
+fn http_reject_and_close(stream: &mut TcpStream, status: i32) {
+    let body = http_reason(status);
+    let mut resp = Vec::with_capacity(96 + body.len());
+    let _ = write!(
+        &mut resp,
+        "HTTP/1.1 {status} {body}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(&resp);
+    let _ = stream.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
 fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 1024];
+    // PERF [nb-net-phase-e]: scan only the newly-appended bytes for the
+    // "\r\n\r\n" header terminator instead of re-running `buf.windows(4)` over
+    // the whole accumulated buffer on every ~1 KiB read. Re-scanning from 0 each
+    // read is O(n^2) in header size. `scanned` records how many leading bytes
+    // have already been checked; each read we restart the window scan 3 bytes
+    // before that point so a terminator straddling the previous/new boundary is
+    // still detected, then capture its absolute position so the post-loop step
+    // need not re-scan either. The detection result is identical to the original
+    // full-buffer `windows(4).position(...)`.
+    let mut scanned = 0usize;
+    let mut sep: Option<usize> = None;
     loop {
         match stream.read(&mut tmp) {
             Ok(0) => break,
             Ok(n) => {
                 buf.extend_from_slice(&tmp[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                // Restart 3 bytes before the previously-scanned end so a
+                // terminator split across the boundary is not missed (saturating
+                // so the first read starts at 0).
+                let start = scanned.saturating_sub(3);
+                if let Some(rel) = buf[start..].windows(4).position(|w| w == b"\r\n\r\n") {
+                    sep = Some(start + rel);
                     break;
                 }
+                // Everything except the trailing 3 bytes (which may begin a
+                // boundary-straddling terminator) is now fully checked.
+                scanned = buf.len().saturating_sub(3);
                 if buf.len() > 1 << 20 {
                     return None;
                 }
@@ -5499,7 +5549,7 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
             Err(_) => return None,
         }
     }
-    let sep = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let sep = sep?;
     let head = std::str::from_utf8(&buf[..sep]).ok()?;
     let mut lines = head.split("\r\n");
     let req_line = lines.next()?;
@@ -5508,22 +5558,85 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
     let uri = rl.next()?.to_string();
     let _ = rl.next()?;
     let mut headers = Vec::new();
-    let mut content_length: usize = 0;
+    // VULN-FIX [nb-net-phase-e]: track Content-Length as an Option and DETECT
+    // duplicate/conflicting declarations instead of silently letting the last
+    // one win. Two differing Content-Length values (or a malformed one) are a
+    // classic request-smuggling vector, so we reject the request with 400.
+    let mut content_length: Option<usize> = None;
     for line in lines {
         if let Some(colon) = line.find(':') {
             let k = line[..colon].trim().to_string();
             let v = line[colon + 1..].trim().to_string();
             if k.eq_ignore_ascii_case("content-length") {
-                content_length = v.parse().unwrap_or(0);
+                // A header value may itself be a comma-separated list of equal
+                // values (RFC 9110 §8.6); any unparseable or conflicting value
+                // is treated as malformed.
+                let parsed = v
+                    .split(',')
+                    .map(|p| p.trim())
+                    .try_fold(None::<usize>, |acc, p| {
+                        let n: usize = p.parse().ok()?;
+                        match acc {
+                            Some(prev) if prev != n => None, // conflicting list members
+                            _ => Some(Some(n)),
+                        }
+                    })
+                    .flatten();
+                match parsed {
+                    Some(n) => match content_length {
+                        Some(prev) if prev != n => {
+                            // Conflicting duplicate Content-Length headers.
+                            http_reject_and_close(&mut stream, 400);
+                            return None;
+                        }
+                        _ => content_length = Some(n),
+                    },
+                    None => {
+                        // Unparseable / list with differing values.
+                        http_reject_and_close(&mut stream, 400);
+                        return None;
+                    }
+                }
             }
             headers.push((k, v));
         }
     }
-    let mut body = buf[sep + 4..].to_vec();
+    let content_length = content_length.unwrap_or(0);
+    // VULN-FIX [nb-net-phase-e]: bound the advertised body length BEFORE we read
+    // or allocate anything. Without this a remote peer could send a huge
+    // Content-Length and stream gigabytes, exhausting process memory.
+    let max_body = http_max_request_body();
+    if content_length > max_body {
+        http_reject_and_close(&mut stream, 413);
+        return None;
+    }
+    // Any bytes already pulled in while reading the header also count toward the
+    // bounded body. Clamp the initial slice so a peer can't smuggle past the cap
+    // via a body that arrived in the same read as the header terminator.
+    let leftover = &buf[sep + 4..];
+    if leftover.len() > max_body {
+        http_reject_and_close(&mut stream, 413);
+        return None;
+    }
+    // Allocate with bounded capacity (never the unbounded client value): we will
+    // read at most `content_length` bytes, itself already <= max_body.
+    let mut body = Vec::with_capacity(content_length.min(max_body));
+    body.extend_from_slice(leftover);
     while body.len() < content_length {
-        match stream.read(&mut tmp) {
+        // Read no more than what is still wanted; stop hard at the cap.
+        let want = content_length - body.len();
+        let chunk = want.min(tmp.len());
+        match stream.read(&mut tmp[..chunk]) {
             Ok(0) => break,
-            Ok(n) => body.extend_from_slice(&tmp[..n]),
+            Ok(n) => {
+                body.extend_from_slice(&tmp[..n]);
+                if body.len() > max_body {
+                    // Defensive: should be unreachable given the checks above,
+                    // but never let the buffer grow past the cap.
+                    http_reject_and_close(&mut stream, 413);
+                    return None;
+                }
+            }
             Err(_) => break,
         }
     }
@@ -5661,6 +5774,9 @@ fn http_reason(code: i32) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        // VULN-FIX [nb-net-phase-e]: 413 used to reject oversized request bodies
+        // (Content-Length exceeding the configurable max — see http_max_request_body()).
+        413 => "Payload Too Large",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
@@ -5995,6 +6111,28 @@ mod tests {
         assert_eq!(body, b"helloworld");
     }
 
+    // FIX(net-phase-e #1): a crafted chunk size must never panic — neither on
+    // numeric overflow of the hex parse nor on the `n + 2` / `&data[..n]`
+    // arithmetic. All malformed/oversize sizes must return a protocol error.
+    #[test]
+    fn re4_http_decode_chunked_overflow_is_error_not_panic() {
+        // Hex value that overflows usize (would have panicked `n + 2` / slice).
+        let huge = b"ffffffffffffffff\r\nx\r\n0\r\n\r\n";
+        assert!(http_decode_chunked(huge).is_err());
+
+        // In-range-but-absurd size beyond MAX_CHUNK cap -> protocol error,
+        // not an out-of-range slice panic.
+        let big = b"7fffffff\r\nx\r\n0\r\n\r\n"; // ~2 GiB declared, tiny body
+        assert!(http_decode_chunked(big).is_err());
+
+        // Non-hex / empty chunk size -> protocol error.
+        assert!(http_decode_chunked(b"zz\r\nx\r\n0\r\n\r\n").is_err());
+        assert!(http_decode_chunked(b"\r\nx\r\n0\r\n\r\n").is_err());
+
+        // A valid small chunk just over the available data is "truncated".
+        assert!(http_decode_chunked(b"5\r\nhi\r\n").is_err());
+    }
+
     #[test]
     fn re4_http_read_response_parses_status_and_body() {
         let raw = b"HTTP/1.1 204 No Content\r\nServer: t\r\nContent-Length: 0\r\n\r\n";
@@ -6044,5 +6182,79 @@ mod tests {
         assert_eq!(req.method, "GET");
         assert_eq!(req.uri, "/hi");
         assert!(req.headers.iter().any(|(k, v)| k == "Host" && v == "x"));
+    }
+
+    // VULN-FIX [nb-net-phase-e] regression: an oversized advertised body must be
+    // rejected with 413 and NOT allocated. We set a tiny per-process unlikely
+    // value by exploiting the default cap (8 MiB) being far above 10 bytes while
+    // we claim a body larger than the cap via Content-Length.
+    #[test]
+    fn re10_oversized_content_length_rejected_with_413() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Advertise a body well beyond the 8 MiB default cap; do NOT actually
+        // send it (the server must refuse before reading the body).
+        let huge = http_max_request_body() + 1;
+        let handle = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c.write_all(
+                format!("POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: {huge}\r\n\r\n").as_bytes(),
+            )
+            .unwrap();
+            // Read back whatever the server responds with.
+            let mut resp = Vec::new();
+            let _ = c.read_to_end(&mut resp);
+            resp
+        });
+        let (stream, _) = listener.accept().unwrap();
+        // parse must reject (None) without reading the huge body.
+        assert!(parse_http_request(stream).is_none());
+        let resp = handle.join().unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with("HTTP/1.1 413"),
+            "expected 413 response, got: {text}"
+        );
+    }
+
+    // VULN-FIX [nb-net-phase-e] regression: conflicting duplicate Content-Length
+    // headers (request-smuggling vector) must be rejected with 400 rather than
+    // last-wins.
+    #[test]
+    fn re10_conflicting_content_length_rejected_with_400() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c.write_all(b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nContent-Length: 5\r\n\r\nabc")
+                .unwrap();
+            let mut resp = Vec::new();
+            let _ = c.read_to_end(&mut resp);
+            resp
+        });
+        let (stream, _) = listener.accept().unwrap();
+        assert!(parse_http_request(stream).is_none());
+        let resp = handle.join().unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with("HTTP/1.1 400"),
+            "expected 400 response, got: {text}"
+        );
+    }
+
+    // VULN-FIX [nb-net-phase-e] regression: a small, well-formed body within the
+    // cap is still accepted unchanged.
+    #[test]
+    fn re10_small_body_within_cap_accepted() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c.write_all(b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello")
+                .unwrap();
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let req = parse_http_request(stream).unwrap();
+        assert_eq!(req.body, b"hello");
     }
 }
