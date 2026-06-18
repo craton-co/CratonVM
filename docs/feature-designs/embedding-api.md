@@ -247,6 +247,30 @@ Next: a C varargs convenience overload of `invoke_static`; real cbindgen header
 generation; `cratonvm_invoke_virtual` + value/array read-back helpers; and the
 Layer-1 curated `cratonvm-embed` Rust facade.
 
+## Increment 3 (Layer 2 string read-back) landed
+
+Closes the first read-back gap flagged in increment 2 — a host can now turn an
+`OBJECT` result (e.g. an interned `String` returned from `cratonvm_invoke_static`)
+back into bytes it can read.
+
+- **`char *cratonvm_string_utf8(CratonVm *vm, CratonRef str)`** — reads a
+  `java.lang.String` handle into a freshly-allocated NUL-terminated UTF-8 buffer,
+  reusing the VM's own `vm::read_java_string` primitive (the same one the JNIEnv
+  `GetStringUTFChars` slot uses; `SharedVm.heap` is `pub` and `vm_object` is
+  re-exported under `cratonvm_vm::vm::*`, so no vm-crate change was needed).
+  Returns NULL + last-error on a bad handle or a non-`String`. Interior NULs are
+  stripped so `CString::new` cannot fail.
+- **`void cratonvm_free_string(char *s)`** — releases that caller-owned buffer
+  (the buffer is NOT the thread-local last-error buffer; this mirrors JNI's
+  `GetStringUTFChars`/`ReleaseStringUTFChars` ownership split).
+- Header `cratonvm.h` + the C harness comment + Rust tests updated: a non-live
+  null-handle test for `cratonvm_string_utf8` and a `free_string(NULL)` no-op,
+  plus a `new_string → string_utf8 → assert "embed" → free_string` round trip in
+  the `--cfg flat_api_live_vm` test.
+- Still next: `cratonvm_invoke_virtual` (needs a clean Vm virtual-dispatch entry
+  — deferred), object-field read-back, the varargs overload, real cbindgen, and
+  the `cratonvm-embed` Rust facade.
+
 ## Effort
 
 L. Layer 1 (curate/document the existing Rust API) is S–M and immediately

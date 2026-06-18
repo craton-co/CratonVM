@@ -7339,7 +7339,14 @@ fn wrap_annotation_in_real_proxy(
     ann_cid: ClassId,
     handler: ObjectRef,
 ) -> Option<ObjectRef> {
-    let proxy_cid = crate::define_or_get_proxy_class(ctx, 0, &[ann_cid])?;
+    let proxy_cid = match crate::define_or_get_proxy_class(ctx, 0, &[ann_cid]) {
+        crate::ProxyClassOutcome::Real(cid) => cid,
+        // Gate-off degrade or a generation failure: fall back to the bare
+        // AnnotationProxy. This annotation path degrades gracefully and is
+        // independently gated (CRATONVM_REAL_ANNOTATIONS) — it never throws,
+        // even when the proxy STRICT mode is on.
+        _ => return None,
+    };
     let n = ctx.class_num_total_fields(proxy_cid).max(3);
     let real = ctx.alloc_object(proxy_cid, n);
     ctx.set_field(real, 0, Value::Object(Some(handler)));

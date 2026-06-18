@@ -150,6 +150,13 @@ struct Args {
     #[arg(long = "XX:AuditMissingNatives")]
     audit_missing_natives: bool,
 
+    /// HotSpot `-XX:+ShowCodeDetailsInExceptionMessages` (JEP 358): route the
+    /// non-invoke null-deref opcodes (getfield/putfield/arraylength/array
+    /// access/monitor/athrow) through the helpful-NPE message helper. Default
+    /// off here pending the message-string compliance soak.
+    #[arg(long = "XX:ShowCodeDetailsInExceptionMessages")]
+    show_code_details_in_exception_messages: bool,
+
     /// NEW-10: dump the missing-natives audit log to the given JSON file
     /// on VM shutdown. Implies `--XX:AuditMissingNatives`. The output
     /// schema is `{ "missing_natives": [{class, name, descriptor,
@@ -905,6 +912,14 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
             // Default is off; nothing to emit.
             i += 1;
         }
+        // `-XX:+ShowCodeDetailsInExceptionMessages` -> the clap toggle.
+        // `-XX:-...` -> drop (default off here, pending the compliance soak).
+        else if a == "-XX:+ShowCodeDetailsInExceptionMessages" {
+            out.push("--XX:ShowCodeDetailsInExceptionMessages".into());
+            i += 1;
+        } else if a == "-XX:-ShowCodeDetailsInExceptionMessages" {
+            i += 1;
+        }
         // `-XX:-UseContainerSupport` -> `--XX:-UseContainerSupport`
         // (the clap long name literally is `XX:-UseContainerSupport`).
         else if a == "-XX:-UseContainerSupport" {
@@ -1229,6 +1244,15 @@ fn run() -> Result<()> {
     if args.enable_native_access.is_some() {
         cratonvm_native_builtins::panama::set_native_access_enabled(true);
     }
+
+    // -XX:+ShowCodeDetailsInExceptionMessages (JEP 358): publish to the
+    // env_cache so the interpreter's helpful-NPE opcode gate observes it on
+    // first read, before Vm::new(config) runs any bytecode (same OnceLock
+    // timing rationale as --nojit above). CRATONVM_HELPFUL_NPE_OPCODES, if set,
+    // still overrides it.
+    cratonvm_vm::runtime::env_cache::set_show_code_details_in_exception_messages(
+        args.show_code_details_in_exception_messages,
+    );
 
     // GPU handlers — only compiled when the `gpu` Cargo feature is on.
     // Without the feature, the CPU execution path below is reached
@@ -1674,6 +1698,11 @@ fn run() -> Result<()> {
     config.audit_missing_natives = args.audit_missing_natives
         || args.dump_missing_natives.is_some()
         || args.dump_missing_natives_grouped.is_some();
+
+    // -XX:±ShowCodeDetailsInExceptionMessages — record on the VmConfig too, so
+    // the resolved config reflects the flag (env_cache was already set from
+    // `args` above for the interpreter gate).
+    config.show_code_details_in_exception_messages = args.show_code_details_in_exception_messages;
 
     // JDWP debug server
     if let Some(port) = args.jdwp_port {
@@ -3970,6 +3999,27 @@ mod tests {
         let out = normalize_java_launcher_argv(argv(&[
             "java",
             "-XX:-AuditMissingNatives",
+            "Main",
+        ]));
+        assert_eq!(out, argv(&["java", "Main"]));
+    }
+
+    #[test]
+    fn hotspot_xx_show_code_details_toggle() {
+        // `-XX:+ShowCodeDetailsInExceptionMessages` -> clap long form.
+        let out = normalize_java_launcher_argv(argv(&[
+            "java",
+            "-XX:+ShowCodeDetailsInExceptionMessages",
+            "Main",
+        ]));
+        assert_eq!(
+            out,
+            argv(&["java", "--XX:ShowCodeDetailsInExceptionMessages", "Main"])
+        );
+        // Disabled form drops the flag (default is off here).
+        let out = normalize_java_launcher_argv(argv(&[
+            "java",
+            "-XX:-ShowCodeDetailsInExceptionMessages",
             "Main",
         ]));
         assert_eq!(out, argv(&["java", "Main"]));

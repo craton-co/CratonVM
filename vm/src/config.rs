@@ -189,6 +189,17 @@ pub struct VmConfig {
     /// auto-size heap and thread pools inside Docker/Kubernetes.
     pub use_container_support: bool,
 
+    /// HotSpot `-XX:±ShowCodeDetailsInExceptionMessages` (JEP 358). When
+    /// `true`, the interpreter routes the *non-invoke* null-deref opcodes
+    /// (getfield/putfield/arraylength/array-access/monitor/athrow) through the
+    /// JEP-358 `Cannot ... because "<expr>" is null` helper. Defaults to `false`
+    /// here (HotSpot's own default is `true`) until a differential compliance
+    /// run clears the message-string change; the increment-1 invoke-site
+    /// message is unconditionally on regardless of this flag. The
+    /// `CRATONVM_HELPFUL_NPE_OPCODES` env var, when set, overrides this flag.
+    /// See [`crate::runtime::env_cache::helpful_npe_opcodes`].
+    pub show_code_details_in_exception_messages: bool,
+
     /// Unified logging spec (`-Xlog:...`). When `Some`, the unified
     /// logging framework is initialized at VM startup with the given
     /// HotSpot-style spec string (e.g. `gc*=info:stdout:time,level,tags`).
@@ -339,6 +350,7 @@ impl Default for VmConfig {
             heap_dump_on_oom: false,
             heap_dump_path: None,
             use_container_support: true,
+            show_code_details_in_exception_messages: false,
             xlog_spec: None,
             jvmti_agent_options: Vec::new(),
             #[cfg(feature = "gpu-offload")]

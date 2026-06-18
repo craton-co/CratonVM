@@ -1,5 +1,21 @@
 # JEP 358 — Helpful NullPointerException Messages
 
+> **Increment 3 landed (2026-06-18).** Step 5b: the real HotSpot opt-out flag
+> `-XX:±ShowCodeDetailsInExceptionMessages` now drives the non-invoke opcode
+> routing, replacing the interim `CRATONVM_HELPFUL_NPE_OPCODES`-only gate.
+> - New `VmConfig.show_code_details_in_exception_messages` (default `false`,
+>   pending the message-string compliance soak; HotSpot's own default is `true`).
+> - `vm-cli` parses `-XX:+/-ShowCodeDetailsInExceptionMessages` (rewritten to the
+>   clap `--XX:ShowCodeDetailsInExceptionMessages` toggle) and publishes it to
+>   `env_cache::set_show_code_details_in_exception_messages` before `Vm::new`.
+> - `env_cache::helpful_npe_opcodes()` now returns: the explicit
+>   `CRATONVM_HELPFUL_NPE_OPCODES` env var if set (developer override, wins),
+>   else the `-XX` flag value, else the built-in default (off). The increment-1
+>   invoke-site message remains unconditionally on.
+> - Remaining: step 6 (JIT-NPE parity, deopt-gated) and flipping the default to
+>   HotSpot parity (`true`) after the differential compliance run. Embedding
+>   (`libcratonvm`) does not yet wire the flag from its `VmConfig` — follow-up.
+
 > **Increment 2 landed (2026-06-18).** Extends the JEP-358 message shape from
 > the increment-1 invoke site to the remaining interpreter null-deref opcodes,
 > and replaces the synthetic `<localN>` spelling with real source names when a
