@@ -14476,39 +14476,62 @@ fn execute_invokestatic_cached(
                 cached.method_name.as_ref(),
                 cached.method_descriptor.as_ref(),
             );
-            // wire-tiered-manager increment 1: start the background compile
-            // thread once (idempotent) so enqueued tasks are drained OFF the
-            // mutator thread. `on_method_invocation` increments the per-method
-            // counter and, when the tiered thresholds are crossed, ENQUEUES a
-            // CompilationTask at the recommended tier (instead of the old code
-            // discarding the tier into `_`). The background worker consumes that
-            // queue. For this increment the worker uses a drain-only compile
-            // closure and the mutator keeps its existing inline upgrade below;
-            // moving compilation fully off-mutator is increment 2.
-            crate::jit::tiered::ensure_background_compiler(&shared.tiered_manager, || {
-                Box::new(|_task: &crate::jit::tiered::CompilationTask| -> u64 {
-                    // Increment-1 placeholder: real codegen wiring (which needs
-                    // VM-init / class-metadata access outside this item's
-                    // subsystem boundary) lands in a later increment. Draining
-                    // here proves tasks flow off-thread and clears the queued
-                    // flag via `complete_task`.
-                    0
-                })
-            });
+            // wire-tiered-manager increment 2: OFF-THREAD codegen, gated
+            // default-OFF behind `CRATONVM_BG_COMPILE`.
+            //
+            //  * Flag ON  — start the background compile thread once (idempotent)
+            //    with the REAL compile closure below, then ENQUEUE-ONLY: the
+            //    tiered manager's `on_method_invocation` pushes a CompilationTask
+            //    at the recommended tier and the worker compiles it off the
+            //    mutator (publishing into `shared.jit_cache`). The mutator does
+            //    NOT compile inline; it keeps interpreting until the worker
+            //    publishes, at which point the `jit_cache` fast-path at the top
+            //    of the `Bytecode` arm flips this call site to `Jit`.
+            //  * Flag OFF (default) — never start the worker; keep the existing
+            //    inline `try_jit_upgrade_with_gate` path EXACTLY as before so the
+            //    off-thread pipeline cannot regress steady-state behaviour until
+            //    proven. (`on_method_invocation` still enqueues, but with no
+            //    worker draining the queue this is the historical no-op.)
+            let bg_compile_on = crate::runtime::env_cache::bg_compile();
+            if bg_compile_on {
+                // Real off-thread compile closure. Captures a `Weak<SharedVm>`
+                // (the worker outlives no Arc of its own) and, per drained task,
+                // upgrades it and runs the same codegen entry point the inline
+                // path uses — `try_jit_compile_callee` does the by-name lookup +
+                // `jit::try_compile` + `shared.jit_cache` publish. Returns the
+                // wall-clock compile time in ms for the tiered stats.
+                let weak_vm: std::sync::Weak<SharedVm> = shared
+                    .self_arc
+                    .read()
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_default();
+                crate::jit::tiered::ensure_background_compiler(&shared.tiered_manager, || {
+                    Box::new(move |task: &crate::jit::tiered::CompilationTask| -> u64 {
+                        background_compile_task(&weak_vm, task)
+                    })
+                });
+            }
             let recommended_tier =
                 shared.tiered_manager.on_method_invocation(&tiered_key);
             if let Some(tier) = recommended_tier {
                 if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
                     eprintln!(
-                        "[cratonvm-jitc] tiered-enqueue {}.{}{} tier={:?} invoc_count={}",
+                        "[cratonvm-jitc] tiered-enqueue {}.{}{} tier={:?} invoc_count={} bg={}",
                         cached.class_name,
                         cached.method_name,
                         cached.method_descriptor,
                         tier,
-                        invoc_count
+                        invoc_count,
+                        bg_compile_on,
                     );
                 }
             }
+            // When background compilation is ON the mutator does NOT compile
+            // inline — the worker owns codegen. Skip straight to interpreted
+            // execution; a later call picks up the published JIT entry via the
+            // `jit_cache` fast-path above.
+            if !bg_compile_on {
             // WP2.4-F1: pass the bytecode entry's gate to inherit
             // the staleness binding — the JIT'd body executes the same
             // declaring class, so a future `redefine_class` must
@@ -14547,6 +14570,7 @@ fn execute_invokestatic_cached(
                     );
                 }
             }
+            } // end !bg_compile_on inline-upgrade path
             } // end invocation threshold check
 
             // Fallback: interpreted execution
@@ -16700,6 +16724,72 @@ fn try_jit_compile_callee_slow(
     }
 
     Some((entry, needs_ctx))
+}
+
+/// wire-tiered-manager increment 2 — the REAL off-thread compile callback.
+///
+/// Invoked on the background compile thread (see
+/// `jit::tiered::start_background_compiler`) for each `CompilationTask` the
+/// tiered manager drained off the mutator. Gated by `CRATONVM_BG_COMPILE`
+/// (the closure is only installed when the flag is on).
+///
+/// It upgrades the captured `Weak<SharedVm>` (the worker holds no `Arc` of its
+/// own, so it cannot keep the VM alive past teardown) and runs the same codegen
+/// entry point the inline mutator path uses: [`try_jit_compile_callee`] does the
+/// by-name `(class, method, descriptor)` lookup, builds the constant-pool
+/// resolvers, calls `jit::try_compile`, and PUBLISHES the result into
+/// `shared.jit_cache`. Publishing into the shared cache is the cross-thread
+/// "flip the invoke cache" mechanism: the per-thread `invoke_cache` is
+/// thread-local and cannot be mutated from here, but the `Bytecode` arm's
+/// `jit_cache` fast-path (interpreter.rs ~14366) upgrades the call site to
+/// `Jit` on the next mutator invocation once the entry is present.
+///
+/// Step 3 (C1/C2 routing): the target tier selects the intended backend via
+/// [`crate::jit::tiered::tier_uses_optimized_backend`]. The VM's current
+/// `try_compile` chooses single-pass vs. optimized by process-global env flags
+/// rather than a per-call switch, so both tiers presently funnel into
+/// `try_jit_compile_callee` and the C1 (no-opt) routing is a documented STUB —
+/// the `optimized` hint is computed and logged but a per-call no-opt toggle
+/// through `try_compile` is follow-up work.
+///
+/// Returns the wall-clock compile time in milliseconds for the tiered stats.
+/// A compile miss / bail (native shadow, skip-listed, backend bail, or a dropped
+/// VM) simply returns `0` — the queued flag is still cleared by the worker's
+/// `complete_task`, and a later mutator invocation re-attempts.
+fn background_compile_task(
+    weak_vm: &std::sync::Weak<SharedVm>,
+    task: &crate::jit::tiered::CompilationTask,
+) -> u64 {
+    let shared = match weak_vm.upgrade() {
+        Some(s) => s,
+        None => return 0, // VM dropped (teardown) — nothing to compile.
+    };
+    let optimized = crate::jit::tiered::tier_uses_optimized_backend(task.target_tier);
+    if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+        eprintln!(
+            "[cratonvm-jitc] bg-compile {}.{}{} tier={:?} optimized={}{}",
+            task.method_key.class_name,
+            task.method_key.method_name,
+            task.method_key.descriptor,
+            task.target_tier,
+            optimized,
+            task.osr_bci
+                .map(|b| format!(" osr_bci={b}"))
+                .unwrap_or_default(),
+        );
+    }
+    let start = std::time::Instant::now();
+    // Real codegen + publish into the shared JIT cache. `try_jit_compile_callee`
+    // is the by-name entry point shared with the JIT dispatch helpers; it stores
+    // the compiled body under `(class, method, descriptor)` so the mutator's
+    // `jit_cache` fast-path flips the call site to `Jit` on its next call.
+    let _ = try_jit_compile_callee(
+        &shared,
+        &task.method_key.class_name,
+        &task.method_key.method_name,
+        &task.method_key.descriptor,
+    );
+    start.elapsed().as_millis() as u64
 }
 
 /// Convert a JIT panic payload into a `MethodCallFailed`.

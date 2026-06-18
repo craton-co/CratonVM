@@ -206,6 +206,15 @@ cached_is_set!(jit_dispatch_dbg, "CRATONVM_DBG_JIT_DISPATCH");
 // Default-OFF until a `try_emit_inline_body` miscompile (Spring boot enum CCE)
 // is root-caused. See `try_jit_upgrade_with_gate`.
 cached_is_set!(jit_main_inline, "CRATONVM_JIT_MAIN_INLINE");
+// wire-tiered-manager increment 2: opt-in OFF-THREAD codegen. When set, the
+// interpreter's invocation tier-up trigger ENQUEUES a `CompilationTask` for the
+// background compile thread (which runs the real codegen via
+// `try_jit_compile_callee` and publishes into `shared.jit_cache`) and DOES NOT
+// compile inline on the mutator. Default-OFF: the mutator keeps its existing
+// inline `try_jit_upgrade_with_gate` path so the off-thread pipeline cannot
+// regress steady-state behaviour until proven on the gauntlet. See
+// `docs/feature-designs/wire-tiered-manager.md` (Increment 2).
+cached_is_set!(bg_compile, "CRATONVM_BG_COMPILE");
 // Invocation-count tier-up for INSTANCE methods (invokevirtual/invokeinterface).
 // DEFAULT-ON as of 2026-06-15 (bug-03 layer B). Previously default-OFF: only
 // static methods had an invocation counter (`execute_invokestatic_cached`), so

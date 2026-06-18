@@ -375,6 +375,26 @@ impl CompilerCore {
 /// supplied by the VM at startup; `tiered.rs` only owns the scheduling.
 pub type CompileFn = Box<dyn Fn(&CompilationTask) -> u64 + Send + 'static>;
 
+/// Whether a target tier should use the **optimized** (C2-equivalent) backend.
+///
+/// wire-tiered-manager increment 2 / Step 3: this is the policy half of the
+/// C1/C2 backend split. `C1`/`C1WithProfiling` map to the fast single-pass
+/// (no-opt) backend; `C2` (and the `FullProfile` collection tier, which only
+/// reaches codegen as a C2 promotion) map to the optimizing pipeline.
+///
+/// The *codegen* half lives VM-side (the `cratonvm-jit` crate cannot reference
+/// `SharedVm` or the interpreter's compile entry points), so the VM-supplied
+/// [`CompileFn`] consumes this hint to pick its compile strategy. The current
+/// VM backend (`jit::try_compile`) selects single-pass vs. optimized by
+/// process-global env flags rather than a per-call switch, so the C1 routing is
+/// presently a *stub* — both tiers funnel into the same entry point and this
+/// hint is advisory until a per-call no-opt toggle is threaded through
+/// `try_compile` (tracked as wire-tiered-manager Step 3 follow-up).
+#[inline]
+pub fn tier_uses_optimized_backend(tier: CompilationTier) -> bool {
+    matches!(tier, CompilationTier::C2 | CompilationTier::FullProfile)
+}
+
 /// Handle to the spawned background compile thread.
 ///
 /// Dropping the handle (or calling [`BackgroundCompiler::shutdown`]) signals the
@@ -1672,6 +1692,115 @@ mod tests {
         }
 
         // Clean shutdown joins the worker thread.
+        drop(bg);
+        assert!(!mgr.compiler_active(), "worker stopped after shutdown");
+    }
+
+    // ── Tier → backend routing (Step 3) ──────────────────────────────────
+
+    #[test]
+    fn tier_routing_selects_optimized_backend_for_c2() {
+        // C1 tiers route to the fast single-pass (no-opt) backend; C2 (and the
+        // FullProfile collection tier, which only reaches codegen as a C2
+        // promotion) route to the optimizing pipeline.
+        assert!(!tier_uses_optimized_backend(CompilationTier::Interpreter));
+        assert!(!tier_uses_optimized_backend(CompilationTier::C1));
+        assert!(!tier_uses_optimized_backend(CompilationTier::C1WithProfiling));
+        assert!(tier_uses_optimized_backend(CompilationTier::FullProfile));
+        assert!(tier_uses_optimized_backend(CompilationTier::C2));
+    }
+
+    // ── Increment 2: flag-gated off-thread compile publishes the Jit target ──
+
+    /// wire-tiered-manager increment 2: with background compilation enabled, a
+    /// crossed threshold enqueues a task that the worker compiles OFF the
+    /// mutator thread; the worker then "publishes" the compiled entry (here a
+    /// shared `Jit`-target map standing in for `SharedVm::jit_cache`, which is
+    /// VM-crate-only) and the manager's tier is flipped to the compiled tier —
+    /// the jit-crate analogue of the invoke cache being updated to the `Jit`
+    /// target. Deterministic: blocks on an `mpsc` recv, never sleeps.
+    #[test]
+    fn flag_on_threshold_compiles_off_thread_and_publishes_jit_target() {
+        use std::sync::mpsc;
+
+        // A stand-in for the VM's `jit_cache`: the compile closure inserts the
+        // method key here to model "the Jit target is now installed/published".
+        let published: Arc<Mutex<Vec<MethodKey>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Low C2 threshold so a couple of invocations route STRAIGHT to C2
+        // (the optimized backend), exercising the Step-3 routing decision.
+        let policy = CompilationPolicy {
+            c1_threshold: u32::MAX, // skip the C1 step
+            c2_threshold: 2,
+            c2_min_invocations: 2,
+            osr_threshold: u32::MAX,
+            tiered_enabled: true,
+            c1_profiling: true,
+        };
+        let mgr = TieredCompilationManager::new(policy);
+        let key = test_key();
+
+        let mutator_thread = std::thread::current().id();
+        let (tx, rx) = mpsc::channel::<(CompilationTier, bool, std::thread::ThreadId)>();
+        let published_w = Arc::clone(&published);
+        let bg = mgr
+            .start_background_compiler(Box::new(move |task: &CompilationTask| -> u64 {
+                // Real compile_fn shape: pick the backend by tier (Step 3),
+                // "publish" the Jit target, and report back off-thread.
+                let optimized = tier_uses_optimized_backend(task.target_tier);
+                published_w.lock().push(task.method_key.clone());
+                tx.send((task.target_tier, optimized, std::thread::current().id()))
+                    .unwrap();
+                3
+            }))
+            .expect("worker should start");
+
+        // Drive invocations on the mutator thread until C2 is recommended.
+        assert!(
+            mgr.on_method_invocation(&key).is_none(),
+            "1st invocation: below threshold"
+        );
+        let rec = mgr.on_method_invocation(&key);
+        assert_eq!(
+            rec,
+            Some(CompilationTier::C2),
+            "threshold crossing enqueues a C2 task (straight-to-C2 path)"
+        );
+
+        // Worker drains + compiles off-thread; block on the channel (no sleep).
+        let (compiled_tier, optimized, worker_thread) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker must drain the task");
+        assert_eq!(compiled_tier, CompilationTier::C2);
+        assert!(
+            optimized,
+            "C2 must route to the optimized backend (Step 3 routing)"
+        );
+        assert_ne!(
+            worker_thread, mutator_thread,
+            "compilation must run OFF the mutator thread"
+        );
+
+        // After completion the worker publishes the tier (invoke-cache analogue)
+        // and clears the queue. Bounded spin on the completion counter.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while mgr.completed_compilations() == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(mgr.completed_compilations(), 1, "one task completed");
+        assert!(mgr.queue_empty(), "queue drained");
+        assert_eq!(
+            mgr.current_tier(&key),
+            CompilationTier::C2,
+            "Jit target (tier) published by the worker"
+        );
+        assert_eq!(
+            *published.lock(),
+            vec![key.clone()],
+            "the compiled method's Jit target was published off-thread"
+        );
+        assert_eq!(mgr.stats().c2_compilations.load(Ordering::Relaxed), 1);
+
         drop(bg);
         assert!(!mgr.compiler_active(), "worker stopped after shutdown");
     }
