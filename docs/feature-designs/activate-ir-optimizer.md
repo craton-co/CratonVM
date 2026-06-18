@@ -110,6 +110,68 @@ not yet on.
    (`FrameValue::VirtualObject` / `materialize_virtual_objects`). Until deopt
    lands, restrict scalar replacement to objects non-escaping on **all** paths.
 
+## Increment 1 (DSE + widened escape analysis) landed
+
+Status: **landed** on `rm/activate-ir-optimizer`. This is the first landable
+slice of Fronts 2 and 3, taken now that the φ/branch SIGSEGV dam is fixed on
+`dev` (the branchy IR path is live, so these passes run on real branchy
+methods).
+
+**What landed**
+
+1. **DSE pass (`jit/src/ir_optimize.rs`, `eliminate_dead_stores`)** — a new
+   dead-*store* pass, distinct from the existing pure-node DCE
+   (`eliminate_dead_nodes`). It removes a `Store` whose written location is
+   overwritten by a later store with no intervening reader. It is wired into
+   the `optimize()` fixed-point loop *before* `eliminate_dead_nodes` so the
+   freed value chains get DCE'd in the same iteration. Soundness guards:
+   - Only stores to a **provably-local allocation** (`New`/`NewArray` base)
+     are ever removed; any Param / loaded-ref / call-result / unknown base is
+     left untouched.
+   - The "overwritten before any read" check is a straight-line scan in
+     node-id order. Every non-pure, non-store node — including all control /
+     merge / phi / projection nodes and any `Load`/`Call`/`Return`/`Guard`/
+     monitor — is a **memory barrier** that flushes the pending set, so two
+     stores only ever match inside one straight-line region (where node-id
+     order is a valid before/after relation). This dodges the "node-id order
+     ≠ global program order" hazard without a real alias oracle.
+   - The location key is structural `(base_node, index_node, MemKind)`; two
+     distinct `New` nodes never alias, so an interleaved store to a different
+     local allocation does not flush.
+   - The `Store` operand reader (`store_operands`) tolerates both the compact
+     `[base, value]` layout (EA bridge / hand-built graphs) and the full
+     `[ctrl, mem, base, index, value]` layout; an unrecognised layout is
+     treated as a barrier (never removed).
+
+2. **Widened escape → scalar replacement (`jit/src/escape_analysis.rs`,
+   `find_scalar_replacements`)** — the candidate walk was rewritten from a
+   single-level use scan (which bailed via the catch-all on *any* non-
+   load/store use) to a transparent-alias worklist:
+   - **`Op::Dead` uses are skipped**, not rejected (a stale dead use-edge
+     observes nothing and must not block SR).
+   - **A `NoEscape` `Op::Phi` that provably aliases *only* this allocation is
+     treated as a transparent copy**: its onward field loads/stores are
+     folded just like direct ones. This fires SR on the
+     `o = (cond ? o : o)`-through-a-merge shape the narrow scan rejected.
+   - Soundness: the phi is accepted only when (a) its resolved points-to set
+     is the singleton `{alloc}` **and** (b) *every* reference-producing input
+     resolves to exactly `{alloc}`. Guard (b) closes the kafka bug-25-class
+     hole where a phi merging the allocation with an unknown reference
+     (`Param`/`Call`/`Load` — which contribute no points-to entry) would
+     spuriously look like a singleton; folding a load through such a phi
+     would miscompile the path that takes the foreign reference.
+
+**Tests added** (run from the worktree):
+- `cargo test -p jit dse` — DSE: removes an overwritten store, keeps a store
+  observed by an intervening load, keeps a store to a non-local (Param) base,
+  and does not match distinct fields.
+- `cargo test -p jit scalar_replacement_through_transparent_phi` and the
+  `phi_merging_*` / `skips_dead_use` cases — escape widening fires on the new
+  shape and the two soundness guards (ambiguous phi, alloc+Param phi) bail.
+
+**Not yet done** (still Fronts 2/3 follow-ups): SCEV-driven LICM/unroll, and
+guard-surviving scalar replacement (gated on `real-frame-deopt.md`).
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.
