@@ -916,6 +916,31 @@ pub struct ClassManager {
     /// T10.9.B: FxHashSet — keys are internal class names during loading.
     loading_guard: FxHashSet<String>,
 
+    /// Names of synthetic-stub classes whose real `.class` is known to be
+    /// absent from every current classpath.
+    ///
+    /// `ensure_synthetic_class` / `load_class` try to *upgrade* an existing
+    /// synthetic stub to its real bytecode by re-running the full
+    /// (CDS → bootstrap → extension → application → IMPL-JARS) classpath
+    /// scan on every call. For stubs that can never resolve to a real class
+    /// — chiefly the VM-internal `cratonvm/synthetic/AnonymousObject$N`
+    /// allocated for every `HashMap`/`LinkedHashMap` node (and friends) —
+    /// that scan re-runs on *every object allocation*. With a large
+    /// application classpath (Hibernate + JAXB + dozens of dep JARs) each
+    /// allocation becomes O(num_jars × zip-probes), turning reflection-heavy
+    /// model building (JAXB `ClassInfoImpl`) into a multi-minute hang
+    /// (HIB-DEV-03). Memoizing the absent result makes the second and all
+    /// later upgrade attempts O(1).
+    ///
+    /// Correctness: the only event that can make a previously-absent name
+    /// resolvable is a classpath extension, so the set is cleared by
+    /// [`Self::extend_application_classpath`] /
+    /// [`Self::extend_bootstrap_classpath`]. `defineClass` does not change
+    /// classpath findability and is reached only after `get_loaded_class_id`
+    /// misses, so it needs no invalidation here. This mirrors the JVM's own
+    /// sticky negative class resolution.
+    synthetic_upgrade_absent: FxHashSet<String>,
+
     /// T10.5 — per-class vtable descriptor layout, indexed by ClassId.
     /// Populated by `define_class_with_options` at link time and used by
     /// subclasses of the same class as the "parent vtable" when computing
@@ -1280,6 +1305,7 @@ impl ClassManager {
             class_bytes_cache_cap: DEFAULT_CLASS_BYTES_CACHE_CAP,
             cds_class_cache: FxHashMap::with_capacity_and_hasher(64, Default::default()),
             loading_guard: FxHashSet::default(),
+            synthetic_upgrade_absent: FxHashSet::default(),
             vtable_descriptors: FxHashMap::with_capacity_and_hasher(256, Default::default()),
             skip_bytecode_verification: FxHashSet::default(),
             hidden_name_counter: 0,
@@ -1391,6 +1417,28 @@ impl ClassManager {
         None
     }
 
+    /// True when a previous classpath scan for `name` failed and the
+    /// classpath has not been extended since. Callers use this to skip the
+    /// (expensive, full-classpath) synthetic-stub upgrade rescan. See
+    /// [`Self::synthetic_upgrade_absent`].
+    #[inline]
+    fn synthetic_upgrade_known_absent(&self, name: &str) -> bool {
+        self.synthetic_upgrade_absent.contains(name)
+    }
+
+    /// Record that the real `.class` for `name` is absent from every current
+    /// classpath, so future upgrade attempts can short-circuit. Bounded with
+    /// clear-on-full so a pathological probe set (many distinct absent names)
+    /// cannot grow the set without limit — losing the memo just reverts to
+    /// the (correct, slower) rescan behaviour.
+    fn note_synthetic_upgrade_absent(&mut self, name: &str) {
+        const SYNTHETIC_ABSENT_CACHE_CAP: usize = 8192;
+        if self.synthetic_upgrade_absent.len() >= SYNTHETIC_ABSENT_CACHE_CAP {
+            self.synthetic_upgrade_absent.clear();
+        }
+        self.synthetic_upgrade_absent.insert(name.to_string());
+    }
+
     /// Register a minimal synthetic class with the given name and field count.
     ///
     /// If a class with this name is already loaded, returns its existing
@@ -1419,14 +1467,24 @@ impl ClassManager {
                 .get(id)
                 .map(|c| c.is_synthetic_stub)
                 .unwrap_or(false);
-            if is_synthetic && !name.starts_with('[') {
-                if let Ok((bytes, loader_id)) = self.find_class_bytes_delegated(name) {
-                    if let Err(e) = self.upgrade_synthetic_class(id, name, &bytes, loader_id) {
-                        tracing::debug!(
-                            class = name,
-                            "ensure_synthetic_class: real-class upgrade failed: {e:?}"
-                        );
+            // HIB-DEV-03: skip the full-classpath upgrade rescan once we've
+            // learned the real `.class` is absent — otherwise every
+            // allocation of this stub (e.g. a `HashMap` node's
+            // `cratonvm/synthetic/AnonymousObject$N`) re-scans every JAR.
+            if is_synthetic
+                && !name.starts_with('[')
+                && !self.synthetic_upgrade_known_absent(name)
+            {
+                match self.find_class_bytes_delegated(name) {
+                    Ok((bytes, loader_id)) => {
+                        if let Err(e) = self.upgrade_synthetic_class(id, name, &bytes, loader_id) {
+                            tracing::debug!(
+                                class = name,
+                                "ensure_synthetic_class: real-class upgrade failed: {e:?}"
+                            );
+                        }
                     }
+                    Err(_) => self.note_synthetic_upgrade_absent(name),
                 }
             }
             return id;
@@ -1448,16 +1506,22 @@ impl ClassManager {
         // bytes are genuinely absent (`find_class_bytes_delegated` errs) we
         // skip this entirely and build the requested-size synthetic stub
         // below, exactly as before.
-        if !name.starts_with('[') && self.find_class_bytes_delegated(name).is_ok() {
-            match self.load_class(name) {
-                Ok(id) => return id,
-                Err(e) => {
-                    tracing::debug!(
-                        class = name,
-                        "ensure_synthetic_class: real-class load failed, \
-                         falling back to synthetic stub: {e:?}"
-                    );
+        if !name.starts_with('[') && !self.synthetic_upgrade_known_absent(name) {
+            if self.find_class_bytes_delegated(name).is_ok() {
+                match self.load_class(name) {
+                    Ok(id) => return id,
+                    Err(e) => {
+                        tracing::debug!(
+                            class = name,
+                            "ensure_synthetic_class: real-class load failed, \
+                             falling back to synthetic stub: {e:?}"
+                        );
+                    }
                 }
+            } else {
+                // No real `.class` on the classpath — memoize so the stub we
+                // create below isn't re-probed on every future allocation.
+                self.note_synthetic_upgrade_absent(name);
             }
         }
         // Every synthetic stub object IS-A `java.lang.Object`, so its
@@ -1987,16 +2051,25 @@ impl ClassManager {
             let is_synthetic = self.class_store.get(id)
                 .map(|c| c.is_synthetic_stub)
                 .unwrap_or(false);
-            if is_synthetic && !name.starts_with('[') {
-                if let Ok((bytes, loader_id)) = self.find_class_bytes_delegated(name) {
-                    match self.upgrade_synthetic_class(id, name, &bytes, loader_id) {
-                        Ok(()) => {
-                            tracing::debug!(class = name, "Upgraded synthetic stub to real class");
-                        }
-                        Err(e) => {
-                            tracing::debug!(class = name, "Failed to upgrade synthetic stub: {e:?}");
+            // HIB-DEV-03: skip the full-classpath upgrade rescan once the real
+            // `.class` is known absent (re-armed on classpath extension) so a
+            // repeatedly-loaded synthetic stub doesn't re-scan every JAR.
+            if is_synthetic
+                && !name.starts_with('[')
+                && !self.synthetic_upgrade_known_absent(name)
+            {
+                match self.find_class_bytes_delegated(name) {
+                    Ok((bytes, loader_id)) => {
+                        match self.upgrade_synthetic_class(id, name, &bytes, loader_id) {
+                            Ok(()) => {
+                                tracing::debug!(class = name, "Upgraded synthetic stub to real class");
+                            }
+                            Err(e) => {
+                                tracing::debug!(class = name, "Failed to upgrade synthetic stub: {e:?}");
+                            }
                         }
                     }
+                    Err(_) => self.note_synthetic_upgrade_absent(name),
                 }
             }
             return Ok(id);
@@ -4156,6 +4229,12 @@ impl ClassManager {
         for path in paths {
             self.application.add_path(path);
         }
+        // A new classpath entry may now contain a class previously memoized
+        // as absent — re-arm the synthetic-stub upgrade scan. See
+        // [`Self::synthetic_upgrade_absent`].
+        if !paths.is_empty() {
+            self.synthetic_upgrade_absent.clear();
+        }
     }
 
     /// Append paths to the BOOTSTRAP class search path so the classes they
@@ -4167,6 +4246,11 @@ impl ClassManager {
     pub fn extend_bootstrap_classpath(&mut self, paths: &[String]) {
         for path in paths {
             self.bootstrap.add_path(path);
+        }
+        // See [`Self::extend_application_classpath`]: a new bootstrap entry can
+        // satisfy a name previously memoized as absent.
+        if !paths.is_empty() {
+            self.synthetic_upgrade_absent.clear();
         }
     }
 
