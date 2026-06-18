@@ -1,0 +1,238 @@
+# Real-Frame-Deopt — x64 Backend Backport (Phase A→production)
+
+Status: scoped / not started. Effort: **L** (the gating slice of the XL keystone;
+Phases B/C deferred). Companion to [`real-frame-deopt.md`](real-frame-deopt.md),
+which landed the mechanism on the dormant IR path. This doc scopes bringing it
+to the **production single-pass x64 backend** so it actually deopts real
+workloads.
+
+> Scoped via a multi-agent understand→design→adversarial-review pass over the
+> seven x64 subsystems involved. `file:line` citations below are from that pass
+> and reflect the tree at the time of writing — verify before editing, code moves.
+
+## Goal
+
+When a guard fails in JIT code, rebuild a **precise** interpreter frame at the
+trapping bci — locals / operand stack reconstructed from live machine state —
+**in the deopt stub, before the epilogue** — instead of returning the `i64::MIN`
+sentinel and re-running the whole method from bci 0
+(`vm/src/runtime/interpreter.rs:17043` → CacheMiss; slow sink `:17322` →
+`Ok(None)`). This kills the side-effect double-execution that blocks all
+speculative JIT optimization.
+
+**Phase-A scope (this doc):** single non-inlined methods; GPR + frame-slot
+provenance only; **no** `VirtualObject` materialization (`deopt.rs:735` is still
+a panic stub); **no** inlined-frame chains; **no** FP/XMM-live, category-2-live,
+or monitor-bearing methods — all excluded by a positive `can_deopt_resume` gate.
+
+## Relationship to the IR-path Phase A (what is reused vs new)
+
+**Reused verbatim** (the backend-agnostic *consumer* + *resolver*): `FrameValue`
+/ `FrameState` / `DeoptimizationPoint`; `reconstruct_frame_from_machine_state`
+(`deopt.rs:844`), `SavedRegisters` (`deopt.rs:764`, `repr(C)`, `gpr[16]`),
+`resolve_value` (`deopt.rs:788`: `Register(r)→gpr[r]`, `StackSlot(off)→*(rbp+off)`),
+`take_last_deopt` (`deopt.rs:870`); the `CompiledMethod.deopt_points` /
+`_deopt_point_boxes` / `find_deopt_point` plumbing (`lib.rs:831,838,1148`). The
+**in-stub trampoline ordering** (call the deopt entry with `rbp` *live* BEFORE
+`add rsp / pop rbp / ret`, `ir_lower.rs:851-860`) and the **per-guard
+boxed-pointer keying** (`ir_lower.rs:650-669`) are reused as the structural model.
+
+**Superseded** (the IR-specific SSA producers — cannot run single-pass):
+`ir_lower.rs` `frame_value_for` (`:786`, NodeId→FrameValue, StackSlot/Int only),
+`resolve_frame_state` (`:876`), `build_deopt_points` (`:891`), `emit_deopt_stub`
+(`:845`); `ir.rs` `SafepointSnapshot` recording. x64 reimplements their
+equivalents over its own state.
+
+**Net-new beyond the IR equivalents** (these were the load-bearing review
+findings — the IR path deferred all three):
+1. **Populated `SavedRegisters` + Register resolution.** `ir_deopt_entry` passes
+   `SavedRegisters::default()` (`deopt.rs:893`) and the IR lowerer spills every
+   value, so `resolve_value`'s `Register` arm (`deopt.rs:790`) has **never run**.
+   x64 is the first producer to emit `FrameValue::Register` — requires a **3-arg**
+   entry carrying the spilled register file (the 2-arg `ir_deopt_entry` can't).
+2. **A real type source.** The IR path tags everything `Int`. x64 must emit
+   `Object` from a *positive* oop source and primitives from a *new* width source
+   (see "Genuinely new", below).
+3. **VM-side interpreter resume.** The IR path only stashes `LAST_DEOPT`
+   (`deopt.rs:895`); pushing real interpreter `Frame`s is entirely new, modeled on
+   `route_jit_exception_through_method` (`interpreter.rs:6697`).
+
+## Reuse map (hosted by x64 today)
+
+| Existing | Location | Reused as |
+|---|---|---|
+| Guard+stub framework: group by `(bci,reason)`, shared stub, forward-JMP patch | `x64.rs:12459-12534` | **Extended** with a new frame-deopt stub branch; existing `jit_uncommon_trap` stubs untouched |
+| Whole-GPR blind-spill at safepoints (SB-CRASH-04 `safepoint_reg_spill` / `reg_spill_base`) | `x64.rs:6310-6331`, `emit_pre_safepoint_spill:6300` | Same `emit_store_local` spill pattern, **extended to all 16 GPRs** laid out for `SavedRegisters.gpr` (RAX=0..R15=15) |
+| Per-slot location model: `StackSlot` enum {Frame/CalleeSaved/Scratch/Xmm}, `local_assignments`/`xmm_assignments` from regalloc, `reg_for_local`/`xmm_for_local`/`local_offset` | `x64.rs:5134-5153,5210,5219,7017-7024,6047` | The **provenance source**: `reg_for_local(i)→Register`, else `StackSlot(-local_offset(i))`; operand `Frame(off)→StackSlot(-off)`, `CalleeSaved/Scratch(r)→Register(r)` |
+| Coverage gate `fully_oop_covered` (`safepoint_pcs ⊆ mapped ∧ !osr ∧ inline_sites empty`) | `x64.rs:21206-21210` | Exact shape mirrored for `can_deopt_resume` |
+| `local_oop_masks` / `local_oop_reached` / `stack_oop_marks` | `x64.rs:5485,5488,5471,2298-2351` | **Positive oop tag ONLY** — `Object` iff bit SET *and* reached. **Never** infer `Int` from a clear bit (see Risks) |
+| Interpreter deopt sinks (`result==i64::MIN && deopt_signaled`) | `interpreter.rs:17043,17322`; `take_jit_deopt_pending:16966` | The branch points. They **cannot** read machine state (frame already torn down) — they only TAKE a pre-built `LAST_DEOPT` frame |
+| `route_jit_exception_through_method` (Frame::new_pooled, refill_pools, push_frame_and_fire_entry → FramePushed) | `interpreter.rs:6697,6808-6843` | Structural **model** for VM-side resume, incl. the GC-root-before-refill ordering |
+
+## Genuinely new components (`build_new`)
+
+1. **3-arg x64 deopt entry** in `jit_integration.rs`:
+   `x64_deopt_entry(point: *const DeoptimizationPoint, rbp: u64, regs: *const SavedRegisters) -> i64`
+   — reads the spilled GPR file, calls `reconstruct_frame_from_machine_state`,
+   stashes `LAST_DEOPT`, returns `i64::MIN`. (`ir_deopt_entry` has no register
+   param.)
+2. **`emit_deopt_snapshot_at_guard(reason)`** — emits a `DeoptimizationPoint` AT
+   the eligible guard (NOT at call-return safepoints; the BCE pilot at
+   `x64.rs:13182` is a loop header, not a safepoint, so `emit_oop_map_for_safepoint`
+   never runs there). Walks locals `0..num_locals` and `self.stack[i]`, tags
+   `Object` only from the positive oop source, primitives from the new width
+   source, `Undefined` otherwise. Boxes the point; bakes the box ptr as imm64 into
+   the guard's deopt branch (mirror `ir_lower.rs:650-669`).
+3. **Primitive type/width source** — the single most under-scoped item.
+   `local_oop_masks`/`stack_oop_marks` are oop-vs-not **binary** and cannot
+   distinguish int/long/float/double or cat-1 vs cat-2. Thread the verifier
+   `StackMapTable` type state (or a small primitive-width shadow) so each non-oop
+   live slot gets a concrete `Int`/`Float`/width. **Treat as a new subsystem, not
+   a sibling of `emit_oop_map_for_safepoint`.**
+4. **Frame-deopt stub variant** inside `emit_deopt_stubs`: spill 16 GPRs into the
+   `SavedRegisters` layout, `arg0`=boxed point ptr (imm64), `arg1`=rbp,
+   `arg2`=lea spill region, `CALL x64_deopt_entry` **before** `emit_epilogue`, set
+   `JIT_DEOPT_PENDING`, RAX=`i64::MIN`.
+5. **`Compiler.deopt_points` + `deopt_boxes` fields + finalize transfer** (mirror
+   `cm.oop_maps = compiler.oop_maps` at `x64.rs:21189`). This producer is new —
+   x64 has **zero** references to `deopt_points` today (grep-verified).
+6. **`can_deopt_resume` per-method flag** (mirror `fully_oop_covered`):
+   `precise_maps ∧ !compiled_via_osr ∧ inline_sites.is_empty() ∧
+   scalar_replaced.is_empty()` (excludes monitor-elision *and* VirtualObject)
+   `∧ no XMM-live / cat-2-live slot at any frame-deopt guard ∧ every guard
+   FrameState fully typed (no Undefined live slot) ∧ !ACC_SYNCHRONIZED`. When
+   false the method stays entirely on the `i64::MIN` re-run path.
+7. **Canonical-boundary eligibility filter** — frame-deopt only at block
+   boundaries where Scratch/Xmm operand caches are flushed
+   (`x64.rs:5146-5152`); mid-bytecode guards (e.g. div-by-zero `x64.rs:12113-12126`,
+   operands already popped → short stack) are excluded in Phase A.
+8. **VM-side resume materializer** — extends the `interpreter.rs:17043`/`:17322`
+   sinks: when `CRATONVM_DEOPT_REAL` on AND `cm.can_deopt_resume` AND
+   `take_last_deopt()==Some` for this invocation → root the frame oops, refill
+   pools, build one `Frame` via `Frame::new_pooled` (cat-2 two-slot expansion,
+   pc=bci), `push_frame_and_fire_entry`, return `FramePushed`. Root oops **before**
+   `refill_pools_from_shared` (GC hazard).
+9. **`CRATONVM_DEOPT_REAL`** env gate (default off) so new-resume and `i64::MIN`
+   re-run are never both live for a method; consulted identically at **both** sinks.
+10. **`CRATONVM_DEOPT_VERIFY`** test-only eager-deopt differential verifier:
+    deopt at every eligible guard, reconstruct, compare reconstructed-interpreter
+    result vs JIT result — catches map/regalloc drift (`real-frame-deopt.md:267-270`).
+    CI-mandatory before any guard family is flipped.
+
+## Design: the in-stub reconstruction model
+
+The single biggest correction over the naive plan: **the `i64::MIN` interpreter
+sink runs AFTER the JIT method returned — `rbp` and the GPRs are gone.** So all
+machine-state capture + reconstruction happens **inside the deopt stub before the
+epilogue** (exactly as the IR path does, `ir_lower.rs:855` call before `:857-860`
+epilogue). The sink only *takes* the pre-built `LAST_DEOPT` frame and pushes
+interpreter `Frame`s.
+
+**Keying:** each guard bakes a pointer to its own boxed `DeoptimizationPoint` as
+an imm64 the stub loads — **not** `find_deopt_point`-by-native-offset. This
+sidesteps the native-offset-anchoring trap entirely (the BCE guard at `13205-13211`
+is emitted before `pc_to_native[pc]` at `13217`). `find_deopt_point` is reserved
+for any future call-return-safepoint deopt.
+
+**Resume disambiguation:** resume keys on `take_last_deopt()` returning `Some` for
+*this* invocation, **NOT** on the `i64::MIN` value — which collides with a legit
+`Long.MIN_VALUE` return (documented `interpreter.rs:17086-17091`). Clear
+`LAST_DEOPT` before every JIT call; both sinks consult the identical predicate.
+
+## Implementation steps (ordered, each independently landable)
+
+1. **Snapshot at the BCE pilot guard, emit-and-discard.** Add `Compiler.deopt_points`
+   + `deopt_boxes`; `emit_deopt_snapshot_at_guard()` called only at the speculative-BCE
+   loop-header guard (`x64.rs:13187`). Build `FrameState` from regalloc; tag `Object`
+   positively, primitives from the new width source, `Undefined` otherwise. Box +
+   bake imm64 into a not-yet-routed slot. No control-flow change, nothing reads it.
+   *Lands:* unit test asserts a point exists at THAT guard's bci with locals matching
+   regalloc (Register for a register-allocated IV, StackSlot for a spilled local,
+   Object for the array ref). *Gate:* none (additive). *Risk:* low — except the new
+   primitive/width source is the real work; emit `Undefined` + `can_deopt_resume=false`
+   rather than guess.
+2. **3-arg entry + in-stub GPR spill + reconstruct (stash, no resume).** Add
+   `x64_deopt_entry`; extend `emit_deopt_stubs` with the frame-deopt branch; route
+   ONLY the pilot guard here behind `CRATONVM_DEOPT_REAL`. *Lands:* unit test — pilot
+   guard fails at runtime, `take_last_deopt()` returns a frame whose Register-resolved
+   locals equal the LIVE register values (non-zero — proves the spill+3-arg wiring;
+   the IR default-zeros path would fail this). *Gate:* new reason; only pilot routes;
+   stashed not resumed → no behavior change without the flag. *Risk:* med — `gpr`
+   indexing must be RAX=0..R15=15; call must precede epilogue.
+3. **Build + validate the interpreter Frame (no resume yet).** At the sink, when
+   flag+gate+`Some`: root oops, refill pools, build a `Frame` from the resolved
+   locals/stack — then DISCARD it and still return CacheMiss. Assert the built frame's
+   locals/stack/pc equal the interpreter's own re-run frame for a side-effect-free,
+   cat-2-free pilot. *Lands:* end-to-end (flag on) equality + a `CRATONVM_GC_STRESS`
+   variant with a young-gen oop local proving the temporary-rooting. *Gate:* built +
+   discarded → still CacheMiss. *Risk:* med — cat-2 + GC-rooting exercised here,
+   de-risked because nothing resumes.
+4. **Flip the resume (both sinks).** Replace discard+CacheMiss with
+   `push_frame_and_fire_entry` + `FramePushed`; apply the IDENTICAL branch at the
+   slow sink (`:17322`, vs `Ok(None)`). Clear `LAST_DEOPT` + `take_jit_deopt_pending`
+   once. *Lands:* a method that deopts after a side-effecting bytecode resumes at the
+   guard bci WITHOUT re-running the side effect (the exact double-exec bug). *Gate:*
+   `CRATONVM_DEOPT_REAL`; off → both sinks behave as today. *Risk:* **high** — first
+   Frame pushed from machine state; mitigated by Step 3 + `can_deopt_resume` exclusions.
+5. **Coverage gate finalize + eager-deopt verifier.** Finalize `can_deopt_resume`;
+   add `CRATONVM_DEOPT_VERIFY`. *Lands:* verifier clean across jit + VM smoke; a
+   deliberately one-slot-shifted snapshot is caught; each exclusion (XMM/cat-2/monitor/
+   inlined/OSR/under-typed) gets a negative test. *Gate:* verifier test-only;
+   `can_deopt_resume` is the per-method kill-switch.
+6. **Widen to other canonical-boundary non-speculative guards + measure.** Route
+   additional canonical-boundary guards one family at a time, still gated; wire
+   `DeoptimizationLog` (`deopt.rs:159`) for deopt-rate/most-common-reason. *Lands:* a
+   representative kafka/h2 method that today re-runs on a bounds/null guard shows
+   precise resume; no fast-path throughput regression.
+
+## Risks (load-bearing, grounded)
+
+- **Sink runs post-return** — all capture is in-stub before the epilogue; any design
+  reading `SavedRegisters`/`rbp` at the sink is incorrect.
+- **`i64::MIN` value collision** — resume must key on `take_last_deopt()==Some`, not
+  the value+flag; both sinks identical; clear `LAST_DEOPT` before each JIT call.
+- **Clear oop bit is NOT primitive** — `compute_local_oop_masks` is an intersection
+  dataflow (`x64.rs:2332`); a clear bit conflates primitive, dead, and
+  conditionally-oop. Tagging clear→`Int` mistypes a live oop as a primitive (GC-root
+  mistake, no conservative backstop on the resume path). Only SET+reached → `Object`;
+  primitives need the separate positive source; else `Undefined` → `can_deopt_resume=false`.
+- **Elided monitors dropped on resume** — `monitorenter`/`exit` emit nothing under
+  scalar replacement (`x64.rs:20376-20396`); a resumed frame's `monitorexit` hits an
+  un-entered monitor. Phase-A gate: `can_deopt_resume=false` if `scalar_replaced`
+  non-empty OR `ACC_SYNCHRONIZED` OR any monitor op present.
+- **Mid-bytecode guards capture a short/non-canonical stack** — div-by-zero pops
+  operands before the test; Scratch/Xmm caches flush before calls/branches. Phase A
+  restricts to canonical block boundaries.
+- **XMM/FP and cat-2 have no resolver slot** — `SavedRegisters` is `gpr[16]` only.
+  `can_deopt_resume=false` for any XMM-resident or cat-2 live slot at a guard, until
+  `SavedRegisters` gains `xmm[16]` + a width source (follow-up).
+- **GC during resume** — `refill_pools_from_shared` (`:6808`) can GC before the Frame
+  is pushed; root the reconstructed oops first (mirror
+  `route_jit_exception_through_method`). GC-stress test required.
+- **Recompilation invalidation** — boxed imm64 ptrs + a FrameState encode a specific
+  regalloc; tie `can_deopt_resume` to a compilation epoch, fall back to `i64::MIN` on
+  MakeNotEntrant until versioned points land; assert each point's region ⊆ owning
+  `CompiledMethod` code range.
+- **Map drift** — a one-slot disagreement silently restores garbage; mitigated by the
+  mandatory eager-deopt verifier and the canonical-boundary restriction (snapshot and
+  codegen read the same state at the same `cur_bc_pc`).
+
+## Open question — pilot guard choice (a real judgment call)
+
+The sequencing reviewer flagged that the design doc says "route one **non-speculative**
+guard first" (`real-frame-deopt.md:247-250`), but this plan pilots the **speculative**
+BCE loop-header guard. The synthesis chose BCE deliberately: it sits at a **canonical
+block boundary** (clean operand stack, int IV + array ref, all GPR/canonical), whereas
+the non-speculative div-by-zero guard is **mid-bytecode** (operands already popped →
+short stack, harder to snapshot). The argument: for piloting the *mechanism*,
+canonical-boundary cleanliness matters more than speculative-vs-not, and resume is
+proven (Steps 1–4) before any real speculation is *flipped* — so speculation
+correctness stays isolated from the deopt machinery. If a non-speculative guard at a
+clean boundary exists, it would satisfy both constraints; otherwise this is the
+recommended tradeoff. **Decide before Step 1.**
+
+Other open questions: primitive/width source granularity (full StackMapTable vs a
+minimal primitive shadow — StackMapTable is a Step-1 prerequisite for any non-int-only
+method); whether to add `SavedRegisters.xmm[16]` now vs Phase B; explicit
+compilation-epoch versioning of deopt points; and the runtime de-speculation action
+when a guard deopts repeatedly (fall back to `i64::MIN` re-run vs MakeNotEntrant).
