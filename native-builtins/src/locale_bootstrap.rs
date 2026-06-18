@@ -165,9 +165,51 @@ fn locale_country(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 
 fn locale_tag(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(Value::Object(Some(this))) = args.first() {
+        // Synthetic locales (our getDefault) carry a recorded BCP-47 tag.
         if let Some(&(_, _, tag)) = synthetic_locale_data().lock().get(this) {
             return Ok(Some(Value::Object(Some(ctx.create_string(tag)))));
         }
+        // Real JDK Locale: build a BCP-47 tag from its baseLocale subtags.
+        // The previous unconditional "und" fallback dropped language/script/
+        // region/variant for ANY real Locale — e.g. `new Locale("","DE")`
+        // produced "und" instead of "und-DE", and even "de-DE" -> "und"
+        // (LocaleJavaTypeDescriptorTest: expected <und-DE> but got <und>).
+        let lang_o = base_locale_field(ctx, *this, "language");
+        let script_o = base_locale_field(ctx, *this, "script");
+        let region_o = base_locale_field(ctx, *this, "region");
+        let variant_o = base_locale_field(ctx, *this, "variant");
+        let lang = lang_o.and_then(|s| ctx.read_string(s)).unwrap_or_default();
+        let script = script_o.and_then(|s| ctx.read_string(s)).unwrap_or_default();
+        let region = region_o.and_then(|s| ctx.read_string(s)).unwrap_or_default();
+        let variant = variant_o.and_then(|s| ctx.read_string(s)).unwrap_or_default();
+
+        // language[-script][-region][-variant…]; empty language => "und".
+        let mut tag = if lang.is_empty() {
+            "und".to_string()
+        } else {
+            lang.to_ascii_lowercase()
+        };
+        if !script.is_empty() {
+            // script subtag is title-case (e.g. "Hant").
+            let mut sc = script.to_ascii_lowercase();
+            if let Some(first) = sc.get_mut(0..1) {
+                first.make_ascii_uppercase();
+            }
+            tag.push('-');
+            tag.push_str(&sc);
+        }
+        if !region.is_empty() {
+            tag.push('-');
+            tag.push_str(&region.to_ascii_uppercase());
+        }
+        if !variant.is_empty() {
+            // Locale stores multiple variants "_"-joined; BCP-47 uses "-".
+            for sub in variant.split('_').filter(|s| !s.is_empty()) {
+                tag.push('-');
+                tag.push_str(&sub.to_ascii_lowercase());
+            }
+        }
+        return Ok(Some(Value::Object(Some(ctx.create_string(&tag)))));
     }
     Ok(Some(Value::Object(Some(ctx.create_string("und")))))
 }
