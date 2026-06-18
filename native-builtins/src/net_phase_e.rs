@@ -5586,7 +5586,12 @@ struct HttpHandlerEntry {
 }
 
 struct ServerState {
-    listener: Option<TcpListener>,
+    // Behind a Mutex so stop() can `take()` (and thus close) the OS listener
+    // SYNCHRONOUSLY — a stopped host must immediately refuse connections so a
+    // round-robin client retries another node instead of connecting into a dead
+    // server (ES MultipleHosts stopRandomHost). The accept loop locks it briefly
+    // per (non-blocking) accept; taking it makes the next iteration exit.
+    listener: Mutex<Option<TcpListener>>,
     running: AtomicBool,
     handlers: Mutex<Vec<HttpHandlerEntry>>,
     bound_port: AtomicI32,
@@ -6273,28 +6278,30 @@ fn re10_start_server(server_id: i32) -> std::io::Result<()> {
     if state.running.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
-    let listener = match state.listener.as_ref() {
-        Some(l) => l.try_clone()?,
-        None => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "not bound",
-            ));
-        }
-    };
+    if state.listener.lock().is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "not bound",
+        ));
+    }
     let state_cl = state.clone();
     std::thread::Builder::new()
         .name(format!("cratonvm-httpserver-{server_id}"))
         .spawn(move || {
-            listener.set_nonblocking(true).ok();
             while state_cl.running.load(Ordering::SeqCst) {
-                match listener.accept() {
+                // Accept under the listener lock (the listener is non-blocking, so
+                // this returns immediately). stop() takes the listener out from
+                // under us to close it synchronously, after which `as_ref()` is
+                // None and we exit.
+                let accepted = {
+                    let guard = state_cl.listener.lock();
+                    match guard.as_ref() {
+                        Some(l) => l.accept(),
+                        None => break,
+                    }
+                };
+                match accepted {
                     Ok((stream, _peer)) => {
-                        // If the server was stopped between accept() returning and
-                        // now, close the connection instead of queueing a request no
-                        // dispatcher will serve — a stopped host must fail fast (so
-                        // the RestClient retries another node) rather than hang the
-                        // request. See ES MultipleHosts stopRandomHost.
                         if !state_cl.running.load(Ordering::SeqCst) {
                             drop(stream);
                             break;
@@ -6322,9 +6329,6 @@ fn re10_start_server(server_id: i32) -> std::io::Result<()> {
                     Err(_) => break,
                 }
             }
-            // Drop our listener clone promptly so the OS socket can close and a
-            // stopped host starts refusing connections.
-            drop(listener);
         })?;
     Ok(())
 }
@@ -6347,10 +6351,13 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             let addr = SocketAddr::new(ip, port.clamp(0, 65535) as u16);
             let listener = TcpListener::bind(addr)
                 .map_err(|e| ioex(format!("HttpServer bind {addr}: {e}")))?;
+            // Non-blocking so the accept loop polls `running` (and so it can be
+            // closed promptly by stop()).
+            listener.set_nonblocking(true).ok();
             let bound_port = listener.local_addr().map(|a| a.port() as i32).unwrap_or(port);
             let server_id = next_server_id();
             let state = std::sync::Arc::new(ServerState {
-                listener: Some(listener),
+                listener: Mutex::new(Some(listener)),
                 running: AtomicBool::new(false),
                 handlers: Mutex::new(Vec::new()),
                 bound_port: AtomicI32::new(bound_port),
@@ -6393,6 +6400,11 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
         if id >= 0 {
             if let Some(state) = server_registry().lock().get(&id) {
                 state.running.store(false, Ordering::SeqCst);
+                // Close the OS listener NOW (drop it) so the port immediately
+                // refuses connections — a round-robin client must see a stopped
+                // host fail fast and retry, not connect into a dead server in the
+                // window before the accept thread notices `running`.
+                state.listener.lock().take();
             }
             re10_dispatch_pending(ctx, id)?;
             server_registry().lock().remove(&id);
