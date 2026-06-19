@@ -3560,6 +3560,12 @@ fn register_hashmap_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "<init>", "()V", native_map_init);
     r.register(c, "<init>", "(I)V", native_map_init_capacity);
     r.register(c, "<init>", "(Ljava/util/Map;)V", native_map_init_from_map);
+    // Serialization: drive the stream from the actual backing so a HashMap that
+    // was built via the native `<init>(Map)` copy-constructor (which leaves the
+    // real `loadFactor`/`table` unset) round-trips instead of serializing
+    // `loadFactor=0.0` + zero entries. See `native_hashmap_write_object`.
+    r.register(c, "writeObject", "(Ljava/io/ObjectOutputStream;)V", native_hashmap_write_object);
+    r.register(c, "readObject", "(Ljava/io/ObjectInputStream;)V", native_hashmap_read_object);
     r.register(c, "size", "()I", native_map_size);
     r.register(c, "isEmpty", "()Z", native_map_is_empty);
     r.register(
@@ -13314,6 +13320,122 @@ fn native_map_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         native_map_put(ctx, &[Value::Object(Some(this)), key, value])?;
     }
 
+    Ok(None)
+}
+
+/// JDK `HashMap.tableSizeFor` — smallest power of two >= `cap`.
+fn hashmap_table_size_for(cap: i32) -> i32 {
+    let mut n = (cap - 1) as u32;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    if (n as i64) + 1 >= (1i64 << 30) {
+        1 << 30
+    } else {
+        (n + 1) as i32
+    }
+}
+
+/// Capacity to serialize as the HashMap stream's `buckets` int. Prefer the real
+/// `table` array length (a real-backed map serializes byte-identically to the
+/// real `writeObject`); otherwise pre-size from the entry count the way
+/// `HashMap.putMapEntries` does. The value is advisory — `readObject` recomputes
+/// threshold from `loadFactor` — so an approximation round-trips correctly.
+fn hashmap_serialized_capacity(ctx: &dyn NativeContext, this: ObjectRef, size: i32) -> i32 {
+    if let Some(slot) = ctx.resolve_field_index("java/util/HashMap", "table") {
+        if slot < ctx.object_num_fields(this) {
+            if let Value::Object(Some(tab)) = ctx.get_field(this, slot) {
+                let len = ctx.array_length(tab);
+                if len > 0 {
+                    return len as i32;
+                }
+            }
+        }
+    }
+    if size <= 0 {
+        return MAP_DEFAULT_CAPACITY as i32;
+    }
+    let ft = (size as f32 / 0.75) + 1.0;
+    hashmap_table_size_for(ft as i32).max(1)
+}
+
+/// `HashMap.writeObject(ObjectOutputStream)` — serialize from whatever backing
+/// the map actually uses.
+///
+/// CratonVM's `HashMap.<init>(Map)` copy-constructor (`native_map_init_from_map`)
+/// populates the synthetic bucket side-table but leaves the real-JDK `table` /
+/// `loadFactor` / `threshold` fields unset. The inherited real `writeObject`
+/// then serialized `loadFactor=0.0` with zero entries, so a peer's `readObject`
+/// threw `InvalidObjectException: Illegal load factor: 0.0` — breaking any
+/// object graph holding a `new HashMap<>(src)` (e.g. Hibernate's
+/// `@AttributeConverter` serializing an `Exif`/`Caption` value). Driving the
+/// stream from `collect_entries_any` (which reads native-backed *and*
+/// real-backed maps via the bucket reader + `entrySet().iterator()` fallback)
+/// and ensuring a valid `loadFactor` reproduces the real stream format for both.
+fn native_hashmap_write_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let oos = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    // Ensure the real `loadFactor`/`threshold` fields hold valid values before
+    // `defaultWriteObject` reads them. Only rewrites when `loadFactor` is still
+    // 0.0 (the native-backed case) — a real-backed map keeps its own 0.75.
+    if let Some(cname) = ctx.class_name_of_id(ctx.class_id_of_object(this)) {
+        ensure_hashtable_load_factor(ctx, this, &cname);
+    }
+    let entries = collect_entries_any(ctx, this);
+    let size = entries.len() as i32;
+    let cap = hashmap_serialized_capacity(ctx, this, size);
+    let oos_cls = "java/io/ObjectOutputStream";
+    // s.defaultWriteObject() — writes the non-transient loadFactor + threshold.
+    ctx.invoke(oos_cls, "defaultWriteObject", "()V", &[Value::Object(Some(oos))])?;
+    // s.writeInt(buckets); s.writeInt(size)
+    ctx.invoke(oos_cls, "writeInt", "(I)V", &[Value::Object(Some(oos)), Value::Int(cap)])?;
+    ctx.invoke(oos_cls, "writeInt", "(I)V", &[Value::Object(Some(oos)), Value::Int(size)])?;
+    // internalWriteEntries: key then value for each mapping.
+    for (key, value) in entries {
+        ctx.invoke(oos_cls, "writeObject", "(Ljava/lang/Object;)V", &[Value::Object(Some(oos)), key])?;
+        ctx.invoke(oos_cls, "writeObject", "(Ljava/lang/Object;)V", &[Value::Object(Some(oos)), value])?;
+    }
+    Ok(None)
+}
+
+/// `HashMap.readObject(ObjectInputStream)` — deserialize into the native
+/// backing. Mirrors `native_hashmap_write_object` and the real stream format:
+/// `defaultReadObject` (loadFactor + threshold), `readInt` buckets (ignored),
+/// `readInt` size, then size×(key, value) re-inserted via `native_map_put`.
+fn native_hashmap_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let ois = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let ois_cls = "java/io/ObjectInputStream";
+    ctx.invoke(ois_cls, "defaultReadObject", "()V", &[Value::Object(Some(ois))])?;
+    // buckets (ignored — capacity is recomputed from size)
+    let _ = ctx.invoke(ois_cls, "readInt", "()I", &[Value::Object(Some(ois))])?;
+    let n = match ctx.invoke(ois_cls, "readInt", "()I", &[Value::Object(Some(ois))])? {
+        Some(Value::Int(v)) => v,
+        _ => 0,
+    };
+    for _ in 0..n {
+        let key = ctx
+            .invoke(ois_cls, "readObject", "()Ljava/lang/Object;", &[Value::Object(Some(ois))])?
+            .unwrap_or(Value::Object(None));
+        let value = ctx
+            .invoke(ois_cls, "readObject", "()Ljava/lang/Object;", &[Value::Object(Some(ois))])?
+            .unwrap_or(Value::Object(None));
+        native_map_put(ctx, &[Value::Object(Some(this)), key, value])?;
+    }
     Ok(None)
 }
 
