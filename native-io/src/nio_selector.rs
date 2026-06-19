@@ -80,6 +80,32 @@ use std::time::{Duration, Instant};
 // the hot select() / interest-op update paths.
 use rustc_hash::FxHashMap;
 
+// Gated selector tracing (CRATONVM_DBG_SELECTOR=1): logs the kernel-wait
+// enter/exit and wakeup() with the carrier OS thread name (which carries the
+// Java thread name, set at Thread.start). Used to diagnose the intermittent
+// reactor worker leak at shutdown — a thread that logs ENTER but never EXIT is
+// parked in the kernel wait; the timeout_c value tells us whether it's an
+// infinite (-1) or timed wait, and whether a matching wakeup fired.
+fn sel_dbg_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CRATONVM_DBG_SELECTOR")
+            .map(|v| {
+                let t = v.trim();
+                !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn sel_dbg(msg: impl AsRef<str>) {
+    let tname = std::thread::current()
+        .name()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    eprintln!("[SEL] {} thread={}", msg.as_ref(), tname);
+}
+
 // ---------------------------------------------------------------------------
 // OP_* constants (JDK SelectionKey.OP_*)
 // ---------------------------------------------------------------------------
@@ -457,6 +483,9 @@ pub fn selector_wakeup(id: i32) -> Result<(), MethodCallFailed> {
         return Err(closed_selector());
     }
     st.woken = true;
+    if sel_dbg_enabled() {
+        sel_dbg(format!("WAKEUP id={id}"));
+    }
 
     // Linux: write a byte to the self-pipe to wake epoll_wait.
     #[cfg(target_os = "linux")]
@@ -1365,12 +1394,19 @@ pub fn selector_select(id: i32, timeout_ms: i64) -> Result<i32, MethodCallFailed
     // we still want the listener-accept side-effect via probe_cycle so the
     // `take_pending_accepted` test passes — but we rely on the kernel for
     // ready-detection.
+    if sel_dbg_enabled() {
+        sel_dbg(format!("ENTER id={id} timeout_c={timeout_c}"));
+    }
     #[cfg(target_os = "linux")]
     let count = kernel_select_linux(id, timeout_c)?;
     #[cfg(windows)]
     let count = kernel_select_windows(id, timeout_c)?;
     #[cfg(all(unix, not(target_os = "linux")))]
     let count = kernel_select_poll(id, timeout_c)?;
+    #[cfg(any(unix, windows))]
+    if sel_dbg_enabled() {
+        sel_dbg(format!("EXIT  id={id} n={count}"));
+    }
     #[cfg(not(any(unix, windows)))]
     let count = {
         // Fallback for unusual targets: probe loop.

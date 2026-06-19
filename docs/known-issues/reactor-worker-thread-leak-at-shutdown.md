@@ -53,6 +53,41 @@ and the worker blocks in `select()` forever → leaked, uninterruptible, empty-s
 This is in the same selector/reactor machinery touched by the ES-HANG-02 connect fix, but is a
 **shutdown-path wakeup race**, not the connect path.
 
+## Deeper diagnosis (this pass)
+
+Added gated selector tracing (`CRATONVM_DBG_SELECTOR=1`, commit pending) and ran the suite ~44 times
+with it on — **0 leaks**, vs ~1/16 without it. So this is a **Heisenbug**: any `eprintln`-based tracing
+(stderr lock + I/O) perturbs the interleaving and masks the race. Logging therefore cannot diagnose it.
+
+The trace (on clean runs) established the reactor I/O workers `select()` with a **finite 1000 ms
+timeout**, not an infinite one. That rules out the simplest theory: a missed wakeup on a 1000 ms select
+only delays shutdown ≤1 s, which would clear well within randomizedtesting's multi-second linger window —
+it cannot produce a *persistent* leak.
+
+Candidate-elimination of the VM's blocking primitives (all can be ruled out as *permanent*-stuck causes):
+- **`LockSupport.park`/AQS** — `ParkState::park` is mutex-serialised (unpark can't be lost), and
+  `park_interruptible` polls the interrupt flag every **5 ms**, so an interrupted/unparked AQS waiter
+  (`LinkedBlockingQueue.take` in a `ThreadPoolExecutor` worker, lock/condition `await`) self-heals in ≤5 ms.
+- **`Object.wait()`** — `Monitor::wait` likewise polls every 5 ms for the interrupt flag, so an interrupted
+  waiter wakes in ≤5 ms.
+- **`Thread.join()`** — uses the Rust `JoinHandle::join` (OS-level), no condvar lost-wakeup.
+- **Selector** — finite timeout + sticky `woken` (now) + buffered wakeup byte.
+
+Remaining permanent-stuck candidate: a thread in `Object.wait()` or a no-timeout blocking native that is
+**neither notified nor interrupted** at shutdown (so the 5 ms interrupt poll never trips). Note the
+`state=RUNNABLE` in the leak report is imprecise — `getState()` (post-`16d23e7b`) maps any alive thread to
+RUNNABLE, so the leaked thread may actually be parked/waiting.
+
+## THE blocker to fix first: cross-thread stack walking
+
+`java.lang.Thread.dumpThreads(...)` (native, `native-builtins/src/lib.rs`) returns **empty**
+`StackTraceElement[][]` ("we don't have full per-thread stack walking"), which is why
+`Thread.getAllStackTraces()` / the leak report shows `at (empty stack)`. Implementing it — safepoint the
+target (or read its frames while it's parked in a blocked region) and materialise its frame descriptors —
+would make the EXISTING leak reports show exactly where the worker is parked, **at leak-detection time,
+without per-call tracing that masks the race**. That is the prerequisite for a targeted fix; do it first,
+then catch one untraced leak and read the real stack.
+
 ## Next steps (remaining ~1/16 leak)
 
 The before-entry window is closed (`4064580d`); the residual is most likely the **worker already
