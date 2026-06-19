@@ -369,6 +369,18 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     #[cfg(feature = "synthetic-jdk")]
     register_phaser_natives(registry);
     register_priority_blocking_queue_natives(registry);
+    // ScheduledThreadPoolExecutor natives use a synthetic 3-field layout
+    // (poolSize=0, shutdown=1, taskList=2). On a REAL STPE that maps onto
+    // ctl(0)/workQueue(1)/mainLock(2): `native_stpe_init` writes Int into the
+    // reference fields ctl/workQueue (coerced to null) and an `Object[16]`
+    // into `mainLock`, so the inherited real `ThreadPoolExecutor.shutdownNow()`
+    // (which f157de8a switched to real worker-reaping bytecode) NPEs on
+    // `mainLock.lock()` in every `TomcatBaseTest.tearDown`. Gate behind
+    // synthetic-jdk only so the self-contained real STPE bytecode runs in
+    // real-JDK mode (same fix pattern as register_blocking_queue_natives /
+    // register_phaser_natives above). See
+    // docs/known-issues/tomcat-suite-bugs/11-stpe-mainlock-npe-teardown-regression.md.
+    #[cfg(feature = "synthetic-jdk")]
     register_executors_scheduled_natives(registry);
     register_concurrent_completeness_natives(registry);
     registry.set_category(__prev_cat);

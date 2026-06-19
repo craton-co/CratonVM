@@ -1470,24 +1470,14 @@ impl SharedVm {
                     Ok(Some(cratonvm_types::Value::Int(to_drain)))
                 },
             );
-            native_methods.register(
-                "java/util/concurrent/ScheduledThreadPoolExecutor",
-                "<init>",
-                "(ILjava/util/concurrent/ThreadFactory;)V",
-                |ctx, args| {
-                    let this = match args.first() {
-                        Some(cratonvm_types::Value::Object(Some(o))) => *o,
-                        _ => return Ok(None),
-                    };
-                    let cores = match args.get(1) {
-                        Some(cratonvm_types::Value::Int(v)) => *v,
-                        _ => 1,
-                    };
-                    ctx.set_field(this, 0, cratonvm_types::Value::Int(cores));
-                    ctx.set_field(this, 1, cratonvm_types::Value::Int(0));
-                    Ok(None)
-                },
-            );
+            // NOTE: do NOT register a synthetic ScheduledThreadPoolExecutor.<init>
+            // here. The synthetic 2-field poke (slots 0/1) corrupts the real STPE
+            // layout (ctl/workQueue) and leaves mainLock null, so the inherited
+            // real ThreadPoolExecutor.shutdownNow() NPEs on mainLock.lock() in
+            // TomcatBaseTest.tearDown. The real STPE constructor bytecode runs
+            // correctly on CratonVM once the synthetic STPE natives are gone (the
+            // native-collections copy is now gated behind synthetic-jdk). See
+            // docs/known-issues/tomcat-suite-bugs/11-stpe-mainlock-npe-teardown-regression.md.
             native_methods.register(
                 "java/util/concurrent/CopyOnWriteArrayList",
                 "addIfAbsent",
