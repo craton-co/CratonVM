@@ -50,11 +50,25 @@ maps default-on `32649b56`, pin-aware shadow reload `f4249f7a`, OOB-reload fix
   null→Class + getBean instantiates; `AfterAdviceBindingTests` 6/6 OK,
   `AroundAdviceBindingTests` 4/4 OK (both were fully failing) == HotSpot.
 
+- **Second shim bug found + fixed (3-state resolution).** The resolve shims
+  conflated "no class name" (a factory-method / `FactoryBean` / parent bean —
+  legitimate null) with "named-but-missing class" (partial-cp). M5's destructive
+  `removeBeanDefinition` fired for the no-class case too, deleting valid beans →
+  `AfterThrowing` lost `testBean` (`NoSuchBeanDefinitionException`). Fixed:
+  `resolve_bean_class_field` now returns `Resolved` / `Missing` / `NoClass`; M5
+  removes ONLY on `Missing`. No more spurious bean deletion (verified: AfterAdvice
+  6/6, Around 4/4 still pass, no regression).
 - **Residuals / caveats:**
-  - `AfterThrowingAdviceBindingTests` still fails — `NoSuchBeanDefinitionException:
-    No bean named 'testBean'` at test-execution time. SEPARATE bug (TestBean
-    resolves fine in AfterAdvice; not a regression — that class never passed on
-    CratonVM). Needs its own trace.
+  - `AfterThrowingAdviceBindingTests` STILL fails (6/6) — now one shim-layer
+    deeper: `BeanCreationException 'testBean': Target object must not be null`
+    from the `SimpleInstantiationStrategy.instantiate` shim, which returns null
+    when `beanClass` is still an unresolved String at instantiation (the
+    resolveBeanClass cache didn't reach the mbd that `instantiate` reads — likely
+    a merged-bean-definition copy mismatch, or `instantiate` should resolve the
+    String class itself like resolveBeanClass does). NEXT STEP: make the
+    `SimpleInstantiationStrategy.instantiate` shim resolve a String `beanClass`
+    via `resolve_bean_class_field` before giving up. Unique to AfterThrowing's
+    `throwing="java.lang.Throwable"` type-name advices; not a regression.
   - The Boot-demo battery (sportme / insurance / letsgo / demo) that these shims
     serve was NOT re-validated. The partial-classpath skip is preserved by
     design (None→skip for missing classes) but unconfirmed — validate before
