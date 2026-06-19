@@ -2458,6 +2458,90 @@ fn s_instantiation_strategy_instantiate(
 /// (`getTypeForFactoryBean`, `predictBeanType`, `isFactoryBean`,
 /// `findAutowireCandidates`) handles null gracefully; throwing would
 /// fail-fast in `preInstantiateSingletons`.
+/// Outcome of resolving a bean definition's class from its `beanClass` field.
+enum BeanClassResolution {
+    /// Loadable — the resolved `Class` mirror (cached back into `beanClass`).
+    Resolved(ObjectRef),
+    /// The definition names a class that is genuinely NOT on the (possibly
+    /// partial) classpath. This is the only case where dropping the bean to
+    /// keep a partial-classpath Boot app booting is appropriate.
+    Missing,
+    /// The definition carries NO class name at all (a factory-method bean, a
+    /// `FactoryBean` product, a parent-only definition, …). Real Spring's
+    /// `resolveBeanClass` returns `null` here WITHOUT touching the registry —
+    /// these beans are created another way and MUST NOT be removed.
+    NoClass,
+}
+
+/// Resolve a bean's class from `AbstractBeanDefinition`/`RootBeanDefinition`'s
+/// single `beanClass` field — an `Object` holding EITHER an already-resolved
+/// `Class` mirror OR the still-unresolved `String` class name. (`setBeanClassName`
+/// does `this.beanClass = beanClassName`; there is NO separate `beanClassName`
+/// field in current Spring — the prior shims read that non-existent field and so
+/// returned `null` for *every* bean, skipping all of them.)
+///
+/// On a loadable class, caches the resolved mirror back into `beanClass` (the
+/// real `resolveBeanClass` bytecode's `this.beanClass = resolvedClass`) so later
+/// `getBeanClass()` / `hasBeanClass()` observe it as resolved. Distinguishes
+/// `Missing` (named-but-unloadable → partial-classpath skip) from `NoClass`
+/// (no class name → legitimate null, never remove the bean).
+fn resolve_bean_class_field(ctx: &mut dyn NativeContext, recv: ObjectRef) -> BeanClassResolution {
+    let dbg = std::env::var_os("CRATONVM_DBG_RESOLVE_SHIM").is_some();
+    // Primary: the `beanClass` Object field (a Class mirror or a String name).
+    let name: Option<String> = match ctx.get_field_by_name(recv, "beanClass") {
+        Value::Object(Some(o)) => {
+            let cid = ctx.class_id_of_object(o);
+            if ctx.class_name_of_id(cid).as_deref() == Some("java/lang/Class") {
+                // Already resolved — return the mirror unchanged.
+                return BeanClassResolution::Resolved(o);
+            }
+            // Otherwise it is the unresolved String class name.
+            ctx.read_string(o)
+        }
+        _ => None,
+    };
+    // Legacy fallback: a dedicated `beanClassName` String field (older Spring).
+    let name = match name.or_else(|| match ctx.get_field_by_name(recv, "beanClassName") {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => None,
+    }) {
+        Some(n) => n,
+        None => {
+            // No class name at all — a factory/parent bean, NOT a missing class.
+            if dbg {
+                eprintln!("[resolve-shim] NoClass: no class name (factory/parent bean)");
+            }
+            return BeanClassResolution::NoClass;
+        }
+    };
+
+    let internal = name.replace('.', "/");
+    // Resolve the name to a Class; only classes actually on the classpath
+    // succeed (a named-but-unloadable class yields Missing → partial-cp skip).
+    let cid = match ctx.class_id_by_name(&internal) {
+        Some(c) => c,
+        None => match ctx.ensure_class_initialized(&internal) {
+            Ok(c) => c,
+            Err(e) => {
+                if dbg {
+                    eprintln!(
+                        "[resolve-shim] Missing: {internal} not on classpath (ensure_class_initialized ERR: {e:?})"
+                    );
+                }
+                return BeanClassResolution::Missing;
+            }
+        },
+    };
+    if dbg {
+        eprintln!("[resolve-shim] Resolved: {internal}");
+    }
+    let mirror = ctx.get_class_mirror(cid);
+    // Cache back into `beanClass` (the real bytecode's `this.beanClass =
+    // resolvedClass`), so getBeanClass()/hasBeanClass() see it resolved.
+    ctx.set_field_by_name(recv, "beanClass", Value::Object(Some(mirror)));
+    BeanClassResolution::Resolved(mirror)
+}
+
 fn m3_abstract_bean_definition_resolve_bean_class(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2466,27 +2550,13 @@ fn m3_abstract_bean_definition_resolve_bean_class(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // Read beanClassName String field via getfield by name
-    let name_obj = match ctx.get_field_by_name(recv, "beanClassName") {
-        Value::Object(Some(s)) => s,
-        _ => return Ok(Some(Value::Object(None))),
+    // Resolve from the real `beanClass` field; return the mirror when loadable,
+    // else null (no CNFE) — like the real bytecode, no registry mutation here.
+    let resolved = match resolve_bean_class_field(ctx, recv) {
+        BeanClassResolution::Resolved(m) => Some(m),
+        BeanClassResolution::Missing | BeanClassResolution::NoClass => None,
     };
-    let class_name = match ctx.read_string(name_obj) {
-        Some(s) => s,
-        None => return Ok(Some(Value::Object(None))),
-    };
-    let internal = class_name.replace('.', "/");
-    // Try to load via class manager; on failure return null (no CNFE).
-    if let Some(cid) = ctx.class_id_by_name(&internal) {
-        let mirror = ctx.get_class_mirror(cid);
-        return Ok(Some(Value::Object(Some(mirror))));
-    }
-    // Fallback: try ensure_class_initialized (which loads if necessary).
-    if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
-        let mirror = ctx.get_class_mirror(cid);
-        return Ok(Some(Value::Object(Some(mirror))));
-    }
-    Ok(Some(Value::Object(None)))
+    Ok(Some(Value::Object(resolved)))
 }
 
 fn m4_abstract_bean_factory_do_resolve_bean_class(
@@ -2498,24 +2568,13 @@ fn m4_abstract_bean_factory_do_resolve_bean_class(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let name_obj = match ctx.get_field_by_name(mbd, "beanClassName") {
-        Value::Object(Some(s)) => s,
-        _ => return Ok(Some(Value::Object(None))),
+    // Resolve from the real `beanClass` field (mirror or String name); null for
+    // a missing/absent class — like the real bytecode, no registry mutation.
+    let resolved = match resolve_bean_class_field(ctx, mbd) {
+        BeanClassResolution::Resolved(m) => Some(m),
+        BeanClassResolution::Missing | BeanClassResolution::NoClass => None,
     };
-    let class_name = match ctx.read_string(name_obj) {
-        Some(s) => s,
-        None => return Ok(Some(Value::Object(None))),
-    };
-    let internal = class_name.replace('.', "/");
-    if let Some(cid) = ctx.class_id_by_name(&internal) {
-        let mirror = ctx.get_class_mirror(cid);
-        return Ok(Some(Value::Object(Some(mirror))));
-    }
-    if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
-        let mirror = ctx.get_class_mirror(cid);
-        return Ok(Some(Value::Object(Some(mirror))));
-    }
-    Ok(Some(Value::Object(None)))
+    Ok(Some(Value::Object(resolved)))
 }
 
 /// Strategy B: `AbstractBeanFactory.resolveBeanClass(RootBeanDefinition,
@@ -2548,33 +2607,22 @@ fn m5_abstract_bean_factory_resolve_bean_class_with_name(
     };
     let bean_name_obj = args.get(2).copied();
 
-    // First, if `beanClass` is already a Class mirror (prior successful
-    // resolve), return it directly.
-    if let Value::Object(Some(cls_mirror)) = ctx.get_field_by_name(mbd, "beanClass") {
-        let cid = ctx.class_id_of_object(cls_mirror);
-        if ctx.class_name_of_id(cid).as_deref() == Some("java/lang/Class") {
-            return Ok(Some(Value::Object(Some(cls_mirror))));
+    // Resolve from the real `beanClass` field (already-resolved mirror, or the
+    // String class name). Loadable classes resolve (and cache back); a bean with
+    // NO class name (factory/parent bean) returns null WITHOUT removal (real
+    // Spring behaviour); ONLY a named-but-unloadable class falls through to the
+    // partial-classpath removal path below.
+    match resolve_bean_class_field(ctx, mbd) {
+        BeanClassResolution::Resolved(mirror) => {
+            return Ok(Some(Value::Object(Some(mirror))));
         }
-    }
-
-    let name_obj = match ctx.get_field_by_name(mbd, "beanClassName") {
-        Value::Object(Some(s)) => s,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let class_name = match ctx.read_string(name_obj) {
-        Some(s) => s,
-        None => return Ok(Some(Value::Object(None))),
-    };
-    let internal = class_name.replace('.', "/");
-
-    // Try to load.
-    if let Some(cid) = ctx.class_id_by_name(&internal) {
-        let mirror = ctx.get_class_mirror(cid);
-        return Ok(Some(Value::Object(Some(mirror))));
-    }
-    if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
-        let mirror = ctx.get_class_mirror(cid);
-        return Ok(Some(Value::Object(Some(mirror))));
+        BeanClassResolution::NoClass => {
+            // Factory-method / FactoryBean / parent bean — legitimate null.
+            // Removing it would corrupt the context (this was the spring-bug-10
+            // residual: AfterThrowing lost 'testBean' via this path).
+            return Ok(Some(Value::Object(None)));
+        }
+        BeanClassResolution::Missing => { /* fall through to removal */ }
     }
 
     // Class not on classpath. Remove the bean definition so Spring's

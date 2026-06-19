@@ -10,6 +10,78 @@
 | **Status** | 🟡 PARTIAL (audit 2026-06-19) — pin-aware shadow-reload correctness fix present (`f4249f7a`) but **only behind `CRATONVM_SHADOW_STACK=1 CRATONVM_SHADOW_PIN=1`** (default-OFF, ~7× overhead; movable path still broken). Under **default** flags the young-gen GC root-undercount race still fires. Family-A. |
 | **Suggested owner** | handoff (mixed causes; some overlap with bug-03 dispatch) |
 
+## ★★★★ UPDATE 2026-06-19 — the GC race is FIXED on current dev; the aspectj residual is a SEPARATE shim bug (resolveBeanClass read the wrong field), now fixed on a branch
+
+Re-measured on a current-dev binary (base `52efa1eb`, which has precise JIT oop
+maps default-on `32649b56`, pin-aware shadow reload `f4249f7a`, OOB-reload fix
+`ed81a263`, lazy-prologue `aa2ae19a`):
+
+- **The documented GC root-undercount race is GONE by default.** `MTRegex` (the
+  fast heavy-load repro) is clean under default / `SHADOW` / `SHADOW+PIN`,
+  including the doc's exact former-SIGSEGV configs (`MTRegex 1 8`, `4 3`) and
+  16-thread stress — `stale=0`, no crash. The aop.aspectj 14-class batch runs
+  **`stale=0`, no SIGSEGV, no LOADERR** (was stale=331 + rc=139). So precise-maps
+  default-on + the shadow-reload fixes closed the race. The `Stale pointer` /
+  `CCE TestExecutionResult$Status` / `AbstractMethodError getId` LOADERR
+  symptoms below no longer reproduce.
+
+- **The remaining aspectj FAILs are a DIFFERENT, deterministic bug — masked
+  until the race was fixed.** Root cause: the `spring_startup_bootstrap.rs`
+  `resolveBeanClass` shim family (M3 `AbstractBeanDefinition.resolveBeanClass`,
+  M4 `doResolveBeanClass`, M5 `AbstractBeanFactory.resolveBeanClass`) read a
+  field named **`beanClassName`**. Current Spring `AbstractBeanDefinition` has no
+  such field — `setBeanClassName` stores into the single `Object beanClass`
+  field. So the shims found nothing and returned **null for every bean** →
+  Spring skipped all beans → `BeanFactory.getType("testAspect")` returned null →
+  `MethodLocatingFactoryBean.setBeanFactory` threw `IllegalArgumentException:
+  Can't determine type of bean with name 'testAspect'`. Minimal repro
+  (`spring-suite/probe/GetTypeProbe.java`, no AOP): a plain
+  `<bean class="java.util.ArrayList">` had `resolveBeanClass`→null while
+  `ClassUtils.forName` + the Class-object path worked. Interpreter-level
+  (`--nojit` too); class-independent.
+
+- **Fix (branch `fix/spring-bug-10-resolvebeanclass-field`, commit `25e38b1b`,
+  NOT on dev).** Shared `resolve_bean_class_field` helper reads the real
+  `beanClass` field (mirror → return; String → resolve via class_id_by_name /
+  ensure_class_initialized; legacy `beanClassName` fallback), caches the resolved
+  mirror back into `beanClass` (the real bytecode's `this.beanClass =
+  resolvedClass`), and returns None only for a genuinely-missing class so the
+  partial-classpath skip M5 relies on is preserved. **Validated:** GetTypeProbe
+  null→Class + getBean instantiates; `AfterAdviceBindingTests` 6/6 OK,
+  `AroundAdviceBindingTests` 4/4 OK (both were fully failing) == HotSpot.
+
+- **Second shim bug found + fixed (3-state resolution).** The resolve shims
+  conflated "no class name" (a factory-method / `FactoryBean` / parent bean —
+  legitimate null) with "named-but-missing class" (partial-cp). M5's destructive
+  `removeBeanDefinition` fired for the no-class case too, deleting valid beans →
+  `AfterThrowing` lost `testBean` (`NoSuchBeanDefinitionException`). Fixed:
+  `resolve_bean_class_field` now returns `Resolved` / `Missing` / `NoClass`; M5
+  removes ONLY on `Missing`. No more spurious bean deletion (verified: AfterAdvice
+  6/6, Around 4/4 still pass, no regression).
+- **Residuals / caveats:**
+  - `AfterThrowingAdviceBindingTests` STILL fails (6/6) — now one shim-layer
+    deeper: `BeanCreationException 'testBean': Target object must not be null`
+    from the `SimpleInstantiationStrategy.instantiate` shim, which returns null
+    when `beanClass` is still an unresolved String at instantiation (the
+    resolveBeanClass cache didn't reach the mbd that `instantiate` reads — likely
+    a merged-bean-definition copy mismatch, or `instantiate` should resolve the
+    String class itself like resolveBeanClass does). NEXT STEP: make the
+    `SimpleInstantiationStrategy.instantiate` shim resolve a String `beanClass`
+    via `resolve_bean_class_field` before giving up. Unique to AfterThrowing's
+    `throwing="java.lang.Throwable"` type-name advices; not a regression.
+  - The Boot-demo battery (sportme / insurance / letsgo / demo) that these shims
+    serve was NOT re-validated. The partial-classpath skip is preserved by
+    design (None→skip for missing classes) but unconfirmed — validate before
+    merging to dev.
+  - This box (16 GB, full disk) OOMs (`memory allocation of ~1GB failed`, rc=127)
+    running these now-real-bean-instantiating tests under load; run with
+    `CRATONVM_DEFAULT_HEAP_MAX_MB=2048 -Xmx512m`.
+
+The original GC-race analysis below is RETAINED for history but the race itself
+no longer reproduces on current dev.
+
+---
+
 ## Symptom
 ~18 classes (mostly `spring-aop` AspectJ tests, compiled with `compileAspectj`) throw from inside
 the JUnit Platform engine during discovery/execution, so KRun reports `LOADERR`. Distinct causes:
