@@ -1,7 +1,7 @@
 # HIB-DEV-03 — JAXB XML mapping hangs in `AbstractCollection.retainAll` (`ClassInfoImpl.findGetterSetterProperties`)
 
 **Severity:** High — `rc=124` at the 600s census timeout; the class never completes.
-**Status:** 🔴 OPEN — CV-only. **Root re-diagnosed (see update): NOT a localized `retainAll`/collection bug.** Standalone `LinkedHashMap.keySet().retainAll(...)` is fully correct on CratonVM (all sizes, under GC). Live-process `cdb` shows the native activity is in **class loading** (`native_map_put → alloc_object → ensure_synthetic_class → ClassPath::find_class → ZipArchive::by_name → indexmap::get_index_of → hashbrown::find_inner`), triggered by JAXB's reflection-heavy model building. Needs deeper investigation (slow class-load storm vs intermittent zip-index probe) — **handoff**, not a quick localized fix.
+**Status:** 🟡 PARTIAL (audit 2026-06-19) — the dominant **class-load rescan-storm** layer is **FIXED**: known-absent synthetic-stub upgrades are now memoized (`1db07c35`, default-on; `class_manager.rs` `synthetic_upgrade_absent`; 250-JAR put loop 20,120ms → 132ms, now classpath-independent). Residual **OPEN**: the broader JAXB/ByteBuddy `MethodGraph` bootstrap throughput and the deeper JTA/socket wedge underneath remain (see [STATUS-remaining-gaps](STATUS-remaining-gaps-2026-06-18.md) #13). The original `retainAll`/collection framing was refuted in-doc (standalone `LinkedHashMap.keySet().retainAll(...)` is fully correct under GC); live `cdb` showed the time is in **class loading** (`native_map_put → alloc_object → ensure_synthetic_class → ClassPath::find_class → ZipArchive::by_name`). Handoff.
 **Mode:** Interpreter (JIT-off census).
 **HotSpot (JDK 25):** affected classes **PASS** (quickly).
 

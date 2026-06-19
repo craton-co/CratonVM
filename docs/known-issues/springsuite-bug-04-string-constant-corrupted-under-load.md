@@ -7,7 +7,7 @@
 | **CratonVM** | a `String` literal reads back as a `java.lang.Object` instance (`toString()` = `java.lang.Object@<hash>`) |
 | **HotSpot JDK 25** | n/a (string identity stable) |
 | **CratonVM HEAD** | `8e8e47d9` (suite run) |
-| **Status** | **OPEN** — manifestation of the known GC race ([[spring-bug-10-junit-platform-execution-loaderr]]); NOT a crash here |
+| **Status** | 🟡 PARTIAL (audit 2026-06-19) — Family-A manifestation of [[spring-bug-10-junit-platform-execution-loaderr]]; the cure (precise shadow-stack roots) exists **only behind `CRATONVM_SHADOW_STACK=1 CRATONVM_SHADOW_PIN=1`** (default-OFF). Under **default** flags this still reproduces (a `String` literal reads back as `Object`); NOT a crash here |
 | **Suggested owner** | handoff / GC-focused (architectural, deferred) |
 
 ## Symptom

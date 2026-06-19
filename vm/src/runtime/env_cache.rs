@@ -158,6 +158,27 @@ pub fn helpful_npe_opcodes() -> bool {
     SHOW_CODE_DETAILS.load(std::sync::atomic::Ordering::Relaxed) == 1
 }
 
+/// proxy-real-classfile — real-super migration gate. When ON, the generated
+/// `$ProxyN` classes extend the **real** `java.lang.reflect.Proxy` (whose sole
+/// instance field `h` sits at slot 0, matching the handler slot the dispatch
+/// path already reads) instead of the synthetic `java/lang/reflect/Proxy$Instance`
+/// shim. DEFAULT **OFF**: the synthetic-super path stays the default until the
+/// real-super path soaks against the reflection suites; both implementations are
+/// retained (nothing is deleted). Parsed once, cached — this is consulted on the
+/// proxy dispatch hot path (`class_chain_reaches_proxy_instance`), so the lookup
+/// must be cheap. `CRATONVM_REAL_PROXY_SUPER` = `1`/`true`/`on`/`yes` → on.
+#[inline]
+pub fn real_proxy_super() -> bool {
+    static GATE: OnceLock<bool> = OnceLock::new();
+    *GATE.get_or_init(|| match std::env::var("CRATONVM_REAL_PROXY_SUPER") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "on" || v == "yes"
+        }
+        Err(_) => false,
+    })
+}
+
 // Cache the per-native-call GC root snapshot's *frozen* lower frames and
 // re-scan only the churning top, keyed by per-frame `seq` + GC generation.
 // Correctness rests on the LIFO stack discipline (a frame still present at

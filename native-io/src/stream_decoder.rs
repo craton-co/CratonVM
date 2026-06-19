@@ -53,6 +53,23 @@ const SD_NUM_FIELDS: usize = 7;
 struct SdState {
     name: String,
     carry: Vec<u8>,
+    /// `Some` when this decoder must implement `sun.util.PropertyResourceBundleCharset`
+    /// semantics, used by `PropertyResourceBundle(InputStream)`: decode UTF-8,
+    /// but on the first malformed/unmappable byte fall back to ISO-8859-1 for the
+    /// rest of the stream (sticky). `None` = a plain charset (decoded by `name`).
+    prop: Option<PropState>,
+}
+
+/// Mirrors the per-decoder state of the JDK's
+/// `sun.util.PropertyResourceBundleCharset$PropertiesFileDecoder`.
+#[derive(Clone, Copy)]
+pub(crate) struct PropState {
+    /// The charset's `strictUTF8` flag. When `true` the JDK reports UTF-8
+    /// errors instead of falling back to ISO-8859-1 (only when the system
+    /// property `java.util.PropertyResourceBundle.encoding` is set to `UTF-8`).
+    strict: bool,
+    /// Sticky: set once a UTF-8 error has switched the stream to ISO-8859-1.
+    fell_back: bool,
 }
 
 fn sd_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, SdState>> {
@@ -83,6 +100,7 @@ pub(crate) fn alloc_stream_decoder(
     ctx: &mut dyn NativeContext,
     is: ObjectRef,
     charset_name: &str,
+    prop: Option<PropState>,
 ) -> ObjectRef {
     let cid = match ctx.ensure_class_initialized("sun/nio/cs/StreamDecoder") {
         Ok(c) => c,
@@ -99,9 +117,47 @@ pub(crate) fn alloc_stream_decoder(
         SdState {
             name: charset_name.to_string(),
             carry: Vec::new(),
+            prop,
         },
     );
     obj
+}
+
+/// Detect a `sun.util.PropertyResourceBundleCharset` charset (or its inner
+/// `PropertiesFileDecoder`) passed to `forInputStreamReader`.
+///
+/// `PropertyResourceBundle(InputStream)` builds its reader from this charset's
+/// decoder, which decodes UTF-8 but falls back to ISO-8859-1 when the bytes are
+/// not valid UTF-8. Our shim resolves only a charset *name* and would otherwise
+/// decode the whole stream as strict UTF-8 (mojibake for ISO-8859-1 property
+/// files), so we mark the decoder for the two-pass fallback. Returns
+/// `Some(PropState)` for that charset/decoder, else `None`.
+fn detect_prop_resource_bundle(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<PropState> {
+    let cid = ctx.class_id_of_object(obj);
+    let cname = ctx.class_name_of_id(cid)?;
+    if !cname.contains("PropertyResourceBundleCharset") {
+        return None;
+    }
+    // `obj` is either the charset (Charset overload) or its non-static inner
+    // `PropertiesFileDecoder` (CharsetDecoder overload). The decoder's
+    // `CharsetDecoder.charset` field points back to the enclosing charset that
+    // carries `strictUTF8`; default to non-strict when it can't be read.
+    let strict = read_strict_utf8(ctx, obj)
+        .or_else(|| match ctx.get_field_by_name(obj, "charset") {
+            Value::Object(Some(cs)) => read_strict_utf8(ctx, cs),
+            _ => None,
+        })
+        .unwrap_or(false);
+    Some(PropState {
+        strict,
+        fell_back: false,
+    })
+}
+
+fn read_strict_utf8(ctx: &dyn NativeContext, charset: ObjectRef) -> Option<bool> {
+    ctx.get_field_by_name(charset, "strictUTF8")
+        .as_int()
+        .map(|v| v != 0)
 }
 
 /// `forInputStreamReader(InputStream, Object, Charset) -> StreamDecoder`.
@@ -114,8 +170,12 @@ fn native_sd_for_isr_charset(
         None => return Ok(Some(Value::Object(None))),
     };
     let charset_obj = obj_arg(args, 2);
+    let prop = match charset_obj {
+        Some(o) => detect_prop_resource_bundle(ctx, o),
+        None => None,
+    };
     let name = resolve_name(ctx, charset_obj, args.get(2));
-    let sd = alloc_stream_decoder(ctx, is, &name);
+    let sd = alloc_stream_decoder(ctx, is, &name, prop);
     Ok(Some(Value::Object(Some(sd))))
 }
 
@@ -137,7 +197,7 @@ fn native_sd_for_isr_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(n) => n,
         None => return Err(throw_unsupported_encoding(ctx, &name_str)),
     };
-    let sd = alloc_stream_decoder(ctx, is, &norm);
+    let sd = alloc_stream_decoder(ctx, is, &norm, None);
     Ok(Some(Value::Object(Some(sd))))
 }
 
@@ -357,11 +417,11 @@ fn decode_into(
         return Ok(0);
     }
     let id = sd_id(ctx, this);
-    let (name, mut bytes) = {
+    let (name, mut bytes, prop) = {
         let t = sd_table().lock().unwrap();
         match t.get(&id) {
-            Some(s) => (s.name.clone(), s.carry.clone()),
-            None => ("UTF-8".to_string(), Vec::new()),
+            Some(s) => (s.name.clone(), s.carry.clone(), s.prop),
+            None => ("UTF-8".to_string(), Vec::new(), None),
         }
     };
 
@@ -405,28 +465,48 @@ fn decode_into(
         return Ok(-1);
     }
 
-    // At true EOF, flush everything (a dangling incomplete sequence decodes to
-    // U+FFFD via the lossy decoder); otherwise carry the incomplete tail.
-    let split = if eof {
-        bytes.len()
-    } else {
-        split_complete_prefix(&name, &bytes)
+    // Decode `bytes` (carried tail + freshly read) into chars, and compute the
+    // incomplete trailing bytes to carry to the next call. The
+    // PropertyResourceBundleCharset decoder needs its own two-pass path (it may
+    // switch the whole stream to ISO-8859-1); every other charset uses the
+    // straight prefix-split decode.
+    let (chars, rest, new_prop) = match prop {
+        Some(p) => decode_prop(&bytes, eof, p),
+        None => {
+            // At true EOF, flush everything (a dangling incomplete sequence
+            // decodes to U+FFFD via the lossy decoder); otherwise carry the
+            // incomplete tail.
+            let split = if eof {
+                bytes.len()
+            } else {
+                split_complete_prefix(&name, &bytes)
+            };
+            let (decodable, tail) = bytes.split_at(split);
+            (
+                engine::decode_bytes_lossy(&name, decodable),
+                tail.to_vec(),
+                None,
+            )
+        }
     };
-    let (decodable, rest) = bytes.split_at(split);
-    let chars = engine::decode_bytes_lossy(&name, decodable);
     let ncopy = chars.len().min(len);
     if ncopy > 0 {
         ctx.write_char_array_from(out, off, &chars[..ncopy]);
     }
 
-    // Persist the incomplete trailing bytes for the next call.
+    // Persist the incomplete trailing bytes (and any updated property-decoder
+    // fallback state) for the next call.
     {
         let mut t = sd_table().lock().unwrap();
         let entry = t.entry(id).or_insert_with(|| SdState {
             name: name.clone(),
             carry: Vec::new(),
+            prop: None,
         });
-        entry.carry = rest.to_vec();
+        entry.carry = rest;
+        if new_prop.is_some() {
+            entry.prop = new_prop;
+        }
     }
 
     if ncopy == 0 {
@@ -438,6 +518,62 @@ fn decode_into(
     Ok(ncopy as i32)
 }
 
+/// Decode one refill for a `sun.util.PropertyResourceBundleCharset` decoder.
+///
+/// Mirrors the JDK `PropertiesFileDecoder.decodeLoop`: try UTF-8, and on the
+/// first malformed/unmappable byte reset and decode the entire current buffer
+/// (carry + fresh) as ISO-8859-1, sticking with ISO-8859-1 for the rest of the
+/// stream. A truncated trailing UTF-8 sequence mid-stream is carried (not an
+/// error yet); the same truncation at EOF is malformed → triggers the fallback.
+/// When `strict` (the charset's `strictUTF8` flag) the UTF-8 errors are not
+/// recovered — there is no fallback.
+///
+/// Returns `(decoded chars, bytes to carry, updated PropState)`. `bytes` is
+/// never empty (the caller returns EOF first). The decoded chars are always ≤
+/// `bytes.len()` for both UTF-8 and ISO-8859-1, so they fit the caller's buffer.
+fn decode_prop(
+    bytes: &[u8],
+    eof: bool,
+    mut p: PropState,
+) -> (Vec<u16>, Vec<u8>, Option<PropState>) {
+    // Already fell back: ISO-8859-1 maps every byte 1:1, nothing to carry.
+    if p.fell_back {
+        return (decode_latin1(bytes), Vec::new(), Some(p));
+    }
+    match engine::decode_bytes("UTF-8", bytes) {
+        // Whole buffer is valid UTF-8 (no truncated tail).
+        Ok(chars) => (chars, Vec::new(), Some(p)),
+        Err(e) => match e.kind {
+            // Truncated trailing multi-byte sequence mid-stream: emit the valid
+            // prefix and carry the incomplete tail for the next refill.
+            engine::CodingErrorKind::Incomplete if !eof => {
+                let split = e.offset; // == valid_up_to()
+                let head = engine::decode_bytes_lossy("UTF-8", &bytes[..split]);
+                (head, bytes[split..].to_vec(), Some(p))
+            }
+            // Malformed/unmappable UTF-8 (or a truncated tail at EOF). The JDK
+            // strict decoder would report the error; we lossily REPLACE so as
+            // not to surface a checked exception from this read path. Otherwise
+            // fall back to ISO-8859-1 for the whole buffer, sticky thereafter.
+            _ => {
+                if p.strict {
+                    return (
+                        engine::decode_bytes_lossy("UTF-8", bytes),
+                        Vec::new(),
+                        Some(p),
+                    );
+                }
+                p.fell_back = true;
+                (decode_latin1(bytes), Vec::new(), Some(p))
+            }
+        },
+    }
+}
+
+/// ISO-8859-1 (Latin-1): every byte maps to the code unit of the same value.
+fn decode_latin1(bytes: &[u8]) -> Vec<u16> {
+    bytes.iter().map(|&b| b as u16).collect()
+}
 
 /// Return the byte index up to which `bytes` forms a complete multi-byte
 /// sequence for the named charset. Bytes past this index should be
@@ -621,5 +757,94 @@ mod tests {
         // factory must reject the name instead of silently decoding as UTF-8.
         assert_eq!(normalize_supported("Shift_JIS"), None);
         assert_eq!(normalize_supported("EUC-JP"), None);
+    }
+
+    // --- PropertyResourceBundleCharset decoder (Bug #19A) ---
+
+    fn fresh() -> PropState {
+        PropState {
+            strict: false,
+            fell_back: false,
+        }
+    }
+
+    #[test]
+    fn prop_decoder_falls_back_to_iso_on_invalid_utf8() {
+        // "Umlaut: äöü" stored as ISO-8859-1: the umlaut bytes E4 F6 FC are not
+        // valid UTF-8, so the JDK falls back to ISO-8859-1 → äöü (not '?').
+        let mut bytes = b"Umlaut: ".to_vec();
+        bytes.extend_from_slice(&[0xE4, 0xF6, 0xFC]);
+        let (chars, rest, p) = decode_prop(&bytes, true, fresh());
+        assert_eq!(
+            String::from_utf16(&chars).unwrap(),
+            "Umlaut: \u{00e4}\u{00f6}\u{00fc}"
+        );
+        assert!(rest.is_empty());
+        assert!(p.unwrap().fell_back, "stream should be sticky-ISO now");
+    }
+
+    #[test]
+    fn prop_decoder_keeps_valid_utf8() {
+        // The same text stored as UTF-8 must stay UTF-8 (no spurious fallback).
+        let bytes = "Umlaut: \u{00e4}\u{00f6}\u{00fc}".as_bytes().to_vec();
+        let (chars, rest, p) = decode_prop(&bytes, true, fresh());
+        assert_eq!(
+            String::from_utf16(&chars).unwrap(),
+            "Umlaut: \u{00e4}\u{00f6}\u{00fc}"
+        );
+        assert!(rest.is_empty());
+        assert!(!p.unwrap().fell_back);
+    }
+
+    #[test]
+    fn prop_decoder_carries_truncated_utf8_midstream() {
+        // "ab" + the first two bytes of the 3-byte sequence for 中 (E4 B8): a
+        // truncated tail mid-stream is carried, NOT treated as an error/fallback.
+        let bytes = vec![b'a', b'b', 0xE4, 0xB8];
+        let (chars, rest, p) = decode_prop(&bytes, false, fresh());
+        assert_eq!(String::from_utf16(&chars).unwrap(), "ab");
+        assert_eq!(rest, vec![0xE4, 0xB8]);
+        assert!(!p.unwrap().fell_back);
+    }
+
+    #[test]
+    fn prop_decoder_truncated_utf8_at_eof_falls_back() {
+        // The same truncated tail at EOF cannot complete → malformed → ISO.
+        let bytes = vec![b'a', b'b', 0xE4, 0xB8];
+        let (chars, rest, p) = decode_prop(&bytes, true, fresh());
+        // ISO-8859-1: 4 bytes -> 4 chars.
+        assert_eq!(chars.len(), 4);
+        assert_eq!(chars[0], b'a' as u16);
+        assert_eq!(chars[2], 0xE4);
+        assert!(rest.is_empty());
+        assert!(p.unwrap().fell_back);
+    }
+
+    #[test]
+    fn prop_decoder_sticky_iso_after_fallback() {
+        // Once fallen back, valid-UTF-8 bytes still decode as ISO-8859-1.
+        let mut p = fresh();
+        p.fell_back = true;
+        let bytes = "中".as_bytes().to_vec(); // E4 B8 AD (valid UTF-8)
+        let (chars, rest, p2) = decode_prop(&bytes, false, p);
+        assert_eq!(chars.len(), 3, "ISO decodes each byte separately");
+        assert!(rest.is_empty());
+        assert!(p2.unwrap().fell_back);
+    }
+
+    #[test]
+    fn prop_decoder_strict_does_not_fall_back() {
+        // strict=true (system property = UTF-8): invalid UTF-8 is REPLACE-decoded
+        // and the decoder stays in UTF-8 mode (no ISO fallback).
+        let mut p = fresh();
+        p.strict = true;
+        let bytes = vec![0xE4, 0xF6, 0xFC];
+        let (chars, rest, p2) = decode_prop(&bytes, true, p);
+        assert!(
+            chars.iter().any(|&c| c == 0xFFFD),
+            "REPLACE substitutes U+FFFD"
+        );
+        assert!(rest.is_empty());
+        assert!(!p2.unwrap().fell_back);
     }
 }

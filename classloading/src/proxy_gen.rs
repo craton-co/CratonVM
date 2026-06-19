@@ -153,7 +153,21 @@ pub fn emit_proxy_classfile(spec: &ProxyClassSpec) -> Result<Vec<u8>, ClassFileE
     let code_attr_name_idx = cp.add_utf8("Code");
 
     // Constructor descriptor and CP refs for super.<init>.
-    let ctor_desc = "(Ljava/lang/reflect/InvocationHandler;[Ljava/lang/Class;)V";
+    //
+    // proxy-real-classfile real-super migration: when the proxy extends the
+    // *real* `java.lang.reflect.Proxy`, its super constructor is the 1-arg
+    // `Proxy(InvocationHandler)` — NOT the synthetic `Proxy$Instance`'s 2-arg
+    // `(InvocationHandler, Class[])`. The generated `$ProxyN.<init>` mirrors the
+    // super arity (it just forwards its args), and the real `Proxy` stores the
+    // handler in its sole instance field `h` (slot 0). For the synthetic super
+    // the 2-arg shape is unchanged. (The `<clinit>` / per-method bodies are
+    // independent of the super, so only the constructor differs.)
+    let real_super = spec.super_class == "java/lang/reflect/Proxy";
+    let ctor_desc = if real_super {
+        "(Ljava/lang/reflect/InvocationHandler;)V"
+    } else {
+        "(Ljava/lang/reflect/InvocationHandler;[Ljava/lang/Class;)V"
+    };
     let init_name_idx = cp.add_utf8("<init>");
     let ctor_desc_idx = cp.add_utf8(ctor_desc);
     let super_ctor_ref = cp.add_methodref(&spec.super_class, "<init>", ctor_desc);
@@ -186,12 +200,14 @@ pub fn emit_proxy_classfile(spec: &ProxyClassSpec) -> Result<Vec<u8>, ClassFileE
     // Emit method blobs.
     let mut method_blobs: Vec<Vec<u8>> = Vec::with_capacity(spec.methods.len() + 2);
 
-    // 1) Constructor `<init>` — pure super-delegate.
+    // 1) Constructor `<init>` — pure super-delegate. `real_super` selects the
+    //    1-arg (real `Proxy`) vs 2-arg (synthetic `Proxy$Instance`) shape.
     method_blobs.push(emit_constructor(
         init_name_idx,
         ctor_desc_idx,
         code_attr_name_idx,
         super_ctor_ref,
+        real_super,
     ));
 
     // 2) `<clinit>` — populate every `m_<i>` static slot.
@@ -790,17 +806,21 @@ fn emit_constructor(
     ctor_desc_idx: u16,
     code_attr_name_idx: u16,
     super_ctor_ref: u16,
+    real_super: bool,
 ) -> Vec<u8> {
     let mut code = CodeBuilder::new();
     code.emit_aload(0); // this
     code.emit_aload(1); // handler
-    code.emit_aload(2); // interfaces
+    if !real_super {
+        // Synthetic `Proxy$Instance.<init>(InvocationHandler, Class[])` takes
+        // the interfaces array too; the real `Proxy(InvocationHandler)` does not.
+        code.emit_aload(2); // interfaces
+    }
     code.emit_invokespecial(super_ctor_ref);
     code.emit_return();
 
-    // max_stack=3 (this + handler + ifaces), max_locals=3 (this, handler, ifaces).
-    let max_stack: u16 = 3;
-    let max_locals: u16 = 3;
+    // Real super: 1 arg (this + handler). Synthetic super: 2 args (+ ifaces).
+    let (max_stack, max_locals): (u16, u16) = if real_super { (2, 2) } else { (3, 3) };
     let access_flags: u16 = 0x0001; // ACC_PUBLIC
 
     build_method_info(
@@ -1314,6 +1334,45 @@ mod tests {
             .iter()
             .any(|m| &*m.name == "<init>"
                 && &*m.descriptor == "(Ljava/lang/reflect/InvocationHandler;[Ljava/lang/Class;)V"));
+        assert!(cf
+            .methods
+            .iter()
+            .any(|m| &*m.name == "get" && &*m.descriptor == "()Ljava/lang/Object;"));
+    }
+
+    /// proxy-real-classfile real-super migration: a spec whose `super_class` is
+    /// the real `java.lang.reflect.Proxy` emits a `$ProxyN` that extends it with
+    /// a **1-arg** `<init>(InvocationHandler)` delegating to
+    /// `Proxy.<init>(InvocationHandler)` — matching the real JDK proxy shape —
+    /// while the synthetic-super path keeps the 2-arg ctor (covered above).
+    #[test]
+    fn emits_real_proxy_super_with_one_arg_ctor() {
+        let mut spec = supplier_spec();
+        spec.gen_class_name = "com/sun/proxy/$Proxy9".to_string();
+        spec.super_class = "java/lang/reflect/Proxy".to_string();
+        let bytes = emit_proxy_classfile(&spec).expect("real-super emitter must succeed");
+        let cf = read_class(&bytes).expect("real-super class file must round-trip");
+
+        // Extends the REAL Proxy, not the synthetic shim.
+        assert_eq!(
+            cf.super_class.as_ref().map(|s| &**s),
+            Some("java/lang/reflect/Proxy")
+        );
+
+        // The constructor is the 1-arg InvocationHandler form (no Class[]).
+        assert!(
+            cf.methods.iter().any(|m| &*m.name == "<init>"
+                && &*m.descriptor == "(Ljava/lang/reflect/InvocationHandler;)V"),
+            "real-super proxy must have a 1-arg <init>(InvocationHandler)"
+        );
+        // …and NOT the synthetic 2-arg form.
+        assert!(
+            !cf.methods.iter().any(|m| &*m.name == "<init>"
+                && &*m.descriptor
+                    == "(Ljava/lang/reflect/InvocationHandler;[Ljava/lang/Class;)V"),
+            "real-super proxy must not carry the synthetic 2-arg <init>"
+        );
+        // The interface method is still emitted.
         assert!(cf
             .methods
             .iter()

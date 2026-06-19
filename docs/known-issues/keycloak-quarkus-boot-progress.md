@@ -1,5 +1,7 @@
 # Keycloak 26.6.3 (Quarkus) boot under CratonVM — progress & gap chain
 
+**Status:** 🟡 PARTIAL (audit 2026-06-19) — **4 of 5 boot gaps FIXED** in dev: Gap 1 `JarEntry` getSize/getMethod=0, Gap 2 NIO missing-file `NoSuchFileException`, Gap 3 stale `sanitizeDisabledMappers` stub removed, Gap 4 static-synchronized methods lock the `Class` mirror (`0e81bc70`, JVMS §2.11.10). Residual **OPEN** = the current boot frontier: **Gap 5** — Quarkus recorder `ShutdownContext` null NPE (`HibernateValidatorRecorder.shutdownConfigValidator`) + the JBoss-LogManager logging gap. The real ArC CDI boot is not yet reached.
+
 Goal: reach and validate the **real Quarkus ArC** CDI path (`CRATONVM_REAL_ARC`,
 the `quarkus_arc.rs` shim's replacement). ArC's `Arc.initialize()` runs **late**
 in the Quarkus boot, so it is gated behind a chain of earlier boot gaps. This

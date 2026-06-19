@@ -266,6 +266,74 @@ pub mod helpful_npe {
         }
     }
 
+    // -- Step 6 (partial): action-only messages for JIT-originated NPEs ------
+    //
+    // The JIT's null-deref signal (`JIT_PENDING_NPE`) carries no bytecode
+    // index, so the increment-1/2 backward expression analysis cannot run on a
+    // JIT-thrown NPE — and `real-frame-deopt.md` is unstarted, so the precise
+    // trapping bci is unavailable (the design doc gates *full* JIT parity on
+    // it). The doc's offered alternative is to "fall back to the **action-only**
+    // message for JIT-originated NPEs" by threading the operation *kind*
+    // through the signal (`set_jit_pending_npe_action`). These codes are the
+    // vocabulary for that channel; only the cases whose action-only string is
+    // *exactly* a HotSpot `BytecodeUtils` string (the array family + length,
+    // where no `because` clause / field-name is needed) are represented — a
+    // field/invoke action would need the name/owner the helper does not have,
+    // so those stay `message: None` (no fabricated text; cf. the Risks doc).
+    pub mod jit_action {
+        /// No action recorded — fall back to the unmessaged NPE (today's shape).
+        pub const NONE: u8 = 0;
+        /// `arraylength` on a null array.
+        pub const ARRAY_LENGTH: u8 = 1;
+        /// `iaload` on a null `int[]`.
+        pub const ALOAD_INT: u8 = 2;
+        /// `aaload` on a null reference array.
+        pub const ALOAD_OBJECT: u8 = 3;
+        /// `baload` on a null `byte[]` (the `b`-helper also serves `boolean[]`;
+        /// the null array can't be type-probed, so this spells the dominant
+        /// `byte` case — an approximation confined to this gated, best-effort path).
+        pub const ALOAD_BYTE: u8 = 4;
+        /// `iastore` into a null `int[]`.
+        pub const ASTORE_INT: u8 = 5;
+        /// `aastore` into a null reference array.
+        pub const ASTORE_OBJECT: u8 = 6;
+        /// `bastore` into a null `byte[]` (see [`ALOAD_BYTE`] on byte/boolean).
+        pub const ASTORE_BYTE: u8 = 7;
+    }
+
+    /// Map a JIT NPE action code (set by `set_jit_pending_npe_action` in the
+    /// array/length helpers) to its JEP 358 *action-only* message, or `None`
+    /// when no action was recorded ([`jit_action::NONE`]) so the caller emits an
+    /// unmessaged NPE exactly as before. Every returned string is a verbatim
+    /// HotSpot `BytecodeUtils` action (action-only is a valid HotSpot shape when
+    /// the null expression can't be reconstructed — see [`combine_opt`]).
+    pub fn jit_action_message(code: u8) -> Option<String> {
+        use jit_action::*;
+        let s = match code {
+            ARRAY_LENGTH => action_array_length(),
+            ALOAD_INT => action_array_load(ArrayElemKind::Int),
+            ALOAD_OBJECT => action_array_load(ArrayElemKind::Object),
+            ALOAD_BYTE => action_array_load(ArrayElemKind::Byte),
+            ASTORE_INT => action_array_store(ArrayElemKind::Int),
+            ASTORE_OBJECT => action_array_store(ArrayElemKind::Object),
+            ASTORE_BYTE => action_array_store(ArrayElemKind::Byte),
+            _ => return None,
+        };
+        Some(s)
+    }
+
+    /// The message to attach to a JIT-originated NPE for action code `code`,
+    /// honoring the `-XX:±ShowCodeDetailsInExceptionMessages` /
+    /// `CRATONVM_HELPFUL_NPE_OPCODES` gate. Returns `None` (unmessaged NPE,
+    /// today's default-path shape) when the gate is off or no action was
+    /// recorded — so the default path is byte-for-byte unchanged.
+    pub fn jit_npe_message_gated(code: u8) -> Option<String> {
+        if !crate::runtime::env_cache::helpful_npe_opcodes() {
+            return None;
+        }
+        jit_action_message(code)
+    }
+
     // -- Bounded backward expression analysis ------------------------------
 
     /// One simulated operand-stack slot, tagged with the bci of the opcode
@@ -1819,5 +1887,57 @@ mod helpful_npe_tests {
         let bare = MockResolver::new(HashMap::new(), HashMap::new());
         let expr_bare = helpful_npe::null_expr_at_depth(&code, trap_bci, 0, &bare);
         assert_eq!(expr_bare.as_deref(), Some("<local3>"));
+    }
+
+    /// Step 6 (partial): the JIT-NPE action codes map to the exact HotSpot
+    /// `BytecodeUtils` action-only strings, and an unrecognised / NONE code
+    /// yields no message (so the caller emits an unmessaged NPE).
+    #[test]
+    fn jit_action_messages_match_hotspot() {
+        use helpful_npe::jit_action::*;
+        assert_eq!(
+            helpful_npe::jit_action_message(ARRAY_LENGTH).as_deref(),
+            Some("Cannot read the array length")
+        );
+        assert_eq!(
+            helpful_npe::jit_action_message(ALOAD_INT).as_deref(),
+            Some("Cannot load from int array")
+        );
+        assert_eq!(
+            helpful_npe::jit_action_message(ALOAD_OBJECT).as_deref(),
+            Some("Cannot load from object array")
+        );
+        assert_eq!(
+            helpful_npe::jit_action_message(ALOAD_BYTE).as_deref(),
+            Some("Cannot load from byte array")
+        );
+        assert_eq!(
+            helpful_npe::jit_action_message(ASTORE_INT).as_deref(),
+            Some("Cannot store to int array")
+        );
+        assert_eq!(
+            helpful_npe::jit_action_message(ASTORE_OBJECT).as_deref(),
+            Some("Cannot store to object array")
+        );
+        assert_eq!(
+            helpful_npe::jit_action_message(ASTORE_BYTE).as_deref(),
+            Some("Cannot store to byte array")
+        );
+        assert_eq!(helpful_npe::jit_action_message(NONE), None);
+        assert_eq!(helpful_npe::jit_action_message(250), None);
+    }
+
+    /// Default path (gate off): the gated wrapper attaches no message, so a
+    /// JIT-originated NPE keeps its byte-for-byte-unchanged unmessaged shape.
+    #[test]
+    fn jit_npe_message_gated_is_none_when_gate_off() {
+        // The gate is a process-global parsed once; only assert the default-off
+        // contract when it is actually off (don't mutate global env in a test).
+        if !crate::runtime::env_cache::helpful_npe_opcodes() {
+            assert_eq!(
+                helpful_npe::jit_npe_message_gated(helpful_npe::jit_action::ALOAD_INT),
+                None
+            );
+        }
     }
 }

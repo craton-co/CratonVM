@@ -4575,6 +4575,55 @@ impl Vm {
         super::set_static_shared(&self.shared, class_id, field_index, value);
     }
 
+    // ----- Instance fields (embedding read-back / write-back) ---------------
+
+    /// Resolve the instance-field slot index of `field_name` on `class_id`,
+    /// walking the superclass chain (the most-derived declaration wins, matching
+    /// `getfield` resolution for a static type). Returns `None` if the class is
+    /// not loaded or declares no such instance field. The returned index is the
+    /// absolute slot suitable for [`Vm::get_instance_field`] /
+    /// [`Vm::set_instance_field`] and `heap.get_field`. Resolution is by **name**
+    /// only (descriptor disambiguation of shadowed same-name fields is a refinement).
+    pub fn instance_field_index(&self, class_id: ClassId, field_name: &str) -> Option<usize> {
+        let cm = self.shared.class_manager.read();
+        super::vm_exec::resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
+    }
+
+    /// Number of instance-field slots in `class_id`'s layout — the valid index
+    /// range `[0, count)` for the instance-field accessors.
+    pub fn instance_field_count(&self, class_id: ClassId) -> usize {
+        self.shared
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| c.num_total_fields)
+            .unwrap_or(0)
+    }
+
+    /// Read instance-field slot `index` of `obj`.
+    pub fn get_instance_field(&self, obj: ObjectRef, index: usize) -> Value {
+        self.shared.heap.get_field(obj, index)
+    }
+
+    /// Write `value` into instance-field slot `index` of `obj`, **GC-barrier
+    /// correct**: the SATB pre-barrier on the overwritten reference plus the
+    /// post write-barrier fired inside `set_field`, exactly mirroring the
+    /// interpreter's `putfield` (so a moving/concurrent collector stays sound).
+    /// The caller is responsible for `index` being in `[0,
+    /// instance_field_count(class))` — an out-of-range slot is dropped by the
+    /// heap's own bounds guard.
+    pub fn set_instance_field(&self, obj: ObjectRef, index: usize, value: Value) {
+        // SATB pre-barrier on the old reference (no-op for primitives/null and
+        // for non-SATB collectors), mirroring `interpreter.rs` putfield.
+        let old = self.shared.heap.get_field(obj, index);
+        if let Value::Object(Some(old_ref)) = old {
+            self.shared.heap.write_barrier_pre(std::ptr::null_mut(), old_ref);
+        }
+        // The post write-barrier (card marking / remembered set) fires inside
+        // `set_field` itself.
+        self.shared.heap.set_field(obj, index, value);
+    }
+
     // ----- Class initialization (delegating to free functions) ---------------
 
     /// Ensure a class is fully initialized.
