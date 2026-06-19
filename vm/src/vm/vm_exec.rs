@@ -10717,8 +10717,14 @@ fn invoke_on_class_shared_inner(
     // executed), and (b) silently swallowed the error on the normal path.
     let _sync_guard = if is_synchronized {
         let obj = if is_static {
-            // Static synchronized: use a per-class synthetic lock object
-            shared.get_class_lock_object(declaring_class_id)
+            // Static synchronized: the monitor is the class's `Class` mirror
+            // (JVMS §2.11.10) — the SAME object user code locks via
+            // `synchronized (X.class)` and signals via `X.class.wait()/notify()`.
+            // A separate synthetic lock object broke `Class.notifyAll()` from a
+            // static synchronized method (IllegalMonitorStateException), which
+            // aborted the real Keycloak/Quarkus boot at
+            // `ApplicationStateNotification.notifyStartupFailed`.
+            super::get_or_create_class_mirror(shared, declaring_class_id)
         } else {
             // Instance synchronized: use args[0] (the `this` reference)
             match args.first() {
