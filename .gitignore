@@ -8,67 +8,25 @@ target/
 .vscode/
 *.iml
 apps/
-!apps/letsgo/
-!apps/SportMe-master/
-!apps/demo/
 .smoke-cache/
+docs
 **/*.jar
 **/*.tar.gz
-apps/**/*.tar.gz
 
 
-# Compiled Java bytecode — stray probe/repro .class files must not be committed.
-# NOTE: .class files in test_classes/ and demo/ are intentional test fixtures
-# and are explicitly kept checked in via the negation patterns below.
-*.class
-!test_classes/**/*.class
-!demo/**/*.class
-!vm-cli/tests/resources/**/*.class
-# Smoke / functional probes shipped with the orchestrator. Each probe
-# is a tiny single-class workload that drives a meaningful chunk of an
-# app's library code (OpenWire round-trip, OSGi framework lifecycle,
-# jboss-modules class loader, etc.) — see docstring on run_smoke /
-# run_functional in scripts/orchestrator.sh.
 test-infra/
-!test-infra/probes/**/*.class
-# Spring Framework jars used by the springboot probe. Checked in so the
-# probe can compile + run without a network fetch at smoke time.
-# See test-infra/spring-libs/ and func_springboot in scripts/orchestrator.sh.
-!test-infra/spring-libs/**/*.jar
-
-# Regression pool: the staged app distros (5 GB+) and per-run results are
-# never committed. The baselines, probes, and scripts are. See
-# test-infra/regression-pool/README.md.
-test-infra/regression-pool/apps/
-test-infra/regression-pool/results/
-
-# JAR files (benchmark dependencies — download separately)
-bench/*.jar
-
-# Bench fixture caches (Maven Central downloads, EJBCA dist zip, WildFly tgz, etc.)
-bench/**/cache/
-bench/**/staged/
-bench/**/staged-*/
-bench/wildfly-boot/wildfly-*.tar.gz
-bench/wildfly-boot/wildfly-*.zip
-bench/ejbca-deploy/ejbca_ce_*.zip
-
-# Temp files
-*.tmp
-
-# Per-developer scratch dirs + Felix OSGi runtime cache + stray bench cache + server logs.
-# These accumulated under `de387c1 save 25.05`; now ignored so they don't slip in again.
-scratch/
-felix-cache/
+bench/
 .bench-cache/
-server.log
 
-# Windows artifacts
-nul
+# Temp files and logs
+*.tmp
+*.log
+
+
+
 
 # Distribution binaries
-dist/*.exe
-dist/*.dll
+dist/
 
 # macOS
 .DS_Store
@@ -92,14 +50,6 @@ applogs/
 *.dis
 __pycache__/
 
-# Local dev scratch / log artifacts — must NOT ship in the public Apache-2.0
-# repo. These are per-developer run logs and internal session-handoff notes
-# that can contain personal filesystem paths and other local-only data.
-applogs/
-/continue_prompt.md
-/err_all.log
-test-infra/suite-results/*.tsv
-
 # regression-suite.sh generated artifacts (per-run, machine-specific)
 test-infra/_regression-cratonvm-shim.bat
 test-infra/suite-results/_cm-*.log
@@ -108,5 +58,4 @@ hs_err_pid*.log
 build-wt.*
 build-*.out
 check-wt.*
-build-wt.*
 build-*.log

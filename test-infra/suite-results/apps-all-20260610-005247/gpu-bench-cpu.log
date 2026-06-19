@@ -1,5 +1,0 @@
-[cratonvm] stack-dump watchdog armed: will dump + abort after 120s
-n=1048576
-heavy_ms=151
-COMPUTE_CHECKSUM=-9127329792
-OUT0=973391616 OUTN=348329215

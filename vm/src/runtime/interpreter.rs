@@ -9693,6 +9693,8 @@ pub(crate) fn proxy_instance_satisfies_target(
             // `Proxy$Instance` shim (which has neither a slot-1 array nor its
             // own declared interface set) keeps the old liberal rule.
             return obj_name == "java/lang/reflect/Proxy$Instance";
+        }
+    };
     // Source the proxy's interface set. The synthetic 3-slot layout stores the
     // `Class[]` at slot 1 (`PROXY_FIELD_INTERFACES`); the real-super layout
     // (proxy-real-classfile migration: the generated `$ProxyN` extends

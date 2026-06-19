@@ -1,4 +1,0 @@
-tomcat-server-info        | rc=1   |  0.16s | REGRESS    | Error: Could not create the Java Virtual Machine.
-
-regression-pool: total=1 pass=0 regress=1 slow=0 no_base=0 no_stage=0
-results: /c/craton/CratonVM/apps/probe/test-infra/regression-pool/results/20260610-084213.tsv

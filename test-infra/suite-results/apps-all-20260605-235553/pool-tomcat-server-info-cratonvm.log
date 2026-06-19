@@ -1,4 +1,0 @@
-tomcat-server-info        | rc=-  |     -s | MISS_PROBE | /c/craton/CratonVM/test-infra/probes/tomcat_probe
-
-regression-pool: total=1 pass=0 regress=0 slow=0 no_base=1 no_stage=0
-results: /c/craton/CratonVM/test-infra/regression-pool/results/20260605-235853.tsv

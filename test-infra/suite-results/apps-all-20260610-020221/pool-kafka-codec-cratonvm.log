@@ -1,4 +1,0 @@
-kafka-codec               | rc=1   |  2.04s | REGRESS    | 2026-06-10T05:04:19.952564Z  WARN cratonvm_vm::vm::vm_exec: NoSuchMethodError method="java/lang/String.findResource(Ljav
-
-regression-pool: total=1 pass=0 regress=1 slow=0 no_base=0 no_stage=0
-results: /c/craton/CratonVM/apps/probe/test-infra/regression-pool/results/20260610-020417.tsv
