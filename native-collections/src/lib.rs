@@ -7136,6 +7136,29 @@ fn compare_via_compare_to(
         (Value::Object(None), _) => Ok(-1),
         (_, Value::Object(None)) => Ok(1),
         (Value::Object(Some(ao)), Value::Object(Some(bo))) => {
+            // The JDK's natural-ordering compare is `((Comparable) k1).compareTo(k2)`.
+            // When the receiver `k1` does not implement `Comparable`, the bytecode
+            // `checkcast java/lang/Comparable` throws `ClassCastException` *before*
+            // `compareTo` is ever dispatched. Replicate that here: without this
+            // guard the bare `invoke_virtual("compareTo")` below would raise a
+            // `NoSuchMethodError` instead (the method simply isn't there), which is
+            // the wrong exception type — callers that legitimately catch
+            // `ClassCastException` (e.g. Spring's `SetDelegate.orderForCodeConsistency`,
+            // which does `new TreeSet<>(set)` on a `Set<Class<?>>` and falls back to
+            // the original set when the elements aren't comparable) would not catch a
+            // `NoSuchMethodError` and the real failure would escape (spring-bug-04).
+            if !implements_comparable(ctx, *ao) {
+                let cname = ctx
+                    .class_name_of_id(ctx.class_id_of_object(*ao))
+                    .unwrap_or_else(|| "<unknown>".to_string())
+                    .replace('/', ".");
+                return Err(cratonvm_types::error::RuntimeError::ClassCastException {
+                    message: format!(
+                        "class {cname} cannot be cast to class java.lang.Comparable"
+                    ),
+                }
+                .into());
+            }
             let r = ctx.invoke_virtual(
                 *ao,
                 "compareTo",
