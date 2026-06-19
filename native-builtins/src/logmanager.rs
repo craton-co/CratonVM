@@ -1894,104 +1894,121 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
         );
     }
 
-    // Round 92: cover the abstract `org/jboss/logging/Logger` overloads
-    // directly. These are the methods WildFly's `ServerLogger.WFLY*`
-    // actually calls — they normally delegate to `doLog`/`doLogf` on a
-    // concrete subtype, but registering as native overrides on the base
-    // class short-circuits the dispatch and guarantees every WFLY* boot
-    // message reaches stderr no matter which `Logger` subclass is in
-    // use (JBossLogManagerLogger, JDKLogger, Slf4jLogger, etc.).
-    let jlog = "org/jboss/logging/Logger";
-    // info family
-    // The `(String loggerFqcn, Object message, Throwable)` forms get the
-    // fqcn-aware handler — message is args[2], NOT the first String arg.
-    registry.register(
-        jlog,
-        "info",
-        "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        native_jboss_logger_info_fqcn,
-    );
-    registry.register(
-        jlog,
-        "warn",
-        "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        native_jboss_logger_warn_fqcn,
-    );
-    registry.register(
-        jlog,
-        "error",
-        "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        native_jboss_logger_error_fqcn,
-    );
-    for (m, sig) in &[
-        ("info", "(Ljava/lang/Object;)V"),
-        ("info", "(Ljava/lang/Object;Ljava/lang/Throwable;)V"),
-        ("infof", "(Ljava/lang/String;Ljava/lang/Object;)V"),
-        ("infof", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V"),
-        ("infof", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V"),
-        ("infof", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
-        ("infof", "(Ljava/lang/Throwable;Ljava/lang/String;[Ljava/lang/Object;)V"),
-        ("infov", "(Ljava/lang/String;Ljava/lang/Object;)V"),
-        ("infov", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V"),
-        ("infov", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V"),
-        ("infov", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
-        ("infov", "(Ljava/lang/Throwable;Ljava/lang/String;[Ljava/lang/Object;)V"),
-    ] {
-        registry.register(jlog, m, sig, native_jboss_logger_info);
-    }
-    for (m, sig) in &[
-        ("warn", "(Ljava/lang/Object;)V"),
-        ("warn", "(Ljava/lang/Object;Ljava/lang/Throwable;)V"),
-        ("warnf", "(Ljava/lang/String;Ljava/lang/Object;)V"),
-        ("warnf", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V"),
-        ("warnf", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V"),
-        ("warnf", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
-        ("warnf", "(Ljava/lang/Throwable;Ljava/lang/String;[Ljava/lang/Object;)V"),
-        ("warnv", "(Ljava/lang/String;Ljava/lang/Object;)V"),
-        ("warnv", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V"),
-        ("warnv", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V"),
-        ("warnv", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
-        ("warnv", "(Ljava/lang/Throwable;Ljava/lang/String;[Ljava/lang/Object;)V"),
-    ] {
-        registry.register(jlog, m, sig, native_jboss_logger_warn);
-    }
-    for (m, sig) in &[
-        ("error", "(Ljava/lang/Object;)V"),
-        ("error", "(Ljava/lang/Object;Ljava/lang/Throwable;)V"),
-        ("errorf", "(Ljava/lang/String;Ljava/lang/Object;)V"),
-        ("errorf", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V"),
-        ("errorf", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V"),
-        ("errorf", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
-        ("errorf", "(Ljava/lang/Throwable;Ljava/lang/String;[Ljava/lang/Object;)V"),
-        ("errorv", "(Ljava/lang/String;Ljava/lang/Object;)V"),
-        ("errorv", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V"),
-        ("errorv", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
-    ] {
-        registry.register(jlog, m, sig, native_jboss_logger_error);
-    }
-    for (m, sig) in &[
-        ("fatal", "(Ljava/lang/Object;)V"),
-        ("fatal", "(Ljava/lang/Object;Ljava/lang/Throwable;)V"),
-        ("fatalf", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
-        ("fatalv", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
-    ] {
-        registry.register(jlog, m, sig, native_jboss_logger_fatal);
-    }
-    for (m, sig) in &[
-        ("debug", "(Ljava/lang/Object;)V"),
-        ("debug", "(Ljava/lang/Object;Ljava/lang/Throwable;)V"),
-        ("debugf", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
-        ("debugv", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
-    ] {
-        registry.register(jlog, m, sig, native_jboss_logger_debug);
-    }
-    for (m, sig) in &[
-        ("trace", "(Ljava/lang/Object;)V"),
-        ("trace", "(Ljava/lang/Object;Ljava/lang/Throwable;)V"),
-        ("tracef", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
-        ("tracev", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
-    ] {
-        registry.register(jlog, m, sig, native_jboss_logger_trace);
+    // Round 92 (OPT-IN ONLY, default OFF): native overrides for the abstract
+    // `org/jboss/logging/Logger.info/warn/error/...` overloads.
+    //
+    // Registering natives on the base `Logger` short-circuits virtual dispatch
+    // to the concrete subtype's `doLog`/`doLogf`. That silently DEFEATS any
+    // user `Logger` subclass that overrides `doLog` to observe events — most
+    // importantly Hibernate's testing `DelegatingLogger`, whose `doLog` drives
+    // the `LogListener` interception behind `@LoggingInspections` /
+    // `MessageKeyWatcher` / `Triggerable`. With these base-class natives in
+    // place every log-assertion test observed ZERO events, producing CV-only
+    // wrong-result FAILs across the Hibernate suite (e.g.
+    // UniqueConstraintBatchingTest expected:<1> but was:<0>, the
+    // DetachedBag delayed-operation watchers, …). So by DEFAULT we now let the
+    // real jboss-logging bytecode run and dispatch through to the real
+    // `doLog`/`doLogf`.
+    //
+    // WildFly boot visibility does NOT depend on this block: the Round-90
+    // `doLog`/`doLogf` intercepts registered above already fire on every
+    // concrete backend subclass (JBossLogManagerLogger, JDKLogger, Slf4jLogger,
+    // Log4j2Logger, Log4jLogger), so `WFLY*` boot messages still reach stderr.
+    // Set CRATONVM_JBOSS_LOGGER_BASE_EMIT=1 to restore the old blanket
+    // base-class emit if a logger outside that set ever needs it.
+    if std::env::var("CRATONVM_JBOSS_LOGGER_BASE_EMIT").as_deref() == Ok("1") {
+        let jlog = "org/jboss/logging/Logger";
+        // info family
+        // The `(String loggerFqcn, Object message, Throwable)` forms get the
+        // fqcn-aware handler — message is args[2], NOT the first String arg.
+        registry.register(
+            jlog,
+            "info",
+            "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Throwable;)V",
+            native_jboss_logger_info_fqcn,
+        );
+        registry.register(
+            jlog,
+            "warn",
+            "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Throwable;)V",
+            native_jboss_logger_warn_fqcn,
+        );
+        registry.register(
+            jlog,
+            "error",
+            "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Throwable;)V",
+            native_jboss_logger_error_fqcn,
+        );
+        for (m, sig) in &[
+            ("info", "(Ljava/lang/Object;)V"),
+            ("info", "(Ljava/lang/Object;Ljava/lang/Throwable;)V"),
+            ("infof", "(Ljava/lang/String;Ljava/lang/Object;)V"),
+            ("infof", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V"),
+            ("infof", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V"),
+            ("infof", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
+            ("infof", "(Ljava/lang/Throwable;Ljava/lang/String;[Ljava/lang/Object;)V"),
+            ("infov", "(Ljava/lang/String;Ljava/lang/Object;)V"),
+            ("infov", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V"),
+            ("infov", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V"),
+            ("infov", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
+            ("infov", "(Ljava/lang/Throwable;Ljava/lang/String;[Ljava/lang/Object;)V"),
+        ] {
+            registry.register(jlog, m, sig, native_jboss_logger_info);
+        }
+        for (m, sig) in &[
+            ("warn", "(Ljava/lang/Object;)V"),
+            ("warn", "(Ljava/lang/Object;Ljava/lang/Throwable;)V"),
+            ("warnf", "(Ljava/lang/String;Ljava/lang/Object;)V"),
+            ("warnf", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V"),
+            ("warnf", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V"),
+            ("warnf", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
+            ("warnf", "(Ljava/lang/Throwable;Ljava/lang/String;[Ljava/lang/Object;)V"),
+            ("warnv", "(Ljava/lang/String;Ljava/lang/Object;)V"),
+            ("warnv", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V"),
+            ("warnv", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V"),
+            ("warnv", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
+            ("warnv", "(Ljava/lang/Throwable;Ljava/lang/String;[Ljava/lang/Object;)V"),
+        ] {
+            registry.register(jlog, m, sig, native_jboss_logger_warn);
+        }
+        for (m, sig) in &[
+            ("error", "(Ljava/lang/Object;)V"),
+            ("error", "(Ljava/lang/Object;Ljava/lang/Throwable;)V"),
+            ("errorf", "(Ljava/lang/String;Ljava/lang/Object;)V"),
+            ("errorf", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V"),
+            ("errorf", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V"),
+            ("errorf", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
+            ("errorf", "(Ljava/lang/Throwable;Ljava/lang/String;[Ljava/lang/Object;)V"),
+            ("errorv", "(Ljava/lang/String;Ljava/lang/Object;)V"),
+            ("errorv", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V"),
+            ("errorv", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
+        ] {
+            registry.register(jlog, m, sig, native_jboss_logger_error);
+        }
+        for (m, sig) in &[
+            ("fatal", "(Ljava/lang/Object;)V"),
+            ("fatal", "(Ljava/lang/Object;Ljava/lang/Throwable;)V"),
+            ("fatalf", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
+            ("fatalv", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
+        ] {
+            registry.register(jlog, m, sig, native_jboss_logger_fatal);
+        }
+        for (m, sig) in &[
+            ("debug", "(Ljava/lang/Object;)V"),
+            ("debug", "(Ljava/lang/Object;Ljava/lang/Throwable;)V"),
+            ("debugf", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
+            ("debugv", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
+        ] {
+            registry.register(jlog, m, sig, native_jboss_logger_debug);
+        }
+        for (m, sig) in &[
+            ("trace", "(Ljava/lang/Object;)V"),
+            ("trace", "(Ljava/lang/Object;Ljava/lang/Throwable;)V"),
+            ("tracef", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
+            ("tracev", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
+        ] {
+            registry.register(jlog, m, sig, native_jboss_logger_trace);
+        }
     }
 
     // JUL convenience methods for callers that bypass jboss-logging.
