@@ -14618,14 +14618,15 @@ fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Vec<Value
     let len = archive.len();
     let mut out = Vec::with_capacity(len);
     for i in 0..len {
-        let (name, size, csize, method) = match archive.by_index(i) {
+        let (name, size, csize, method, crc) = match archive.by_index(i) {
             Ok(entry) => {
                 let name = entry.name().to_string();
                 let size = entry.size() as i64;
                 let csize = entry.compressed_size() as i64;
                 #[allow(deprecated)]
                 let method = entry.compression().to_u16() as i32;
-                (name, size, csize, method)
+                let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
+                (name, size, csize, method, crc)
             }
             Err(_) => continue,
         };
@@ -14635,6 +14636,18 @@ fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Vec<Value
         ctx.set_field(je, 1, Value::Long(size));
         ctx.set_field(je, 2, Value::Long(csize));
         ctx.set_field(je, 3, Value::Int(method));
+        // Real-JDK mode: `ZipEntry.getSize()/getMethod()/getCompressedSize()/getCrc()`
+        // read the REAL fields by their actual offset, not the synthetic slots
+        // above (real order: name,xdostime,crc,size,csize,method,…). Tomcat's
+        // webapp class loader sizes its class-byte read from `entry.getSize()`;
+        // a 0 yields a 0-length class → ClassFormatError "class file too short"
+        // (JSTL JstlCoreTLV). Mirror the real field names (same fix as
+        // `p59_jar_lookup_entry`).
+        ctx.set_field_by_name(je, "name", Value::Object(Some(name_s)));
+        ctx.set_field_by_name(je, "size", Value::Long(size));
+        ctx.set_field_by_name(je, "csize", Value::Long(csize));
+        ctx.set_field_by_name(je, "method", Value::Int(method));
+        ctx.set_field_by_name(je, "crc", Value::Long(crc));
         out.push(Value::Object(Some(je)));
     }
     out
