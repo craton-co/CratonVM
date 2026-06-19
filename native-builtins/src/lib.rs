@@ -15922,6 +15922,21 @@ pub fn unsafe_arena_contains(addr: i64) -> bool {
     unsafe_arena::store().contains(addr)
 }
 
+/// True if `addr` carries the arena tag bit (bit 62) — i.e. it is an
+/// `Unsafe.allocateMemory` handle (LIVE **or** freed), as opposed to a real OS
+/// pointer such as a `ByteBuffer.allocateDirect` address from `dbb_allocate`.
+///
+/// The single-element `Unsafe.get/putX(long)` natives use this to classify a
+/// store-rejected address: a *tagged* reject is a freed/out-of-bounds handle
+/// and must keep surfacing the use-after-free `IllegalArgumentException`, while
+/// an *untagged* reject is a real pointer that should fall through to a raw
+/// access (mirroring the `copyMemory` real-pointer path). Unlike
+/// [`unsafe_arena_contains`], this is true for freed handles too — it tests the
+/// tag, not liveness.
+pub(crate) fn unsafe_arena_addr_is_tagged(addr: i64) -> bool {
+    addr & unsafe_arena::ARENA_TAG != 0
+}
+
 /// Copy bytes out of the Unsafe arena (arena → `out`). Returns false if the
 /// range isn't fully inside one live arena block. See [`unsafe_arena_contains`].
 pub fn unsafe_arena_copy_out(addr: i64, out: &mut [u8]) -> bool {

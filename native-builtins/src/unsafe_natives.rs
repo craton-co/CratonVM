@@ -178,6 +178,24 @@ fn invalidate_arena_cache() {
     ARENA_CACHE.with(|c| c.set(None));
 }
 
+// FIX(bug-A): real-pointer fall-through for the single-element `Unsafe.get/putX(long)`
+// natives. An address the arena store rejected but whose tag bit (62) is CLEAR is
+// a real OS pointer — e.g. a `DirectByteBuffer` address from `dbb_allocate` that
+// Netty pooled buffers write through `Unsafe.putByte`. Route it to real memory via
+// the unified `NativeContext` accessor (the same one the `copyMemory` path uses,
+// which raw-reads/writes real pointers and routes arena handles to the off-heap
+// store). TAGGED rejects are freed/out-of-bounds handles and MUST keep surfacing
+// the use-after-free `IllegalArgumentException` — never raw-access them (that would
+// dereference a synthetic 0x4000_… address and SIGSEGV), so they are excluded here.
+#[inline]
+fn real_ptr_read(ctx: &dyn NativeContext, addr: i64, out: &mut [u8]) -> bool {
+    addr > 0 && !crate::unsafe_arena_addr_is_tagged(addr) && ctx.copy_from_native_memory(addr, out)
+}
+#[inline]
+fn real_ptr_write(ctx: &mut dyn NativeContext, addr: i64, data: &[u8]) -> bool {
+    addr > 0 && !crate::unsafe_arena_addr_is_tagged(addr) && ctx.copy_to_native_memory(addr, data)
+}
+
 // ---------------------------------------------------------------------------
 // 1. weakCompareAndSet* — alias to strong CAS.
 // ---------------------------------------------------------------------------
@@ -303,7 +321,7 @@ fn native_unsafe_invoke_cleaner(
 // path so the next iteration hits.
 
 fn native_unsafe_get_byte_at_address(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let addr = match args.get(1) {
@@ -329,6 +347,11 @@ fn native_unsafe_get_byte_at_address(
         // Java caller. Instead drop the stale entry and surface the same
         // IllegalArgumentException the validated slow path mandates.
         None => {
+            // FIX(bug-A): untagged real pointer (e.g. DirectByteBuffer) → raw read.
+            let mut b = [0u8; 1];
+            if real_ptr_read(ctx, addr, &mut b) {
+                return Ok(Some(Value::Int(b[0] as i32)));
+            }
             invalidate_arena_cache();
             Err(RuntimeError::IllegalArgumentException {
                 message: format!("Unsafe.getByte: address 0x{addr:x} is not in any live arena"),
@@ -339,7 +362,7 @@ fn native_unsafe_get_byte_at_address(
 }
 
 fn native_unsafe_put_byte_at_address(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let addr = match args.get(1) {
@@ -364,6 +387,10 @@ fn native_unsafe_put_byte_at_address(
     // masking the use-after-free in the Java caller. Drop the stale entry
     // and surface the `IllegalArgumentException` the validated path (and
     // Java's `Unsafe.putByte(long, byte)` contract) mandates.
+    // FIX(bug-A): untagged real pointer (e.g. DirectByteBuffer) → raw write.
+    if real_ptr_write(ctx, addr, &[v]) {
+        return Ok(None);
+    }
     invalidate_arena_cache();
     Err(RuntimeError::IllegalArgumentException {
         message: format!("Unsafe.putByte: address 0x{addr:x} is not in any live arena"),
@@ -372,7 +399,7 @@ fn native_unsafe_put_byte_at_address(
 }
 
 fn native_unsafe_get_short_at_address(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let addr = match args.get(1) {
@@ -388,6 +415,11 @@ fn native_unsafe_get_short_at_address(
         // audit-round6 fix (LOW): see `get_byte_at_address`. A stale cache
         // hit must not mask the validated accessor's freed-arena verdict.
         None => {
+            // FIX(bug-A): untagged real pointer (e.g. DirectByteBuffer) → raw read.
+            let mut b = [0u8; 2];
+            if real_ptr_read(ctx, addr, &mut b) {
+                return Ok(Some(Value::Int(i16::from_le_bytes(b) as i32)));
+            }
             invalidate_arena_cache();
             Err(RuntimeError::IllegalArgumentException {
                 message: format!("Unsafe.getShort: address 0x{addr:x} is not in any live arena"),
@@ -398,7 +430,7 @@ fn native_unsafe_get_short_at_address(
 }
 
 fn native_unsafe_put_short_at_address(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let addr = match args.get(1) {
@@ -416,6 +448,10 @@ fn native_unsafe_put_short_at_address(
     }
     // audit-round6 fix (LOW): see `put_byte_at_address`. A stale cache hit
     // must not mask the validated accessor's freed-arena rejection.
+    // FIX(bug-A): untagged real pointer (e.g. DirectByteBuffer) → raw write.
+    if real_ptr_write(ctx, addr, &v.to_le_bytes()) {
+        return Ok(None);
+    }
     invalidate_arena_cache();
     Err(RuntimeError::IllegalArgumentException {
         message: format!("Unsafe.putShort: address 0x{addr:x} is not in any live arena"),
@@ -424,7 +460,7 @@ fn native_unsafe_put_short_at_address(
 }
 
 fn native_unsafe_get_int_at_address(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let addr = match args.get(1) {
@@ -440,6 +476,11 @@ fn native_unsafe_get_int_at_address(
         // audit-round6 fix (LOW): see `get_byte_at_address`. A stale cache
         // hit must not mask the validated accessor's freed-arena verdict.
         None => {
+            // FIX(bug-A): untagged real pointer (e.g. DirectByteBuffer) → raw read.
+            let mut b = [0u8; 4];
+            if real_ptr_read(ctx, addr, &mut b) {
+                return Ok(Some(Value::Int(i32::from_le_bytes(b))));
+            }
             invalidate_arena_cache();
             Err(RuntimeError::IllegalArgumentException {
                 message: format!("Unsafe.getInt: address 0x{addr:x} is not in any live arena"),
@@ -450,7 +491,7 @@ fn native_unsafe_get_int_at_address(
 }
 
 fn native_unsafe_put_int_at_address(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let addr = match args.get(1) {
@@ -468,6 +509,10 @@ fn native_unsafe_put_int_at_address(
     }
     // audit-round6 fix (LOW): see `put_byte_at_address`. A stale cache hit
     // must not mask the validated accessor's freed-arena rejection.
+    // FIX(bug-A): untagged real pointer (e.g. DirectByteBuffer) → raw write.
+    if real_ptr_write(ctx, addr, &v.to_le_bytes()) {
+        return Ok(None);
+    }
     invalidate_arena_cache();
     Err(RuntimeError::IllegalArgumentException {
         message: format!("Unsafe.putInt: address 0x{addr:x} is not in any live arena"),
@@ -476,7 +521,7 @@ fn native_unsafe_put_int_at_address(
 }
 
 fn native_unsafe_get_long_at_address(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let addr = match args.get(1) {
@@ -492,6 +537,11 @@ fn native_unsafe_get_long_at_address(
         // audit-round6 fix (LOW): see `get_byte_at_address`. A stale cache
         // hit must not mask the validated accessor's freed-arena verdict.
         None => {
+            // FIX(bug-A): untagged real pointer (e.g. DirectByteBuffer) → raw read.
+            let mut b = [0u8; 8];
+            if real_ptr_read(ctx, addr, &mut b) {
+                return Ok(Some(Value::Long(i64::from_le_bytes(b))));
+            }
             invalidate_arena_cache();
             Err(RuntimeError::IllegalArgumentException {
                 message: format!("Unsafe.getLong: address 0x{addr:x} is not in any live arena"),
@@ -502,7 +552,7 @@ fn native_unsafe_get_long_at_address(
 }
 
 fn native_unsafe_put_long_at_address(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let addr = match args.get(1) {
@@ -521,6 +571,10 @@ fn native_unsafe_put_long_at_address(
     }
     // audit-round6 fix (LOW): see `put_byte_at_address`. A stale cache hit
     // must not mask the validated accessor's freed-arena rejection.
+    // FIX(bug-A): untagged real pointer (e.g. DirectByteBuffer) → raw write.
+    if real_ptr_write(ctx, addr, &v.to_le_bytes()) {
+        return Ok(None);
+    }
     invalidate_arena_cache();
     Err(RuntimeError::IllegalArgumentException {
         message: format!("Unsafe.putLong: address 0x{addr:x} is not in any live arena"),
