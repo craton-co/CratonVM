@@ -787,19 +787,100 @@ fn ensure_options_initialized(ctx: &mut dyn NativeContext) -> MethodCallResult {
     // classloader context to pass for the type-Class argument, we
     // synthesize a type string and let the option-cast path handle it
     // by name.
+    // bug-08 FIX (wildfly-suite-bugs/bug-08): `Options.<clinit>` is shimmed to a
+    // no-op (so the stock `Option.simple(...)` cascade never runs), so EVERY
+    // `public static final Option` field must be populated here. The previous
+    // 12-entry list left the other 69 fields null — `XnioWorker.<clinit>` reads
+    // `Options.WORKER_TASK_KEEPALIVE` (a missing entry) → `SetBuilder.add(null)`
+    // → IllegalArgumentException → ExceptionInInitializerError, cascading to
+    // NoClassDefFoundError(XnioWorker) and Arquillian remoting-client failures
+    // across the WildFly suite. This is the full set of `org.xnio.Options`
+    // option constants (xnio-api 3.8.x), so every `getstatic Options.<NAME>`
+    // observes a non-null synthetic Option.
     let specs: &[(&str, &str)] = &[
-        ("WORKER_IO_THREADS", "java/lang/Integer"),
-        ("WORKER_TASK_CORE_THREADS", "java/lang/Integer"),
-        ("WORKER_TASK_MAX_THREADS", "java/lang/Integer"),
-        ("WORKER_NAME", "java/lang/String"),
-        ("BACKLOG", "java/lang/Integer"),
-        ("KEEP_ALIVE", "java/lang/Boolean"),
-        ("TCP_NODELAY", "java/lang/Boolean"),
-        ("CORK", "java/lang/Boolean"),
+        ("ALLOW_BLOCKING", "java/lang/Boolean"),
+        ("MULTICAST", "java/lang/Boolean"),
+        ("BROADCAST", "java/lang/Boolean"),
+        ("CLOSE_ABORT", "java/lang/Boolean"),
+        ("RECEIVE_BUFFER", "java/lang/Integer"),
         ("REUSE_ADDRESSES", "java/lang/Boolean"),
+        ("SEND_BUFFER", "java/lang/Integer"),
+        ("TCP_NODELAY", "java/lang/Boolean"),
+        ("MULTICAST_TTL", "java/lang/Integer"),
+        ("IP_TRAFFIC_CLASS", "java/lang/Integer"),
+        ("TCP_OOB_INLINE", "java/lang/Boolean"),
+        ("KEEP_ALIVE", "java/lang/Boolean"),
+        ("BACKLOG", "java/lang/Integer"),
         ("READ_TIMEOUT", "java/lang/Integer"),
         ("WRITE_TIMEOUT", "java/lang/Integer"),
+        ("MAX_INBOUND_MESSAGE_SIZE", "java/lang/Integer"),
+        ("MAX_OUTBOUND_MESSAGE_SIZE", "java/lang/Integer"),
         ("SSL_ENABLED", "java/lang/Boolean"),
+        ("SSL_CLIENT_AUTH_MODE", "org/xnio/SslClientAuthMode"),
+        ("SSL_ENABLED_CIPHER_SUITES", "org/xnio/Sequence"),
+        ("SSL_SUPPORTED_CIPHER_SUITES", "org/xnio/Sequence"),
+        ("SSL_ENABLED_PROTOCOLS", "org/xnio/Sequence"),
+        ("SSL_SUPPORTED_PROTOCOLS", "org/xnio/Sequence"),
+        ("SSL_PROVIDER", "java/lang/String"),
+        ("SSL_PROTOCOL", "java/lang/String"),
+        ("SSL_ENABLE_SESSION_CREATION", "java/lang/Boolean"),
+        ("SSL_USE_CLIENT_MODE", "java/lang/Boolean"),
+        ("SSL_CLIENT_SESSION_CACHE_SIZE", "java/lang/Integer"),
+        ("SSL_CLIENT_SESSION_TIMEOUT", "java/lang/Integer"),
+        ("SSL_SERVER_SESSION_CACHE_SIZE", "java/lang/Integer"),
+        ("SSL_SERVER_SESSION_TIMEOUT", "java/lang/Integer"),
+        ("SSL_JSSE_KEY_MANAGER_CLASSES", "org/xnio/Sequence"),
+        ("SSL_JSSE_TRUST_MANAGER_CLASSES", "org/xnio/Sequence"),
+        ("SSL_RNG_OPTIONS", "org/xnio/OptionMap"),
+        ("SSL_PACKET_BUFFER_SIZE", "java/lang/Integer"),
+        ("SSL_APPLICATION_BUFFER_SIZE", "java/lang/Integer"),
+        ("SSL_PACKET_BUFFER_REGION_SIZE", "java/lang/Integer"),
+        ("SSL_APPLICATION_BUFFER_REGION_SIZE", "java/lang/Integer"),
+        ("SSL_STARTTLS", "java/lang/Boolean"),
+        ("SSL_PEER_HOST_NAME", "java/lang/String"),
+        ("SSL_PEER_PORT", "java/lang/Integer"),
+        ("SSL_NON_BLOCKING_KEY_MANAGER", "java/lang/Boolean"),
+        ("SSL_NON_BLOCKING_TRUST_MANAGER", "java/lang/Boolean"),
+        ("USE_DIRECT_BUFFERS", "java/lang/Boolean"),
+        ("SECURE", "java/lang/Boolean"),
+        ("SASL_POLICY_FORWARD_SECRECY", "java/lang/Boolean"),
+        ("SASL_POLICY_NOACTIVE", "java/lang/Boolean"),
+        ("SASL_POLICY_NOANONYMOUS", "java/lang/Boolean"),
+        ("SASL_POLICY_NODICTIONARY", "java/lang/Boolean"),
+        ("SASL_POLICY_NOPLAINTEXT", "java/lang/Boolean"),
+        ("SASL_POLICY_PASS_CREDENTIALS", "java/lang/Boolean"),
+        ("SASL_QOP", "org/xnio/Sequence"),
+        ("SASL_STRENGTH", "org/xnio/sasl/SaslStrength"),
+        ("SASL_SERVER_AUTH", "java/lang/Boolean"),
+        ("SASL_REUSE", "java/lang/Boolean"),
+        ("SASL_MECHANISMS", "org/xnio/Sequence"),
+        ("SASL_DISALLOWED_MECHANISMS", "org/xnio/Sequence"),
+        ("SASL_PROPERTIES", "org/xnio/Sequence"),
+        ("FILE_ACCESS", "org/xnio/FileAccess"),
+        ("FILE_APPEND", "java/lang/Boolean"),
+        ("FILE_CREATE", "java/lang/Boolean"),
+        ("STACK_SIZE", "java/lang/Long"),
+        ("WORKER_NAME", "java/lang/String"),
+        ("THREAD_PRIORITY", "java/lang/Integer"),
+        ("THREAD_DAEMON", "java/lang/Boolean"),
+        ("WORKER_IO_THREADS", "java/lang/Integer"),
+        ("WORKER_READ_THREADS", "java/lang/Integer"),
+        ("WORKER_WRITE_THREADS", "java/lang/Integer"),
+        ("SPLIT_READ_WRITE_THREADS", "java/lang/Boolean"),
+        ("WORKER_ESTABLISH_WRITING", "java/lang/Boolean"),
+        ("WORKER_ACCEPT_THREADS", "java/lang/Integer"),
+        ("WORKER_TASK_CORE_THREADS", "java/lang/Integer"),
+        ("WORKER_TASK_MAX_THREADS", "java/lang/Integer"),
+        ("WORKER_TASK_KEEPALIVE", "java/lang/Integer"),
+        ("WORKER_TASK_LIMIT", "java/lang/Integer"),
+        ("CORK", "java/lang/Boolean"),
+        ("CONNECTION_HIGH_WATER", "java/lang/Integer"),
+        ("CONNECTION_LOW_WATER", "java/lang/Integer"),
+        ("COMPRESSION_LEVEL", "java/lang/Integer"),
+        ("COMPRESSION_TYPE", "org/xnio/CompressionType"),
+        ("BALANCING_TOKENS", "java/lang/Integer"),
+        ("BALANCING_CONNECTIONS", "java/lang/Integer"),
+        ("WATCHER_POLL_INTERVAL", "java/lang/Integer"),
     ];
     let declaring = ctx.create_string("org/xnio/Options");
     for (name, ty) in specs {
@@ -1318,12 +1399,24 @@ pub fn register_xnio_async_natives(registry: &mut NativeMethodRegistry) {
     );
 
     // Options
-    registry.register(
-        "org/xnio/Options",
-        "<clinit>",
-        "()V",
-        native_options_clinit,
-    );
+    // bug-09 fix (supersedes the bug-08 synthetic-completion approach): do NOT
+    // shim `Options.<clinit>`. The stock clinit runs the real
+    // `Option.simple(...)` / `Option.sequence(...)` cascade, which — since the
+    // `Option.simple` native is de-registered above — constructs REAL
+    // `SingleOption`/`SequenceOption` instances. Shimming `<clinit>` to
+    // `native_options_clinit` instead left the `public static final Option`
+    // fields as *synthetic* abstract `org/xnio/Option` objects, which:
+    //   * had no `cast` Code → `OptionMap.create` → `option.cast(v)` →
+    //     `AbstractMethodError` → `DefaultXnioWorkerHolder.<clinit>` fails (bug-09);
+    //   * only covered 12/81 fields → 69 null incl. WORKER_TASK_KEEPALIVE,
+    //     breaking `XnioWorker.<clinit>` (bug-08);
+    //   * had no real `type` field → WildFly `determineOptionType` reflection
+    //     (`getDeclaredField("type")`) would fail (the original WFLYSRV0055).
+    // Real Options instances have working `cast`/`parseValue`/`getName` and a
+    // real `type` field; their slot layout (declClass/name/type) still matches
+    // the OptionMap/Builder slot reads. See docs/internal/wildfly-suite-bugs/
+    // bug-08 + bug-09.
+    let _ = native_options_clinit;
     // Accessors for each well-known field. Registered as top-level fn
     // pointers (not closures) because the native registry stores raw
     // function pointers.

@@ -4559,7 +4559,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
 }
 
 /// Build a MethodType object from a JVM method descriptor string.
-pub(crate) fn build_method_type_from_descriptor(
+pub fn build_method_type_from_descriptor(
     ctx: &mut dyn NativeContext,
     desc: &str,
 ) -> Option<ObjectRef> {

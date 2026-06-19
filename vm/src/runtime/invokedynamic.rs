@@ -16,6 +16,10 @@ use std::sync::Arc;
 
 use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
+// `NativeContext` trait brought into scope for `ctx.get_class_mirror(...)` on
+// `NativeContextImpl` in the generic-invokedynamic bootstrap path.
+use cratonvm_native_api::NativeContext;
+
 use crate::classloading::resolution::{
     LambdaCallSite, MethodHandle, MethodHandleKind, RecordMethodKind, ResolvedCallSite, SwitchLabel,
 };
@@ -252,30 +256,320 @@ pub fn execute_invokedynamic(
     } else if info.bsm_class == OBJECT_METHODS && info.bsm_method == BOOTSTRAP {
         bootstrap_record_object_method(shared, thread, frame_idx, cp_index, &info)
     } else {
-        // Unrecognized bootstrap method. JVMS §5.4.3.6 / §6.5 (invokedynamic)
-        // require that a bootstrap method which cannot produce a usable CallSite
-        // raises `java.lang.BootstrapMethodError`. Previously this path popped the
-        // descriptor arguments and pushed a silent null/zero default, which kept
-        // the operand stack balanced but corrupted the *calling* method with a
-        // wrong value (a bogus null String, a 0 int, etc.) that then flows into
-        // arbitrary downstream logic — a silent-wrong-result that is far worse to
-        // diagnose than a loud failure. Fail loud instead.
-        let nat_str = format!("{}{}", info.target_name, info.target_descriptor);
-        let caller = {
-            let f = &thread.frames[frame_idx];
-            format!("{}.{}{} pc={}", f.class_name(), f.method_name(), f.method_descriptor(), f.pc)
-        };
-        crate::runtime::diagnostics::record_swallow(
-            shared,
-            "invokedynamic",
-            "unrecognized-bsm",
-            &format!(
-                "bsm={}.{} target={} caller=[{}]",
-                info.bsm_class, info.bsm_method, nat_str, caller
-            ),
-        );
-        raise_bootstrap_method_error(shared, thread, &info, &caller)
+        // Generic invokedynamic: a bootstrap method outside the hardcoded JDK
+        // factory set above (e.g. Groovy's
+        // `org.codehaus.groovy.vmplugin.v8.IndyInterface.bootstrap`). Per JVMS
+        // §5.4.3.6 the linkage runs the bootstrap method itself to obtain a
+        // `CallSite`, then invokes that call site's target `MethodHandle` with
+        // the dynamic arguments. `bootstrap_generic` does exactly that; if the
+        // bootstrap genuinely cannot be executed it surfaces a loud error
+        // (BootstrapMethodError / InternalError), never a silent wrong value.
+        bootstrap_generic(shared, thread, frame_idx, cp_index, &info, current_class_id)
     }
+}
+
+/// A bootstrap static argument resolved out of the constant pool, captured in a
+/// lock-free form so it can be materialised into a `Value` *after* the
+/// `class_manager` read lock is dropped (materialisation may allocate / load
+/// classes / run `<clinit>`).
+enum StaticArg {
+    Int(i32),
+    Long(i64),
+    Float(f32),
+    Double(f64),
+    Str(String),
+    Class(String),
+    MType(String),
+}
+
+/// Resolve a single bootstrap static-argument CP entry to a [`StaticArg`].
+fn resolve_static_arg_kind(cp: &ConstantPool, index: u16) -> Result<StaticArg, MethodCallFailed> {
+    let entry = cp.get(index).ok_or_else(|| VmError::Internal {
+        message: format!("invokedynamic generic: bootstrap static arg cp#{index} missing"),
+    })?;
+    Ok(match entry {
+        ConstantPoolEntry::Integer(i) => StaticArg::Int(*i),
+        ConstantPoolEntry::Long(l) => StaticArg::Long(*l),
+        ConstantPoolEntry::Float(f) => StaticArg::Float(*f),
+        ConstantPoolEntry::Double(d) => StaticArg::Double(*d),
+        ConstantPoolEntry::StringReference { .. } => {
+            StaticArg::Str(resolve_string_constant(cp, index).unwrap_or_default())
+        }
+        ConstantPoolEntry::ClassReference { .. } => {
+            let name = cp.get_class_name(index).ok_or_else(|| VmError::Internal {
+                message: format!("invokedynamic generic: bad Class static arg cp#{index}"),
+            })?;
+            StaticArg::Class(name.to_string())
+        }
+        ConstantPoolEntry::MethodType { .. } => {
+            let desc = resolve_method_type(cp, index).ok_or_else(|| VmError::Internal {
+                message: format!("invokedynamic generic: bad MethodType static arg cp#{index}"),
+            })?;
+            StaticArg::MType(desc)
+        }
+        other => {
+            return Err(VmError::Internal {
+                message: format!(
+                    "invokedynamic generic: unsupported bootstrap static arg kind at cp#{index} ({other:?})"
+                ),
+            }
+            .into());
+        }
+    })
+}
+
+/// Generic invokedynamic linkage: execute an arbitrary bootstrap method to
+/// obtain a `CallSite`, then invoke its target `MethodHandle`.
+///
+/// Correctness-first (no call-site caching yet): the bootstrap runs on every
+/// execution of the instruction. That is slower than a real JVM (which links
+/// once and caches the `CallSite`) but is semantically correct — each call goes
+/// through the freshly-produced target. The hardcoded JDK factories above keep
+/// their cached fast paths; only previously-unsupported bootstraps reach here.
+fn bootstrap_generic(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    cp_index: u16,
+    info: &IndyInfo,
+    current_class_id: ClassId,
+) -> Result<(), MethodCallFailed> {
+    // --- Re-resolve the BSM (with descriptor) + static args under the lock. ---
+    let (bsm_class, bsm_method, bsm_desc, static_args) = {
+        let cm = shared.class_manager.read();
+        let class = cm.get_class(current_class_id).ok_or_else(|| VmError::Internal {
+            message: format!("invokedynamic generic: class {current_class_id} not found"),
+        })?;
+        let bsm_index = match class.constant_pool.get(cp_index) {
+            Some(ConstantPoolEntry::InvokeDynamic {
+                bootstrap_method_attr_index,
+                ..
+            }) => *bootstrap_method_attr_index,
+            _ => {
+                return Err(VmError::Internal {
+                    message: format!("invokedynamic generic cp#{cp_index}: not an InvokeDynamic entry"),
+                }
+                .into())
+            }
+        };
+        let bsm = class
+            .bootstrap_methods
+            .get(bsm_index as usize)
+            .ok_or_else(|| VmError::Internal {
+                message: format!("invokedynamic generic: bsm index {bsm_index} out of bounds"),
+            })?;
+        let h = resolve_method_handle_full(&class.constant_pool, bsm.bootstrap_method_ref)?;
+        let mut sargs = Vec::with_capacity(bsm.bootstrap_arguments.len());
+        for &idx in &bsm.bootstrap_arguments {
+            sargs.push(resolve_static_arg_kind(&class.constant_pool, idx)?);
+        }
+        (
+            h.class_name.to_string(),
+            h.member_name.to_string(),
+            h.descriptor.to_string(),
+            sargs,
+        )
+    };
+
+    // --- Build bootstrap args: (Lookup, name, MethodType, static args...). ---
+    // Every reference-typed arg is pinned in `native_pin_roots` (a scanned +
+    // forwarded GC root) and re-read from its slot before use, because the
+    // allocations below — and the bootstrap invocation itself — can move the
+    // heap. `bsm_pins` maps an arg position to its pin slot.
+    let pin_base = thread.native_pin_roots.len();
+    let mut bsm_args: Vec<Value> = Vec::with_capacity(3 + static_args.len());
+    let mut bsm_pins: Vec<(usize, usize)> = Vec::new();
+
+    // 1. Lookup for the caller class. `MethodHandles.lookup()` is
+    //    caller-sensitive; invoked from here the innermost Java frame is the
+    //    current indy method, so `lookupClass` resolves to `current_class_id`.
+    let lookup = crate::vm::invoke_shared(
+        shared,
+        thread,
+        "java/lang/invoke/MethodHandles",
+        "lookup",
+        "()Ljava/lang/invoke/MethodHandles$Lookup;",
+        &[],
+    )?
+    .unwrap_or(Value::Object(None));
+    if let Value::Object(Some(o)) = lookup {
+        bsm_pins.push((0, thread.native_pin_roots.len()));
+        thread.native_pin_roots.push(o);
+    }
+    bsm_args.push(lookup);
+
+    // 2. The call-site name.
+    let name_ref = create_java_string(shared, &info.target_name);
+    bsm_pins.push((1, thread.native_pin_roots.len()));
+    thread.native_pin_roots.push(name_ref);
+    bsm_args.push(Value::Object(Some(name_ref)));
+
+    // 3. The call-site MethodType.
+    let mt = {
+        let mut ctx = NativeContextImpl { shared, thread: &mut *thread };
+        cratonvm_native_builtins::lang_invoke::build_method_type_from_descriptor(
+            &mut ctx,
+            &info.target_descriptor,
+        )
+    }
+    .ok_or_else(|| VmError::Internal {
+        message: format!(
+            "invokedynamic generic: cannot build MethodType from {}",
+            info.target_descriptor
+        ),
+    })?;
+    bsm_pins.push((2, thread.native_pin_roots.len()));
+    thread.native_pin_roots.push(mt);
+    bsm_args.push(Value::Object(Some(mt)));
+
+    // 4. Static bootstrap args.
+    for sa in &static_args {
+        let pos = bsm_args.len();
+        let v = match sa {
+            StaticArg::Int(i) => Value::Int(*i),
+            StaticArg::Long(l) => Value::Long(*l),
+            StaticArg::Float(f) => Value::Float(*f),
+            StaticArg::Double(d) => Value::Double(*d),
+            StaticArg::Str(s) => {
+                let r = create_java_string(shared, s);
+                bsm_pins.push((pos, thread.native_pin_roots.len()));
+                thread.native_pin_roots.push(r);
+                Value::Object(Some(r))
+            }
+            StaticArg::Class(name) => {
+                let cid = shared.load_class_concurrent(name)?;
+                let m = {
+                    let mut ctx = NativeContextImpl { shared, thread: &mut *thread };
+                    ctx.get_class_mirror(cid)
+                };
+                bsm_pins.push((pos, thread.native_pin_roots.len()));
+                thread.native_pin_roots.push(m);
+                Value::Object(Some(m))
+            }
+            StaticArg::MType(desc) => {
+                let m = {
+                    let mut ctx = NativeContextImpl { shared, thread: &mut *thread };
+                    cratonvm_native_builtins::lang_invoke::build_method_type_from_descriptor(
+                        &mut ctx, desc,
+                    )
+                }
+                .ok_or_else(|| VmError::Internal {
+                    message: format!("invokedynamic generic: bad MethodType static arg {desc}"),
+                })?;
+                bsm_pins.push((pos, thread.native_pin_roots.len()));
+                thread.native_pin_roots.push(m);
+                Value::Object(Some(m))
+            }
+        };
+        bsm_args.push(v);
+    }
+
+    // Re-read object args from their (possibly forwarded) pin slots.
+    for &(pos, slot) in &bsm_pins {
+        if let Some(o) = thread.native_pin_roots.get(slot).copied() {
+            bsm_args[pos] = Value::Object(Some(o));
+        }
+    }
+
+    // --- Invoke the bootstrap method → CallSite. ---
+    let callsite_val =
+        crate::vm::invoke_shared(shared, thread, &bsm_class, &bsm_method, &bsm_desc, &bsm_args)?;
+    thread.native_pin_roots.truncate(pin_base); // bootstrap args no longer needed
+
+    let callsite = match callsite_val {
+        Some(Value::Object(Some(cs))) => cs,
+        _ => {
+            return Err(VmError::Internal {
+                message: format!(
+                    "invokedynamic generic: bootstrap {bsm_class}.{bsm_method} returned a non-CallSite"
+                ),
+            }
+            .into())
+        }
+    };
+    // Pin the CallSite across getTarget().
+    thread.native_pin_roots.push(callsite);
+    let callsite = thread.native_pin_roots[pin_base];
+
+    // --- callSite.getTarget() → target MethodHandle. ---
+    let target_val = crate::vm::invoke_shared(
+        shared,
+        thread,
+        "java/lang/invoke/CallSite",
+        "getTarget",
+        "()Ljava/lang/invoke/MethodHandle;",
+        &[Value::Object(Some(callsite))],
+    )?;
+    thread.native_pin_roots.truncate(pin_base); // callsite no longer needed
+    let target_mh = match target_val {
+        Some(Value::Object(Some(mh))) => mh,
+        _ => {
+            return Err(VmError::Internal {
+                message: format!(
+                    "invokedynamic generic: {bsm_class}.{bsm_method} CallSite has a null target"
+                ),
+            }
+            .into())
+        }
+    };
+    // Pin the target across the dynamic-arg pop + invocation.
+    let mh_slot = thread.native_pin_roots.len();
+    thread.native_pin_roots.push(target_mh);
+
+    // --- Pop the dynamic call arguments (descriptor-typed) and pin objects. ---
+    let arg_types = parse_descriptor_args(&info.target_descriptor);
+    let mut dyn_args: Vec<Value> = Vec::with_capacity(arg_types.len());
+    for i in 0..arg_types.len() {
+        let cv = thread.frames[frame_idx].stack.pop_compact();
+        let desc_byte = arg_types
+            .get(arg_types.len() - 1 - i)
+            .copied()
+            .unwrap_or('L') as u8;
+        dyn_args.push(cv.decode_by_descriptor(desc_byte));
+    }
+    dyn_args.reverse();
+    let mut dyn_pins: Vec<(usize, usize)> = Vec::new();
+    for (i, v) in dyn_args.iter().enumerate() {
+        if let Value::Object(Some(o)) = v {
+            dyn_pins.push((i, thread.native_pin_roots.len()));
+            thread.native_pin_roots.push(*o);
+        }
+    }
+
+    // --- Invoke the target: MethodHandle.invoke(args...). The signature-
+    //     polymorphic native reads the real descriptor off the handle and
+    //     adapts each spread argument, so we pass the dynamic args directly. ---
+    let target_mh = thread.native_pin_roots[mh_slot];
+    for &(i, slot) in &dyn_pins {
+        if let Some(o) = thread.native_pin_roots.get(slot).copied() {
+            dyn_args[i] = Value::Object(Some(o));
+        }
+    }
+    let mut invoke_args: Vec<Value> = Vec::with_capacity(dyn_args.len() + 1);
+    invoke_args.push(Value::Object(Some(target_mh)));
+    invoke_args.extend_from_slice(&dyn_args);
+    let result = crate::vm::invoke_shared(
+        shared,
+        thread,
+        "java/lang/invoke/MethodHandle",
+        "invoke",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        &invoke_args,
+    )?;
+    thread.native_pin_roots.truncate(pin_base);
+
+    // --- Push the result, coerced to the call-site return type. ---
+    let ret_byte = info
+        .target_descriptor
+        .rfind(')')
+        .and_then(|i| info.target_descriptor.as_bytes().get(i + 1).copied())
+        .unwrap_or(b'V');
+    if ret_byte != b'V' {
+        let val = result.unwrap_or(Value::Object(None));
+        let coerced = crate::vm::coerce_value_against_ret_char(val, ret_byte, shared);
+        thread.frames[frame_idx].stack.push(coerced)?;
+    }
+    Ok(())
 }
 
 /// Raise `java.lang.BootstrapMethodError` for a bootstrap method outside the
@@ -291,6 +585,7 @@ pub fn execute_invokedynamic(
 /// `catch (Throwable)` / `catch (Error)` observe it normally — instead of a
 /// silent wrong value that corrupts the caller's computation.
 #[cold]
+#[allow(dead_code)] // retained as a loud fallback for future BSM gating
 fn raise_bootstrap_method_error(
     shared: &SharedVm,
     thread: &mut JvmThread,
