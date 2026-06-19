@@ -8699,7 +8699,12 @@ fn native_map_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 // ===========================================================================
 
 const STREAM_FIELD_ELEMENTS: usize = 0;
-const STREAM_NUM_FIELDS: usize = 1;
+// keycloak #16 Part A: synthetic streams carry their registered BaseStream.onClose
+// Runnables in field 1 (an Object[] of Runnable, or Object(None) when none). close()
+// runs them once; intermediate ops propagate them; flatMap/concat follow the JDK
+// close-handler contract. See docs/known-issues/keycloak-16-stream-onclose-and-laziness.md.
+const STREAM_FIELD_CLOSE_HANDLERS: usize = 1;
+const STREAM_NUM_FIELDS: usize = 2;
 
 /// Create a Stream from a slice of values.
 fn make_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCallResult {
@@ -8709,7 +8714,103 @@ fn make_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCallRes
         ctx.set_array_element(arr, i, *val);
     }
     ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+    ctx.set_field(stream, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
     Ok(Some(Value::Object(Some(stream))))
+}
+
+/// Copy `src`'s close-handler array onto `dst` (intermediate-op propagation).
+/// Shares the array ref — `onClose` appends into a fresh array, so this never
+/// mutates `src`'s handlers, and `close()` only clears the per-stream field.
+fn stream_inherit_close_handlers(
+    ctx: &mut dyn NativeContext,
+    src: ObjectRef,
+    dst: ObjectRef,
+) {
+    if src == dst {
+        return;
+    }
+    if let Value::Object(Some(arr)) = ctx.get_field(src, STREAM_FIELD_CLOSE_HANDLERS) {
+        ctx.set_field(dst, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(Some(arr)));
+    }
+}
+
+/// `make_stream` for an intermediate op: build the result, then inherit `src`'s
+/// close handlers so a later `close()` on the result runs the upstream handlers.
+fn make_derived_stream(
+    ctx: &mut dyn NativeContext,
+    src: ObjectRef,
+    elements: &[Value],
+) -> MethodCallResult {
+    let r = make_stream(ctx, elements)?;
+    if let Some(Value::Object(Some(dst))) = &r {
+        stream_inherit_close_handlers(ctx, src, *dst);
+    }
+    Ok(r)
+}
+
+/// Run (once) the close handlers registered on a synthetic stream: clear the
+/// field first (run-once / re-entrancy safe), then invoke each `Runnable.run()`.
+fn stream_run_close_handlers(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    if let Value::Object(Some(arr)) = ctx.get_field(this, STREAM_FIELD_CLOSE_HANDLERS) {
+        ctx.set_field(this, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
+        let len = ctx.array_length(arr);
+        for i in 0..len {
+            if let Value::Object(Some(r)) = ctx.get_array_element(arr, i) {
+                ctx.invoke_virtual(r, "run", "()V", &[])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `BaseStream.onClose(Runnable)` for synthetic streams: append the handler to
+/// field 1 and return `this`. No-op (returns `this`) for non-synthetic receivers.
+fn native_stream_on_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(args.first().copied()),
+    };
+    let cn = ctx.class_name_of_id(ctx.class_id_of_object(this)).unwrap_or_default();
+    if !is_synthetic_stream(&cn) {
+        return Ok(Some(Value::Object(Some(this))));
+    }
+    let handler = match args.get(1) {
+        Some(Value::Object(Some(h))) => *h,
+        _ => return Ok(Some(Value::Object(Some(this)))),
+    };
+    let appended = match ctx.get_field(this, STREAM_FIELD_CLOSE_HANDLERS) {
+        Value::Object(Some(old)) => {
+            let n = ctx.array_length(old);
+            let arr = alloc_ref_array(ctx, n + 1);
+            for i in 0..n {
+                let v = ctx.get_array_element(old, i);
+                ctx.set_array_element(arr, i, v);
+            }
+            ctx.set_array_element(arr, n, Value::Object(Some(handler)));
+            arr
+        }
+        _ => {
+            let arr = alloc_ref_array(ctx, 1);
+            ctx.set_array_element(arr, 0, Value::Object(Some(handler)));
+            arr
+        }
+    };
+    ctx.set_field(this, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(Some(appended)));
+    Ok(Some(Value::Object(Some(this))))
+}
+
+/// `BaseStream.close()` for synthetic streams: run the registered close handlers.
+fn native_stream_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first() {
+        let cn = ctx.class_name_of_id(ctx.class_id_of_object(*this)).unwrap_or_default();
+        if is_synthetic_stream(&cn) {
+            stream_run_close_handlers(ctx, *this)?;
+        }
+    }
+    Ok(None)
 }
 
 /// Extract elements from a Stream.
@@ -8897,13 +8998,36 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
     // Without this, jboss-modules / WildFly / Keycloak boot hits
     // "BaseStream.close()V has no Code attribute" inside lambda/stream-based
     // utility methods during MBean / module wiring.
-    let close_noop: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
-        |_ctx, _args| Ok(None);
-    r.register(c, "close", "()V", close_noop);
-    r.register("java/util/stream/BaseStream", "close", "()V", close_noop);
-    r.register("java/util/stream/IntStream", "close", "()V", close_noop);
-    r.register("java/util/stream/LongStream", "close", "()V", close_noop);
-    r.register("java/util/stream/DoubleStream", "close", "()V", close_noop);
+    // keycloak #16 Part A: real close-handler semantics for synthetic streams.
+    // onClose(Runnable) records the handler (field 1); close() runs them once.
+    // Registered here so this last-registration WINS over the streams.rs
+    // `return_this`/no-op stubs (registration order: register_builtins then
+    // register_collections_natives, per vm/src/vm/vm_init.rs).
+    for sc in &[
+        c,
+        "java/util/stream/BaseStream",
+        "java/util/stream/IntStream",
+        "java/util/stream/LongStream",
+        "java/util/stream/DoubleStream",
+    ] {
+        r.register(sc, "close", "()V", native_stream_close);
+    }
+    // Override every (class, return-descriptor) combo streams.rs registered for
+    // onClose (each call site records its own covariant return type, plus the
+    // erased BaseStream return) so our handler-recording native always wins.
+    for (cls, ret) in &[
+        ("java/util/stream/BaseStream", "Ljava/util/stream/BaseStream;"),
+        ("java/util/stream/Stream", "Ljava/util/stream/Stream;"),
+        ("java/util/stream/Stream", "Ljava/util/stream/BaseStream;"),
+        ("java/util/stream/IntStream", "Ljava/util/stream/IntStream;"),
+        ("java/util/stream/IntStream", "Ljava/util/stream/BaseStream;"),
+        ("java/util/stream/LongStream", "Ljava/util/stream/LongStream;"),
+        ("java/util/stream/LongStream", "Ljava/util/stream/BaseStream;"),
+        ("java/util/stream/DoubleStream", "Ljava/util/stream/DoubleStream;"),
+        ("java/util/stream/DoubleStream", "Ljava/util/stream/BaseStream;"),
+    ] {
+        r.register(cls, "onClose", &format!("(Ljava/lang/Runnable;){}", ret), native_stream_on_close);
+    }
     r.register(
         c,
         "findFirst",
@@ -9306,17 +9430,39 @@ fn native_stream_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
 }
 
 fn native_stream_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let a = match args.first() {
-        Some(Value::Object(Some(r))) => stream_elements(ctx, *r),
-        _ => Vec::new(),
-    };
-    let b = match args.get(1) {
-        Some(Value::Object(Some(r))) => stream_elements(ctx, *r),
-        _ => Vec::new(),
-    };
+    let a_ref = match args.first() { Some(Value::Object(Some(r))) => Some(*r), _ => None };
+    let b_ref = match args.get(1) { Some(Value::Object(Some(r))) => Some(*r), _ => None };
+    let a = a_ref.map(|r| stream_elements(ctx, r)).unwrap_or_default();
+    let b = b_ref.map(|r| stream_elements(ctx, r)).unwrap_or_default();
     let mut combined = a;
     combined.extend(b);
-    make_stream(ctx, &combined)
+    let r = make_stream(ctx, &combined)?;
+    if let Some(Value::Object(Some(dst))) = &r {
+        // JDK contract: closing the concatenated stream closes BOTH inputs.
+        // Only merge handlers from synthetic inputs (a foreign Stream impl keeps
+        // unrelated data in field 1; its own close() owns its handlers).
+        let mut handlers: Vec<Value> = Vec::new();
+        for src in [a_ref, b_ref].into_iter().flatten() {
+            let cn = ctx.class_name_of_id(ctx.class_id_of_object(src)).unwrap_or_default();
+            if !is_synthetic_stream(&cn) {
+                continue;
+            }
+            if let Value::Object(Some(arr)) = ctx.get_field(src, STREAM_FIELD_CLOSE_HANDLERS) {
+                let n = ctx.array_length(arr);
+                for i in 0..n {
+                    handlers.push(ctx.get_array_element(arr, i));
+                }
+            }
+        }
+        if !handlers.is_empty() {
+            let arr = alloc_ref_array(ctx, handlers.len());
+            for (i, h) in handlers.iter().enumerate() {
+                ctx.set_array_element(arr, i, *h);
+            }
+            ctx.set_field(*dst, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(Some(arr)));
+        }
+    }
+    Ok(r)
 }
 
 fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9398,7 +9544,7 @@ fn native_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             kept.push(*elem);
         }
     }
-    make_stream(ctx, &kept)
+    make_derived_stream(ctx, this, &kept)
 }
 
 fn native_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9424,7 +9570,7 @@ fn native_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         )?;
         mapped.push(result.unwrap_or(Value::Object(None)));
     }
-    make_stream(ctx, &mapped)
+    make_derived_stream(ctx, this, &mapped)
 }
 
 fn native_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9448,9 +9594,14 @@ fn native_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         if let Some(Value::Object(Some(inner_stream))) = result {
             let inner = stream_elements_mut(ctx, inner_stream);
             flat.extend(inner);
+            // JDK contract: each mapped stream is closed after its contents are
+            // placed into the result (this is what runs keycloak's flatMap-inner
+            // onClose handlers). Real ClosingStream.close() → delegate.close();
+            // a synthetic inner runs its own handlers.
+            ctx.invoke_virtual(inner_stream, "close", "()V", &[])?;
         }
     }
-    make_stream(ctx, &flat)
+    make_derived_stream(ctx, this, &flat)
 }
 
 /// Extract a numeric sort key from a Value, unboxing wrapper objects.
@@ -9504,7 +9655,7 @@ fn native_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         strs.sort_by(|a, b| a.0.cmp(&b.0));
         elements = strs.into_iter().map(|(_, v)| v).collect();
     }
-    make_stream(ctx, &elements)
+    make_derived_stream(ctx, this, &elements)
 }
 
 fn native_stream_sorted_cmp(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9531,7 +9682,7 @@ fn native_stream_sorted_cmp(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         }
     })?;
 
-    make_stream(ctx, &elems)
+    make_derived_stream(ctx, this, &elems)
 }
 
 fn native_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9547,7 +9698,7 @@ fn native_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             unique.push(*elem);
         }
     }
-    make_stream(ctx, &unique)
+    make_derived_stream(ctx, this, &unique)
 }
 
 fn native_stream_limit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9562,7 +9713,7 @@ fn native_stream_limit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let elements = stream_elements(ctx, this);
     let limited: Vec<Value> = elements.into_iter().take(n).collect();
-    make_stream(ctx, &limited)
+    make_derived_stream(ctx, this, &limited)
 }
 
 fn native_stream_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9577,7 +9728,7 @@ fn native_stream_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let elements = stream_elements(ctx, this);
     let skipped: Vec<Value> = elements.into_iter().skip(n).collect();
-    make_stream(ctx, &skipped)
+    make_derived_stream(ctx, this, &skipped)
 }
 
 fn native_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9593,7 +9744,7 @@ fn native_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     for elem in &elements {
         ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[*elem])?;
     }
-    make_stream(ctx, &elements)
+    make_derived_stream(ctx, this, &elements)
 }
 
 // -- Terminal operations --
@@ -9918,7 +10069,11 @@ fn native_stream_map_to_int(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             ctx.invoke_virtual(function, "applyAsInt", "(Ljava/lang/Object;)I", &[*elem])?;
         ints.push(result.unwrap_or(Value::Int(0)));
     }
-    make_int_stream(ctx, &ints)
+    let r = make_int_stream(ctx, &ints)?;
+    if let Some(Value::Object(Some(dst))) = &r {
+        stream_inherit_close_handlers(ctx, this, *dst);
+    }
+    Ok(r)
 }
 
 // ===========================================================================
@@ -11034,6 +11189,7 @@ fn make_int_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCal
         ctx.set_array_element(arr, i, *val);
     }
     ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+    ctx.set_field(stream, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
     Ok(Some(Value::Object(Some(stream))))
 }
 
@@ -11679,6 +11835,7 @@ fn make_long_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCa
         ctx.set_array_element(arr, i, *val);
     }
     ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+    ctx.set_field(stream, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
     Ok(Some(Value::Object(Some(stream))))
 }
 
@@ -12085,6 +12242,7 @@ fn make_double_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> Method
         ctx.set_array_element(arr, i, *val);
     }
     ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+    ctx.set_field(stream, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
     Ok(Some(Value::Object(Some(stream))))
 }
 

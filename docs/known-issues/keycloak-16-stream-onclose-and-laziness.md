@@ -1,10 +1,21 @@
-# keycloak #16 — `java.util.stream` native shim: `onClose`/`close` no-ops + eager intermediate ops (OPEN)
+# keycloak #16 — `java.util.stream` native shim: ~~`onClose`/`close` no-ops~~ (Part A ✅ FIXED) + eager intermediate ops (Part B OPEN)
 
-**Status:** open, deferred. Part A (close handlers) is a self-contained fix worth
-doing; Part B (laziness) is architectural. Documented here for a focused follow-up.
+**Status:** **Part A (close handlers) ✅ FIXED** (2026-06-18, branch `fix/keycloak-16-stream-close`,
+`native-collections/src/lib.rs`). **Part B (laziness/short-circuit) remains OPEN** (architectural).
+
+**Part A fix (verified):** synthetic streams now carry their `onClose` `Runnable`s in a new field
+(`STREAM_FIELD_CLOSE_HANDLERS`); `close()` runs them once; intermediate ops propagate handlers
+(`make_derived_stream`); `flatMap` closes each mapped inner stream and `concat` merges both inputs'
+handlers (JDK contract). `onClose`/`close` registered to win over the `streams.rs` no-op stubs.
+Verified by the pure-JDK 6-way `repros/keycloak-16-stream-onclose/StreamClose2.java` (all PASS;
+matches HotSpot) and no regression in a full stream-ops sanity vs HotSpot. The 6 close-handler tests
+(`testAutoClosingOfClosingStream*`, `testMultipleClosingHandlersOnClosingStream`) should now pass;
+the 2 laziness tests still fail (Part B).
 
 **Affected (CV-only, HotSpot passes):**
-- `org.keycloak.utils.StreamsUtilTest` (server-spi-private) — 8/8 fail.
+- `org.keycloak.utils.StreamsUtilTest` (server-spi-private) — was 8/8 fail; **Part A fix clears the 6
+  close-handler tests**, leaving the 2 Part-B laziness tests (`testLimitOnClosingStream`,
+  `testSortedInsideOfFlatMapShouldRespectTerminalOperation`).
 
 ## Symptom
 ```
