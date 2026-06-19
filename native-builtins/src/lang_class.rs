@@ -518,6 +518,31 @@ fn enforce_module_check_on_field(
 // java.lang.Class natives
 // ---------------------------------------------------------------------------
 
+/// Synthesize the HotSpot-style binary name for a synthetic lambda-proxy class
+/// (`<defining-class-dotted>$$Lambda/0x<id>`), or `None` if `class_id` is not a
+/// lambda proxy. Mirrors JDK 15+ hidden-class lambda names; the real JDK uses a
+/// per-run hidden-class address after `/0x` (so it is never byte-stable across
+/// runs anyway) — we use the stable proxy class id instead. The returned name
+/// is already dotted and MUST be used verbatim: it intentionally contains a `/`
+/// (before `0x`) that the usual internal→dotted `/`→`.` rewrite would corrupt.
+fn lambda_proxy_class_name(ctx: &dyn NativeContext, class_id: ClassId) -> Option<String> {
+    // Fast reject for ordinary classes (avoids the `lambda_proxies` read lock on
+    // the hot getName path): lambda proxy ids are always >= 0x8000_0000.
+    if class_id.as_u32() < 0x8000_0000 {
+        return None;
+    }
+    let host = ctx.lambda_proxy_host(class_id)?;
+    let host_dotted = host.replace('/', ".");
+    Some(format!("{host_dotted}$$Lambda/0x{:x}", class_id.as_u32()))
+}
+
+/// True only for synthetic lambda-proxy class ids (>= 0x8000_0000). Cheap gate
+/// to skip the `lambda_proxies` lock for ordinary classes.
+#[inline]
+fn is_lambda_proxy_id(class_id: ClassId) -> bool {
+    class_id.as_u32() >= 0x8000_0000
+}
+
 pub(crate) fn native_class_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = this (Class mirror object)
     let this = match args.first() {
@@ -526,6 +551,22 @@ pub(crate) fn native_class_get_name(ctx: &mut dyn NativeContext, args: &[Value])
     };
 
     let dbg_bb = dbg_bb_enabled();
+
+    // Synthetic lambda proxies first: their mirror's slot-1 name is the
+    // placeholder "unknown_<id>" (they're not in the class store), so the
+    // strict-name path below would short-circuit on it. Report the HotSpot-style
+    // "<host>$$Lambda/0x<id>" name instead so Spring's `ClassUtils.isLambdaClass`
+    // (`getName().contains("$$Lambda")`) and string-based identity match HotSpot.
+    // Gated on the lambda id range, so ordinary classes pay nothing. bug-06 fam5 #1.
+    if let Some(class_id) = mirror_class_id(ctx, this) {
+        if let Some(lname) = lambda_proxy_class_name(ctx, class_id) {
+            if dbg_bb {
+                eprintln!("[bb-dbg] getName(id={}) -> {:?} [lambda]", class_id.as_u32(), lname);
+            }
+            let name_obj = ctx.create_string(&lname);
+            return Ok(Some(Value::Object(Some(name_obj))));
+        }
+    }
 
     // bytebuddy_probe (agent-bb4) — STRICT-NAME-FIRST.
     //
@@ -2171,6 +2212,15 @@ pub(crate) fn native_class_get_simple_name(ctx: &mut dyn NativeContext, args: &[
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Lambda proxies: HotSpot's `getSimpleName()` returns the whole hidden-class
+    // name (`Host$$Lambda/0x..`), NOT a `$`/`/`-split tail. Return the same
+    // synthesized name as `getName()` so it isn't sliced to "0x..". bug-06 fam5 #1.
+    if let Some(class_id) = mirror_class_id(ctx, this) {
+        if let Some(lname) = lambda_proxy_class_name(ctx, class_id) {
+            let result = ctx.create_string(&lname);
+            return Ok(Some(Value::Object(Some(result))));
+        }
+    }
     // Cache the simple-name derivation per `ClassId` only when the VM's
     // reverse mirror map owns this mirror. Test-fixture mirrors that
     // encode ClassId only via field-0 are excluded to avoid cross-test
@@ -7079,6 +7129,16 @@ pub(crate) fn native_class_get_modifiers(ctx: &mut dyn NativeContext, args: &[Va
         None => return Ok(Some(Value::Int(0))),
     };
 
+    // Lambda proxies are JVM hidden classes — HotSpot reports them as
+    // `final synthetic` (0x1010, verified on JDK 25). Without this they carry no
+    // class-store access flags and read back 0, so `Class.isSynthetic()` is false
+    // and Spring's `ClassUtils.isLambdaClass()` (which requires `isSynthetic()`)
+    // misclassifies every lambda. bug-06 fam5 #1.
+    const ACC_SYNTHETIC: i32 = 0x1000;
+    if is_lambda_proxy_id(class_id) && ctx.lambda_proxy_host(class_id).is_some() {
+        return Ok(Some(Value::Int(ACC_FINAL | ACC_SYNTHETIC)));
+    }
+
     // Array classes: HotSpot's JVM_GetClassModifiers returns the element type's
     // accessibility (PUBLIC/PROTECTED/PRIVATE) OR'd with FINAL|ABSTRACT — every
     // array class is `final abstract`. Our array Class mirrors carry only the
@@ -10070,6 +10130,14 @@ pub(crate) fn native_class_get_canonical_name(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Lambda proxies are JVM hidden classes — HotSpot's `getCanonicalName()`
+    // returns null for them (no canonical name). Without this the fallback
+    // below would leak "unknown_<id>". bug-06 fam5 #1.
+    if let Some(class_id) = mirror_class_id(ctx, this) {
+        if is_lambda_proxy_id(class_id) && ctx.lambda_proxy_host(class_id).is_some() {
+            return Ok(Some(Value::Object(None)));
+        }
+    }
     if let Some(class_id) = ctx.class_id_from_mirror(this) {
         if let Some(arc) = cache_get(&CANONICAL_CLASS_NAME_CACHE, class_id) {
             return Ok(Some(Value::Object(Some(ctx.create_string(&arc)))));
@@ -10089,6 +10157,13 @@ pub(crate) fn native_class_get_type_name(ctx: &mut dyn NativeContext, args: &[Va
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Lambda proxies: `getTypeName()` mirrors `getName()` (the hidden-class
+    // `Host$$Lambda/0x..` name), not "unknown_<id>". bug-06 fam5 #1.
+    if let Some(class_id) = mirror_class_id(ctx, this) {
+        if let Some(lname) = lambda_proxy_class_name(ctx, class_id) {
+            return Ok(Some(Value::Object(Some(ctx.create_string(&lname)))));
+        }
+    }
     // `Class.getTypeName()` returns the dotted form for non-array refs and
     // the dotted form of the descriptor for arrays. Both forms are pure
     // derivations from the slashed internal name and equal what
@@ -10632,6 +10707,18 @@ pub(crate) fn native_class_get_nest_host(
         Some(id) => id,
         None => return Ok(Some(Value::Object(Some(this)))),
     };
+
+    // Lambda proxies: HotSpot reports the *defining* class as the nest host
+    // (e.g. `Refl6` for a lambda defined in Refl6), not the synthetic proxy
+    // itself. Resolve the host; fall through to self if it can't be resolved.
+    // bug-06 fam5 #1.
+    if is_lambda_proxy_id(class_id) {
+        if let Some(host) = ctx.lambda_proxy_host(class_id) {
+            if let Some(host_id) = ctx.class_id_by_name(&host) {
+                return Ok(Some(Value::Object(Some(ctx.get_class_mirror(host_id)))));
+            }
+        }
+    }
 
     match ctx.nest_host_name(class_id) {
         Some(host_name) => {

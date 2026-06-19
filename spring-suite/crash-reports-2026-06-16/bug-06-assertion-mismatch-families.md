@@ -169,13 +169,22 @@ listener lambdas, and a null there propagates into a null resolved class →
 
 **Remaining synthetic-type reflection gaps (documented follow-ups, distinct bugs, NOT the
 family-5 null):**
-1. lambda/hidden-class `getName()`/`getCanonicalName()`/`getSimpleName()` = `unknown_<classid>`
-   (HS `Foo$$Lambda/0x..`) + bogus `getNestHost()` + `isSynthetic()=false` — the lambda proxy
-   id isn't registered in the class-name map (`alloc_lambda_proxy_id` → `lambda_proxies`, not
-   the class manager). Bigger change (name synthesis from the lambda registry).
-2. `getNestMembers0` returns only `[self]` instead of all nestmates.
+1. ✅ **FIXED** — lambda/hidden-class `getName()`/`getSimpleName()`/`getTypeName()` returned
+   `unknown_<classid>`, `getCanonicalName()` leaked it, `getNestHost()` was bogus,
+   `isSynthetic()=false`, `isHidden()=false`. Root cause: lambda proxy ids (≥ `0x8000_0000`,
+   via `alloc_lambda_proxy_id` → `lambda_proxies`) were never registered in the class-name map
+   → `class_name_of_id` None → the `unknown_<id>` fallback. **Fix:** record the *defining*
+   class per proxy id in a new `SharedVm.lambda_proxy_hosts` side table (populated in
+   `bootstrap_lambda`); a `lambda_proxy_host()` `NativeContext` accessor; and lambda-aware
+   arms in `getName`/`getSimpleName`/`getTypeName`/`getCanonicalName`(→null)/`getNestHost`
+   (→defining class)/`getModifiers`(→`0x1010` FINAL|SYNTHETIC)/`isHidden`(→true). Now
+   `Class.getName()` = `<host>$$Lambda/0x<id>` and `ClassUtils.isLambdaClass()` matches HotSpot.
+   Verified byte-identical to HotSpot JDK 25 (probe `spring-suite/probe/LMod.java`, all of
+   lambda + custom-SAM + cross-class method-ref) modulo the inherent non-deterministic
+   `/0x<hex>` suffix. The id-range gate keeps ordinary classes off the lambda lock.
+2. `getNestMembers0` returns only `[self]` instead of all nestmates. (still open)
 3. JDK `Proxy` subclass leaks: `getSuperclass()`/`getGenericSuperclass()` = `Proxy$Instance`
-   (HS `java.lang.reflect.Proxy`), `isSynthetic()=true` (HS false).
+   (HS `java.lang.reflect.Proxy`), `isSynthetic()=true` (HS false). (still open)
 
 ### Family 6 — open sub-bugs in Spring's synthesis layer (`spring-bug-01`)
 Raw annotation reading is JVMS-conformant (sub-bugs #0/#1 already fixed). Residual mismatches
