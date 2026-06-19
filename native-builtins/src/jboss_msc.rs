@@ -1273,14 +1273,60 @@ fn native_lockable_lock_noop(
 /// for ServiceLogger/ElytronMessages the `log` field is null. The
 /// SecurityDomain$Builder.build call at line 1100 invokes
 /// `isTraceEnabled` on the synthetic ElytronMessages_$logger and NPEs.
-/// Shim to return false (trace disabled) so trace-gated code paths
-/// take the fast no-trace branch. Same shim covers isDebugEnabled —
-/// many WildFly call sites follow the same null-log pattern.
-fn native_delegating_logger_returns_false(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+/// `DelegatingBasicLogger.is{Trace,Debug,Info}Enabled()` — delegate to the
+/// wrapped `this.log` when it is present (so real backends report their true
+/// enabled-state), falling back to `false` ONLY when `this.log` is null.
+///
+/// The blanket `return false` this replaces was added so WildFly's synthetic
+/// `ServiceLogger.ROOT/SERVICE/FAIL` / `ElytronMessages.log` backfills (which
+/// leave `this.log` null) don't NPE on `this.log.isXEnabled()` during a
+/// non-logging boot. But returning false unconditionally also suppressed
+/// level-guarded log calls on REAL loggers — notably Hibernate's testing
+/// `DelegatingLogger`, where `if (COLLECTION_LOGGER.isDebugEnabled())` gates
+/// the HHH90030006 rollback message that the test's `LogListener` observes.
+/// That made `DetachedBagDelayedOperationTest` (and similar level-guarded
+/// log-assertion tests) FAIL on CratonVM only. Honoring a non-null delegate
+/// keeps the WildFly null-safety while letting real backends answer truthfully.
+fn delegating_logger_is_enabled(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
 ) -> MethodCallResult {
-    Ok(Some(Value::Int(0)))
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let log = match ctx.get_field_by_name(this, "log") {
+        Value::Object(Some(o)) => o,
+        // Null delegate (WildFly synthetic backfill): real bytecode would NPE,
+        // so preserve the historical false.
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    match ctx.invoke_virtual(log, method, "()Z", &[]) {
+        Ok(Some(v @ Value::Int(_))) => Ok(Some(v)),
+        _ => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_delegating_logger_is_trace_enabled(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    delegating_logger_is_enabled(ctx, args, "isTraceEnabled")
+}
+
+fn native_delegating_logger_is_debug_enabled(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    delegating_logger_is_enabled(ctx, args, "isDebugEnabled")
+}
+
+fn native_delegating_logger_is_info_enabled(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    delegating_logger_is_enabled(ctx, args, "isInfoEnabled")
 }
 
 /// R63 (WildFly): `ServiceLogger_$logger.greeting(String)` is the
@@ -2142,16 +2188,18 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         r.register(logger_impl, name, sig, native_service_logger_greeting_noop);
     }
 
-    // R63 (WildFly): shim DelegatingBasicLogger.isTraceEnabled/isDebugEnabled
-    // to return false. The default impls do `this.log.isTraceEnabled()`,
-    // but our synthetic backfills for ServiceLogger.ROOT/SERVICE/FAIL and
-    // ElytronMessages.log leave `this.log` null. Returning false makes
-    // every "if (log.isTraceEnabled()) ..." guard skip the inner work,
-    // which is what we want for a non-logging boot.
+    // R63 (WildFly): DelegatingBasicLogger.isTraceEnabled/isDebugEnabled/
+    // isInfoEnabled. The default impls do `this.log.isXEnabled()`, but our
+    // synthetic backfills for ServiceLogger.ROOT/SERVICE/FAIL and
+    // ElytronMessages.log leave `this.log` null, which would NPE. These
+    // natives delegate to `this.log` when present and only return false when
+    // it is null — preserving the non-logging-boot null-safety WITHOUT
+    // suppressing level-guarded log calls on real loggers (e.g. Hibernate's
+    // testing DelegatingLogger, whose isDebugEnabled gates HHH90030006).
     let dbl = "org/jboss/logging/DelegatingBasicLogger";
-    r.register(dbl, "isTraceEnabled", "()Z", native_delegating_logger_returns_false);
-    r.register(dbl, "isDebugEnabled", "()Z", native_delegating_logger_returns_false);
-    r.register(dbl, "isInfoEnabled", "()Z", native_delegating_logger_returns_false);
+    r.register(dbl, "isTraceEnabled", "()Z", native_delegating_logger_is_trace_enabled);
+    r.register(dbl, "isDebugEnabled", "()Z", native_delegating_logger_is_debug_enabled);
+    r.register(dbl, "isInfoEnabled", "()Z", native_delegating_logger_is_info_enabled);
 
     // R79 (WildFly): replace MSC IdentityHashSet's iterator with a
     // CME-tolerant native implementation. Eager worker scheduling in
