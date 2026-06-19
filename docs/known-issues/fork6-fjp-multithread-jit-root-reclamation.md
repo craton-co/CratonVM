@@ -215,6 +215,48 @@ slot=14`) fires during the run but is benign lock-free retry noise (the test
 failures are GC reclamation, not the CAS), though it remains a candidate masker
 to rule out once the reclamation is fixed.
 
+### Follow-up 2026-06-19b — two more levers REFUTED; the measurement is unreliable
+
+Pursuing the fix further, two more candidate fixes were built/measured and both
+**fail**, narrowing the locus but confirming this is the unsolved frontier:
+
+1. **Blocked-path JIT + full-stack scan in `deposit_root_snapshot`.** Hypothesis:
+   `update_root_snapshot` (running-safepoint path) calls `scan_active_jit_frames`
+   but `deposit_root_snapshot` (blocking path) scans only `thread.frames`, so a
+   worker *blocked* in `join()` with a task oop in its JIT `runWorker`/`doExec`
+   frame publishes none of it. Added `scan_active_jit_frames` + a new
+   `scan_full_native_stack` to deposit, gated on the FJP gate. Result: **12 ok /
+   12 bad / 6 timeout / 30 — much WORSE than baseline.** Over-retention (pinning
+   the whole blocked stack at every deposit) inflates the young gen → more GCs →
+   more reclamation windows for the *still-missed* root, plus hangs. Reverted.
+
+2. **`CRATONVM_JIT_SAFEPOINT_REG_SPILL` (callee-saved blind spill) default-on under
+   the gate.** A first 20-run sample read 18/0/2 (looked like a fix) but was
+   **load-variance luck** (0 failures in 20 at a ~12.5% rate happens ~7% of the
+   time). A controlled 30-run rerun: **18 ok / 7 bad / 5 timeout — no better, with
+   added timeouts from the spill overhead.** Spilling *every* used callee-saved GPR
+   to a frame slot at each safepoint does **not** capture the missed oop ⇒ the oop
+   is **not in a callee-saved register**. It must be caller-saved / `RAX` / an
+   operand-stack *scratch* reg, or live at a **non-call (loop back-edge) safepoint**
+   where caller-saved regs aren't spilled. (Note the calling-convention tension:
+   at a CALL safepoint, caller-saved regs holding a value needed afterwards are
+   already spilled by correct codegen — so the surviving suspect is a non-call
+   safepoint, or a transient the oop-tracker never tags.)
+
+**Critical blocker for ANY fix: the repro is load-dependent and NOT reliably
+deterministic.** The same config measured 0/20 and 7/30 depending on concurrent
+system load (other builds/sessions). At a ~12.5% base rate, distinguishing a fix
+from noise needs ≳100 interleaved A/B runs per condition, and the failure rate
+itself drifts with load — so a partial fix cannot be validated with `Fork6` as-is.
+**A more deterministic repro (single forced GC at a pinned worker state, or a
+unit-test harness that parks a worker mid-`runWorker` and asserts the task oop is a
+root) is a prerequisite** before the precise reg-oop encoding can be implemented
+and verified. Net for the next attempt: (a) build a deterministic repro first;
+(b) instrument to capture the exact missing oop's register + safepoint PC + method
+(extend `CRATONVM_DBG_SWEEP_ZERO` to name the holder register, or single-step the
+reclaiming GC); (c) only then add a precise reg-oop map covering caller-saved/RAX
+at *non-call* safepoints. Conservative spill-everything levers are exhausted.
+
 ## Where to look (multi-thread shadow path)
 
 - `vm/src/runtime/interpreter.rs:1463` — §4 "multi-thread shadow scan, marking
