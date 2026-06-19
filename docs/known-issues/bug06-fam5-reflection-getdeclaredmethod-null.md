@@ -1,7 +1,7 @@
 # BUG-06-FAM5 — reflection returns `null` where HotSpot returns a `Class`/`Method` (`getDeclaredMethod on null` ×28)
 
 **Severity:** Medium — CV-unique reflection mismatch in the Spring suite assertion tail.
-**Status:** 🔴 OPEN — basic reflection paths **verified clean**; the failing narrow path is **not yet attributed to a test class**. Handoff / needs suite-level bisection.
+**Status:** 🟡 PARTIAL (audit 2026-06-19) — the one clean family-5 reflection-null is **FIXED**: lambda/method-ref `getGenericSuperclass` now returns `Object` not `null` (`9d0974cf`, default path; `lang_class.rs` lambda guard). Residual **OPEN**: the headline `getDeclaredMethod`-on-null ×28 is a cross-family **cascade** (bug-04 GC + bug-05 generics + synthetic-type gaps), not a single reflection-null; per-test attribution never completed. Refl5/Refl6/BridgeProbe/SpringFam5 are byte-identical to HotSpot. Handoff / needs suite-level bisection.
 **Mode:** Interpreter (JIT-off); the null comes from a native, not codegen.
 **HotSpot (JDK 25):** the affected reflection calls return non-null.
 **Origin:** family 5 of the bug-06 assertion-mismatch census (`spring-suite/crash-reports-2026-06-16/bug-06-assertion-mismatch-families.md`).

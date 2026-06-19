@@ -6,7 +6,7 @@
 | **Modules** | spring-context, spring-scripting, spring-scheduling |
 | **HotSpot JDK 25** | OK |
 | **CratonVM HEAD** | c5644da4 |
-| **Status** | OPEN (inventory; needs per-cluster trace) |
+| **Status** | 🟡 PARTIAL (audit 2026-06-19) — the rc=139 **SIGSEGV crash** (this ticket's subject) is **FIXED** via the bug-12 real `HashMap` layout fix (`87091dec`, default path). Residual **OPEN**: a **separate** non-crash Groovy compile/execute hang at `BEGIN` (deep indy/MethodHandle/reflection), re-scoped out of this VM-CRASH ticket. |
 | **Suggested owner** | handoff (Groovy runtime is deep) / me (scheduler) |
 
 ## ★★ PINNED (this session, worktree `fix/spring-bug-10-11`) — culprit is `HashMap$KeySpliterator.tryAdvance`, OSR + dup_x1, DETERMINISTIC (not GC, not canonicalize, not dup2)

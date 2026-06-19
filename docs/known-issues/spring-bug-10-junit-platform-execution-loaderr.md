@@ -7,7 +7,7 @@
 | **CratonVM** | LOADERR — exception thrown from `launcher.execute()` before any RESULT |
 | **HotSpot JDK 25** | OK |
 | **CratonVM HEAD** | c5644da4 (pre-fixes) |
-| **Status** | OPEN (documented) |
+| **Status** | 🟡 PARTIAL (audit 2026-06-19) — pin-aware shadow-reload correctness fix present (`f4249f7a`) but **only behind `CRATONVM_SHADOW_STACK=1 CRATONVM_SHADOW_PIN=1`** (default-OFF, ~7× overhead; movable path still broken). Under **default** flags the young-gen GC root-undercount race still fires. Family-A. |
 | **Suggested owner** | handoff (mixed causes; some overlap with bug-03 dispatch) |
 
 ## Symptom

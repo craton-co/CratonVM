@@ -1,5 +1,7 @@
 # Fork6 — multi-thread (ForkJoinPool worker) JIT-root reclamation
 
+**Status:** 🟡 PARTIAL (audit 2026-06-19) — the dominant **lost-tag** manifestation is mitigated (conservative interp-local roots under the non-moving sweep, `00429413`) but **only behind the experimental `CRATONVM_REAL_FORKJOINPOOL=1` gate** (the default path is byte-identical baseline). Residual **OPEN**: the worker-forked-subtask reclamation (~15%) remains, now additionally masked by a separate real-FJP `ForkJoinPool` CAS bug. The family-wide precise-JIT-maps default-on (`32649b56`) does **not** close this — see [README](README.md) A4 = OPEN/inconclusive.
+
 > **Consolidated doc.** This merges the two previous files that described the
 > *same* bug from different sessions:
 > `precise-jit-stack-maps-multithread-fjp-worker-testcase.md` (the HIB-CV-20
