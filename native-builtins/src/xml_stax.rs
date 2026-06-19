@@ -88,6 +88,15 @@ struct StaxEvent {
     text: String,
     /// Attribute table for START_ELEMENT events.
     attributes: Vec<StaxAttr>,
+    /// Namespace declarations (`xmlns` / `xmlns:p`) that appear LITERALLY on
+    /// this START_ELEMENT, as `(prefix, uri)` in source order (the default
+    /// namespace uses prefix == ""). The event API's
+    /// `XMLEventAllocatorImpl.fillNamespaceAttributes` reads these via
+    /// `getNamespaceCount()`/`getNamespaceURI(i)`/`getNamespacePrefix(i)` to
+    /// attach `Namespace` events, which an `XMLEventWriter` re-emits — without
+    /// them an inline `xmlns="…"`/`xmlns:p="…"` on a re-serialized element is
+    /// dropped.
+    namespaces: Vec<(String, String)>,
     /// 1-based source line of the event start (StAX `Location.getLineNumber`).
     line: i32,
     /// 1-based source column of the event start (StAX `Location.getColumnNumber`).
@@ -99,6 +108,12 @@ struct StaxEvent {
 #[derive(Clone, Debug)]
 struct StaxAttr {
     local_name: String,
+    /// Attribute prefix ("" when unprefixed). Needed by the event API:
+    /// `XMLEventAllocatorImpl.fillAttributes` builds the attribute QName from
+    /// `getAttributeName(i)` and a downstream `XMLEventWriter` rejects an
+    /// attribute whose QName has an empty prefix but a non-empty namespace URI
+    /// ("prefix cannot be null or empty").
+    prefix: String,
     namespace_uri: String,
     value: String,
 }
@@ -438,9 +453,15 @@ fn make_element_event(
             .unescape_value()
             .map(|c| c.into_owned())
             .unwrap_or_else(|_| String::from_utf8_lossy(&a.value).into_owned());
-        // Skip xmlns / xmlns:* declarations themselves — they are not reported
-        // as ordinary attributes by StAX (getAttributeCount excludes them).
-        if key == b"xmlns" || key.starts_with(b"xmlns:") {
+        // xmlns / xmlns:* declarations are NOT ordinary attributes
+        // (getAttributeCount excludes them) — they are reported separately via
+        // the getNamespace*(i) surface, in source order, so an XMLEventWriter
+        // can re-emit a literal `xmlns(:p)="…"` on this element.
+        if key == b"xmlns" {
+            ev.namespaces.push((String::new(), val));
+            continue;
+        } else if let Some(p) = key.strip_prefix(b"xmlns:") {
+            ev.namespaces.push((String::from_utf8_lossy(p).into_owned(), val));
             continue;
         }
         // Per the Namespaces-in-XML spec, an UNPREFIXED attribute has NO
@@ -454,6 +475,7 @@ fn make_element_event(
         };
         ev.attributes.push(StaxAttr {
             local_name: attr_local,
+            prefix: attr_prefix,
             namespace_uri: attr_ns,
             value: val,
         });
@@ -1064,14 +1086,47 @@ fn native_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => String::new(),
     };
     if name == "javax.xml.stream.isNamespaceAware" {
+        // Report namespace-aware so `XMLEventAllocatorImpl` runs its
+        // `fillNamespaceAttributes` path — attaching each START_ELEMENT's own
+        // `xmlns`/`xmlns:p` declarations (via getNamespaceCount/URI/Prefix) as
+        // Namespace events. Without this, an `XMLEventWriter` re-serializing the
+        // events drops a literal default `xmlns="…"`. The sibling
+        // `setNamespaceContext` cast is satisfied by `getNamespaceContext()`
+        // below returning a real `NamespaceContextWrapper`.
         return ctx.invoke(
             "java/lang/Boolean",
             "valueOf",
             "(Z)Ljava/lang/Boolean;",
-            &[Value::Int(0)],
+            &[Value::Int(1)],
         );
     }
     Ok(Some(Value::Object(None)))
+}
+
+/// `XMLStreamReader.getNamespaceContext()` — the event allocator's
+/// `setNamespaceContext` casts the result to the concrete xerces
+/// `NamespaceContextWrapper`, so return a real (empty) one:
+/// `new NamespaceContextWrapper(new NamespaceSupport())`. The event stream's
+/// own namespace declarations are carried separately (fillNamespaceAttributes →
+/// getNamespaceCount/URI/Prefix); this context only needs to exist and be of
+/// the expected type so the allocator does not throw.
+fn native_get_namespace_context(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let ns = match ctx.new_object_initialized(
+        "com/sun/org/apache/xerces/internal/util/NamespaceSupport",
+        "()V",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    match ctx.new_object_initialized(
+        "com/sun/org/apache/xerces/internal/util/NamespaceContextWrapper",
+        "(Lcom/sun/org/apache/xerces/internal/util/NamespaceSupport;)V",
+        &[Value::Object(Some(ns))],
+    ) {
+        Ok(Some(v)) => Ok(Some(v)),
+        _ => Ok(Some(Value::Object(None))),
+    }
 }
 
 /// `XMLStreamReader.getAttributeType(int)` — StAX reports "CDATA" for an
@@ -1565,9 +1620,27 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         "javax/xml/stream/XMLStreamReader",
+        "getNamespaceContext",
+        "()Ljavax/xml/namespace/NamespaceContext;",
+        native_get_namespace_context,
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
         "getNamespaceCount",
         "()I",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        native_get_namespace_count,
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "getNamespaceURI",
+        "(I)Ljava/lang/String;",
+        native_get_namespace_uri_indexed,
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "getNamespacePrefix",
+        "(I)Ljava/lang/String;",
+        native_get_namespace_prefix_indexed,
     );
     // Event-API support: XMLEventReaderImpl's ctor + XMLEventAllocatorImpl call
     // these on the wrapped cursor reader while building XMLEvent objects.
@@ -1779,20 +1852,22 @@ fn native_get_attr_qname(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Value::Int(n) => Some(*n as usize),
         _ => None,
     }).unwrap_or(0);
-    let (local, ns) = with_state(ctx, this, |s| {
+    let (local, ns, prefix) = with_state(ctx, this, |s| {
         match s.current() {
             Some(e) if idx < e.attributes.len() => {
                 let a = &e.attributes[idx];
-                (a.local_name.clone(), a.namespace_uri.clone())
+                (a.local_name.clone(), a.namespace_uri.clone(), a.prefix.clone())
             }
-            _ => (String::new(), String::new()),
+            _ => (String::new(), String::new(), String::new()),
         }
     })
     .unwrap_or_default();
     let qname = crate::alloc_concurrent_synthetic(ctx, "javax/xml/namespace/QName", 3);
     let local_s = ctx.create_string(&local);
     let ns_s = ctx.create_string(&ns);
-    let prefix_s = ctx.create_string("");
+    // Carry the real prefix (not ""): a prefixed attribute in a non-empty
+    // namespace must round-trip its prefix or an XMLEventWriter rejects it.
+    let prefix_s = ctx.create_string(&prefix);
     ctx.set_field_by_name(qname, "localPart", Value::Object(Some(local_s)));
     ctx.set_field_by_name(qname, "namespaceURI", Value::Object(Some(ns_s)));
     ctx.set_field_by_name(qname, "prefix", Value::Object(Some(prefix_s)));
@@ -1814,6 +1889,48 @@ fn native_get_attr_namespace(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     })
     .unwrap_or_default();
     Ok(Some(Value::Object(Some(ctx.create_string(&ns)))))
+}
+
+/// `XMLStreamReader.getNamespaceCount()` — number of `xmlns`/`xmlns:p`
+/// declarations that appear LITERALLY on the current START/END_ELEMENT (not the
+/// in-scope total). Used by `XMLEventAllocatorImpl.fillNamespaceAttributes`.
+fn native_get_namespace_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_obj(args)?;
+    require_state(ctx, this)?;
+    let n = with_state(ctx, this, |s| {
+        s.current().map(|e| e.namespaces.len()).unwrap_or(0)
+    })
+    .unwrap_or(0);
+    Ok(Some(Value::Int(n as i32)))
+}
+
+/// `XMLStreamReader.getNamespaceURI(int)` — URI of the i-th namespace
+/// declaration on the current element.
+fn native_get_namespace_uri_indexed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_obj(args)?;
+    require_state(ctx, this)?;
+    let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+    let uri = with_state(ctx, this, |s| match s.current() {
+        Some(e) if idx < e.namespaces.len() => e.namespaces[idx].1.clone(),
+        _ => String::new(),
+    })
+    .unwrap_or_default();
+    Ok(Some(Value::Object(Some(ctx.create_string(&uri)))))
+}
+
+/// `XMLStreamReader.getNamespacePrefix(int)` — prefix of the i-th namespace
+/// declaration on the current element. The default namespace (`xmlns="…"`) is
+/// reported as `""`; `fillNamespaceAttributes` treats `""`/null identically.
+fn native_get_namespace_prefix_indexed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_obj(args)?;
+    require_state(ctx, this)?;
+    let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+    let prefix = with_state(ctx, this, |s| match s.current() {
+        Some(e) if idx < e.namespaces.len() => e.namespaces[idx].0.clone(),
+        _ => String::new(),
+    })
+    .unwrap_or_default();
+    Ok(Some(Value::Object(Some(ctx.create_string(&prefix)))))
 }
 
 fn native_has_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

@@ -2092,11 +2092,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(None))),
             };
             let key = ctx.read_string(key_obj).unwrap_or_default();
-            let old = ctx.get_system_property(&key);
-            // Setting to empty is a soft-clear; full clear API requires a
-            // separate trait method that we don't have yet.
-            let _ = ctx.set_system_property(&key, "");
-            match old {
+            // Actually REMOVE the key (not soft-clear to ""): after
+            // `System.clearProperty`, `System.getProperty` must return null, not
+            // "" — keycloak's `${name}` placeholder resolution (and any code that
+            // distinguishes unset from empty) depends on the key being absent.
+            // Returns the prior value, matching `Hashtable.remove`.
+            match ctx.remove_system_property(&key) {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
                 None => Ok(Some(Value::Object(None))),
             }
