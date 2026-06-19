@@ -13,16 +13,15 @@ docs
 **/*.jar
 **/*.tar.gz
 
-
+# Test and benchmarking suites
 test-infra/
+scratch/
 bench/
 .bench-cache/
 
 # Temp files and logs
 *.tmp
 *.log
-
-
 
 
 # Distribution binaries
