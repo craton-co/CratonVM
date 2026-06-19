@@ -614,6 +614,13 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
             }
 
             let mut field_values: Vec<Option<NodeId>> = vec![None; *num_fields];
+            // Per field, the id of the `Store` node that set `field_values`.
+            // Used to enforce program-order "last write wins" independent of the
+            // order in which the worklist visits the allocation's stores (it
+            // pops LIFO, so two stores to the same field can be seen in either
+            // order). `add_node` assigns ids in creation = program order, so a
+            // larger store-node id is a later store.
+            let mut field_value_store: Vec<Option<NodeId>> = vec![None; *num_fields];
             let mut replaced_loads = Vec::new();
             let mut eliminated_stores = Vec::new();
             let mut can_replace = true;
@@ -687,8 +694,26 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                             // value operand is malformed, leave the field as
                             // None (uninitialised) rather than guessing.
                             if let Some(stored_val) = store_value(use_node) {
-                                field_values[*field_idx] = Some(stored_val);
+                                // LAST WRITE WINS (program order). The worklist
+                                // pops uses LIFO, so the same field's stores can
+                                // be visited out of program order; only let a
+                                // store overwrite a previously-recorded value
+                                // when it is the same-or-later store (larger
+                                // node id). Without this, an EARLIER store could
+                                // clobber a LATER one's value and a scalar-
+                                // replaced object would forward the stale first
+                                // value to post-store loads
+                                // (`test_multiple_stores_to_same_field_last_wins`).
+                                let supersedes = field_value_store[*field_idx]
+                                    .map_or(true, |prev| use_id >= prev);
+                                if supersedes {
+                                    field_values[*field_idx] = Some(stored_val);
+                                    field_value_store[*field_idx] = Some(use_id);
+                                }
                             }
+                            // Both stores are eliminated regardless of which
+                            // value wins — the heap object is gone, so every
+                            // store to it is dead.
                             eliminated_stores.push(use_id);
                         } else if is_value {
                             // Published into another object's field -> escapes;
