@@ -1235,13 +1235,24 @@ fn native_stream_support_stream_from_spliterator(
     };
     let spl_class = ctx.class_name_of_id(ctx.class_id_of_object(spliterator));
     if spl_class.as_deref() != Some("java/util/Spliterator") {
-        // Real Spliterator implementation — drain via its own tryAdvance.
-        let arr = drain_real_spliterator(ctx, spliterator)?;
+        // Real Spliterator implementation. DEFER draining: stash the spliterator
+        // in the synthetic stream's lazy slot (field 2) so the terminal op can
+        // drive it lazily. This makes
+        //   `StreamSupport.stream(spliterator, false).forEach(consumer)`
+        // consume each element AS it is produced (interleaved tryAdvance/accept),
+        // matching the JDK — required for side-effecting consumers such as
+        // Hibernate's `getResultStream().forEach(ld -> { …; em.flush(); em.clear(); })`,
+        // where eager buffering detached a shared entity (DetachedPreviousRowStateTest).
+        // Any non-forEach op materialises on demand — see native-collections
+        // `materialize_lazy_stream` / `stream_lazy_spliterator`.
         let cid = ctx.ensure_class_initialized("java/util/stream/Stream")
             .unwrap_or(cratonvm_types::ClassId::new(0));
-        let nfields = ctx.class_num_total_fields(cid).max(1);
+        // Force ≥3 fields so the lazy-spliterator slot (2) exists alongside
+        // elements (0) and close-handlers (1).
+        let nfields = ctx.class_num_total_fields(cid).max(3);
         let stream = ctx.alloc_object(cid, nfields);
-        ctx.set_field(stream, 0, Value::Object(Some(arr)));
+        ctx.set_field(stream, 0, Value::Object(None));
+        ctx.set_field(stream, 2, Value::Object(Some(spliterator)));
         return Ok(Some(Value::Object(Some(stream))));
     }
     // Synthetic spliterator: field 0 is the fully-materialised Object[]
