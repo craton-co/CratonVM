@@ -3871,7 +3871,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "getNameCount", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let count = p.split('/').filter(|s| !s.is_empty()).count() as i32;
+        let count = p57_parse_win_root(&p).1.len() as i32;
         Ok(Some(Value::Int(count)))
     });
 
@@ -3882,7 +3882,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let p = p57_read_path(ctx, this);
-        let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+        let parts: Vec<String> = p57_parse_win_root(&p).1;
         // FIX (finding 4): match the JDK — index < 0 or >= name count throws
         // IllegalArgumentException instead of silently returning an empty path.
         if idx < 0 || idx as usize >= parts.len() {
@@ -3891,7 +3891,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             }
             .into());
         }
-        let name = parts[idx as usize];
+        let name = parts[idx as usize].as_str();
         let result = p57_alloc_path(ctx, name);
         Ok(Some(Value::Object(Some(result))))
     });
@@ -3907,7 +3907,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let p = p57_read_path(ctx, this);
-        let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+        let parts: Vec<String> = p57_parse_win_root(&p).1;
         let count = parts.len() as i32;
         // FIX (finding 4): match the JDK — beginIndex must be in [0,count),
         // endIndex in (beginIndex,count]; otherwise IllegalArgumentException.
@@ -3917,7 +3917,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             }
             .into());
         }
-        let sub: Vec<&str> = parts[begin as usize..end as usize].to_vec();
+        let sub: Vec<String> = parts[begin as usize..end as usize].to_vec();
         let result = p57_alloc_path(ctx, &sub.join("/"));
         Ok(Some(Value::Object(Some(result))))
     });
@@ -3965,7 +3965,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "iterator", "()Ljava/util/Iterator;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+        let parts: Vec<String> = p57_parse_win_root(&p).1;
         use cratonvm_types::ArrayElementType;
         let arr = ctx.new_array(ArrayElementType::Reference, parts.len());
         for (i, part) in parts.iter().enumerate() {
@@ -4262,15 +4262,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "getRoot", "()Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        if p.starts_with('/') {
-            let result = p57_alloc_path(ctx, "/");
-            Ok(Some(Value::Object(Some(result))))
-        } else if p.len() >= 3 && p.as_bytes()[1] == b':' && p.as_bytes()[2] == b'\\' {
-            // Windows root like C:\
-            let result = p57_alloc_path(ctx, &p[..3]);
-            Ok(Some(Value::Object(Some(result))))
-        } else {
-            Ok(Some(Value::Object(None)))
+        // keycloak-15: explicit Windows drive/UNC root parsing (the stored string
+        // is '/'-canonical, so the old `[2]==b'\\'` check never matched a drive).
+        match p57_parse_win_root(&p).0 {
+            Some(root) => {
+                let result = p57_alloc_path(ctx, &root);
+                Ok(Some(Value::Object(Some(result))))
+            }
+            None => Ok(Some(Value::Object(None))),
         }
     });
 
@@ -6467,7 +6466,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "getNameCount", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let count = p.split('/').filter(|s| !s.is_empty()).count();
+        let count = p57_parse_win_root(&p).1.len();
         Ok(Some(Value::Int(count as i32)))
     });
 
@@ -6475,7 +6474,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let idx = match args[1] { Value::Int(i) => i, _ => 0 };
         let p = p57_read_path(ctx, this);
-        let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+        let parts: Vec<String> = p57_parse_win_root(&p).1;
         // FIX (finding 4): JDK throws IllegalArgumentException for out-of-range index.
         if idx < 0 || idx as usize >= parts.len() {
             return Err(RuntimeError::IllegalArgumentException {
@@ -6483,7 +6482,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             }
             .into());
         }
-        let name = parts[idx as usize];
+        let name = parts[idx as usize].as_str();
         let result = p57_alloc_path(ctx, name);
         Ok(Some(Value::Object(Some(result))))
     });
@@ -6530,7 +6529,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "iterator", "()Ljava/util/Iterator;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+        let parts: Vec<String> = p57_parse_win_root(&p).1;
         use cratonvm_types::ArrayElementType;
         let arr = ctx.new_array(ArrayElementType::Reference, parts.len());
         for (i, part) in parts.iter().enumerate() {
@@ -6548,7 +6547,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let begin = match args[1] { Value::Int(i) => i, _ => 0 };
         let end = match args[2] { Value::Int(i) => i, _ => 0 };
         let p = p57_read_path(ctx, this);
-        let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+        let parts: Vec<String> = p57_parse_win_root(&p).1;
         let count = parts.len() as i32;
         // FIX (finding 4): JDK throws IllegalArgumentException for an out-of-range range.
         if begin < 0 || begin >= count || end <= begin || end > count {
@@ -6557,7 +6556,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             }
             .into());
         }
-        let sub: Vec<&str> = parts[begin as usize..end as usize].to_vec();
+        let sub: Vec<String> = parts[begin as usize..end as usize].to_vec();
         let result = p57_alloc_path(ctx, &sub.join("/"));
         Ok(Some(Value::Object(Some(result))))
     });
@@ -6954,6 +6953,64 @@ fn p57_to_os_path(p: &str) -> String {
         return p[1..].to_string();
     }
     p.to_string()
+}
+
+/// keycloak-15: explicit Windows (sun.nio.fs.WindowsPath) root/name parsing for
+/// the p57 path natives. The stored string is '/'-canonical (see `p57_alloc_path`),
+/// and `std::path::Component` does not classify the drive/UNC prefix in this build,
+/// so getRoot/getNameCount/getName must parse the prefix themselves. Accepts both
+/// '/' and '\\' separators. Returns `(root, names-after-root)`: root is the JDK
+/// root string (`C:\`, `\\server\share\`, `C:`, `\`) or None for a relative path.
+fn p57_parse_win_root(s: &str) -> (Option<String>, Vec<String>) {
+    let is_sep = |c: u8| c == b'\\' || c == b'/';
+    let split_names = |rest: &str| -> Vec<String> {
+        rest.split(|c| c == '\\' || c == '/')
+            .filter(|seg| !seg.is_empty())
+            .map(|seg| seg.to_string())
+            .collect()
+    };
+    let (work, verbatim) = {
+        let b = s.as_bytes();
+        if b.len() >= 4 && is_sep(b[0]) && is_sep(b[1]) && b[2] == b'?' && is_sep(b[3]) {
+            (&s[4..], true)
+        } else {
+            (s, false)
+        }
+    };
+    let wb = work.as_bytes();
+    if verbatim
+        && wb.len() >= 4
+        && work.get(..3).map_or(false, |p| p.eq_ignore_ascii_case("UNC"))
+        && is_sep(wb[3])
+    {
+        let after = &work[4..];
+        let mut it = after.splitn(3, |c| c == '\\' || c == '/');
+        let server = it.next().unwrap_or("");
+        let share = it.next().unwrap_or("");
+        let remainder = it.next().unwrap_or("");
+        return (Some(format!("\\\\{}\\{}\\", server, share)), split_names(remainder));
+    }
+    if wb.len() >= 2 && is_sep(wb[0]) && is_sep(wb[1]) {
+        let after = &work[2..];
+        let mut it = after.splitn(3, |c| c == '\\' || c == '/');
+        let server = it.next().unwrap_or("");
+        let share = it.next().unwrap_or("");
+        if !server.is_empty() && !share.is_empty() {
+            let remainder = it.next().unwrap_or("");
+            return (Some(format!("\\\\{}\\{}\\", server, share)), split_names(remainder));
+        }
+    }
+    if wb.len() >= 2 && (wb[0] as char).is_ascii_alphabetic() && wb[1] == b':' {
+        let drive = format!("{}:", wb[0] as char);
+        if wb.len() >= 3 && is_sep(wb[2]) {
+            return (Some(format!("{}\\", drive)), split_names(&work[3..]));
+        }
+        return (Some(drive), split_names(&work[2..]));
+    }
+    if !wb.is_empty() && is_sep(wb[0]) {
+        return (Some("\\".to_string()), split_names(&work[1..]));
+    }
+    (None, split_names(work))
 }
 
 fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
@@ -19615,7 +19672,9 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
         let entry = jarfs_decode(&path_str)
             .map(|(_, e)| e)
             .unwrap_or(path_str);
-        let count = std::path::Path::new(&entry).components().count() as i32;
+        // keycloak-15: count name elements after the (explicitly parsed) Windows
+        // drive/UNC root, not std::path components (which mis-count `C:` as a name).
+        let count = p57_parse_win_root(&entry).1.len() as i32;
         Ok(Some(Value::Int(count.max(0))))
     });
     r.set_category(__prev_cat);

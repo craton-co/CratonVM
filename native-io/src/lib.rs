@@ -7944,24 +7944,82 @@ fn native_path_get_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     }
 }
 
+/// keycloak-15: explicit Windows (sun.nio.fs.WindowsPath) root/name parsing.
+/// `std::path::Component` does not reliably classify the drive/UNC prefix in this
+/// build (it leaves `C:` as a Normal component), so getRoot/getNameCount/getName
+/// must parse the prefix themselves. Returns `(root, names)` where `root` is the
+/// JDK root string (e.g. `C:\`, `\\server\share\`, `C:`, `\`) or None for a
+/// relative path, and `names` are the path elements after the root (curdir `.`
+/// and parentdir `..` kept, matching HotSpot's name list).
+fn parse_windows_path_root(s: &str) -> (Option<String>, Vec<String>) {
+    let is_sep = |c: u8| c == b'\\' || c == b'/';
+    let split_names = |rest: &str| -> Vec<String> {
+        rest.split(|c| c == '\\' || c == '/')
+            .filter(|seg| !seg.is_empty())
+            .map(|seg| seg.to_string())
+            .collect()
+    };
+    // Strip a `\\?\` (verbatim) prefix and parse the underlying form.
+    let (work, verbatim) = {
+        let b = s.as_bytes();
+        if b.len() >= 4 && is_sep(b[0]) && is_sep(b[1]) && b[2] == b'?' && is_sep(b[3]) {
+            (&s[4..], true)
+        } else {
+            (s, false)
+        }
+    };
+    let wb = work.as_bytes();
+    // Verbatim UNC: \\?\UNC\server\share\...
+    if verbatim
+        && wb.len() >= 4
+        && work.get(..3).map_or(false, |p| p.eq_ignore_ascii_case("UNC"))
+        && is_sep(wb[3])
+    {
+        let after = &work[4..];
+        let mut it = after.splitn(3, |c| c == '\\' || c == '/');
+        let server = it.next().unwrap_or("");
+        let share = it.next().unwrap_or("");
+        let remainder = it.next().unwrap_or("");
+        return (Some(format!("\\\\{}\\{}\\", server, share)), split_names(remainder));
+    }
+    // UNC: \\server\share\...
+    if wb.len() >= 2 && is_sep(wb[0]) && is_sep(wb[1]) {
+        let after = &work[2..];
+        let mut it = after.splitn(3, |c| c == '\\' || c == '/');
+        let server = it.next().unwrap_or("");
+        let share = it.next().unwrap_or("");
+        if !server.is_empty() && !share.is_empty() {
+            let remainder = it.next().unwrap_or("");
+            return (Some(format!("\\\\{}\\{}\\", server, share)), split_names(remainder));
+        }
+    }
+    // Drive: `C:\...` / `C:/...` (absolute) or `C:foo` (drive-relative).
+    if wb.len() >= 2 && (wb[0] as char).is_ascii_alphabetic() && wb[1] == b':' {
+        let drive = format!("{}:", wb[0] as char);
+        if wb.len() >= 3 && is_sep(wb[2]) {
+            return (Some(format!("{}\\", drive)), split_names(&work[3..]));
+        }
+        return (Some(drive), split_names(&work[2..]));
+    }
+    // Single leading separator (root-relative on Windows): `\foo` / `/foo`.
+    if !wb.is_empty() && is_sep(wb[0]) {
+        return (Some("\\".to_string()), split_names(&work[1..]));
+    }
+    (None, split_names(work))
+}
+
 fn native_path_get_root(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
     let s = read_path_str(ctx, this);
-    let p = std::path::Path::new(&s);
-    match p.components().next() {
-        Some(std::path::Component::RootDir) | Some(std::path::Component::Prefix(_)) => {
-            let root_str = if let Some(std::path::Component::Prefix(pre)) = p.components().next() {
-                format!("{}\\", pre.as_os_str().to_string_lossy())
-            } else {
-                "/".to_string()
-            };
-            let result = alloc_path(ctx, &root_str);
+    match parse_windows_path_root(&s).0 {
+        Some(root) => {
+            let result = alloc_path(ctx, &root);
             Ok(Some(Value::Object(Some(result))))
         }
-        _ => Ok(Some(Value::Object(None))),
+        None => Ok(Some(Value::Object(None))),
     }
 }
 
@@ -8160,11 +8218,7 @@ fn native_path_get_name_count(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => return Ok(Some(Value::Int(0))),
     };
     let s = read_path_str(_ctx, this);
-    let p = std::path::Path::new(&s);
-    let count = p
-        .components()
-        .filter(|c| matches!(c, std::path::Component::Normal(_)))
-        .count();
+    let count = parse_windows_path_root(&s).1.len();
     Ok(Some(Value::Int(count as i32)))
 }
 
@@ -8178,14 +8232,9 @@ fn native_path_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => 0,
     };
     let s = read_path_str(ctx, this);
-    let p = std::path::Path::new(&s);
-    let normals: Vec<_> = p
-        .components()
-        .filter(|c| matches!(c, std::path::Component::Normal(_)))
-        .collect();
-    if idx < normals.len() {
-        let name = normals[idx].as_os_str().to_string_lossy().to_string();
-        let result = alloc_path(ctx, &name);
+    let names = parse_windows_path_root(&s).1;
+    if idx < names.len() {
+        let result = alloc_path(ctx, &names[idx]);
         Ok(Some(Value::Object(Some(result))))
     } else {
         Ok(Some(Value::Object(None)))
