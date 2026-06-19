@@ -19,17 +19,44 @@ I/O* native (read / accept), NOT `park`/`Object.wait`/a select-with-Java-frames 
 show frames). The earlier infinite-`select()` cap (`CRATONVM_SELECT_MAX_BLOCK_MS`, commit `26382a17`) is a
 sound defensive fix but did **NOT** stop the leak — confirming the stuck thread is not in `select()`.
 
-### Concrete next step (now unblocked, modulo perturbation)
+### PIVOTAL FINDING — it is GC stale/zeroed-OOP corruption, NOT a socket block
 
-Add a frame-snapshot publish (the cheap `capture_frames_no_lines`) to the blocking *socket* natives
-(`SocketChannel.read`/`write` EAGAIN-park, `ServerSocketChannel.accept`, any blocking `Net`/socket read)
-and the selector `select` native — i.e. call the same publish that `deposit_root_snapshot` does, at those
-native blocking points. Then catch one leak: the now-non-empty stack names the exact stuck socket call,
-and the fix follows (give it a finite timeout / interrupt-driven unblock, like every other primitive).
-CAVEAT: the leak is a Heisenbug — heavy `eprintln` tracing masks it; the lock-free `frame_trace` publish
-is light enough that it still reproduced (~1/60), so keep instrumentation lock-free. Also run on an
-otherwise-idle machine — concurrent peer sessions (`cratonvm_*` worktree runs) inflate the rate and
-confound measurement.
+A leaking run captured WITH the cross-thread stack walker (`/tmp/leakstk2/run21.log`) shows the real
+cause, and it is **not** a parked socket native. During the post-test teardown/leak-handling phase there
+is **widespread stale/zeroed-object corruption** — multiple distinct objects logged with an *all-zero
+header* (`num_slots=0`, `class_id=ClassId(0)`) being dereferenced:
+
+```
+Stale pointer ... receiver (ptr=0x870d27d8, all-zero header) — fallback CP class java/lang/StringBuilder
+Stale pointer ... receiver (ptr=0x89f988a8, all-zero header) — fallback CP class java/lang/StringBuilder
+gen_heap::get_field OOB: obj=0x89fe0340 index=7 num_slots=0
+Stale pointer ... receiver (ptr=0x82099d28, all-zero header) — fallback CP class java/lang/Thread
+gen_heap::get_field OOB: obj=0x82099d28 index=2 num_slots=0   <- the leaked Thread's tid slot
+NoSuchMethodError java/lang/StringBuilder.flush()V            <- corrupted dispatch off a zeroed obj
+NPE: Cannot read field 'randomnesses' ...   NPE: Cannot read field 'group' ...
+```
+
+`0x82099d28` is the leaked thread's **`java.lang.Thread` object**, zeroed by the GC while the thread is
+still registry-`alive`. That is why `getStackTrace()` is empty (the object — not a "non-depositing
+native" — is the problem), why it is "uninterruptible" (operations on a freed object no-op), and why the
+report shows `state=RUNNABLE` (`getState` reads the tid at field 2 of a zeroed header → registry lookup
+degrades). The concurrent StringBuilder zeroing + the bogus `StringBuilder.flush()` are the same epidemic.
+
+**Root cause is therefore the GC zeroing live objects — the "stale/zeroed-OOP dispatch" class (DF02 in
+CRATONVM_BUGS / the young-gen sweep zeroing live make/check nodes; see
+[[reference_reflrepro_a2_register_root]] and the precise-JIT-stack-maps work), not thread lifecycle or
+socket I/O.** The intermittent reactor "thread leak" is a *downstream symptom*: a Thread object happens to
+be one of the objects zeroed during teardown GC churn, so randomizedtesting can't resolve/interrupt it.
+The earlier socket-frame-deposit idea is SUPERSEDED — the thread is not blocked in a socket native.
+
+### Concrete next step (redirected)
+
+Chase the GC stale/zeroed-OOP corruption directly (DF02), not this leak in isolation. Repro:
+`/tmp/leakstk2/run21.log`; grep for `all-zero header` / `num_slots=0` to see the zeroed objects. The
+cross-thread stack walker added here makes a zeroed *Thread* object visible as an empty-stack leaked
+thread, but the fix is in the GC sweep/root path that is reclaiming still-live objects. CAVEAT: Heisenbug
+(any `eprintln` tracing masks it) + concurrent peer-session worktree load (`cratonvm_*`) inflates the rate
+and confounds measurement — run on an idle machine.
 
 ## Progress (commit `4064580d`)
 
