@@ -2006,8 +2006,17 @@ fn abstract_bean_definition_get_bean_class_name(
     // have attempted `ensure_class_initialized`, so a class that's truly on
     // the classpath will have a ClassId by this point.
     let internal = name.replace('.', "/");
-    let loadable =
-        ctx.class_id_by_name(&internal).is_some() || ctx.class_id_by_name(&name).is_some();
+    let loadable = ctx.class_id_by_name(&internal).is_some()
+        || ctx.class_id_by_name(&name).is_some()
+        // FIX(bug-B): a bean class can be ON the classpath but not yet LOADED —
+        // lazily-resolved nested / method-injection / proxied bean classes (e.g.
+        // a `<lookup-method>` AbstractBean) are loaded only at the instantiation
+        // site. `class_id_by_name` is a loaded-SET lookup, so it false-negatives
+        // those, and we used to hide a legitimately-loadable bean → this getter
+        // returned null → Spring instantiated a null instance → BeanWrapperImpl
+        // asserted "Target object must not be null". Probe the classpath resource
+        // (no clinit) so ONLY genuinely-absent classes are hidden.
+        || ctx.find_resource(&format!("{internal}.class")).is_some();
 
     if !loadable {
         tracing::warn!(
@@ -2753,7 +2762,11 @@ fn bdru_register_bean_definition(
             if !cn.is_empty() {
                 let internal = cn.replace('.', "/");
                 let loadable = ctx.class_id_by_name(&internal).is_some()
-                    || ctx.class_id_by_name(&cn).is_some();
+                    || ctx.class_id_by_name(&cn).is_some()
+                    // FIX(bug-B): see the getBeanClassName filter above — a
+                    // loaded-set miss is NOT proof of absence; probe the classpath
+                    // resource before dropping a legitimately-loadable bean.
+                    || ctx.find_resource(&format!("{internal}.class")).is_some();
                 if !loadable {
                     tracing::warn!(
                         "[bean-orphan] SKIP registering '{}' (class '{}' not loadable)",
