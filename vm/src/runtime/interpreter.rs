@@ -13479,6 +13479,22 @@ fn force_native_over_real_jdk_bytecode(
                 "elements",
                 "()Ljava/util/Enumeration;",
             )
+            // spring-bug-08: `ObjectInputStream.resolveProxyClass(String[])`
+            // has a real JDK body whose default routes
+            // `Proxy.getProxyClass` → `ProxyBuilder.getDynamicModule` →
+            // `Module.defineModule0` (a native the synthetic proxy model can't
+            // satisfy → `UnsatisfiedLinkError`/`ClassNotFoundException: null`).
+            // Force CratonVM's registered native (serialization.rs), which
+            // returns a generated `$ProxyN` class directly, so a serialized JDK
+            // dynamic proxy round-trips on CratonVM's own proxy machinery. Only
+            // a plain `java/io/ObjectInputStream` is forced — a subclass that
+            // overrides `resolveProxyClass` dispatches under its own class name
+            // and keeps its override.
+            | (
+                "java/io/ObjectInputStream",
+                "resolveProxyClass",
+                "([Ljava/lang/String;)Ljava/lang/Class;",
+            )
     ) || (class_name == "java/net/URL"
         && matches!(method_name, "getAuthority" | "getHostAddress"))
         || (matches!(

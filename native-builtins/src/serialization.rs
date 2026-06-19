@@ -2389,6 +2389,16 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
     //
     // The JDK contract here is symmetrical: each proxy interface name
     // must clear the filter before the proxy class is materialised.
+    //
+    // spring-bug-08: register as a `Bridge`, NOT the default `SyntheticStub`.
+    // In no-synthetic-stubs / real-JDK mode the registry DROPS every
+    // `SyntheticStub` serialization native (so the real OIS bytecode runs) —
+    // which is correct for `readObject`/`resolveClass`, but `resolveProxyClass`
+    // MUST override the real body (whose default routes the unsupported
+    // `Proxy.getProxyClass` dynamic-module path). A `Bridge` survives the drop
+    // and is then force-dispatched via `force_native_over_real_jdk_bytecode`.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(cls, "resolveProxyClass", "([Ljava/lang/String;)Ljava/lang/Class;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
@@ -2398,6 +2408,7 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(None))),
             };
             let len = ctx.array_length(arr);
+            let mut names: Vec<String> = Vec::with_capacity(len);
             for i in 0..len {
                 let iface = match ctx.get_array_element(arr, i) {
                     Value::Object(Some(s)) => s,
@@ -2413,11 +2424,24 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
                         }
                         .into());
                     }
+                    names.push(name);
                 }
+            }
+            // spring-bug-08: resolve to a CratonVM generated `$ProxyN` class
+            // ourselves rather than returning null (which lets the JDK default
+            // `resolveProxyClass` run `Proxy.getProxyClass` → the dynamic-module
+            // path that the synthetic proxy model can't drive, surfacing as
+            // `ClassNotFoundException: null`). The returned class extends the
+            // serializable `Proxy$Instance` super, so the proxy's `h` handler
+            // field deserializes back into it and the proxy round-trips.
+            if let Some(cid) = crate::resolve_serialized_proxy_class(ctx, &names) {
+                let mirror = ctx.get_class_mirror(cid);
+                return Ok(Some(Value::Object(Some(mirror))));
             }
             Ok(Some(Value::Object(None)))
         },
     );
+    r.set_category(__prev_cat);
 
     // setObjectInputFilter(ObjectInputFilter)V — per-stream filter slot.
     // Must be set before the first object is read (we do NOT enforce that
