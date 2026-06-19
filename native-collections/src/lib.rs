@@ -8746,6 +8746,90 @@ const STREAM_FIELD_ELEMENTS: usize = 0;
 // close-handler contract. See docs/known-issues/keycloak-16-stream-onclose-and-laziness.md.
 const STREAM_FIELD_CLOSE_HANDLERS: usize = 1;
 const STREAM_NUM_FIELDS: usize = 2;
+/// Lazy source spliterator slot, populated only by
+/// `StreamSupport.stream(realSpliterator, false)` (see service_loader.rs). When
+/// present (and `STREAM_FIELD_ELEMENTS` is still null), the stream has NOT been
+/// drained: `forEach` drives the spliterator one element at a time, and every
+/// other op materialises it first via `materialize_lazy_stream`.
+const STREAM_FIELD_LAZY_SPLITERATOR: usize = 2;
+
+/// The lazy source spliterator stashed on a synthetic stream by
+/// `StreamSupport.stream(realSpliterator, false)`, or `None` for an ordinary
+/// (already-materialised) stream. Guards on the field count so streams allocated
+/// with the legacy 2-field layout are simply never lazy.
+fn stream_lazy_spliterator(ctx: &dyn NativeContext, stream: ObjectRef) -> Option<ObjectRef> {
+    if ctx.object_num_fields(stream) <= STREAM_FIELD_LAZY_SPLITERATOR {
+        return None;
+    }
+    match ctx.get_field(stream, STREAM_FIELD_LAZY_SPLITERATOR) {
+        Value::Object(Some(s)) => Some(s),
+        _ => None,
+    }
+}
+
+/// Drain a real `Spliterator` into an exact-sized `Object[]` via its
+/// `tryAdvance(Consumer)` contract with a `cratonvm/internal/StreamCollector`
+/// (the accept native, registered globally, appends + grows). Pins both objects
+/// across the loop since every `tryAdvance` re-enters Java and may move them.
+fn drain_spliterator_to_array(ctx: &mut dyn NativeContext, spl: ObjectRef) -> ObjectRef {
+    let collector = alloc_synthetic(ctx, "cratonvm/internal/StreamCollector", 2);
+    let storage = alloc_ref_array(ctx, 16);
+    ctx.set_field(collector, 0, Value::Object(Some(storage)));
+    ctx.set_field(collector, 1, Value::Int(0));
+    let spl_pin = ctx.pin_native_root(spl);
+    let col_pin = ctx.pin_native_root(collector);
+    const SAFETY_CAP: usize = 1_000_000;
+    let mut n = 0usize;
+    loop {
+        let s = ctx.read_native_pin(spl_pin, spl);
+        let c = ctx.read_native_pin(col_pin, collector);
+        match ctx.invoke_virtual(
+            s,
+            "tryAdvance",
+            "(Ljava/util/function/Consumer;)Z",
+            &[Value::Object(Some(c))],
+        ) {
+            Ok(Some(Value::Int(v))) if v != 0 => {
+                n += 1;
+                if n >= SAFETY_CAP {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    let col = ctx.read_native_pin(col_pin, collector);
+    ctx.unpin_native_roots(spl_pin);
+    ctx.unpin_native_roots(col_pin);
+    let len = match ctx.get_field(col, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    let storage = match ctx.get_field(col, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return alloc_ref_array(ctx, 0),
+    };
+    let out = alloc_ref_array(ctx, len);
+    for i in 0..len {
+        let v = ctx.get_array_element(storage, i);
+        ctx.set_array_element(out, i, v);
+    }
+    out
+}
+
+/// If `stream` is lazy (holds a source spliterator in slot 2 and has no
+/// materialised element array yet), drain the spliterator into slot 0 and clear
+/// the lazy slot. Idempotent; a no-op for ordinary streams. Called at the top of
+/// `stream_elements` so EVERY non-forEach op transparently materialises.
+fn materialize_lazy_stream(ctx: &mut dyn NativeContext, stream: ObjectRef) {
+    let spl = match stream_lazy_spliterator(ctx, stream) {
+        Some(s) => s,
+        None => return,
+    };
+    let arr = drain_spliterator_to_array(ctx, spl);
+    ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+    ctx.set_field(stream, STREAM_FIELD_LAZY_SPLITERATOR, Value::Object(None));
+}
 
 /// Create a Stream from a slice of values.
 fn make_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCallResult {
@@ -8855,24 +8939,31 @@ fn native_stream_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 /// Extract elements from a Stream.
-fn stream_elements(ctx: &dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
+fn stream_elements(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
+    // Lazy streams (from `StreamSupport.stream(realSpliterator, false)`) hold
+    // their source spliterator in slot 2 with no element array yet — drain it
+    // now so EVERY non-forEach op sees the full element list. (`forEach` handles
+    // the lazy case itself, driving the spliterator one element at a time.)
+    materialize_lazy_stream(ctx, stream);
     // For our synthetic Stream object, field 0 holds an Object[] of elements.
     // But some streams are real JDK ReferencePipeline instances (returned by
-    // e.g. Spring's MergedAnnotations.stream()). In those cases we can't peek
-    // at field 0 — fall through to materialize via Stream.toArray().
+    // e.g. Spring's MergedAnnotations.stream()) — materialize those via toArray().
     let class_id = ctx.class_id_of_object(stream);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
-    let is_synthetic = is_synthetic_stream(&class_name);
-    if is_synthetic {
+    if is_synthetic_stream(&class_name) {
         if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
             let len = ctx.array_length(arr);
             return (0..len).map(|i| ctx.get_array_element(arr, i)).collect();
         }
+        return Vec::new();
     }
-    // Non-synthetic streams (real JDK ReferencePipeline etc.) require an
-    // `invoke_virtual` call to materialize via `Stream.toArray()` — use
-    // `stream_elements_mut` from a context that has `&mut dyn NativeContext`.
-    Vec::new()
+    match ctx.invoke_virtual(stream, "toArray", "()[Ljava/lang/Object;", &[]) {
+        Ok(Some(Value::Object(Some(arr)))) => {
+            let len = ctx.array_length(arr);
+            (0..len).map(|i| ctx.get_array_element(arr, i)).collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// True for CratonVM's synthetic Stream / IntStream / LongStream / DoubleStream
@@ -8895,26 +8986,10 @@ fn is_synthetic_stream(class_name: &str) -> bool {
     )
 }
 
-/// Mutable variant of stream_elements that can invoke virtual methods.
+/// Back-compat alias: `stream_elements` is now `&mut` and itself materialises
+/// lazy streams + real `ReferencePipeline`s via `toArray`.
 fn stream_elements_mut(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
-    let class_id = ctx.class_id_of_object(stream);
-    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
-    let is_synthetic = is_synthetic_stream(&class_name);
-    if is_synthetic {
-        if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
-            let len = ctx.array_length(arr);
-            return (0..len).map(|i| ctx.get_array_element(arr, i)).collect();
-        }
-        return Vec::new();
-    }
-    // Real ReferencePipeline (or any JDK Stream impl): materialize via toArray.
-    match ctx.invoke_virtual(stream, "toArray", "()[Ljava/lang/Object;", &[]) {
-        Ok(Some(Value::Object(Some(arr)))) => {
-            let len = ctx.array_length(arr);
-            (0..len).map(|i| ctx.get_array_element(arr, i)).collect()
-        }
-        _ => Vec::new(),
-    }
+    stream_elements(ctx, stream)
 }
 
 /// Materialise a possibly-REAL primitive stream's elements. CratonVM's synthetic
@@ -8925,6 +9000,7 @@ fn stream_elements_mut(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Va
 /// selects the right one. Used by `flatMap`, whose mapper commonly returns such
 /// real primitive streams.
 fn prim_stream_values(ctx: &mut dyn NativeContext, stream: ObjectRef, toarray_desc: &str) -> Vec<Value> {
+    materialize_lazy_stream(ctx, stream);
     let cn = ctx.class_name_of_id(ctx.class_id_of_object(stream)).unwrap_or_default();
     if is_synthetic_stream(&cn) {
         if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
@@ -9498,8 +9574,16 @@ fn native_stream_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
 fn native_stream_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a_ref = match args.first() { Some(Value::Object(Some(r))) => Some(*r), _ => None };
     let b_ref = match args.get(1) { Some(Value::Object(Some(r))) => Some(*r), _ => None };
-    let a = a_ref.map(|r| stream_elements(ctx, r)).unwrap_or_default();
-    let b = b_ref.map(|r| stream_elements(ctx, r)).unwrap_or_default();
+    // (Sequential `&mut` borrows — `stream_elements` is now `&mut`, so avoid the
+    // closure form which would capture `ctx` mutably twice.)
+    let a = match a_ref {
+        Some(r) => stream_elements(ctx, r),
+        None => Vec::new(),
+    };
+    let b = match b_ref {
+        Some(r) => stream_elements(ctx, r),
+        None => Vec::new(),
+    };
     let mut combined = a;
     combined.extend(b);
     let r = make_stream(ctx, &combined)?;
@@ -9824,6 +9908,40 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
+    // Lazy path: a stream straight from `StreamSupport.stream(realSpliterator,
+    // false)` (no intervening op materialised it) drives its source spliterator
+    // one element at a time, so a side-effecting consumer observes per-element
+    // processing exactly like the JDK (the fix for DetachedPreviousRowStateTest).
+    if let Some(spl) = stream_lazy_spliterator(ctx, this) {
+        let spl_pin = ctx.pin_native_root(spl);
+        let con_pin = ctx.pin_native_root(consumer);
+        const SAFETY_CAP: usize = 1_000_000;
+        let mut n = 0usize;
+        let result = loop {
+            let s = ctx.read_native_pin(spl_pin, spl);
+            let c = ctx.read_native_pin(con_pin, consumer);
+            match ctx.invoke_virtual(
+                s,
+                "tryAdvance",
+                "(Ljava/util/function/Consumer;)Z",
+                &[Value::Object(Some(c))],
+            ) {
+                Ok(Some(Value::Int(v))) if v != 0 => {
+                    n += 1;
+                    if n >= SAFETY_CAP {
+                        break Ok(None);
+                    }
+                }
+                Ok(_) => break Ok(None),
+                Err(e) => break Err(e),
+            }
+        };
+        ctx.unpin_native_roots(spl_pin);
+        ctx.unpin_native_roots(con_pin);
+        // Mark consumed so a (illegal) second terminal sees an empty stream.
+        ctx.set_field(this, STREAM_FIELD_LAZY_SPLITERATOR, Value::Object(None));
+        return result;
+    }
     let elements = stream_elements(ctx, this);
     for elem in &elements {
         ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[*elem])?;
@@ -11259,7 +11377,7 @@ fn make_int_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCal
     Ok(Some(Value::Object(Some(stream))))
 }
 
-fn int_stream_elements(ctx: &dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
+fn int_stream_elements(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
     stream_elements(ctx, stream)
 }
 
