@@ -14545,31 +14545,50 @@ fn populate_invoke_cache(
         return;
     };
 
+    // Native-shadow check keyed on the *declaring* class. This covers two
+    // cases that the CP-class lookup above (line ~14428) misses:
+    //   1. The method is `native` in a superclass (the original intent).
+    //   2. The method has real-JDK *bytecode* but CratonVM shadows it with a
+    //      Rust native registered on the declaring class — e.g.
+    //      `ClassLoader.loadClass(String,Z)`. When reached via
+    //      `super.loadClass(...)` from a `URLClassLoader` subclass
+    //      (GroovyClassLoader's AST-transform loader), the CP symbolic ref
+    //      names the immediate super (`java/net/URLClassLoader`), not
+    //      `java/lang/ClassLoader`, so the CP-class native lookup misses and
+    //      we fall through to cache `Bytecode`. The slow path (cache MISS)
+    //      always serves the declaring-class shadow, so the first call works
+    //      but every cached call afterwards runs the real delegation bytecode
+    //      — which CratonVM cannot satisfy (BuiltinClassLoader module graph),
+    //      yielding a spurious ClassNotFoundException. Resolve the shadow here
+    //      so the cache matches the slow path.
+    let declaring_name = store
+        .get(declaring_id)
+        .map(|c| &*c.name)
+        .unwrap_or("");
+    if let Some(callback) =
+        shared
+            .native_methods
+            .find(declaring_name, &method_name, &descriptor)
+    {
+        // WP2.4-F1: gate bound to the *declaring* class — that's the
+        // class whose method body could be replaced via redefine.
+        let gate = RedefineGate::snapshot(
+            cm.class_redefine_generation_handle(declaring_id),
+        );
+        drop(cm);
+        let target = CachedInvokeTarget::Native {
+            callback,
+            num_params: num_params as u16, // Widening: parameter count conversion
+            gate,
+        };
+        shared.shared_resolution.insert_promoted_invoke(promoted_key, target.clone());
+        thread.invoke_cache.put(caller_class_id, cp_index, is_special, target);
+        return;
+    }
     if method.is_native() {
-        // Already handled above, but the method might be native in a superclass
-        let declaring_name = store
-            .get(declaring_id)
-            .map(|c| &*c.name)
-            .unwrap_or("");
-        if let Some(callback) =
-            shared
-                .native_methods
-                .find(declaring_name, &method_name, &descriptor)
-        {
-            // WP2.4-F1: gate bound to the *declaring* class — that's the
-            // class whose method body could be replaced via redefine.
-            let gate = RedefineGate::snapshot(
-                cm.class_redefine_generation_handle(declaring_id),
-            );
-            drop(cm);
-            let target = CachedInvokeTarget::Native {
-                callback,
-                num_params: num_params as u16, // Widening: parameter count conversion
-                gate,
-            };
-            shared.shared_resolution.insert_promoted_invoke(promoted_key, target.clone());
-            thread.invoke_cache.put(caller_class_id, cp_index, is_special, target);
-        }
+        // Declaring-class native shadow not found, but the method is flagged
+        // `native` and has no bytecode body — leave it to the slow path
+        // (preserves the prior behavior of returning without caching).
         return;
     }
 
