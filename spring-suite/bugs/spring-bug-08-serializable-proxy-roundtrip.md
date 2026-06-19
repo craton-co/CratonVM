@@ -5,11 +5,19 @@
 | **Category** | VM-CORRECTNESS (proxy + serialization) |
 | **Module** | spring-core |
 | **Test class** | `org.springframework.core.SerializableTypeWrapperTests` |
-| **CratonVM** | FAIL — 7/8 (after [[spring-bug-05]] fixed the Proxy `InternalError`) |
+| **CratonVM** | FIXED — serializable JDK-proxy round-trip now works |
 | **HotSpot JDK 25** | OK (8/8) |
-| **CratonVM HEAD** | c5644da4 + bug-05 fix |
-| **Status** | OPEN |
-| **Suggested owner** | handoff candidate (serialization + proxy interaction) |
+| **CratonVM HEAD** | branch `fix/spring-bug-08-proxy-serial` (off dev 77f17d99) |
+| **Status** | **FIXED** (full write-up: `docs/known-issues/spring-bug-08-serializable-proxy-roundtrip.md`) |
+| **Suggested owner** | done |
+
+> FIX SUMMARY: synthetic `Proxy$Instance` super now implements `Serializable` +
+> declares the `h` handler field (so OOS serializes the handler via `superDesc`);
+> `Proxy.isProxyClass(Proxy$Instance)` returns false (only `$ProxyN` subclasses
+> are proxy classes — fixes the "Circular reference" on the duplicated proxy
+> desc); and `ObjectInputStream.resolveProxyClass` is force-overridden to return a
+> CratonVM `$ProxyN` instead of crashing on `Module.defineModule0`. See the
+> known-issues doc for the full root-cause analysis and verification.
 
 ## Symptom
 Surfaced only **after** [[spring-bug-05]] (dynamic proxy creation) was fixed. Spring's

@@ -35193,7 +35193,54 @@ pub fn register_reflect_proxy_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
         native_proxy_dispatch_invoke,
     );
+    // spring-bug-08: `ObjectInputStream.resolveProxyClass(String[])` override.
+    // The serialization module's own copy (serialization.rs) is gated behind the
+    // `experimental-serialization` feature and absent from the default build,
+    // where the real OIS bytecode runs — and its default routes the unsupported
+    // `Proxy.getProxyClass` dynamic-module path (`Module.defineModule0`),
+    // surfacing as `ClassNotFoundException: null` when deserializing a JDK
+    // dynamic proxy. Register the override HERE (always compiled, always called,
+    // `Bridge` category so it survives the no-synthetic-stubs drop) and
+    // force-dispatch it via `force_native_over_real_jdk_bytecode`. It returns a
+    // CratonVM generated `$ProxyN` class for the stream's interface set, keeping
+    // the round-trip on CratonVM's own proxy machinery.
+    registry.register(
+        "java/io/ObjectInputStream",
+        "resolveProxyClass",
+        "([Ljava/lang/String;)Ljava/lang/Class;",
+        native_ois_resolve_proxy_class,
+    );
     registry.set_category(__prev_cat);
+}
+
+/// spring-bug-08 — body of the always-on `ObjectInputStream.resolveProxyClass`
+/// override (see `register_reflect_proxy_natives`). Reads the interface-name
+/// `String[]` (arg 1) and resolves it to a CratonVM generated `$ProxyN` class
+/// via [`resolve_serialized_proxy_class`], bypassing the real
+/// `Proxy.getProxyClass` dynamic-module path. Returns `null` (→ the caller's
+/// default) only if resolution fails, preserving the original error semantics.
+fn native_ois_resolve_proxy_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let arr = match args.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let len = ctx.array_length(arr);
+    let mut names: Vec<String> = Vec::with_capacity(len);
+    for i in 0..len {
+        if let Value::Object(Some(s)) = ctx.get_array_element(arr, i) {
+            if let Some(name) = ctx.read_string(s) {
+                names.push(name);
+            }
+        }
+    }
+    if let Some(cid) = resolve_serialized_proxy_class(ctx, &names) {
+        let mirror = ctx.get_class_mirror(cid);
+        return Ok(Some(Value::Object(Some(mirror))));
+    }
+    Ok(Some(Value::Object(None)))
 }
 
 fn native_proxy_is_proxy_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -35207,7 +35254,25 @@ fn native_proxy_is_proxy_class(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => return Ok(Some(Value::Int(0))),
     };
     let is_proxy = match crate::lang_class::mirror_class_id(ctx, class_mirror) {
-        Some(cid) => proxy_chain_reaches_instance(ctx, cid),
+        Some(cid) => {
+            // spring-bug-08: the synthetic super `Proxy$Instance` is the analog
+            // of `java.lang.reflect.Proxy` — it is NOT itself a proxy class
+            // (`Proxy.isProxyClass(Proxy.class) == false`). Only generated
+            // `$ProxyN` SUBCLASSES are proxy classes. Without this exclusion,
+            // ObjectOutputStream sees the proxy's superclass as a proxy too and
+            // writes its `superDesc` as a second `TC_PROXYCLASSDESC` (instead of
+            // the non-proxy `Proxy$Instance` desc that carries the serializable
+            // `h` field), so the handler is lost on write and the duplicate
+            // proxy name trips `ObjectStreamClass`'s "Circular reference." guard
+            // on read.
+            if ctx.class_name_of_id(cid).as_deref()
+                == Some("java/lang/reflect/Proxy$Instance")
+            {
+                false
+            } else {
+                proxy_chain_reaches_instance(ctx, cid)
+            }
+        }
         None => false,
     };
     Ok(Some(Value::Int(if is_proxy { 1 } else { 0 })))
@@ -35775,6 +35840,71 @@ fn define_or_get_proxy_class(
             if dbg { eprintln!("[DBG_PROXY] FALLBACK(define): define_class_full({gen_name}) failed: {e}"); }
             ProxyClassOutcome::Failed("define")
         }
+    }
+}
+
+/// spring-bug-08 — read-side proxy-class resolution for
+/// `ObjectInputStream.resolveProxyClass`. Given the interface names read
+/// from the stream (dotted, as written by `Class.getName()`), resolve them
+/// to a CratonVM generated `$ProxyN` class WITHOUT entering the real
+/// `Proxy.getProxyClass` path. The synthetic proxy model has no real
+/// `ProxyGenerator`/dynamic-module support, so the JDK default
+/// (`resolveProxyClass` → `Proxy.getProxyClass` → `ProxyBuilder.getDynamicModule`
+/// → `Module.defineModule0`) throws `UnsatisfiedLinkError`/`IllegalArgumentException`
+/// (surfacing as `ClassNotFoundException: null`). Returning a generated
+/// `$ProxyN` here keeps the whole round-trip on CratonVM's own proxy
+/// machinery — exactly the class `Proxy.newProxyInstance` would have built.
+pub(crate) fn resolve_serialized_proxy_class(
+    ctx: &mut dyn NativeContext,
+    iface_names: &[String],
+) -> Option<cratonvm_types::ClassId> {
+    if iface_names.is_empty() {
+        return None;
+    }
+    // Resolve each interface name -> ClassId (ensuring it is loaded). The
+    // interfaces are normally already loaded at deserialization time (they
+    // were referenced when the original proxy and the handler were created),
+    // so this is a lookup in the common case.
+    let mut iface_cids: Vec<cratonvm_types::ClassId> = Vec::with_capacity(iface_names.len());
+    let mut loader_id: u32 = 0;
+    for n in iface_names {
+        let internal = n.replace('.', "/");
+        let cid = match ctx.ensure_class_initialized(&internal) {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
+        // Prefer a non-bootstrap loader namespace so a cold (cache-miss)
+        // `define_class_full` can resolve app interfaces.
+        let lid = ctx.loader_id_of_class(cid);
+        if lid > 0 {
+            loader_id = lid as u32;
+        }
+        iface_cids.push(cid);
+    }
+    // Sorted+deduped key matching `define_or_get_proxy_class`'s cache key.
+    let mut sorted = iface_cids.clone();
+    sorted.sort_by_key(|c| c.as_u32());
+    sorted.dedup();
+    // Primary: reuse an already-generated `$ProxyN` with this interface set,
+    // regardless of the loader namespace that created it. The common case —
+    // an in-process write→read round-trip (e.g. Spring's
+    // `SerializableTypeWrapper`) — always hits here because the write side
+    // created the proxy class via `Proxy.newProxyInstance` first.
+    {
+        let guard = PROXY_CLASS_CACHE.read();
+        if let Some(map) = guard.as_ref() {
+            for ((_ns, key), &cid) in map.iter() {
+                if *key == sorted {
+                    return Some(cid);
+                }
+            }
+        }
+    }
+    // Fallback (cold deserialization with no prior proxy of this interface
+    // set in-process): generate one now.
+    match define_or_get_proxy_class(ctx, loader_id, &iface_cids) {
+        ProxyClassOutcome::Real(cid) => Some(cid),
+        _ => None,
     }
 }
 

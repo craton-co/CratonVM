@@ -1665,6 +1665,39 @@ impl ClassManager {
         } else {
             self.get_loaded_class_id("java/lang/Object")
         };
+        // spring-bug-08: the synthetic `Proxy$Instance` super of every
+        // generated `$ProxyN` must mirror the real `java.lang.reflect.Proxy`
+        // closely enough for `ObjectOutputStream`/`ObjectInputStream` to
+        // round-trip a JDK dynamic proxy. Two facts of the real `Proxy`:
+        //   (a) `java.lang.reflect.Proxy implements java.io.Serializable`, so
+        //       EVERY proxy is serializable; without this, real-OOS
+        //       `lookup(superclass, all=false)` returns null for `Proxy$Instance`
+        //       (not Serializable) → the proxy's `superDesc` is written as
+        //       `TC_NULL` and the handler is dropped.
+        //   (b) `Proxy` declares `protected InvocationHandler h;` — the single
+        //       serialized field. Declaring `h` here (slot 0, the same slot the
+        //       proxy natives already use for the handler) puts the handler in
+        //       the serialized field set so it is restored on read.
+        // Slots 1 (interfaces `Class[]`) and 2 (identity-hash) stay native-only
+        // (accessed by raw index, undeclared) so they are not serialized.
+        let (synthetic_interfaces, synthetic_fields): (
+            Vec<ClassId>,
+            Vec<cratonvm_reader::field::ClassFileField>,
+        ) = if name == "java/lang/reflect/Proxy$Instance" {
+            let ifaces = self
+                .get_loaded_class_id("java/io/Serializable")
+                .into_iter()
+                .collect();
+            let fields = vec![cratonvm_reader::field::ClassFileField {
+                access_flags: FieldAccessFlags::empty(),
+                name: cratonvm_types::intern_arc("h"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/reflect/InvocationHandler;"),
+                attributes: vec![],
+            }];
+            (ifaces, fields)
+        } else {
+            (vec![], vec![])
+        };
         let id = self.class_store.next_id();
         let class = Class {
             id,
@@ -1679,8 +1712,8 @@ impl ClassManager {
             ]),
             access_flags: cratonvm_reader::class_access_flags::ClassAccessFlags::from_bits_truncate(0x0021),
             superclass: synthetic_superclass,
-            interfaces: vec![],
-            fields: vec![],
+            interfaces: synthetic_interfaces,
+            fields: synthetic_fields,
             methods: synthetic_stub_ctor_methods(name),
             first_field_index: 0,
             num_total_fields: num_fields,
