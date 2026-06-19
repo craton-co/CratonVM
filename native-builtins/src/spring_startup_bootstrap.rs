@@ -2449,6 +2449,56 @@ fn s_instantiation_strategy_instantiate(
 /// (`getTypeForFactoryBean`, `predictBeanType`, `isFactoryBean`,
 /// `findAutowireCandidates`) handles null gracefully; throwing would
 /// fail-fast in `preInstantiateSingletons`.
+/// Resolve a bean's class from `AbstractBeanDefinition`/`RootBeanDefinition`'s
+/// single `beanClass` field — an `Object` holding EITHER an already-resolved
+/// `Class` mirror OR the still-unresolved `String` class name. (`setBeanClassName`
+/// does `this.beanClass = beanClassName`; there is NO separate `beanClassName`
+/// field in current Spring — the prior shims read that non-existent field and so
+/// returned `null` for *every* bean, skipping all of them.)
+///
+/// Returns the resolved `Class` mirror when the class is loadable and — matching
+/// the real `resolveBeanClass` bytecode (`this.beanClass = resolvedClass`) —
+/// caches it back into the field so later `getBeanClass()` / `hasBeanClass()`
+/// observe it as resolved. Returns `None` only when the field is absent or the
+/// named class is genuinely not on the (possibly partial) classpath, so the
+/// partial-classpath skip behaviour these shims exist for is preserved.
+fn resolve_bean_class_field(ctx: &mut dyn NativeContext, recv: ObjectRef) -> Option<ObjectRef> {
+    // Primary: the `beanClass` Object field (a Class mirror or a String name).
+    let name: Option<String> = match ctx.get_field_by_name(recv, "beanClass") {
+        Value::Object(Some(o)) => {
+            let cid = ctx.class_id_of_object(o);
+            if ctx.class_name_of_id(cid).as_deref() == Some("java/lang/Class") {
+                // Already resolved — return the mirror unchanged.
+                return Some(o);
+            }
+            // Otherwise it is the unresolved String class name.
+            ctx.read_string(o)
+        }
+        _ => None,
+    };
+    // Legacy fallback: a dedicated `beanClassName` String field (older Spring).
+    let name = name.or_else(|| match ctx.get_field_by_name(recv, "beanClassName") {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => None,
+    })?;
+
+    let internal = name.replace('.', "/");
+    // Resolve the name to a Class; only classes actually on the classpath
+    // succeed (a missing class yields None → caller preserves the skip).
+    let cid = match ctx.class_id_by_name(&internal) {
+        Some(c) => c,
+        None => match ctx.ensure_class_initialized(&internal) {
+            Ok(c) => c,
+            Err(_) => return None,
+        },
+    };
+    let mirror = ctx.get_class_mirror(cid);
+    // Cache back into `beanClass` (the real bytecode's `this.beanClass =
+    // resolvedClass`), so getBeanClass()/hasBeanClass() see it resolved.
+    ctx.set_field_by_name(recv, "beanClass", Value::Object(Some(mirror)));
+    Some(mirror)
+}
+
 fn m3_abstract_bean_definition_resolve_bean_class(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2457,27 +2507,9 @@ fn m3_abstract_bean_definition_resolve_bean_class(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // Read beanClassName String field via getfield by name
-    let name_obj = match ctx.get_field_by_name(recv, "beanClassName") {
-        Value::Object(Some(s)) => s,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let class_name = match ctx.read_string(name_obj) {
-        Some(s) => s,
-        None => return Ok(Some(Value::Object(None))),
-    };
-    let internal = class_name.replace('.', "/");
-    // Try to load via class manager; on failure return null (no CNFE).
-    if let Some(cid) = ctx.class_id_by_name(&internal) {
-        let mirror = ctx.get_class_mirror(cid);
-        return Ok(Some(Value::Object(Some(mirror))));
-    }
-    // Fallback: try ensure_class_initialized (which loads if necessary).
-    if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
-        let mirror = ctx.get_class_mirror(cid);
-        return Ok(Some(Value::Object(Some(mirror))));
-    }
-    Ok(Some(Value::Object(None)))
+    // Resolve from the real `beanClass` field; null only for a genuinely
+    // missing class (no CNFE), preserving partial-classpath skip.
+    Ok(Some(Value::Object(resolve_bean_class_field(ctx, recv))))
 }
 
 fn m4_abstract_bean_factory_do_resolve_bean_class(
@@ -2489,24 +2521,9 @@ fn m4_abstract_bean_factory_do_resolve_bean_class(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let name_obj = match ctx.get_field_by_name(mbd, "beanClassName") {
-        Value::Object(Some(s)) => s,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let class_name = match ctx.read_string(name_obj) {
-        Some(s) => s,
-        None => return Ok(Some(Value::Object(None))),
-    };
-    let internal = class_name.replace('.', "/");
-    if let Some(cid) = ctx.class_id_by_name(&internal) {
-        let mirror = ctx.get_class_mirror(cid);
-        return Ok(Some(Value::Object(Some(mirror))));
-    }
-    if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
-        let mirror = ctx.get_class_mirror(cid);
-        return Ok(Some(Value::Object(Some(mirror))));
-    }
-    Ok(Some(Value::Object(None)))
+    // Resolve from the real `beanClass` field (mirror or String name); null
+    // only for a genuinely missing class, preserving partial-classpath skip.
+    Ok(Some(Value::Object(resolve_bean_class_field(ctx, mbd))))
 }
 
 /// Strategy B: `AbstractBeanFactory.resolveBeanClass(RootBeanDefinition,
@@ -2539,32 +2556,10 @@ fn m5_abstract_bean_factory_resolve_bean_class_with_name(
     };
     let bean_name_obj = args.get(2).copied();
 
-    // First, if `beanClass` is already a Class mirror (prior successful
-    // resolve), return it directly.
-    if let Value::Object(Some(cls_mirror)) = ctx.get_field_by_name(mbd, "beanClass") {
-        let cid = ctx.class_id_of_object(cls_mirror);
-        if ctx.class_name_of_id(cid).as_deref() == Some("java/lang/Class") {
-            return Ok(Some(Value::Object(Some(cls_mirror))));
-        }
-    }
-
-    let name_obj = match ctx.get_field_by_name(mbd, "beanClassName") {
-        Value::Object(Some(s)) => s,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let class_name = match ctx.read_string(name_obj) {
-        Some(s) => s,
-        None => return Ok(Some(Value::Object(None))),
-    };
-    let internal = class_name.replace('.', "/");
-
-    // Try to load.
-    if let Some(cid) = ctx.class_id_by_name(&internal) {
-        let mirror = ctx.get_class_mirror(cid);
-        return Ok(Some(Value::Object(Some(mirror))));
-    }
-    if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
-        let mirror = ctx.get_class_mirror(cid);
+    // Resolve from the real `beanClass` field (already-resolved mirror, or the
+    // String class name). Loadable classes resolve (and cache back); only a
+    // genuinely missing class falls through to the removal path below.
+    if let Some(mirror) = resolve_bean_class_field(ctx, mbd) {
         return Ok(Some(Value::Object(Some(mirror))));
     }
 
