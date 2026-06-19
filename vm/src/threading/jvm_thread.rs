@@ -271,6 +271,13 @@ pub struct JvmThread {
     /// Updated at safepoints and before blocking operations.
     pub root_snapshot: Arc<parking_lot::Mutex<Vec<ObjectRef>>>,
 
+    /// Frame trace snapshot: shared with ThreadRegistry so another thread can
+    /// read this thread's Java call stack (cross-thread `Thread.getStackTrace()`
+    /// / `dumpThreads()`). Published at the same blocking deposit points as
+    /// `root_snapshot`, so for a parked thread it reflects where it is stuck.
+    /// Line-less (see `stackwalker::capture_frames_no_lines`) to stay lock-free.
+    pub frame_trace: Arc<parking_lot::Mutex<Vec<cratonvm_native_api::StackTraceEntry>>>,
+
     /// Opt-in root-snapshot cache (`CRATONVM_ROOTSNAP_CACHE`): per *frozen*
     /// frame, `(frame.seq, that frame's scanned GC roots)`, indexed parallel to
     /// `frames[0..rs_cache.len()]`. Lets `update_root_snapshot` reuse the deep,
@@ -453,6 +460,7 @@ impl JvmThread {
             java_thread_obj: None,
             park_state: Arc::new(ParkState::new()),
             root_snapshot: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            frame_trace: Arc::new(parking_lot::Mutex::new(Vec::new())),
             rs_cache: Vec::new(),
             rs_cache_gen: 0,
             gc_block_state: Arc::new(GcBlockState::new()),

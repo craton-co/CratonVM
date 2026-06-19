@@ -98,6 +98,22 @@ fn sel_dbg_enabled() -> bool {
     })
 }
 
+/// Coarse cap (ms) applied to an otherwise-INDEFINITE `Selector.select()` so a
+/// missed wakeup self-heals (see the call site). Default 1000 ms — matches the
+/// reactor's usual finite select timeout, clears a stuck worker within ~1 s
+/// (well under thread-leak detectors' linger window), and costs only ~1 idle
+/// wakeup/sec per blocked selector. Overridable via CRATONVM_SELECT_MAX_BLOCK_MS.
+fn select_infinite_cap_ms() -> i32 {
+    static CAP: OnceLock<i32> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("CRATONVM_SELECT_MAX_BLOCK_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1000)
+    })
+}
+
 fn sel_dbg(msg: impl AsRef<str>) {
     let tname = std::thread::current()
         .name()
@@ -1387,6 +1403,27 @@ pub fn selector_select(id: i32, timeout_ms: i64) -> Result<i32, MethodCallFailed
         i32::MAX
     } else {
         timeout_ms as i32
+    };
+
+    // Self-healing cap on an INDEFINITE wait. An infinite kernel wait that
+    // misses its wakeup() — a dropped/raced loopback nudge while the thread is
+    // already inside the kernel poll — would park the worker FOREVER. That is
+    // the intermittent reactor-worker leak at client shutdown: the leaked
+    // thread is RUNNABLE with an empty Java stack (parked in this select native,
+    // which deposits no frame snapshot), stuck because its `select()`/`select(0)`
+    // mapped to an infinite wait and the shutdown wakeup was lost. Every OTHER
+    // CratonVM blocking primitive (`LockSupport.park`, `Object.wait`) polls every
+    // 5 ms so a missed signal self-heals; the selector was the lone outlier that
+    // could block forever. Cap an infinite wait at a coarse interval and return
+    // (0 — a permitted spurious select wakeup) so the caller's event loop
+    // re-checks its own running/shutdown flag and exits, exactly as it would on
+    // a real wakeup. Finite timeouts are left alone (a missed wakeup there only
+    // delays them by ≤ the timeout, which the reactor's default 1 s select
+    // already bounds). Tunable via CRATONVM_SELECT_MAX_BLOCK_MS.
+    let timeout_c = if timeout_c < 0 {
+        select_infinite_cap_ms()
+    } else {
+        timeout_c
     };
 
     // Even-loop wrapper: epoll_wait/WSAPoll honor the deadline themselves

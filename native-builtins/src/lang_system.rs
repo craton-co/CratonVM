@@ -1555,9 +1555,50 @@ pub(crate) fn native_pb_start(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     Ok(Some(Value::Object(Some(proc))))
 }
 
-pub(crate) fn native_thread_get_stack_trace(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Return empty StackTraceElement[]
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+/// Materialize a `java/lang/StackTraceElement[]` from a captured frame trace
+/// (innermost frame first, as `getStackTrace()` expects index 0 = current
+/// call). Shared by `Thread.getStackTrace0()` and `Thread.dumpThreads()`.
+pub(crate) fn build_stack_trace_element_array(
+    ctx: &mut dyn NativeContext,
+    trace: &[cratonvm_native_api::StackTraceEntry],
+) -> cratonvm_types::ObjectRef {
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), trace.len());
+    // The captured trace is outermost-first (frame[0] = bottom of stack);
+    // getStackTrace()/getAllStackTraces() want index 0 = the innermost (current)
+    // call, so materialize reversed — matching HotSpot ordering.
+    for (i, e) in trace.iter().rev().enumerate() {
+        let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
+        let cls_dotted = match ctx.class_id_by_name(&e.class_name) {
+            Some(cid) => crate::lang_class::dotted_class_name(cid, &e.class_name),
+            None => std::sync::Arc::from(e.class_name.replace('/', ".")),
+        };
+        crate::lang_misc::fill_stack_trace_element(
+            ctx,
+            ste,
+            &e.class_name,
+            &cls_dotted,
+            &e.method_name,
+            e.source_file.as_deref(),
+            e.line_number,
+        );
+        ctx.set_array_element(arr, i, Value::Object(Some(ste)));
+    }
+    arr
+}
+
+/// `Thread.getStackTrace0()` — the live stack of the receiver thread (or, for
+/// another thread, its last-published blocking-deposit snapshot). Returns a
+/// `StackTraceElement[]`. Previously stubbed to an empty array.
+pub(crate) fn native_thread_get_stack_trace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+            return Ok(Some(Value::Object(Some(arr))));
+        }
+    };
+    let trace = ctx.thread_stack_trace(this);
+    let arr = build_stack_trace_element_array(ctx, &trace);
     Ok(Some(Value::Object(Some(arr))))
 }
 

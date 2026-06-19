@@ -36,6 +36,50 @@ diagnosis was impeded by the reversed-stack-trace bug — see
 [FAIL-throwable-stacktrace-order-reversed.md](../../apps/hibernate-orm/cratonvm-bug-reports/dev-run-20260617/FAIL-throwable-stacktrace-order-reversed.md), now fixed, which
 should make the precise NPE site visible on a re-run.)
 
+## Refinement 2026-06-18 (#2) — PINNED to a serialized-stream STRUCTURE divergence in `SessionImpl` (deep core-serialization bug)
+
+With the throwable-order fix in, the deser NPE now has a **readable stack**:
+```
+NullPointerException: Cannot invoke "SessionFactoryImplementor.getMappingMetamodel()" because the receiver is null
+  … ObjectInputStream.readObject
+  at org/hibernate/internal/SessionImpl.readObject(SessionImpl.java:2843)
+  at org/hibernate/engine/internal/StatefulPersistenceContext.deserialize(StatefulPersistenceContext.java:1942)
+```
+`StatefulPersistenceContext.deserialize` (called from `SessionImpl.readObject`) calls `session.getFactory()
+.getMappingMetamodel()` and **`session.getFactory()` is null** — the `factory` field (set by
+`AbstractSharedSessionContract.readObject` → `SessionFactoryImpl.deserialize(ois)` →
+`locateSessionFactoryOnDeserialization(uuid,name)`) never got reconnected.
+
+**Root pinned via a minimal probe** (`jsonrepro/EmUuidProbe.java`, real `Configuration.buildSessionFactory()`
++ `createEntityManager()` + serialize): the SF uuid **is** present in CratonVM's serialized `EntityManager`
+stream — but **at a completely different offset**:
+
+| | serialized `EntityManager` stream | factory-uuid offset |
+|---|---|---|
+| HotSpot | 3197 bytes | **1244** (early, super's region) |
+| CratonVM | 3087 bytes | **2863** (near the end) |
+
+So CratonVM's `ObjectOutputStream` writes the SessionImpl object graph in a **different structure** (the
+factory lands ~1600 bytes later, total 110 bytes shorter). On read, `SessionFactoryImpl.deserialize` consumes
+the stream at the position the *bytecode* expects (early) but CratonVM put the factory data elsewhere → it
+reads the wrong bytes → `locate` misses → `factory = null` → NPE.
+
+**Ruled out as the cause** (all match HotSpot on CratonVM): class-hierarchy `writeObject`/`readObject`
+ordering at **2 levels** (`jsonrepro/HierSer.java`) **and 3 levels** (`jsonrepro/Hier3.java`) — super-first,
+correct offsets; `ObjectInputStream.writeUTF`/`readUTF` round-trip (`jsonrepro/UtfProbe.java`); the
+`writeReplace`/`readResolve`/`findSessionFactory` reconnect of a SF serialized **directly**
+(`jsonrepro/SfRegProbe.java`, `deser SF == original`). So it is **not** any of those — it is a
+**field/handle/back-reference ORDER divergence** in CratonVM's `ObjectOutputStream` for a complex,
+deep object graph (the difference only manifests on the real SessionImpl, not on 2–3 level toy hierarchies).
+
+**Conclusion:** confirmed, precisely located — but a **deep core-serialization bug** in CratonVM's
+`ObjectOutputStream`/`ObjectStreamClass` object-graph encoding, not a localized native fix. Next step is
+serialization-stream forensics: dump and diff the TC_OBJECT/TC_CLASSDESC/TC_REFERENCE structure of the CV vs
+HotSpot `EntityManager` stream to find the field/handle whose position diverges (the ~1600-byte shift before
+the factory). Repros in `.cratonvm-suite/jsonrepro/`.
+
+---
+
 ## Refinement 2026-06-18 — generic serialization mechanisms all verified working (gap is Hibernate-specific)
 
 Attempted to localize; **ruled out** every generic cause (all match HotSpot on CratonVM):

@@ -1,7 +1,70 @@
 # Intermittent reactor worker-thread leak at client shutdown (RUNNABLE, empty stack)
 
-**Status:** OPEN (intermittent, ~1 in 16 runs — reduced surface, one window closed). Follow-up to the
-`Thread.getState()` fix (commit `16d23e7b`).
+**Status:** OPEN (intermittent, ~1 in 16–60 runs; rate inflated by concurrent peer-session load on the
+shared worktree). Follow-up to the `Thread.getState()` fix (commit `16d23e7b`).
+
+## UPDATE: cross-thread stack walking now works; leak thread has NO Java frames
+
+`Thread.dumpThreads()` / `getStackTrace()` were stubs returning empty arrays — the reason the leak report
+showed `at (empty stack)`. **Cross-thread stack walking is now implemented** (commits in HEAD +
+`26382a17`): each thread publishes a frame snapshot at its blocking deposit points
+(`deposit_root_snapshot` → `stackwalker::capture_frames_no_lines` → registry `frame_trace`), and
+`dumpThreads` materialises it. Verified vs HotSpot (`scratch/eshang/StackDumpTest.java`): a
+`LinkedBlockingQueue.take()`-parked worker now reports its real 5-frame stack.
+
+**But the leaked reactor thread STILL reports an empty stack** when caught (it reproduced at ~1/16–1/60
+even with the stack walker). That is itself the key finding: the leaked thread has **no Java frames at
+all**, so it is parked in a **native that does not deposit a frame snapshot** — i.e. a blocking *socket
+I/O* native (read / accept), NOT `park`/`Object.wait`/a select-with-Java-frames (those deposit and now
+show frames). The earlier infinite-`select()` cap (`CRATONVM_SELECT_MAX_BLOCK_MS`, commit `26382a17`) is a
+sound defensive fix but did **NOT** stop the leak — confirming the stuck thread is not in `select()`.
+
+### PIVOTAL FINDING — it is GC stale/zeroed-OOP corruption, NOT a socket block
+
+A leaking run captured WITH the cross-thread stack walker (`/tmp/leakstk2/run21.log`) shows the real
+cause, and it is **not** a parked socket native. During the post-test teardown/leak-handling phase there
+is **widespread stale/zeroed-object corruption** — multiple distinct objects logged with an *all-zero
+header* (`num_slots=0`, `class_id=ClassId(0)`) being dereferenced:
+
+```
+Stale pointer ... receiver (ptr=0x870d27d8, all-zero header) — fallback CP class java/lang/StringBuilder
+Stale pointer ... receiver (ptr=0x89f988a8, all-zero header) — fallback CP class java/lang/StringBuilder
+gen_heap::get_field OOB: obj=0x89fe0340 index=7 num_slots=0
+Stale pointer ... receiver (ptr=0x82099d28, all-zero header) — fallback CP class java/lang/Thread
+gen_heap::get_field OOB: obj=0x82099d28 index=2 num_slots=0   <- the leaked Thread's tid slot
+NoSuchMethodError java/lang/StringBuilder.flush()V            <- corrupted dispatch off a zeroed obj
+NPE: Cannot read field 'randomnesses' ...   NPE: Cannot read field 'group' ...
+```
+
+`0x82099d28` is the leaked thread's **`java.lang.Thread` object**, zeroed by the GC while the thread is
+still registry-`alive`. That is why `getStackTrace()` is empty (the object — not a "non-depositing
+native" — is the problem), why it is "uninterruptible" (operations on a freed object no-op), and why the
+report shows `state=RUNNABLE` (`getState` reads the tid at field 2 of a zeroed header → registry lookup
+degrades). The concurrent StringBuilder zeroing + the bogus `StringBuilder.flush()` are the same epidemic.
+
+**Root cause is therefore the GC zeroing live objects — the "stale/zeroed-OOP dispatch" class (DF02 in
+CRATONVM_BUGS / the young-gen sweep zeroing live make/check nodes; see
+[[reference_reflrepro_a2_register_root]] and the precise-JIT-stack-maps work), not thread lifecycle or
+socket I/O.** The intermittent reactor "thread leak" is a *downstream symptom*: a Thread object happens to
+be one of the objects zeroed during teardown GC churn, so randomizedtesting can't resolve/interrupt it.
+The earlier socket-frame-deposit idea is SUPERSEDED — the thread is not blocked in a socket native.
+
+### Concrete next step (redirected)
+
+Chase the GC stale/zeroed-OOP corruption directly (DF02), not this leak in isolation. Repro:
+`/tmp/leakstk2/run21.log`; grep for `all-zero header` / `num_slots=0` to see the zeroed objects. The
+cross-thread stack walker added here makes a zeroed *Thread* object visible as an empty-stack leaked
+thread, but the fix is in the GC sweep/root path that is reclaiming still-live objects. CAVEAT: Heisenbug
+(any `eprintln` tracing masks it) + concurrent peer-session worktree load (`cratonvm_*`) inflates the rate
+and confounds measurement — run on an idle machine.
+
+## Progress (commit `4064580d`)
+
+One lost-wakeup window was closed: `selector_wakeup()` documented that "the woken flag still gets
+observed at top of select()", but the blocking select paths (`WSAPoll`/`epoll_wait`/`poll`) only
+checked `woken` in the empty-key sleep branch — the normal path went straight into the kernel wait.
+A pre-wait `woken` check (drain + return 0) was added to all three `kernel_select_*` paths, so a
+`wakeup()` that lands *before* `select()` enters the wait is no longer lost. Verified no regression
 
 ## Progress (commit `4064580d`)
 

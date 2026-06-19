@@ -4135,8 +4135,10 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     });
     registry.register("java/lang/Thread", "getStackTrace0", "()Ljava/lang/Object;", native_thread_get_stack_trace);
     registry.register("java/lang/Thread", "dumpThreads", "([Ljava/lang/Thread;)[[Ljava/lang/StackTraceElement;", |ctx, args| {
-        // For each input Thread, return its stack trace. We don't have full per-thread
-        // stack walking, so return empty StackTraceElement[] arrays of matching length.
+        // For each input Thread, return its Java call stack. Cross-thread stack
+        // walking reads each target's published frame snapshot (live frames for
+        // the current thread); for a parked thread this shows where it is stuck.
+        // Backs Thread.getAllStackTraces(), which thread-leak detectors use.
         let input_arr = match args.first() {
             Some(Value::Object(Some(a))) => *a,
             _ => return Ok(Some(Value::Object(None))),
@@ -4144,7 +4146,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         let len = ctx.array_length(input_arr);
         let outer = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
         for i in 0..len {
-            let inner = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+            let inner = match ctx.get_array_element(input_arr, i) {
+                Value::Object(Some(t)) => {
+                    let trace = ctx.thread_stack_trace(t);
+                    crate::lang_system::build_stack_trace_element_array(ctx, &trace)
+                }
+                _ => ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0),
+            };
             ctx.set_array_element(outer, i, Value::Object(Some(inner)));
         }
         Ok(Some(Value::Object(Some(outer))))
@@ -30219,21 +30227,24 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
 
-    // Round 82: Keycloak — `PropertyMappers$MappersConfig.sanitizeDisabledMappers`
-    // walks `entrySet().stream()` looking for any key with >1 mapper and throws
-    // `PropertyException("Duplicated mapper for key '%s'")`. Under our boot, the
-    // MultivaluedHashMap accumulates duplicate entries for `kc.file` because the
-    // configuration mappers list is iterated more than once during preinit (the
-    // sanitize step runs from both initConfig() and PersistedConfigSource's
-    // runWithDisabled). The duplicate-detection is a defensive check, not a
-    // semantic invariant — bypassing it lets KC continue past initConfig().
-    // Stub the entire method to a no-op.
-    registry.register(
-        "org/keycloak/quarkus/runtime/configuration/mappers/PropertyMappers$MappersConfig",
-        "sanitizeDisabledMappers",
-        "(Lorg/keycloak/quarkus/runtime/cli/command/AbstractCommand;)V",
-        |_ctx, _args| Ok(None),
-    );
+    // Round 82 stub REMOVED (keycloak-quarkus-boot gap #3): the no-op stub of
+    // `PropertyMappers$MappersConfig.sanitizeDisabledMappers` was added to dodge a
+    // `PropertyException("Duplicated mapper for key 'kc.file'")` (the
+    // MultivaluedHashMap was seen accumulating duplicate mappers because the
+    // sanitize step runs from both initConfig() and
+    // PersistedConfigSource.runWithDisabled). But `sanitizeDisabledMappers` is
+    // ALSO where Keycloak configures the feature `Profile`: it calls
+    // `DisabledMappersInterceptor.runWithDisabled(Runnable)` → a runnable that
+    // (via `lambda$sanitizeDisabledMappers$3`) calls
+    // `Environment.getCurrentOrCreateFeatureProfile()` → `Profile.configure(...)`,
+    // which sets the static `Profile.CURRENT`. No-op'ing the method left
+    // `Profile.CURRENT` null, so the real Keycloak (Quarkus) server boot NPE'd
+    // later at `Profile.isFeatureEnabled` ("Cannot read field 'features' because
+    // the object is null") during CLI config validation
+    // (PropertyMapper.isRequired → InfinispanUtils.isRemoteInfinispan). Run the
+    // real bytecode so Profile is configured; if the duplicate-mapper
+    // accumulation recurs it must be fixed at its source (the map/collection
+    // layer), not by skipping this method.
 
     // No-op log methods (covers the most common arities that JCL /
     // commons-logging / direct-SLF4J callers use). The synthetic-jdk

@@ -1105,6 +1105,16 @@ impl<'a> NativeContextImpl<'a> {
         }
 
         drop(snapshot);
+        // Publish a line-less frame trace alongside the root snapshot so another
+        // thread can read where THIS thread is parked (cross-thread
+        // `Thread.getStackTrace()` / `dumpThreads()`). Same deposit points as the
+        // root snapshot, so for a blocked thread it reflects the blocking call
+        // site. Capture is lock-free (no ClassStore / line lookup) to stay cheap
+        // at every deposit site.
+        {
+            let trace = crate::runtime::stackwalker::capture_frames_no_lines(&self.thread.frames);
+            *self.thread.frame_trace.lock() = trace;
+        }
         // Mark the blocked region AFTER the snapshot is complete: from this
         // point on, every GC initiator maintains this thread's roots via
         // `fold_pointer_map_into_blocked` (snapshot remap + frame-fixup
@@ -3390,6 +3400,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             shared_arc
                 .thread_registry
                 .set_root_snapshot(tid, jvm_thread.root_snapshot.clone());
+            // Share the frame-trace slot too, so cross-thread getStackTrace /
+            // dumpThreads can read this worker's parked call stack.
+            shared_arc
+                .thread_registry
+                .set_frame_trace(tid, jvm_thread.frame_trace.clone());
             // Share blocked-region GC state so initiators can maintain this
             // thread's roots while it parks in a blocking native.
             shared_arc
@@ -3645,6 +3660,35 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 }
             }
         }
+    }
+
+    fn thread_stack_trace(&self, thread_obj: ObjectRef) -> Vec<StackTraceEntry> {
+        // The current thread: walk its LIVE frames (full trace with line numbers).
+        if self.thread.java_thread_obj == Some(thread_obj) {
+            let cm = self.shared.class_manager.read();
+            return crate::runtime::stackwalker::capture_full_trace(
+                &cm.class_store,
+                &self.thread.frames,
+            );
+        }
+        // Another thread: return its last-published (line-less) frame snapshot —
+        // for a parked thread this is the blocking call site. Resolve line
+        // numbers from the BCI now that we hold the ClassStore (so a dump still
+        // gets source lines without paying for them at every deposit).
+        let tid = match self.shared.heap.get_field(thread_obj, 2) {
+            Value::Long(id) => Some(ThreadId(id as u64)),
+            _ => self
+                .shared
+                .thread_registry
+                .find_thread_id_by_thread_obj(thread_obj),
+        };
+        let Some(tid) = tid else {
+            return Vec::new();
+        };
+        // Line-less snapshot (class.method + BCI). The published entry doesn't
+        // carry the ClassId/descriptor needed to resolve source lines, but
+        // class.method is sufficient to pinpoint where a parked thread is stuck.
+        self.shared.thread_registry.frame_trace_of(tid)
     }
 
     fn current_thread_object(&mut self) -> ObjectRef {

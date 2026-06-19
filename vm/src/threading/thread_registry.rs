@@ -44,6 +44,11 @@ struct ThreadEntry {
     /// Root snapshot: ObjectRefs from this thread's frames, deposited at safepoints
     /// and before blocking operations. Used by GC to scan all threads' roots.
     root_snapshot: Arc<Mutex<Vec<ObjectRef>>>,
+    /// Frame trace snapshot (shared with the JvmThread, like `root_snapshot`):
+    /// this thread's Java call stack, published at the same blocking deposit
+    /// points. Lets another thread read where this one is parked, backing
+    /// cross-thread `Thread.getStackTrace()` / `dumpThreads()`.
+    frame_trace: Arc<Mutex<Vec<cratonvm_native_api::StackTraceEntry>>>,
     /// Blocked-region GC state (shared with the JvmThread, like `root_snapshot`):
     /// lets a GC initiator remap this thread's snapshot and accumulate frame
     /// fixups while the thread is parked in a blocking native. See
@@ -134,6 +139,7 @@ impl ThreadRegistry {
             park_state: park_state.clone(),
             interrupted: Arc::new(AtomicBool::new(false)),
             root_snapshot: Arc::new(Mutex::new(Vec::new())),
+            frame_trace: Arc::new(Mutex::new(Vec::new())),
             gc_block_state: Arc::new(GcBlockState::new()),
             async_exception_slot: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
@@ -493,6 +499,28 @@ impl ThreadRegistry {
         if let Some(entry) = self.threads.lock().get_mut(&thread_id) {
             entry.root_snapshot = snapshot;
         }
+    }
+
+    /// Share the JvmThread's frame-trace Arc with the registry, so other threads
+    /// can read this thread's published call stack.
+    pub fn set_frame_trace(
+        &self,
+        thread_id: ThreadId,
+        trace: Arc<Mutex<Vec<cratonvm_native_api::StackTraceEntry>>>,
+    ) {
+        if let Some(entry) = self.threads.lock().get_mut(&thread_id) {
+            entry.frame_trace = trace;
+        }
+    }
+
+    /// Read a copy of `thread_id`'s last-published frame trace (call stack),
+    /// innermost frame first. Empty if the thread is unknown or never deposited.
+    pub fn frame_trace_of(&self, thread_id: ThreadId) -> Vec<cratonvm_native_api::StackTraceEntry> {
+        self.threads
+            .lock()
+            .get(&thread_id)
+            .map(|e| e.frame_trace.lock().clone())
+            .unwrap_or_default()
     }
 
     /// DBG (CRATONVM_DBG_MTROOTS): per-thread (tid, in_blocked_region,

@@ -1087,6 +1087,16 @@ pub trait NativeContext {
         0
     }
 
+    /// The Java call stack of the target thread (identified by its Thread
+    /// object), innermost frame first. For the *current* thread this is the live
+    /// stack; for another thread it is the snapshot published at its last
+    /// blocking deposit point (so for a parked thread it shows where it is
+    /// stuck). Empty if unavailable. Backs cross-thread `Thread.getStackTrace()`
+    /// / `Thread.dumpThreads()`. The default returns empty.
+    fn thread_stack_trace(&self, _thread_obj: ObjectRef) -> Vec<StackTraceEntry> {
+        Vec::new()
+    }
+
     /// Get the Java Thread object for the current thread.
     fn current_thread_object(&mut self) -> ObjectRef;
 
