@@ -919,23 +919,67 @@ fn native_jboss_logger_get_effective_level(_ctx: &mut dyn NativeContext, _args: 
 /// stderr so the operator still sees what would have been logged.
 /// Returns `void`.
 fn native_jboss_logger_log_raw(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() { Some(Value::Object(o)) => *o, _ => None };
-    // Best-effort logger name from slot 0.
-    let logger = match this {
-        Some(obj) => {
-            if let Value::Object(Some(name_str)) = ctx.get_field(obj, LOGGER_FIELD_NAME) {
-                ctx.read_string(name_str).unwrap_or_else(|| "<root>".to_string())
-            } else { "<root>".to_string() }
-        }
-        None => "<root>".to_string(),
+    // args[0] = this (Logger), args[1] = the (Ext)LogRecord. In real-JDK mode the
+    // record's inherited `java.util.logging.LogRecord` fields are resolvable BY
+    // NAME (`level`/`message`/`loggerName`/`thrown`), so we surface the REAL log
+    // line instead of the old "<jboss-logmanager logRaw>" placeholder. This is the
+    // single convergence point for every `org.jboss.logmanager.Logger.info/error/
+    // warn/...` call, so it makes Keycloak/Quarkus boot logging — including the
+    // startup-failure stack trace — visible on stderr (keycloak-quarkus-boot 5b).
+    let record = match args.get(1) {
+        Some(Value::Object(Some(r))) => Some(*r),
+        _ => None,
     };
-    // The ExtLogRecord layout in real-JDK has many fields; we only
-    // probe the inherited `j.u.l.LogRecord` slots (level slot 1 in the
-    // real layout, message slot 5). Since we never allocated this
-    // record, we don't actually know the field offsets — best effort
-    // is to emit a fixed entry. Avoids NPE; matches the
-    // jboss_logmanager.rs raw stub's behavior.
-    eprintln!("INFO [{logger}] <jboss-logmanager logRaw>");
+    // Logger name: prefer record.loggerName, else this.name (synthetic slot 0).
+    let mut logger: Option<String> = None;
+    if let Some(r) = record {
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(r, "loggerName") {
+            logger = ctx.read_string(s);
+        }
+    }
+    if logger.is_none() {
+        if let Some(Value::Object(Some(o))) = args.first() {
+            if let Value::Object(Some(s)) = ctx.get_field(*o, LOGGER_FIELD_NAME) {
+                logger = ctx.read_string(s);
+            }
+        }
+    }
+    let logger = logger.unwrap_or_else(|| "<root>".to_string());
+    // Level → its `name` field (SEVERE/WARNING/INFO/CONFIG/FINE...).
+    let mut level_name = String::from("INFO");
+    if let Some(r) = record {
+        if let Value::Object(Some(lvl)) = ctx.get_field_by_name(r, "level") {
+            if let Value::Object(Some(s)) = ctx.get_field_by_name(lvl, "name") {
+                if let Some(n) = ctx.read_string(s) {
+                    level_name = n;
+                }
+            }
+        }
+    }
+    let tag = match level_name.as_str() {
+        "SEVERE" => "ERROR",
+        "WARNING" => "WARN",
+        "INFO" | "CONFIG" => "INFO",
+        // Suppress fine-grained trace noise (matches the logp interceptor).
+        "FINE" | "FINER" | "FINEST" => return Ok(None),
+        other => other,
+    };
+    let mut message = String::new();
+    if let Some(r) = record {
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(r, "message") {
+            if let Some(m) = ctx.read_string(s) {
+                message = m;
+            }
+        }
+    }
+    eprintln!("{tag} [{logger}] {message}");
+    // If the record carries a throwable, dump class + message + stack + cause
+    // chain — this is how the real Quarkus startup-failure surfaces.
+    if let Some(r) = record {
+        if let Value::Object(Some(t)) = ctx.get_field_by_name(r, "thrown") {
+            dump_throwable_to_stderr(ctx, t, "  ");
+        }
+    }
     Ok(None)
 }
 

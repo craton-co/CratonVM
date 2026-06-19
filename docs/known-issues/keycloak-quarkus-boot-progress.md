@@ -74,43 +74,125 @@ on both.)
 builder) instead of the generic `p57_io_error`. (Boot-verification pending an
 isolated rebuild — the shared `target/` is under concurrent-session contention.)
 
-### Gap 3 — `Profile.features` is null (synthetic `Stream` layout) ⏳ OPEN (next)
-**Symptom:** with gaps 1+2 fixed, the boot reaches Keycloak's CLI config
-validation and NPEs:
-```
-java.lang.NullPointerException: Cannot read field 'features' because the object is null
-  at org.keycloak.common.Profile.isFeatureEnabled(Profile.java:495)
-  at org.keycloak.infinispan.util.InfinispanUtils.isRemoteInfinispan(InfinispanUtils.java:51)
-  at org.keycloak.quarkus.runtime.configuration.mappers.PropertyMapper.isRequired(PropertyMapper.java:215)
-  at org.keycloak.quarkus.runtime.cli.Picocli.validateProperty/validateConfig
-  at ...AbstractAutoBuildCommand.runCommand → QuarkusEntryPoint
-```
-So the real boot now gets through the entire Quarkus bootstrap + runtime init +
-SmallRye config and into **Keycloak's own CLI config validation** — much closer
-to ArC, but still pre-`Arc.initialize()`.
+### Gap 3 — `Profile.CURRENT` null at config validation ✅ FIXED (stale synthetic stub removed)
+**Root cause (found):** CratonVM had a `native-builtins/src/lib.rs` "Round 82"
+native that **stubbed `PropertyMappers$MappersConfig.sanitizeDisabledMappers` to a
+no-op** — added to dodge a `PropertyException("Duplicated mapper for key
+'kc.file'")`. But `sanitizeDisabledMappers` is *also* where Keycloak configures
+the feature `Profile`: it runs `DisabledMappersInterceptor.runWithDisabled(Runnable)`
+→ `lambda$sanitizeDisabledMappers$3` → `Environment.getCurrentOrCreateFeatureProfile()`
+→ `Profile.configure(...)` → sets `Profile.CURRENT`. No-op'ing the method left
+`CURRENT` null. (Confirmed: the boot's `CRATONVM_DBG_ATHROW` trace showed
+`Profile.configure` was *never* called — no exception, just skipped.)
+**Fix:** removed the no-op stub so the real `sanitizeDisabledMappers` bytecode
+runs. The duplicate-mapper `PropertyException` it guarded against **did not recur**
+(the underlying map bug was already fixed elsewhere — the stub was stale). After
+the fix the boot configures Profile, passes CLI config validation, prints
+*"Running the server in development mode"*, and proceeds into the Quarkus
+application startup (`Quarkus.run` → `ApplicationImpl.<clinit>`) — i.e. into the
+lifecycle where ArC runs. **Lesson:** this is exactly the forbidden-synthetic-stub
+pattern — a no-op shim added for one symptom silently skipped an unrelated,
+load-bearing side effect.
 
-**Lead (strong):** immediately before the NPE the GC guard logs an out-of-bounds
-field read on a **synthetic `java/util/stream/Stream`**:
-`index=1 num_slots=1 class_id=ClassId(275) class_name=java/util/stream/Stream
-real_field_count=Some(0)` — "speculative collection-layout probe dispatched on a
-non-matching receiver type". `org.keycloak.common.Profile` builds its `features`
-map via a stream `collect`; CratonVM's synthetic `Stream` (1 slot, 0 real fields)
-returns wrong/empty data, so `Profile`'s current-instance `features` ends up null.
-**Next step:** find which native allocates the 1-slot synthetic `Stream` that
-`Profile.<init>`/`configure` consumes, and give it the real layout (or run the
-real `java.util.stream` bytecode) so the feature map is populated. Likely a
-general synthetic-Stream-layout bug (cf. the synthetic-collection-layout family).
+### Gap 4 — `static synchronized` used a synthetic lock, not the `Class` mirror ✅ FIXED
+**Symptom:** with gap 3 fixed, the boot reaches the real Quarkus application
+startup (`Quarkus.run → ApplicationImpl.<clinit>`) and dies:
+```
+ExceptionInInitializerError in io/quarkus/runner/ApplicationImpl.<clinit>
+  cause = java.lang.IllegalMonitorStateException:
+          thread Thread-0 called notifyAll() without owning the monitor
+  at io.quarkus.dev.appstate.ApplicationStateNotification.notifyStartupFailed
+```
+**Root cause (general VM bug):** `ApplicationStateNotification.notifyStartupFailed`
+is `static synchronized` and does `ApplicationStateNotification.class.notifyAll()`.
+Per JVMS §2.11.10 a `static synchronized` method's monitor is the class's `Class`
+object — but CratonVM acquired a **synthetic per-class lock object**
+(`get_class_lock_object`) instead. So the thread held a *different* monitor than the
+`Class` mirror that `notifyAll()` operates on → `IllegalMonitorStateException`.
+Reproduced minimally: a `static synchronized` method doing `X.class.notifyAll()`
+throws on CratonVM but not HotSpot; instance `synchronized` was unaffected.
+**Fix:** all four monitor-acquisition sites (`vm/src/runtime/interpreter.rs` ×3,
+`vm/src/vm/vm_exec.rs` ×1) now use `get_or_create_class_mirror(shared, class_id)`
+— the same `Class` object that `synchronized (X.class)` blocks and
+`X.class.wait()/notify()` use. Verified: a 3-part probe (static-sync
+`Class.notifyAll`; cross-thread static-sync wait/notify — the exact
+`ApplicationStateNotification` pattern; static-sync mutual exclusion) passes on
+CratonVM == HotSpot. After the fix the boot runs the **whole** Quarkus application
+startup (recorders, ArC via its shim, Hibernate Validator) and surfaces gap 5.
 
-### Gap 4+ — beyond
-Not yet reached. After Profile/feature setup, expect Infinispan
-(`InfinispanUtils`), datasource/Agroal, Hibernate, and finally
-`Arc.initialize()` (the actual `CRATONVM_REAL_ARC` target).
+### Gap 5 — Quarkus app startup fails: `HibernateValidatorRecorder` NPE ⏳ OPEN (next)
+**Symptom:** the monitor fix unmasked the real failure. The boot now runs
+`ApplicationImpl.<clinit>` to bci=814 (deep into the recorder chain — past ArC) and
+fails:
+```
+ExceptionInInitializerError in io/quarkus/runner/ApplicationImpl.<clinit>
+  cause = java.lang.RuntimeException: Failed to start quarkus
+    cause = java.lang.NullPointerException
+            at io.quarkus.hibernate.validator.runtime.HibernateValidatorRecorder.shutdownConfigValidator(HibernateValidatorRecorder.java:74)
+            at io.quarkus.runner.ApplicationImpl.<clinit> (bci=405)
+```
+**Refined root cause (5a — the primary failure).** `shutdownConfigValidator` does
+NOT "close a validator factory" — decompiled, its whole body is
+`shutdownContext.addShutdownTask(new HibernateValidatorRecorder$11(this))` (it just
+*registers* a shutdown task). The NPE at bci=9 is on the `invokeinterface
+ShutdownContext.addShutdownTask` — i.e. the **`ShutdownContext` argument is null**.
+In Quarkus, `io.quarkus.runtime.StartupContext implements ShutdownContext`, and
+`ShutdownContext` is **not referenced anywhere in CratonVM's natives**. The
+`native-builtins/src/quarkus_staticinit.rs` shim (which models `StartupContext` /
+`RuntimeValue` / `getValue` / `addShutdownTask` / `runAllInStartupContext`) is
+handing the generated `ApplicationImpl` a **null** where the `StartupContext`/
+`ShutdownContext` should be — likely `StartupContext.getValue(key)` (or the
+StartupContext local in the recorder-replay path) returning null. Note: CratonVM's
+own `CLINIT-CAUSE` diagnostic surfaces this NPE directly, so the logging gap (5b)
+is **not** required to diagnose 5a.
+**Next step (5a):** trace how the generated `ApplicationImpl` obtains the
+`ShutdownContext` arg for `shutdownConfigValidator` (CratonVM tracing on
+`StartupContext.getValue` / the recorder-call args) and make the
+`quarkus_staticinit` shim provide the real StartupContext there. Deep Quarkus
+recorder-framework / generated-bytecode work.
+
+**5b — the logging gap (investigated; deeper than one fix).** Keycloak produces
+**zero** logger output on stderr — not even the SmallRye `SRCFG` config warnings
+that appear on HotSpot (only the direct `System.out.println` "Running the server in
+development mode" from Picocli shows). Investigation:
+- `native-builtins/src/logmanager.rs` already intercepts both
+  `org.jboss.logmanager.Logger.logRaw(ExtLogRecord/LogRecord)` **and**
+  `JBossLogManagerLogger.doLog/doLogf` (the JBoss-Logging-facade backends) and
+  routes them to stderr.
+- The `logRaw` native was a **placeholder** that printed `<jboss-logmanager logRaw>`
+  with no real content; I **upgraded** it to read the record's inherited
+  `java.util.logging.LogRecord` fields by name (`level`/`loggerName`/`message`/
+  `thrown`) and dump the throwable via `dump_throwable_to_stderr` — a correct,
+  general improvement (kept), but **`logRaw` is never hit** on the Keycloak boot.
+- Even the `doLog` interceptor produces nothing → **Keycloak's loggers don't reach
+  any intercepted path at all.** So the gap is upstream: the JBoss-Logging-facade
+  *provider selection* / the synthetic `Logger` returned by the LogManager shim
+  swallowing `log()` before it reaches `doLog`/`logRaw`, OR the boot failing before
+  substantial logging. Pinning it is a multi-step logging-subsystem investigation.
+- **Not blocking 5a:** CratonVM's own `CLINIT-CAUSE` diagnostic already surfaces the
+  primary failure (the null-`ShutdownContext` NPE), so 5a can proceed without 5b.
+
+This is **past ArC initialization** — the boot exercises the real Quarkus recorder
+chain end to end up to Hibernate Validator. Gap 5 is the next frontier and is a
+**multi-session, Quarkus-recorder-framework** effort (5a), with 5b as a visibility
+enabler.
 
 ## Key takeaway
 
-**ArC is not directly reachable** — it is gated behind the full Quarkus boot.
-Validating `CRATONVM_REAL_ARC` requires first walking the real server boot past
-each gap above (and the ones after). Two general VM bugs (jar-entry metadata, NIO
-missing-file exception type) are fixed; both are real bugs that affect more than
-Keycloak. The boot is a productive, HotSpot-comparable driver for surfacing them
-one at a time.
+Walking the **real** Keycloak (Quarkus) server boot under CratonVM, with HotSpot
+as the oracle, has surfaced and fixed **four general VM bugs** so far — each a real
+bug affecting more than Keycloak:
+1. `JarEntry.getSize()/getMethod()` returned 0 (Quarkus `RunnerClassLoader`).
+2. NIO `Files.newInputStream` threw `IOException` not `NoSuchFileException` for a
+   missing file (optional-config sources).
+3. a stale no-op stub of `sanitizeDisabledMappers` that also skipped Profile config.
+4. `static synchronized` methods locked a synthetic object instead of the `Class`
+   mirror (broke `Class.wait()/notify()` from static-sync methods).
+
+The boot has advanced from *"dies at the first class load"* to *"runs the entire
+Quarkus application startup — recorders, ArC (via its shim), Hibernate Validator —
+and fails at gap 5"*, i.e. **past `Arc.initialize()`**. The single highest-leverage
+next step is the **logging gap** (gap 5b): Keycloak's JBoss-LogManager output barely
+reaches stdout, so primary failures are invisible. Fixing it makes gap 5 and every
+subsequent gap directly readable instead of inferred. The boot is a productive,
+HotSpot-comparable driver for the remaining gaps toward `Listening on …`.
