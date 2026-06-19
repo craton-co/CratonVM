@@ -168,6 +168,53 @@ This converges with the single-thread CRASH-04 fix: both want precise (or full
 conservative) JIT-frame + register roots for the non-moving/selective-promotion
 young sweep.
 
+## Update 2026-06-19 — the anticipated "full native stack scan" is REFUTED; the missed root is **register-only**
+
+Measured baseline (gate on, JIT on, conservative-locals fix present, dev
+`43033660`): **3 / 24 fail (~12.5%)** — exactly manifestation 2. The crash
+signature is `Stale pointer detected in invokevirtual receiver (… all-zero
+header)` for a swept `Fork6$StrTask` / `ForkJoinTask`, plus a flood of
+reclaimed **worker `Thread` mirrors** (`NoSuchMethodError java/lang/Object.
+threadState()/isTerminated()/getThreadGroup()` on `class_id=0` receivers — the
+FJP pool-management code calling into reclaimed worker mirrors).
+
+**The handoff's anticipated complete fix — a full conservative native-stack scan
+per parked thread — does NOT close it.** `CRATONVM_DBG_FULLSTACK_SCAN=1` (which
+makes every `update_root_snapshot` / safepoint self-scan walk the thread's entire
+`[scanner_sp, GetCurrentThreadStackLimits.high]` range, validated by
+`is_object_address` and pinned by default) was measured at **5 / 20 fail + 1
+timeout — no better than baseline.** Since that scan covers *every* qword on the
+worker's live native stack (interpreter Rust transients, JIT spill slots, dead
+spills — everything between SP and the stack base), the missed `StrTask` oop is
+**not on the stack at all.** This matches the doc's own `NO_SELECTIVE_PROMOTE`
+result (9/30 → 3/30): the residual 3/30 is a **marking gap** (the object is never
+*marked*, so disabling evacuation can't save it), not a pinning/evacuation gap.
+
+**Conclusion: the residual is the *identical* register-invisibility root cause as
+the single-thread A3 / SB-CRASH-04** — a live task oop sits **only in a
+caller-saved CPU register** of a worker's JIT-compiled `ForkJoinPool.runWorker` /
+`ForkJoinTask.doExec` frame at the safepoint, not spilled to the stack and not in
+that method's precise oop-map at the call PC. The self-scan path *does* run precise
+oop maps (`scan_one_frame_precise`, default-on `CRATONVM_PRECISE_JIT_MAPS`) and the
+conservative range scan, but a register-only oop is invisible to both — so it is
+never a mark root and the non-moving sweep zeroes its young slot. This is why
+`--nojit` passes (no register oops; the moving collector precisely scans + remaps
+interpreter frames) and `-Xmx8g` passes (no young GC). It is the **same unsolved
+problem** recorded for A2/A3 in `reflrepro-register-resident-jit-root-handoff.md`,
+where *every* coverage lever (`reg-spill`, `fullstack`, `shadow-pin`) also fails.
+
+**There is no sound conservative quick-fix** — registers are not on the stack to
+scan, and the moving collector (which would remap them) cannot run while any
+thread is in JIT without precise per-safepoint oop maps to rewrite the JIT-held
+pointers. The complete fix is the **deferred precise-JIT-stack-maps / safepoint
+register-spill project** (`project_precise_jit_stack_maps`): generate complete
+oop maps for the FJP worker methods (`runWorker`/`doExec`/`WorkQueue.*`) so every
+live-oop register is reported (or spilled) at each safepoint. Separately, the
+real-FJP `ForkJoinPool` CTL CAS diagnostic (`T19_H6_CAS_DIAG cas_long FAIL
+slot=14`) fires during the run but is benign lock-free retry noise (the test
+failures are GC reclamation, not the CAS), though it remains a candidate masker
+to rule out once the reclamation is fixed.
+
 ## Where to look (multi-thread shadow path)
 
 - `vm/src/runtime/interpreter.rs:1463` — §4 "multi-thread shadow scan, marking
