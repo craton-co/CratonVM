@@ -8957,6 +8957,10 @@ fn stream_elements(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Value>
         }
         return Vec::new();
     }
+    // Real JDK object pipeline (e.g. Spring's MergedAnnotations.stream()):
+    // materialize via the object toArray. (Real PRIMITIVE pipelines don't reach
+    // here — `Arrays.stream(int[])` / `IntStream.of(...)` are intercepted to
+    // produce synthetic primitive streams; see register_essential_natives.)
     match ctx.invoke_virtual(stream, "toArray", "()[Ljava/lang/Object;", &[]) {
         Ok(Some(Value::Object(Some(arr)))) => {
             let len = ctx.array_length(arr);
@@ -12095,14 +12099,37 @@ fn native_int_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     Ok(Some(Value::Object(Some(arr))))
 }
 
+/// Box each primitive stream element to its wrapper object so `boxed()` yields a
+/// real `Stream<Integer/Long/Double>` — collect/iteration then observe wrapper
+/// objects, not raw primitive `Value`s in reference slots.
+fn box_primitive_stream_elements(ctx: &mut dyn NativeContext, elements: &[Value]) -> Vec<Value> {
+    let mut out = Vec::with_capacity(elements.len());
+    for v in elements {
+        let boxed = match v {
+            Value::Int(i) => {
+                ctx.invoke("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;", &[Value::Int(*i)])
+            }
+            Value::Long(l) => {
+                ctx.invoke("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;", &[Value::Long(*l)])
+            }
+            Value::Double(d) => {
+                ctx.invoke("java/lang/Double", "valueOf", "(D)Ljava/lang/Double;", &[Value::Double(*d)])
+            }
+            other => Ok(Some(*other)),
+        };
+        out.push(boxed.ok().flatten().unwrap_or(Value::Object(None)));
+    }
+    out
+}
+
 fn native_int_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
     let elements = int_stream_elements(ctx, this);
-    // Elements are already Value::Int — just wrap in a Stream
-    make_stream(ctx, &elements)
+    let boxed = box_primitive_stream_elements(ctx, &elements);
+    make_stream(ctx, &boxed)
 }
 
 fn native_int_stream_average(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -12586,7 +12613,8 @@ fn native_long_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return make_stream(ctx, &[]),
     };
     let elements = stream_elements(ctx, this);
-    make_stream(ctx, &elements)
+    let boxed = box_primitive_stream_elements(ctx, &elements);
+    make_stream(ctx, &boxed)
 }
 
 fn native_long_stream_as_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -12964,7 +12992,8 @@ fn native_double_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         _ => return make_stream(ctx, &[]),
     };
     let elements = stream_elements(ctx, this);
-    make_stream(ctx, &elements)
+    let boxed = box_primitive_stream_elements(ctx, &elements);
+    make_stream(ctx, &boxed)
 }
 
 fn native_double_stream_map_to_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
