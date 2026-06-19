@@ -5532,6 +5532,15 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     ctx.set_field(channel, 2, Value::Int(data.len() as i32)); // size
                     Ok(Some(Value::Object(Some(channel))))
                 }
+                // NIO contract: a missing file must surface as
+                // `java.nio.file.NoSuchFileException`, NOT a bare `IOException`.
+                // Frameworks treat config sources as OPTIONAL by catching
+                // NoSuchFileException (e.g. SmallRye Config loading Keycloak's
+                // profile-specific `keycloak-<profile>.conf`); a generic
+                // IOException escapes that catch and aborts boot (SRCFG00035).
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Err(p57_no_such_file(ctx, &p))
+                }
                 Err(e) => Err(p57_io_error(&e)),
             }
         },
@@ -5561,6 +5570,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     ctx.set_field_by_name(stream, "mark", Value::Int(0));
                     ctx.set_field_by_name(stream, "count", Value::Int(data.len() as i32));
                     Ok(Some(Value::Object(Some(stream))))
+                }
+                // NIO contract: missing file → NoSuchFileException (see
+                // newByteChannel above) so optional-config catches match.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Err(p57_no_such_file(ctx, &p))
                 }
                 Err(e) => Err(p57_io_error(&e)),
             }
@@ -5974,6 +5988,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     ctx.set_field_by_name(stream, "mark", Value::Int(0));
                     ctx.set_field_by_name(stream, "count", Value::Int(data.len() as i32));
                     Ok(Some(Value::Object(Some(stream))))
+                }
+                // NIO contract: missing file → NoSuchFileException (see
+                // newByteChannel above) so optional-config catches match.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Err(p57_no_such_file(ctx, &p))
                 }
                 Err(e) => Err(p57_io_error(&e)),
             }
@@ -13709,13 +13728,30 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             if let Ok(file) = std::fs::File::open(&path) {
                 if let Ok(mut archive) = zip::ZipArchive::new(file) {
                     if let Ok(entry) = archive.by_name(&entry_name) {
+                        let size = entry.size() as i64;
+                        let csize = entry.compressed_size() as i64;
+                        #[allow(deprecated)]
+                        let method = entry.compression().to_u16() as i32;
+                        let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
+                        drop(entry);
                         let ze = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
                         let name_s = ctx.create_string(&entry_name);
                         ctx.set_field(ze, 0, Value::Object(Some(name_s)));
-                        ctx.set_field(ze, 1, Value::Long(entry.size() as i64));
-                        ctx.set_field(ze, 2, Value::Long(entry.compressed_size() as i64));
-                        #[allow(deprecated)]
-                        ctx.set_field(ze, 3, Value::Int(entry.compression().to_u16() as i32));
+                        ctx.set_field(ze, 1, Value::Long(size));
+                        ctx.set_field(ze, 2, Value::Long(csize));
+                        ctx.set_field(ze, 3, Value::Int(method));
+                        // Real-JDK mode: `ZipEntry.getSize()/getMethod()/...` run
+                        // real bytecode that reads the REAL fields by their actual
+                        // offset, NOT the synthetic slots above. Quarkus'
+                        // RunnerClassLoader sizes its class-byte read from
+                        // `entry.getSize()`; if that returns 0 the class is defined
+                        // from a 0-length array → ClassFormatError. Mirror the real
+                        // field names (matches zip_real_jar::alloc_zip_entry).
+                        ctx.set_field_by_name(ze, "name", Value::Object(Some(name_s)));
+                        ctx.set_field_by_name(ze, "size", Value::Long(size));
+                        ctx.set_field_by_name(ze, "csize", Value::Long(csize));
+                        ctx.set_field_by_name(ze, "method", Value::Int(method));
+                        ctx.set_field_by_name(ze, "crc", Value::Long(crc));
                         return Ok(Some(Value::Object(Some(ze))));
                     }
                 }
@@ -14551,14 +14587,15 @@ fn p59_jar_lookup_entry(ctx: &mut dyn NativeContext, path: &str, entry_name: &st
         Ok(a) => a,
         Err(_) => return Value::Object(None),
     };
-    let (name, size, csize, method) = match archive.by_name(entry_name) {
+    let (name, size, csize, method, crc) = match archive.by_name(entry_name) {
         Ok(entry) => {
             let name = entry.name().to_string();
             let size = entry.size() as i64;
             let csize = entry.compressed_size() as i64;
             #[allow(deprecated)]
             let method = entry.compression().to_u16() as i32;
-            (name, size, csize, method)
+            let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
+            (name, size, csize, method, crc)
         }
         Err(_) => return Value::Object(None),
     };
@@ -14568,6 +14605,16 @@ fn p59_jar_lookup_entry(ctx: &mut dyn NativeContext, path: &str, entry_name: &st
     ctx.set_field(je, 1, Value::Long(size));
     ctx.set_field(je, 2, Value::Long(csize));
     ctx.set_field(je, 3, Value::Int(method));
+    // Real-JDK mode: `ZipEntry.getSize()/getMethod()/getCompressedSize()/getCrc()`
+    // run real bytecode reading the REAL fields by their actual offset, not the
+    // synthetic slots above. Quarkus' RunnerClassLoader sizes its class-byte read
+    // from `entry.getSize()`; a 0 there yields a 0-length class → ClassFormatError.
+    // Mirror the real field names (matches zip_real_jar::alloc_zip_entry).
+    ctx.set_field_by_name(je, "name", Value::Object(Some(name_s)));
+    ctx.set_field_by_name(je, "size", Value::Long(size));
+    ctx.set_field_by_name(je, "csize", Value::Long(csize));
+    ctx.set_field_by_name(je, "method", Value::Int(method));
+    ctx.set_field_by_name(je, "crc", Value::Long(crc));
     Value::Object(Some(je))
 }
 

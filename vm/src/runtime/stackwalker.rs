@@ -166,6 +166,26 @@ pub fn capture_full_trace(class_store: &ClassStore, frames: &[Frame]) -> Vec<Sta
         .collect()
 }
 
+/// Like [`capture_full_trace`] but WITHOUT resolving source-line numbers — so it
+/// needs no `ClassStore` and takes no lock. Used to publish a per-thread frame
+/// snapshot at blocking deposit points (see `deposit_root_snapshot`) for
+/// cross-thread `Thread.getStackTrace()` / `dumpThreads()`: the diagnostic only
+/// needs `class.method` (+ BCI) to pinpoint where a parked thread is stuck, and
+/// keeping it lock-free keeps it safe to call from every deposit site. The line
+/// number is left `UNKNOWN` (callers may resolve it lazily from the BCI).
+pub fn capture_frames_no_lines(frames: &[Frame]) -> Vec<StackTraceEntry> {
+    frames
+        .iter()
+        .map(|f| StackTraceEntry {
+            class_name: f.class_name_arc(),
+            method_name: f.method_name_arc(),
+            source_file: f.source_file_arc(),
+            line_number: LINE_NUMBER_UNKNOWN,
+            byte_code_index: f.last_instr_pc.min(i32::MAX as usize) as i32,
+        })
+        .collect()
+}
+
 /// Synthesize a synthetic "no source info" entry. Used for native frames
 /// injected from outside the interpreter (JNI up-calls, host-side
 /// StackWalker probes during VM bootstrap).
