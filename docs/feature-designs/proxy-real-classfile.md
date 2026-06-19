@@ -426,3 +426,46 @@ super proxy serializes identically to the synthetic path (correct super-desc
 `name`, no synthetic-slot assumptions) is the prerequisite for re-soaking and
 flipping. Real-app suites (Keycloak/Quarkus ArC, Hibernate JdbcSpies) not yet run —
 gated behind fixing the serialization blocker first.
+
+### Increment 5 — serialization blocker FIXED (real-super `instanceof` admission)
+
+The Increment-4 soak's serialization regression is **fixed**. Root cause was NOT
+in the serialization machinery at all — it was a `checkcast`/`instanceof`
+type-check bug exposed by the real-super layout:
+
+- **Root cause.** `interpreter::proxy_instance_satisfies_target` (the per-instance
+  `instanceof`/`checkcast` admission for dynamic proxies) read the proxy's
+  interface `Class[]` from **slot 1** (`PROXY_FIELD_INTERFACES`, the synthetic
+  3-slot layout). On a real-super proxy (sole field `h` at slot 0, 1 slot total)
+  that read is out of bounds → returns null → the function fell into its **liberal
+  "no interfaces recorded → match every target" fallback** → the proxy reported
+  `instanceof` **TRUE for arbitrary types, including `java.lang.Class`**.
+  `ObjectOutputStream.writeObject0` then took its `obj instanceof Class` branch and
+  routed the proxy through `writeClass` → `ObjectStreamClass.writeNonProxy` wrote a
+  null-`name` descriptor → NPE. (The earlier-observed OOB reads at synthetic slots
+  1 and 18 were the same bug + its consequence: slot-1 = the bad interfaces read;
+  slot-18 = the serializer accessing the misidentified proxy at `java.lang.Class`'s
+  field offsets. Both vanish with the fix.) The Proxy super-desc, `objectFieldOffset`,
+  and field layout were all correct — `Proxy.h` resolves to slot 0, fully
+  consistent — disproving the initial offset-mismatch hypothesis.
+- **Fix** (`vm/src/runtime/interpreter.rs`, `proxy_instance_satisfies_target`).
+  Source the interface set by the **receiver's field count**, exactly mirroring the
+  Increment-4 `proxy_resolve_declaring_class_mirror` fix: `num_total_fields >= 2` →
+  read slot 1 (synthetic, unchanged); otherwise → use the proxy **class's declared
+  interfaces** (the generated real-super `$ProxyN` declares them directly). Run the
+  precise identity / superinterface / name check against that set; only the
+  synthetic-layout *missing-array* case keeps the historical liberal `true`. The
+  synthetic default path is byte-for-byte unchanged (it always takes the
+  `has_iface_slot` branch).
+- **Validation.** Full `scratch/proxysoak/` soak re-run (fresh release binary):
+  `ProxySer` now **`realsuper == HotSpot` and `realsuper == default`** (was an NPE);
+  `ProxyInstOf` confirms `proxy instanceof Class == false` (was `true`); zero OOB
+  warnings. For every soak program `realsuper` now equals the proven default path
+  except the intended `getSuperclass()` improvement (`java.lang.reflect.Proxy`,
+  matching HotSpot). Default path unaffected. The three orthogonal pre-existing gaps
+  (`invokeDefault`/`proxyClassLookup`, `getProxyClass`, `com.sun.proxy` naming) remain
+  — equal in both modes, do not block the flip.
+- **Flip status.** The named serialization soak target now passes. Remaining before
+  flipping `real_proxy_super()` default-ON: run the real-app proxy suites
+  (Keycloak/Quarkus ArC, Hibernate JdbcSpies, Spring/JDK dynamic proxies) under
+  `CRATONVM_REAL_PROXY_SUPER=1`. Default stays OFF until that soak is green.
