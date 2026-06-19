@@ -7,7 +7,7 @@
 | **CratonVM** | FAIL — `JUnitException: Chain of InvocationInterceptors called invocation multiple times` |
 | **HotSpot JDK 25** | OK |
 | **CratonVM HEAD** | 694c957f (dev) |
-| **Status** | FIXED (branch `fix/spring-bug-04-timeout-chain`) |
+| **Status** | FIXED — commit `fc20e970` (merged to `dev`) |
 | **Suggested owner** | — |
 
 ## ★ FIXED (2026-06-18) — NOT threading/MethodHandle: a synthetic-collection compare raised the wrong exception TYPE, masked by the JUnit chain
