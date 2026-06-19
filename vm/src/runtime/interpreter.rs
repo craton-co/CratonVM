@@ -3545,10 +3545,16 @@ pub fn execute(
                     // catch block. The `InternalError` fallback handles the
                     // rt.jar-not-loaded boot path (no NPE class yet).
                     let npe_routed = if crate::jit::helpers::take_jit_pending_npe() {
+                        // JEP 358 (partial): a JIT array/length helper may have
+                        // recorded its operation kind — attach the action-only
+                        // message when the gate is on (else `None`, today's shape).
+                        let npe_msg = crate::runtime::exceptions::helpful_npe::jit_npe_message_gated(
+                            crate::jit::helpers::take_jit_pending_npe_action(),
+                        );
                         match crate::runtime::exceptions::throw_runtime_error(
                             shared,
                             thread,
-                            RuntimeError::NullPointerException { message: None },
+                            RuntimeError::NullPointerException { message: npe_msg },
                         ) {
                             MethodCallFailed::ExceptionThrown(exc) => {
                                 jit_early_exception = Some(exc);
@@ -10070,6 +10076,16 @@ pub(crate) fn aastore_element_assignable(
 fn class_chain_reaches_proxy_instance(shared: &SharedVm, class_id: ClassId) -> bool {
     const MAX_DEPTH: usize = 32;
     const PROXY_INSTANCE: &str = "java/lang/reflect/Proxy$Instance";
+    // proxy-real-classfile real-super migration: when the gate is on, generated
+    // proxies extend the *real* `java.lang.reflect.Proxy` (its sole instance
+    // field `h` is at slot 0 — the same handler slot the dispatch path reads),
+    // so the chain walk must also recognise that super. Default-off → this is a
+    // strict no-op and the function behaves exactly as before. (Only OUR
+    // generated proxies extend `java.lang.reflect.Proxy` — `newProxyInstance`
+    // and proxy deserialisation both route through CratonVM's own machinery —
+    // so recognising the real super does not misclassify any real JDK class.)
+    let recognise_real_proxy = crate::runtime::env_cache::real_proxy_super();
+    const REAL_PROXY: &str = "java/lang/reflect/Proxy";
 
     let cm = shared.class_manager.read();
     let mut current = Some(class_id);
@@ -10083,6 +10099,9 @@ fn class_chain_reaches_proxy_instance(shared: &SharedVm, class_id: ClassId) -> b
             None => return false,
         };
         if &*class.name == PROXY_INSTANCE {
+            return true;
+        }
+        if recognise_real_proxy && &*class.name == REAL_PROXY {
             return true;
         }
         // Stop early once we hit Object — Proxy$Instance sits below it
@@ -15705,10 +15724,15 @@ fn try_osr(
         // OSR→interpreter handoff and gets surfaced by the next JIT
         // helper return drain (~line 2253 / ~12723) so it does not
         // disappear silently.
+        // JEP 358 (partial): record the JIT helper's action kind so the NPE
+        // surfaced here (and any re-stash below) keeps its action-only message.
+        let npe_action = crate::jit::helpers::take_jit_pending_npe_action();
+        let npe_msg =
+            crate::runtime::exceptions::helpful_npe::jit_npe_message_gated(npe_action);
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
-            RuntimeError::NullPointerException { message: None },
+            RuntimeError::NullPointerException { message: npe_msg },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
                 if let Some((handler_pc, exc_ref)) = find_exception_handler_any_pc(
@@ -15732,7 +15756,7 @@ fn try_osr(
                 // Couldn't construct a Java NPE object (e.g. rt.jar not
                 // loaded) — re-stash the raw flag as before so the next
                 // JIT drain still surfaces it.
-                crate::jit::helpers::stash_jit_pending_npe();
+                crate::jit::helpers::stash_jit_pending_npe_action(npe_action);
             }
         }
         return None;
@@ -17846,10 +17870,15 @@ fn execute_jit_call(
     // (which can't safely match without a known PC) but still matches
     // typed handlers by exception class.
     if crate::jit::helpers::take_jit_pending_npe() {
+        // JEP 358 (partial): attach the JIT helper's action-only message
+        // (gate-on; else `None`).
+        let npe_msg = crate::runtime::exceptions::helpful_npe::jit_npe_message_gated(
+            crate::jit::helpers::take_jit_pending_npe_action(),
+        );
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
-            RuntimeError::NullPointerException { message: None },
+            RuntimeError::NullPointerException { message: npe_msg },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
                 let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
@@ -18173,10 +18202,15 @@ fn execute_jit_call_decoded(
     // Drain pending NPE / AIOOBE set by void-return store helpers (same as
     // execute_jit_call) — route through the JIT'd method's exception table.
     if crate::jit::helpers::take_jit_pending_npe() {
+        // JEP 358 (partial): attach the JIT helper's action-only message
+        // (gate-on; else `None`).
+        let npe_msg = crate::runtime::exceptions::helpful_npe::jit_npe_message_gated(
+            crate::jit::helpers::take_jit_pending_npe_action(),
+        );
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
-            RuntimeError::NullPointerException { message: None },
+            RuntimeError::NullPointerException { message: npe_msg },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
                 return route_jit_exception_through_method(

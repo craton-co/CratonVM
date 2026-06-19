@@ -1,0 +1,131 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
+//! # `cratonvm-embed` — curated Rust embedding facade for CratonVM
+//!
+//! This is **Layer 1** of `docs/feature-designs/embedding-api.md`: a thin,
+//! curated, semver-stable facade over the `cratonvm-vm` crate's embedding
+//! surface. It re-exports *exactly* the supported types and adds the few
+//! conveniences an embedder needs, so a host does not have to depend on the
+//! whole `cratonvm-vm` crate and reach into its internals.
+//!
+//! For a **C / non-Rust** host, use the `libcratonvm` crate instead (the
+//! `cdylib`/`staticlib` with the JNI Invocation API + the flat `cratonvm_*` C
+//! ABI). This crate is for **Rust** hosts that want a stable, minimal API.
+//!
+//! ## Lifecycle (API contract)
+//!
+//! ```text
+//! Vm::new(VmConfig)        // construct + bootstrap to init level 1
+//!   → System.initPhaseN    // advance init levels (the CLI/embedder drives these)
+//!   → vm.invoke(...)        // drive static/instance calls
+//!   → drop(vm)              // tear down
+//! ```
+//!
+//! * **One `JvmThread` per Java thread.** `SharedVm` is `Send + Sync`; the
+//!   per-thread `JvmThread` (inside `Vm`) is not shared across OS threads.
+//! * **Natives are immutable after construction** — register them on the
+//!   `VmConfig` / `SharedVm` before first use.
+//! * **One VM per process** is the only tested configuration (the process-global
+//!   signal handlers / sandbox roots make multiple or restarted VMs fragile).
+//!
+//! ## Example
+//!
+//! ```no_run
+//! use cratonvm_embed::{Vm, VmConfig, Value};
+//!
+//! let mut vm = Vm::new(VmConfig::with_host_jdk_default());
+//! // (drive System.initPhaseN here as the reference embedder does)
+//! let args = cratonvm_embed::make_string_array(&mut vm, &["hello"]).unwrap();
+//! let _ = vm.invoke("HelloWorld", "main", "([Ljava/lang/String;)V",
+//!     &[Value::Object(Some(args))]);
+//! ```
+
+#![forbid(unsafe_code)]
+
+// ---------------------------------------------------------------------------
+// Curated re-exports — the supported, semver-stable surface.
+// ---------------------------------------------------------------------------
+
+pub use cratonvm_vm::config::VmConfig;
+pub use cratonvm_vm::error::{MethodCallFailed, MethodCallResult, VmError};
+pub use cratonvm_vm::threading::{JvmThread, ThreadId};
+pub use cratonvm_vm::types::{ObjectRef, Value};
+pub use cratonvm_vm::vm::{SharedVm, StackTraceFrame, Vm};
+pub use cratonvm_vm::ClassId;
+
+// ---------------------------------------------------------------------------
+// Conveniences — the small set of helpers an embedder always reaches for.
+// ---------------------------------------------------------------------------
+
+/// Build a `java.lang.String[]` from Rust strings — the array a host passes to
+/// a `main(String[])` (or any `[Ljava/lang/String;` parameter).
+///
+/// Each element is an interned `java.lang.String` (the same constructor the
+/// interpreter uses for an `ldc` of a literal). Returns the array handle, or a
+/// [`VmError`] if `java.lang.String` cannot be loaded.
+pub fn make_string_array(vm: &mut Vm, items: &[&str]) -> Result<ObjectRef, VmError> {
+    let string_class = vm.load_class("java/lang/String")?;
+    let arr = vm.new_ref_array(string_class, items.len());
+    for (i, s) in items.iter().enumerate() {
+        let js = cratonvm_vm::vm::create_java_string(&vm.shared, s);
+        // Index is in `[0, items.len())` by construction, so the bounds-check
+        // (the `Err(i32)` AIOOBE index) cannot fire; ignore it.
+        let _ = vm
+            .shared
+            .heap
+            .set_array_element(arr, i, Value::Object(Some(js)));
+    }
+    Ok(arr)
+}
+
+/// Read a `java.lang.String` handle back into a Rust `String`. Returns `None`
+/// if the handle is not a `java.lang.String`.
+pub fn read_string(vm: &Vm, obj: ObjectRef) -> Option<String> {
+    cratonvm_vm::vm::read_java_string(&vm.shared.heap, obj)
+}
+
+/// The runtime-class internal name of a heap object (`"java/lang/String"`),
+/// or `None` if the class is unresolvable.
+pub fn object_class_name(vm: &Vm, obj: ObjectRef) -> Option<String> {
+    let class_id = vm.shared.heap.class_id_of(obj);
+    vm.class_name(class_id)
+}
+
+/// A human-readable description of a failed call: the internal VM error text,
+/// or — for a thrown Java exception — the runtime class name of the throwable.
+/// (Reading the throwable's `getMessage()` requires a live call, so this
+/// read-only helper reports the class; invoke `getMessage` yourself if needed.)
+pub fn describe_failure(vm: &Vm, e: &MethodCallFailed) -> String {
+    match e {
+        MethodCallFailed::InternalError(err) => err.to_string(),
+        MethodCallFailed::ExceptionThrown(obj) => {
+            let cls = object_class_name(vm, *obj).unwrap_or_else(|| "<unknown>".to_string());
+            format!("{cls} thrown")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Compile-time pin that the curated surface re-exports the supported types.
+    /// (A live round-trip would require the full VM bootstrap; the `libcratonvm`
+    /// crate's `flat_api_live_vm` test covers the runtime path.)
+    #[test]
+    fn facade_reexports_exist() {
+        fn _assert_sized<T>() {}
+        _assert_sized::<VmConfig>();
+        _assert_sized::<Vm>();
+        _assert_sized::<SharedVm>();
+        _assert_sized::<JvmThread>();
+        _assert_sized::<ThreadId>();
+        _assert_sized::<ClassId>();
+        _assert_sized::<Value>();
+        _assert_sized::<ObjectRef>();
+        _assert_sized::<VmError>();
+        _assert_sized::<MethodCallFailed>();
+        _assert_sized::<StackTraceFrame>();
+    }
+}

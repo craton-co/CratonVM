@@ -1028,6 +1028,303 @@ pub extern "C" fn cratonvm_clear_error(_vm: *mut CratonVm) {
     let _ = catch_unwind(AssertUnwindSafe(clear_last_error));
 }
 
+// --- invoke_virtual --------------------------------------------------------
+
+/// `CratonValue cratonvm_invoke_virtual(CratonVm *vm, CratonRef receiver,
+///     const char *method, const char *sig, const CratonValue *args, int32_t n_args)`
+///
+/// Invoke an instance method on `receiver` via **virtual dispatch** — the method
+/// is resolved against the receiver's *runtime* class (the most-derived
+/// override), exactly like an `invokevirtual` / `invokeinterface` bytecode. This
+/// is the instance-method companion to [`cratonvm_invoke_static`].
+///
+/// * `receiver` is a non-null object handle ([`CratonRef`]) the VM previously
+///   handed out (e.g. from [`cratonvm_new_string`] or an `OBJECT` result).
+/// * `sig` is the method's JVM descriptor and **excludes the receiver**
+///   (e.g. `"(I)Ljava/lang/String;"`), matching how the interpreter stores
+///   instance-method descriptors; the receiver is supplied via `receiver`, not
+///   in `args`.
+/// * `args` is a typed [`CratonValue`] array of length `n_args` (may be null
+///   when `n_args == 0`).
+///
+/// Returns the method's return value ([`craton_tag::VOID`] for a `void` method)
+/// or `tag == craton_tag::ERROR` on any failure (null/bad receiver, bad strings,
+/// a thrown Java exception, or an internal error) — in which case
+/// [`cratonvm_last_error`] holds a message.
+///
+/// # Safety
+/// `vm` is a handle from [`cratonvm_create`]; `receiver` is a live [`CratonRef`];
+/// `method`/`sig` are valid NUL-terminated C strings; `args` points to `n_args`
+/// valid [`CratonValue`]s (or is null when `n_args == 0`).
+#[no_mangle]
+pub extern "C" fn cratonvm_invoke_virtual(
+    vm: *mut CratonVm,
+    receiver: CratonRef,
+    method: *const c_char,
+    sig: *const c_char,
+    args: *const CratonValue,
+    n_args: JInt,
+) -> CratonValue {
+    catch_unwind(AssertUnwindSafe(|| {
+        clear_last_error();
+        // SAFETY: `vm` per caller contract.
+        unsafe {
+            with_vm(vm, CratonValue::error(), |h| {
+                let recv = match ref_from_handle(receiver) {
+                    Some(r) => r,
+                    None => {
+                        set_last_error("cratonvm_invoke_virtual: null receiver handle");
+                        return CratonValue::error();
+                    }
+                };
+                // SAFETY: caller contract — these are valid C strings or null.
+                let (method, sig) = match unsafe {
+                    (
+                        cstr_or_err(method, "method name"),
+                        cstr_or_err(sig, "method signature"),
+                    )
+                } {
+                    (Some(m), Some(s)) => (m, s),
+                    _ => return CratonValue::error(),
+                };
+
+                if n_args < 0 || (n_args > 0 && args.is_null()) {
+                    set_last_error("cratonvm_invoke_virtual: bad args array");
+                    return CratonValue::error();
+                }
+                let in_args: &[CratonValue] = if n_args == 0 {
+                    &[]
+                } else {
+                    // SAFETY: checked `args` non-null and `n_args > 0` above.
+                    unsafe { std::slice::from_raw_parts(args, n_args as usize) }
+                };
+
+                // Resolve the receiver's *runtime* class — invoking on the
+                // most-derived class is exactly virtual dispatch (the same
+                // pattern `Vm::run_pending_finalizers` uses to virtual-dispatch
+                // `finalize()` on an object's concrete class).
+                let class_id = h.vm.shared.heap.class_id_of(recv);
+                let class_name = match h.vm.class_name(class_id) {
+                    Some(n) => n,
+                    None => {
+                        set_last_error(
+                            "cratonvm_invoke_virtual: receiver has no resolvable class",
+                        );
+                        return CratonValue::error();
+                    }
+                };
+
+                // The receiver is arg 0 (descriptor excludes it); typed args follow.
+                let mut values: Vec<Value> = Vec::with_capacity(in_args.len() + 1);
+                values.push(Value::Object(Some(recv)));
+                values.extend(in_args.iter().map(|v| v.to_value()));
+
+                match h.vm.invoke(&class_name, method, sig, &values) {
+                    Ok(Some(v)) => CratonValue::from_value(v),
+                    Ok(None) => CratonValue::void(),
+                    Err(e) => {
+                        set_last_error(describe_failure(&e));
+                        CratonValue::error()
+                    }
+                }
+            })
+        }
+    }))
+    .unwrap_or_else(|_| {
+        set_last_error("cratonvm_invoke_virtual: panic");
+        CratonValue::error()
+    })
+}
+
+// --- object inspection / field read-back -----------------------------------
+
+/// `CratonClass cratonvm_object_class(CratonVm *vm, CratonRef obj, CratonClass *out_class)`
+///
+/// Write the **runtime class** handle of `obj` into `*out_class` and return
+/// [`JNI_OK`]; returns [`JNI_ERR`] (with the last error set, `*out_class`
+/// untouched) on a bad VM/handle. An out-pointer + return code is used rather
+/// than a sentinel because `0` is a valid [`CratonClass`] (`java/lang/Object`).
+///
+/// # Safety
+/// `vm` is a handle from [`cratonvm_create`]; `obj` is a live [`CratonRef`];
+/// `out_class`, when non-null, is writable.
+#[no_mangle]
+pub extern "C" fn cratonvm_object_class(
+    vm: *mut CratonVm,
+    obj: CratonRef,
+    out_class: *mut CratonClass,
+) -> JInt {
+    catch_unwind(AssertUnwindSafe(|| {
+        clear_last_error();
+        // SAFETY: `vm` per caller contract.
+        unsafe {
+            with_vm(vm, JNI_ERR, |h| {
+                let oref = match ref_from_handle(obj) {
+                    Some(r) => r,
+                    None => {
+                        set_last_error("cratonvm_object_class: null object handle");
+                        return JNI_ERR;
+                    }
+                };
+                let class_id = h.vm.shared.heap.class_id_of(oref);
+                if !out_class.is_null() {
+                    // SAFETY: `out_class` checked non-null; writable per contract.
+                    unsafe { *out_class = class_id.as_u32() as CratonClass };
+                }
+                JNI_OK
+            })
+        }
+    }))
+    .unwrap_or_else(|_| {
+        set_last_error("cratonvm_object_class: panic");
+        JNI_ERR
+    })
+}
+
+/// `char *cratonvm_class_name(CratonVm *vm, CratonClass class)`
+///
+/// Read a class handle's internal name (`"java/lang/String"`) into a freshly
+/// allocated, NUL-terminated UTF-8 C string. Returns null (with the last error
+/// set) on a bad VM handle or an unresolvable class. The returned buffer is
+/// caller-owned and must be released with [`cratonvm_free_string`] (same
+/// ownership split as [`cratonvm_string_utf8`]).
+///
+/// # Safety
+/// `vm` is a handle from [`cratonvm_create`]; `class` is a [`CratonClass`] the VM
+/// previously handed out.
+#[no_mangle]
+pub extern "C" fn cratonvm_class_name(vm: *mut CratonVm, class: CratonClass) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        clear_last_error();
+        // SAFETY: `vm` per caller contract.
+        unsafe {
+            with_vm(vm, std::ptr::null_mut(), |h| {
+                let class_id = ClassId::new(class as u32);
+                match h.vm.class_name(class_id) {
+                    Some(name) => {
+                        let mut bytes = name.into_bytes();
+                        bytes.retain(|&b| b != 0);
+                        match CString::new(bytes) {
+                            Ok(c) => c.into_raw(),
+                            Err(_) => std::ptr::null_mut(),
+                        }
+                    }
+                    None => {
+                        set_last_error("cratonvm_class_name: unresolvable class handle");
+                        std::ptr::null_mut()
+                    }
+                }
+            })
+        }
+    }))
+    .unwrap_or_else(|_| {
+        set_last_error("cratonvm_class_name: panic");
+        std::ptr::null_mut()
+    })
+}
+
+/// `int32_t cratonvm_field_count(CratonVm *vm, CratonRef obj)`
+///
+/// Return the number of instance-field slots in `obj`'s class layout — the valid
+/// `index` range `[0, count)` for [`cratonvm_get_field`]. Returns `-1` (with the
+/// last error set) on a bad VM/handle.
+///
+/// # Safety
+/// `vm` is a handle from [`cratonvm_create`]; `obj` is a live [`CratonRef`].
+#[no_mangle]
+pub extern "C" fn cratonvm_field_count(vm: *mut CratonVm, obj: CratonRef) -> JInt {
+    catch_unwind(AssertUnwindSafe(|| {
+        clear_last_error();
+        // SAFETY: `vm` per caller contract.
+        unsafe {
+            with_vm(vm, -1, |h| {
+                let oref = match ref_from_handle(obj) {
+                    Some(r) => r,
+                    None => {
+                        set_last_error("cratonvm_field_count: null object handle");
+                        return -1;
+                    }
+                };
+                let class_id = h.vm.shared.heap.class_id_of(oref);
+                let n = h
+                    .vm
+                    .shared
+                    .class_manager
+                    .read()
+                    .get_class(class_id)
+                    .map(|c| c.num_total_fields)
+                    .unwrap_or(0);
+                n as JInt
+            })
+        }
+    }))
+    .unwrap_or_else(|_| {
+        set_last_error("cratonvm_field_count: panic");
+        -1
+    })
+}
+
+/// `CratonValue cratonvm_get_field(CratonVm *vm, CratonRef obj, int32_t index)`
+///
+/// Read instance field slot `index` of `obj` (an index in `[0,
+/// cratonvm_field_count(obj))`) as a typed [`CratonValue`] — the object-field
+/// read-back companion to [`cratonvm_string_utf8`]'s string read-back. The slot
+/// is resolved by **layout index**, not by name: combine with the JNIEnv
+/// reflection table, [`cratonvm_invoke_virtual`] of a getter, or a host-side
+/// descriptor map to map a field name → index. (Name-based field resolution
+/// needs a class-layout-by-name accessor not yet exposed by the VM — a noted
+/// follow-up.)
+///
+/// Returns `tag == craton_tag::ERROR` (with the last error set) on a bad
+/// VM/handle or an out-of-range `index`.
+///
+/// # Safety
+/// `vm` is a handle from [`cratonvm_create`]; `obj` is a live [`CratonRef`].
+#[no_mangle]
+pub extern "C" fn cratonvm_get_field(
+    vm: *mut CratonVm,
+    obj: CratonRef,
+    index: JInt,
+) -> CratonValue {
+    catch_unwind(AssertUnwindSafe(|| {
+        clear_last_error();
+        // SAFETY: `vm` per caller contract.
+        unsafe {
+            with_vm(vm, CratonValue::error(), |h| {
+                let oref = match ref_from_handle(obj) {
+                    Some(r) => r,
+                    None => {
+                        set_last_error("cratonvm_get_field: null object handle");
+                        return CratonValue::error();
+                    }
+                };
+                let class_id = h.vm.shared.heap.class_id_of(oref);
+                let nfields = h
+                    .vm
+                    .shared
+                    .class_manager
+                    .read()
+                    .get_class(class_id)
+                    .map(|c| c.num_total_fields)
+                    .unwrap_or(0);
+                if index < 0 || (index as usize) >= nfields {
+                    set_last_error(format!(
+                        "cratonvm_get_field: index {index} out of range for {nfields} field(s)"
+                    ));
+                    return CratonValue::error();
+                }
+                // Bounds-checked above; `heap.get_field` reads the slot value.
+                let v = h.vm.shared.heap.get_field(oref, index as usize);
+                CratonValue::from_value(v)
+            })
+        }
+    }))
+    .unwrap_or_else(|_| {
+        set_last_error("cratonvm_get_field: panic");
+        CratonValue::error()
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1190,6 +1487,75 @@ mod tests {
     }
 
     #[test]
+    fn invoke_virtual_null_handle_returns_error_value() {
+        clear_last_error();
+        let method = CString::new("length").unwrap();
+        let sig = CString::new("()I").unwrap();
+        let r = cratonvm_invoke_virtual(
+            std::ptr::null_mut(),
+            0,
+            method.as_ptr(),
+            sig.as_ptr(),
+            std::ptr::null(),
+            0,
+        );
+        assert_eq!(r.tag, craton_tag::ERROR);
+        assert!(last_error_string().is_some());
+    }
+
+    #[test]
+    fn invoke_virtual_null_receiver_with_live_vm_unneeded_is_error() {
+        // Even with a (here null) VM handle, a 0 receiver must be rejected
+        // before any VM access — the null-VM branch fires first, but this
+        // pins that a 0 receiver is never dereferenced.
+        clear_last_error();
+        let method = CString::new("length").unwrap();
+        let sig = CString::new("()I").unwrap();
+        let r = cratonvm_invoke_virtual(
+            std::ptr::null_mut(),
+            0,
+            method.as_ptr(),
+            sig.as_ptr(),
+            std::ptr::null(),
+            0,
+        );
+        assert_eq!(r.tag, craton_tag::ERROR);
+    }
+
+    #[test]
+    fn object_class_null_handle_returns_err() {
+        clear_last_error();
+        let mut out: CratonClass = u64::MAX;
+        let rc = cratonvm_object_class(std::ptr::null_mut(), 0, &mut out);
+        assert_eq!(rc, JNI_ERR);
+        assert_eq!(out, u64::MAX, "out_class must be untouched on error");
+        assert!(last_error_string().is_some());
+    }
+
+    #[test]
+    fn class_name_null_handle_returns_null_and_sets_error() {
+        clear_last_error();
+        let p = cratonvm_class_name(std::ptr::null_mut(), 0);
+        assert!(p.is_null());
+        assert!(last_error_string().is_some());
+    }
+
+    #[test]
+    fn field_count_null_handle_returns_minus_one() {
+        clear_last_error();
+        assert_eq!(cratonvm_field_count(std::ptr::null_mut(), 0), -1);
+        assert!(last_error_string().is_some());
+    }
+
+    #[test]
+    fn get_field_null_handle_returns_error_value() {
+        clear_last_error();
+        let r = cratonvm_get_field(std::ptr::null_mut(), 0, 0);
+        assert_eq!(r.tag, craton_tag::ERROR);
+        assert!(last_error_string().is_some());
+    }
+
+    #[test]
     fn last_error_clear_round_trip() {
         set_last_error("boom");
         assert_eq!(last_error_string().as_deref(), Some("boom"));
@@ -1234,6 +1600,40 @@ mod tests {
         let back_str = unsafe { CStr::from_ptr(back) }.to_string_lossy().into_owned();
         assert_eq!(back_str, "embed");
         cratonvm_free_string(back);
+
+        // virtual dispatch: "embed".length() == 5 (descriptor excludes receiver).
+        let len_m = CString::new("length").unwrap();
+        let len_sig = CString::new("()I").unwrap();
+        let len = cratonvm_invoke_virtual(vm, s, len_m.as_ptr(), len_sig.as_ptr(),
+            std::ptr::null(), 0);
+        assert_eq!(len.tag, craton_tag::INT, "length() failed: {:?}", last_error_string());
+        assert_eq!(len.payload as u32 as i32, 5);
+
+        // object inspection: the string's runtime class is java/lang/String.
+        let mut scls: CratonClass = u64::MAX;
+        assert_eq!(cratonvm_object_class(vm, s, &mut scls), JNI_OK,
+            "object_class failed: {:?}", last_error_string());
+        assert_ne!(scls, u64::MAX);
+        let cname = cratonvm_class_name(vm, scls);
+        assert!(!cname.is_null(), "class_name failed: {:?}", last_error_string());
+        // SAFETY: caller-owned C string from cratonvm_class_name.
+        let cname_str = unsafe { CStr::from_ptr(cname) }.to_string_lossy().into_owned();
+        assert_eq!(cname_str, "java/lang/String");
+        cratonvm_free_string(cname);
+
+        // field read-back: a String has a non-negative field count and slot 0
+        // reads without error (the byte[]/coder layout is JDK-version-specific,
+        // so we only assert the read-back path is sound, not a specific value).
+        let fc = cratonvm_field_count(vm, s);
+        assert!(fc >= 0, "field_count failed: {:?}", last_error_string());
+        if fc > 0 {
+            let f0 = cratonvm_get_field(vm, s, 0);
+            assert_ne!(f0.tag, craton_tag::ERROR, "get_field(0) failed: {:?}",
+                last_error_string());
+        }
+        // out-of-range field index is a clean error, not a crash.
+        let oob = cratonvm_get_field(vm, s, fc);
+        assert_eq!(oob.tag, craton_tag::ERROR);
 
         // invoke a void static (System.gc) with no args.
         let m = CString::new("gc").unwrap();

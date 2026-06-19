@@ -108,6 +108,15 @@ CratonValue cratonvm_invoke_static(CratonVm *vm, const char *cls,
                                    const char *method, const char *sig,
                                    const CratonValue *args, cratonvm_jint n_args);
 
+/* Invoke an instance method on `receiver` via VIRTUAL dispatch (resolved
+ * against the receiver's runtime class). `sig` EXCLUDES the receiver
+ * (e.g. "(I)Ljava/lang/String;"); the receiver is passed via `receiver`, not in
+ * `args`. `args` is a typed CratonValue array of length `n_args` (NULL when 0).
+ * Returns the result (tag VOID for void), or tag CRATON_TAG_ERROR on failure. */
+CratonValue cratonvm_invoke_virtual(CratonVm *vm, CratonRef receiver,
+                                    const char *method, const char *sig,
+                                    const CratonValue *args, cratonvm_jint n_args);
+
 /* Create an interned java.lang.String from a UTF-8 C string. Returns its
  * handle, or 0 on failure (last error set). */
 CratonRef cratonvm_new_string(CratonVm *vm, const char *utf8);
@@ -120,6 +129,27 @@ char *cratonvm_string_utf8(CratonVm *vm, CratonRef str);
 
 /* Release a buffer returned by cratonvm_string_utf8. NULL is a no-op. */
 void cratonvm_free_string(char *s);
+
+/* ---- object inspection / field read-back ------------------------------ */
+
+/* Write the runtime class handle of `obj` into *out_class. Returns 0 (JNI_OK)
+ * or -1 (JNI_ERR) on a bad handle (last error set, *out_class untouched). */
+cratonvm_jint cratonvm_object_class(CratonVm *vm, CratonRef obj, CratonClass *out_class);
+
+/* Read a class handle's internal name ("java/lang/String") into a freshly
+ * allocated NUL-terminated UTF-8 buffer (CALLER-owned; free with
+ * cratonvm_free_string). Returns NULL on a bad/unresolvable handle. */
+char *cratonvm_class_name(CratonVm *vm, CratonClass cls);
+
+/* Return the number of instance-field slots in `obj`'s class (the valid index
+ * range [0, count) for cratonvm_get_field), or -1 on a bad handle. */
+cratonvm_jint cratonvm_field_count(CratonVm *vm, CratonRef obj);
+
+/* Read instance field slot `index` of `obj` as a typed CratonValue. The slot is
+ * resolved by LAYOUT INDEX (not by name; combine with reflection or a getter via
+ * cratonvm_invoke_virtual for name-based access). Returns tag CRATON_TAG_ERROR
+ * on a bad handle or out-of-range index (last error set). */
+CratonValue cratonvm_get_field(CratonVm *vm, CratonRef obj, cratonvm_jint index);
 
 /* ---- error access (thread-local) -------------------------------------- */
 

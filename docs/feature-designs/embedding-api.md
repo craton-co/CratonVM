@@ -271,6 +271,52 @@ back into bytes it can read.
   — deferred), object-field read-back, the varargs overload, real cbindgen, and
   the `cratonvm-embed` Rust facade.
 
+## Increment 4 (virtual dispatch + object read-back + Layer-1 facade + cbindgen) landed
+
+Closes most of the increment-3 "still next" list — the conveniences a host needs
+once it can create a VM and call statics.
+
+- **`cratonvm_invoke_virtual(vm, receiver, method, sig, args, n_args)`** — the
+  instance-method companion to `cratonvm_invoke_static`. Resolves the method
+  against the receiver's **runtime** class (most-derived override = virtual
+  dispatch), the same pattern `Vm::run_pending_finalizers` uses; `sig` excludes
+  the receiver, which is passed separately and prepended as arg 0.
+- **Object inspection / field read-back** (Layer 2): `cratonvm_object_class`
+  (runtime class handle), `cratonvm_class_name` (class internal name, caller-owned
+  buffer), `cratonvm_field_count` (the valid `get_field` index range), and
+  `cratonvm_get_field(vm, obj, index)` (typed `CratonValue` read of a bounds-
+  checked instance-field slot via the public `heap.get_field`). Field resolution
+  is **by layout index**, not by name — a name-based resolver needs a
+  class-layout-by-name accessor the VM does not yet expose (noted follow-up); a
+  host maps name→index via reflection or a getter through
+  `cratonvm_invoke_virtual`.
+- **`cratonvm-embed` (new crate)** — the curated, semver-stable **Layer 1** Rust
+  facade: re-exports exactly the supported types (`Vm`, `VmConfig`, `Value`,
+  `MethodCallFailed`, `JvmThread`, `ClassId`, …), documents the lifecycle /
+  threading contract as API guarantees, and adds the conveniences embedders reach
+  for — `make_string_array` (build a `String[]` for `main`), `read_string`,
+  `object_class_name`, `describe_failure`. `#![forbid(unsafe_code)]`; registered
+  in the workspace `members`.
+- **Real cbindgen wiring** — `libcratonvm/cbindgen.toml` + a `build.rs` that
+  regenerates `include/cratonvm.h` via the `cbindgen` CLI **only** when
+  `CRATONVM_REGEN_HEADER=1`. It is a **no-op by default** and cbindgen is
+  deliberately *not* a Cargo dependency, so the default build graph / `Cargo.lock`
+  are untouched and offline builds are unaffected; the hand-maintained header is
+  kept byte-compatible with the config.
+- **The varargs overload is intentionally NOT shipped** — a C-varargs *definition*
+  (`extern "C" fn(...)`) is unsound/unavailable on stable Rust; the typed
+  `CratonValue` array + count is the stable, ABI-portable form and the recommended
+  shape. (Documented, not faked.)
+- **Header + tests.** `cratonvm.h` declares all new functions; the live
+  round-trip example (`--cfg flat_api_live_vm`) now also exercises `length()` via
+  `invoke_virtual`, `object_class`/`class_name` (asserts `java/lang/String`), and
+  bounds-checked `get_field`. Null-handle unit tests for every new entry point
+  pass without a VM bootstrap; `cratonvm-embed` adds a re-export compile-pin + a
+  `no_run` doc example.
+- **Still next:** name-based field resolution (needs a VM layout-by-name
+  accessor), object-field *write-back*, and a C-varargs *convenience shim* layered
+  over the typed-array core (if a host ABI ever needs it).
+
 ## Effort
 
 L. Layer 1 (curate/document the existing Rust API) is S–M and immediately

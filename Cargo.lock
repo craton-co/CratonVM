@@ -476,6 +476,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cratonvm-embed"
+version = "0.3.0"
+dependencies = [
+ "cratonvm-vm",
+]
+
+[[package]]
 name = "cratonvm-gc"
 version = "0.3.0"
 dependencies = [

@@ -301,3 +301,69 @@ Design §3, first half. A genuine proxy-class generation failure no longer
 - Test: `proxy_strict_gate_tests::real_proxy_strict_defaults_off` (the throw path
   itself needs a live VM; exercised by the suites under
   `CRATONVM_REAL_PROXY_STRICT=1`).
+
+## Increment 4 — real-super migration (landed, gated `CRATONVM_REAL_PROXY_SUPER`)
+
+Design §1/§2 groundwork: generate `$ProxyN` that extends the **real**
+`java.lang.reflect.Proxy` instead of the synthetic `Proxy$Instance` super. This
+is the prerequisite for §3's eventual shim deletion — but **nothing is deleted**:
+both supers are retained, the synthetic path stays the default, and the
+real-super path is opt-in (`CRATONVM_REAL_PROXY_SUPER=1`) pending the
+reflection-suite soak.
+
+- **Why deletion is blocked (the finding that scoped this increment).** The
+  generated `$ProxyN` *extends* `Proxy$Instance` as its superclass
+  (`proxy_gen.rs:97,159`), so the shim is load-bearing for the **real** path, not
+  just the fallback — deleting it requires first re-pointing the super to real
+  `Proxy`. This increment lands exactly that re-pointing, behind a gate.
+- **Layout compatibility (the enabling fact).** Real `java.lang.reflect.Proxy`
+  has a single instance field `h` (the `InvocationHandler`) at **slot 0** — the
+  same slot the synthetic 3-slot layout uses for the handler. So the dispatch
+  path (`proxy_invoke_handler_shared` → `get_field(proxy, 0)`,
+  `vm_exec.rs:6863`) reads the handler **uniformly** for both supers; only the
+  *extra* synthetic slots (1 = interfaces, 2 = identity-hash) are absent on the
+  real-super layout (its `getInterfaces()` comes from the class's declared
+  interfaces).
+- **Emitter (`classloading/src/proxy_gen.rs`).** `emit_proxy_classfile` derives
+  the constructor from the spec's `super_class`: real `Proxy` →
+  `<init>(InvocationHandler)` delegating to `Proxy.<init>(InvocationHandler)`
+  (the real JDK shape); synthetic `Proxy$Instance` → the existing 2-arg
+  `<init>(InvocationHandler, Class[])`. `emit_constructor` gained a `real_super`
+  arity switch. The `<clinit>` / per-method bodies are super-independent and
+  unchanged. Test: `emits_real_proxy_super_with_one_arg_ctor`.
+- **Gate + super selection (`native-builtins`).** `real_proxy_super()`
+  (`CRATONVM_REAL_PROXY_SUPER`, default OFF) + `proxy_super_class_name()`;
+  `build_proxy_spec_for` sets `super_class` accordingly. `native_proxy_new_instance`
+  allocates the real-super proxy with the class's real field count (≥1) and writes
+  **only** slot 0 = handler (the Degrade/Failed fallbacks still allocate the
+  synthetic 3-slot shim and write all three, keyed on the *actual* allocated
+  shape, not the gate). `proxy_chain_reaches_instance` + `isProxyClass` recognise
+  (and self-exclude) the real `Proxy` super. Test:
+  `proxy_strict_gate_tests::real_proxy_super_defaults_off`.
+- **VM dispatch recognition (`vm`).** `env_cache::real_proxy_super()` (cached) +
+  `interpreter::class_chain_reaches_proxy_instance` recognise real-`Proxy`-super
+  proxies so they route through the proven slot-0 handler dispatch. Default-off →
+  strict no-op (the chain walk is byte-for-byte unchanged). Only CratonVM's own
+  generated proxies extend real `Proxy` (`newProxyInstance` + proxy
+  deserialisation both route through CratonVM machinery), so recognising the real
+  super never misclassifies a real JDK class.
+- **Declaring-class resolution (`vm_exec.rs`).** `proxy_resolve_declaring_class_mirror`
+  read the proxy's interfaces from slot 1 per dispatch — absent on the 1-field
+  real-super proxy (tripping the `gen_heap` OOB-read guard and mis-resolving
+  `Method.getDeclaringClass()` to `Object`). It now sources interfaces from the
+  proxy **class's declared interfaces** when there is no slot-1 layout (decided
+  by the receiver's field count), leaving the synthetic 3-slot path byte-for-byte
+  unchanged.
+- **Validation.** Unit tests green across `classloading` (13 proxy_gen),
+  `native-builtins` (proxy + gate), `vm` (19 proxy + 15 JEP-358 + 8 JIT-NPE
+  helper regressions — all unaffected). **Live smoke test PASSED** (debug binary,
+  real JDK 25): a `Proxy.newProxyInstance` program exercising method dispatch,
+  `isProxyClass`, `getInvocationHandler`, `getInterfaces`, and Object-method
+  routing (`toString`/`hashCode`) produces output **identical to HotSpot** both
+  by default (synthetic super) AND under `CRATONVM_REAL_PROXY_SUPER=1` (real
+  super, clean — no OOB-read warnings). **Not yet run:** the broader reflection /
+  proxy-using app suites (logging proxies, Spring/JDK dynamic proxies, proxy
+  serialization round-trips) — the default flip waits on that soak.
+- **Still deferred:** flipping the default to real-super, then (design §3)
+  deleting the `Proxy$Instance` shim + the three name-keyed intercepts once the
+  real-super path is default-on and green. Both retained for now.

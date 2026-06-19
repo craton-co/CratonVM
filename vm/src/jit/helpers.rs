@@ -165,6 +165,15 @@ thread_local! {
     /// real `NullPointerException` through the method's exception table.
     static JIT_PENDING_NPE: Cell<bool> = const { Cell::new(false) };
 
+    /// JEP 358 (partial) — the *operation kind* that raised the pending JIT NPE,
+    /// as a `helpful_npe::jit_action` code (`0` = none). Set in lockstep with
+    /// `JIT_PENDING_NPE` so the interpreter's drain can attach an action-only
+    /// JEP-358 message (e.g. "Cannot load from int array") to a JIT-originated
+    /// NPE — the deopt-independent fallback for the (unstarted) precise-bci
+    /// path. Reset to `0` by every `set_jit_pending_npe()` so a stale code can
+    /// never leak onto an unrelated NPE.
+    static JIT_PENDING_NPE_ACTION: Cell<u8> = const { Cell::new(0) };
+
     /// Out-of-band deopt/exception signal (MEDIUM fix: `i64::MIN` sentinel
     /// collision). The JIT signals exception/deopt to its caller by returning
     /// `i64::MIN` in RAX, and the interpreter's post-invoke check
@@ -466,10 +475,39 @@ pub fn take_jit_pending_npe() -> bool {
     JIT_PENDING_NPE.with(|e| e.take())
 }
 
-/// Internal: set the pending-NPE flag. Called from the array helpers.
+/// Take (consume) the JEP-358 *action code* recorded alongside a pending JIT
+/// NPE (`helpful_npe::jit_action::*`; `0` when none was recorded — e.g. the NPE
+/// came from a helper that doesn't carry its operation kind). The interpreter
+/// drain calls this right after [`take_jit_pending_npe`] to build the
+/// action-only message.
+pub fn take_jit_pending_npe_action() -> u8 {
+    JIT_PENDING_NPE_ACTION.with(|e| e.take())
+}
+
+/// Internal: set the pending-NPE flag with no action code (the existing bare
+/// signal — yields an unmessaged NPE). Resets the action cell to `0` so a stale
+/// code from a prior op can never leak onto this NPE.
 #[inline]
 fn set_jit_pending_npe() {
     JIT_PENDING_NPE.with(|e| e.set(true));
+    JIT_PENDING_NPE_ACTION.with(|e| e.set(0));
+}
+
+/// Internal: set the pending-NPE flag *with* a JEP-358 action code
+/// (`helpful_npe::jit_action::*`). Called from the array/length helpers that
+/// know their operation kind, so the interpreter can attach an action-only
+/// JEP-358 message to the JIT-originated NPE.
+#[inline]
+fn set_jit_pending_npe_action(code: u8) {
+    JIT_PENDING_NPE.with(|e| e.set(true));
+    JIT_PENDING_NPE_ACTION.with(|e| e.set(code));
+}
+
+/// Re-stash a previously-taken JIT NPE action code (OSR drain-without-route
+/// path, mirroring [`stash_jit_pending_npe`]). Preserves the action so a
+/// re-surfaced NPE keeps its JEP-358 message.
+pub(crate) fn stash_jit_pending_npe_action(code: u8) {
+    set_jit_pending_npe_action(code);
 }
 
 /// Set the out-of-band deopt/exception signal (MEDIUM fix: `i64::MIN` sentinel
@@ -1468,7 +1506,9 @@ pub unsafe extern "C" fn jit_baload(array_ptr: i64, index: i64) -> i64 {
         // masked real null-deref bugs in user code. Match the iaload/aaload
         // protocol: flag the pending NPE and return the deopt sentinel so the
         // post-JIT interpreter path throws on resume.
-        set_jit_pending_npe();
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::ALOAD_BYTE,
+        );
         return i64::MIN;
     }
     // SAFETY: array_ptr is non-null and points to a live array object on the GC heap.
@@ -1529,7 +1569,9 @@ pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
         // inline-store codegen also emits an explicit `TEST receiver,
         // receiver; JZ deopt_npe` guard before the bounds check, so
         // this helper is the second line of defense.
-        set_jit_pending_npe();
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::ASTORE_BYTE,
+        );
         // Out-of-band deopt signal: the x64 `emit_null_check_store_stubs` stub
         // calls this helper with `array_ptr == 0` and then loads `i64::MIN` as
         // the method's return value, so flag the deopt to keep the interpreter
@@ -1567,7 +1609,9 @@ pub unsafe extern "C" fn jit_iaload(array_ptr: i64, index: i64) -> i64 {
         // JVMS §iaload: throw NullPointerException on null array reference.
         // Signal the interpreter via the pending-NPE flag + `i64::MIN` deopt
         // sentinel (same protocol as `jit_throw_aioobe`).
-        set_jit_pending_npe();
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::ALOAD_INT,
+        );
         return i64::MIN;
     }
     // SAFETY: array_ptr is non-null and points to a live int[] on the GC heap.
@@ -1598,7 +1642,9 @@ pub unsafe extern "C" fn jit_iastore(array_ptr: i64, index: i64, val: i64) {
         // pending-NPE flag; the interpreter's post-JIT path now drains it
         // on every return, so the void-return sentinel-less channel is
         // no longer a correctness blocker.
-        set_jit_pending_npe();
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::ASTORE_INT,
+        );
         return;
     }
     // SAFETY: array_ptr is non-null and points to a live int[] on the GC heap.
@@ -1626,7 +1672,9 @@ pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     if array_ptr == 0 {
         // JVMS §aaload: throw NullPointerException on null array reference.
-        set_jit_pending_npe();
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::ALOAD_OBJECT,
+        );
         return i64::MIN;
     }
     // SAFETY: array_ptr is non-null and points to a live Object[] on the GC heap.
@@ -1659,7 +1707,9 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
         // pending-NPE flag; the interpreter's post-JIT path now drains it
         // on every return, so the void-return sentinel-less channel is
         // no longer a correctness blocker.
-        set_jit_pending_npe();
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::ASTORE_OBJECT,
+        );
         return;
     }
     // SAFETY: array_ptr is non-null and points to a live Object[] on the GC heap.
@@ -1802,7 +1852,9 @@ pub unsafe extern "C" fn jit_arraylength(array_ptr: i64) -> i64 {
         // JVMS §arraylength: throw NullPointerException on null array reference.
         // Previously returned -1, which JIT'd Java would happily compare against
         // and use as an array bound — masking real null-deref bugs in user code.
-        set_jit_pending_npe();
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::ARRAY_LENGTH,
+        );
         return i64::MIN;
     }
     // SAFETY: array_ptr is non-null and points to a live array on the GC heap.

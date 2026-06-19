@@ -8248,29 +8248,58 @@ pub(super) fn proxy_resolve_declaring_class_mirror(
     method_name: &str,
     descriptor: &str,
 ) -> ObjectRef {
-    let interfaces = match shared.heap.get_field(proxy, 1) {
-        Value::Object(Some(arr)) => arr,
-        _ => return super::get_or_create_class_mirror(shared, ClassId::new(0)),
-    };
-    let n = shared.heap.array_length(interfaces);
+    // Source the proxy's implemented interfaces. The synthetic 3-slot layout
+    // stores the `Class[]` at slot 1; the real-super layout (proxy-real-classfile
+    // migration: extends `java.lang.reflect.Proxy` — single field `h` at slot 0)
+    // has no such slot, so read the interfaces from the proxy class's own
+    // declared interfaces instead. Decide by the receiver's field count so we
+    // never read slot 1 out of bounds on the 1-field real-super proxy (which
+    // would trip the gen_heap OOB guard and mis-resolve `getDeclaringClass()` to
+    // `Object`).
+    let proxy_cid = shared.heap.class_id_of(proxy);
+    let has_iface_slot = shared
+        .class_manager
+        .read()
+        .get_class(proxy_cid)
+        .map(|c| c.num_total_fields >= 2)
+        .unwrap_or(false);
+
+    // Collect the interface ClassIds to search + the first interface's mirror
+    // (the fallback declaring class when no interface declares the method).
+    let mut iface_cids: Vec<ClassId> = Vec::new();
     let mut first_iface_mirror: Option<ObjectRef> = None;
-    for i in 0..n {
-        let iface_mirror = match shared.heap.get_array_element(interfaces, i) {
-            Ok(Value::Object(Some(m))) => m,
-            _ => continue,
-        };
-        if first_iface_mirror.is_none() {
-            first_iface_mirror = Some(iface_mirror);
+    if has_iface_slot {
+        if let Value::Object(Some(arr)) = shared.heap.get_field(proxy, 1) {
+            let n = shared.heap.array_length(arr);
+            for i in 0..n {
+                if let Ok(Value::Object(Some(m))) = shared.heap.get_array_element(arr, i) {
+                    if first_iface_mirror.is_none() {
+                        first_iface_mirror = Some(m);
+                    }
+                    if let Some(cid) = shared.class_mirrors_reverse.read().get(&m).copied() {
+                        iface_cids.push(cid);
+                    }
+                }
+            }
         }
-        let iface_cid = match shared
-            .class_mirrors_reverse
+    } else {
+        // Real-super layout: the proxy class's declared interfaces ARE the proxy
+        // interface set (the generated `$ProxyN` declares them directly).
+        let cids = shared
+            .class_manager
             .read()
-            .get(&iface_mirror)
-            .copied()
-        {
-            Some(cid) => cid,
-            None => continue,
-        };
+            .get_class(proxy_cid)
+            .map(|c| c.interfaces.clone())
+            .unwrap_or_default();
+        for cid in cids {
+            if first_iface_mirror.is_none() {
+                first_iface_mirror = Some(super::get_or_create_class_mirror(shared, cid));
+            }
+            iface_cids.push(cid);
+        }
+    }
+
+    for iface_cid in iface_cids {
         // Walk this interface + all super-interfaces (transitively)
         // looking for a declared method matching (name, descriptor).
         let mut visited: rustc_hash::FxHashSet<ClassId> = rustc_hash::FxHashSet::default();

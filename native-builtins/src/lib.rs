@@ -35303,8 +35303,13 @@ fn native_proxy_is_proxy_class(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             // `h` field), so the handler is lost on write and the duplicate
             // proxy name trips `ObjectStreamClass`'s "Circular reference." guard
             // on read.
-            if ctx.class_name_of_id(cid).as_deref()
-                == Some("java/lang/reflect/Proxy$Instance")
+            // The super itself is NOT a proxy class (`isProxyClass(Proxy.class)
+            // == false`), only its generated `$ProxyN` subclasses are. Exclude
+            // BOTH the synthetic `Proxy$Instance` and — for the real-super
+            // migration — the real `java.lang.reflect.Proxy`.
+            let self_name = ctx.class_name_of_id(cid);
+            if self_name.as_deref() == Some("java/lang/reflect/Proxy$Instance")
+                || self_name.as_deref() == Some("java/lang/reflect/Proxy")
             {
                 false
             } else {
@@ -35319,6 +35324,10 @@ fn native_proxy_is_proxy_class(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// Whether `class_id` is (or descends from) the synthetic
 /// `java/lang/reflect/Proxy$Instance` super class — i.e. it is a proxy class.
 fn proxy_chain_reaches_instance(ctx: &dyn NativeContext, class_id: cratonvm_types::ClassId) -> bool {
+    // proxy-real-classfile real-super migration: when the gate is on, generated
+    // proxies extend the real `java.lang.reflect.Proxy`, so recognise that super
+    // too. Default-off → strict no-op (only the synthetic shim is recognised).
+    let recognise_real = real_proxy_super();
     let mut current = Some(class_id);
     let mut guard = 0;
     while let Some(cid) = current {
@@ -35326,7 +35335,11 @@ fn proxy_chain_reaches_instance(ctx: &dyn NativeContext, class_id: cratonvm_type
         if guard > 64 {
             break; // defensive: never loop on a malformed hierarchy
         }
-        if ctx.class_name_of_id(cid).as_deref() == Some("java/lang/reflect/Proxy$Instance") {
+        let name = ctx.class_name_of_id(cid);
+        if name.as_deref() == Some("java/lang/reflect/Proxy$Instance") {
+            return true;
+        }
+        if recognise_real && name.as_deref() == Some("java/lang/reflect/Proxy") {
             return true;
         }
         current = ctx.superclass_of(cid);
@@ -35417,33 +35430,52 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(loader_obj))) => ctx.identity_hash_code(*loader_obj) as u32,
         _ => 0,
     };
-    let proxy = match define_or_get_proxy_class(ctx, loader_namespace, &iface_cids) {
-        ProxyClassOutcome::Real(cid) => {
-            // The generated class extends `Proxy$Instance` (3 slots:
-            // handler / interfaces / identity-hash). Use whichever is
-            // larger of the declared field count or 3 — `class_num_total_fields`
-            // returns 0 if the class is loaded as a synthetic stub
-            // without bytecode parsing.
-            let n = ctx.class_num_total_fields(cid).max(3);
-            ctx.alloc_object(cid, n)
-        }
-        ProxyClassOutcome::Degrade => {
-            alloc_concurrent_synthetic(ctx, "java/lang/reflect/Proxy$Instance", 3)
-        }
-        ProxyClassOutcome::Failed(stage) => {
-            // increment 3 (§3): STRICT mode surfaces the real failure as the JDK
-            // does (IllegalArgumentException); the default (non-strict) path keeps
-            // the synthetic shim so existing apps keep running while the real
-            // generated-classfile path soaks.
-            if real_proxy_strict() {
-                return Err(throw_proxy_failure(ctx, stage));
+    // proxy-real-classfile real-super migration: the generated class extends the
+    // real `java.lang.reflect.Proxy` (single field `h` at slot 0) only on the
+    // `Real` arm with the gate on; the Degrade/Failed fallbacks always allocate
+    // the synthetic 3-slot `Proxy$Instance` regardless of the gate. Track the
+    // *actual* allocated shape so the slot writes below match it.
+    let use_real_super = real_proxy_super();
+    let (proxy, proxy_is_real_super) =
+        match define_or_get_proxy_class(ctx, loader_namespace, &iface_cids) {
+            ProxyClassOutcome::Real(cid) => {
+                // Real super → real `Proxy`'s single `h` field (slot 0); use the
+                // class's real field count (≥1). Synthetic super → the 3-slot
+                // handler/interfaces/identity-hash layout (`.max(3)` because a
+                // synthetic stub loaded without bytecode can report 0 fields).
+                let min_fields = if use_real_super { 1 } else { 3 };
+                let n = ctx.class_num_total_fields(cid).max(min_fields);
+                (ctx.alloc_object(cid, n), use_real_super)
             }
-            alloc_concurrent_synthetic(ctx, "java/lang/reflect/Proxy$Instance", 3)
-        }
-    };
+            ProxyClassOutcome::Degrade => (
+                alloc_concurrent_synthetic(ctx, "java/lang/reflect/Proxy$Instance", 3),
+                false,
+            ),
+            ProxyClassOutcome::Failed(stage) => {
+                // increment 3 (§3): STRICT mode surfaces the real failure as the JDK
+                // does (IllegalArgumentException); the default (non-strict) path keeps
+                // the synthetic shim so existing apps keep running while the real
+                // generated-classfile path soaks.
+                if real_proxy_strict() {
+                    return Err(throw_proxy_failure(ctx, stage));
+                }
+                (
+                    alloc_concurrent_synthetic(ctx, "java/lang/reflect/Proxy$Instance", 3),
+                    false,
+                )
+            }
+        };
+    // Handler at slot 0 — common to both layouts, so the dispatch path
+    // (`proxy_invoke_handler_shared` → `get_field(proxy, 0)`) reads it uniformly.
     ctx.set_field(proxy, 0, handler);
-    ctx.set_field(proxy, 1, interfaces);
-    ctx.set_field(proxy, 2, Value::Int(0));
+    if !proxy_is_real_super {
+        // Synthetic-super layout only: interfaces (slot 1) + identity-hash
+        // override (slot 2). The real `Proxy` has neither field — its
+        // `getInterfaces()` comes from the class's declared interfaces, and the
+        // global `set_proxy_last_interfaces` cache below still backs legacy readers.
+        ctx.set_field(proxy, 1, interfaces);
+        ctx.set_field(proxy, 2, Value::Int(0));
+    }
 
     // Backward-compat: keep the global "last-proxy interfaces" cache
     // populated so legacy readers (lang_class::native_class_get_interfaces
@@ -35716,6 +35748,36 @@ pub fn real_proxy_strict() -> bool {
     })
 }
 
+/// proxy-real-classfile real-super migration — generate `$ProxyN` classes that
+/// extend the **real** `java.lang.reflect.Proxy` (sole instance field `h` at
+/// slot 0, matching the handler slot the dispatch path reads) rather than the
+/// synthetic `java/lang/reflect/Proxy$Instance` shim. DEFAULT **OFF**: the
+/// synthetic super remains the default until the real-super path soaks against
+/// the reflection suites; both paths are kept (nothing is deleted) so the
+/// synthetic shim is still available for experiments via the default.
+///
+/// Must stay in lockstep with the VM-side accessor
+/// `crate::runtime::env_cache::real_proxy_super()` (same env var) — the VM reads
+/// it to recognise real-`Proxy`-super proxies in the dispatch chain walk.
+/// `CRATONVM_REAL_PROXY_SUPER` = `1`/`true`/`on`/`yes` → on.
+pub fn real_proxy_super() -> bool {
+    matches!(std::env::var("CRATONVM_REAL_PROXY_SUPER"), Ok(v) if {
+        let v = v.trim().to_ascii_lowercase();
+        v == "1" || v == "true" || v == "on" || v == "yes"
+    })
+}
+
+/// The internal name of the super class generated `$ProxyN` proxies extend,
+/// selected by [`real_proxy_super`]. Centralised so the emitter spec, the
+/// allocation field-layout, and the proxy-chain recognition all agree.
+fn proxy_super_class_name() -> &'static str {
+    if real_proxy_super() {
+        "java/lang/reflect/Proxy"
+    } else {
+        "java/lang/reflect/Proxy$Instance"
+    }
+}
+
 /// Outcome of [`define_or_get_proxy_class`]. Distinguishes the *intended*
 /// gate-off degrade (use the synthetic shim) from a *genuine* generation
 /// failure, so STRICT mode ([`real_proxy_strict`]) can surface the latter as a
@@ -35760,6 +35822,19 @@ mod proxy_strict_gate_tests {
     #[test]
     fn real_proxy_strict_defaults_off() {
         assert!(!super::real_proxy_strict());
+    }
+
+    /// proxy-real-classfile real-super migration: the real-`Proxy`-super path is
+    /// opt-in and OFF by default, so generated proxies keep extending the
+    /// synthetic `Proxy$Instance` shim until the soak flips it. (Both paths are
+    /// retained — nothing is deleted.)
+    #[test]
+    fn real_proxy_super_defaults_off() {
+        assert!(!super::real_proxy_super());
+        assert_eq!(
+            super::proxy_super_class_name(),
+            "java/lang/reflect/Proxy$Instance"
+        );
     }
 }
 
@@ -36092,7 +36167,11 @@ fn build_proxy_spec_for(
         gen_class_name.clone(),
         ProxyClassSpec {
             gen_class_name,
-            super_class: "java/lang/reflect/Proxy$Instance".to_string(),
+            // proxy-real-classfile real-super migration: extend the real
+            // `java.lang.reflect.Proxy` when the gate is on, else the synthetic
+            // `Proxy$Instance` shim (default). The emitter derives the matching
+            // 1-arg vs 2-arg `<init>` from this name.
+            super_class: proxy_super_class_name().to_string(),
             interfaces: iface_names,
             methods,
         },

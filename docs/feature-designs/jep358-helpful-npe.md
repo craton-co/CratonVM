@@ -1,5 +1,45 @@
 # JEP 358 — Helpful NullPointerException Messages
 
+> **Increment 4 landed.** Step 6 (partial, deopt-independent): action-only
+> JEP-358 messages for **JIT-originated** NPEs, via the doc's offered fallback —
+> "thread the operation kind through the JIT NPE signal" — since the precise
+> trapping bci needs `real-frame-deopt.md` (unstarted) and the JIT NPE signal
+> carried no context.
+> - **Signal widened.** `JIT_PENDING_NPE` (a bare `bool`) gains a companion
+>   `JIT_PENDING_NPE_ACTION: Cell<u8>` (`vm/src/jit/helpers.rs`) carrying a
+>   `helpful_npe::jit_action` code, set in lockstep via the new
+>   `set_jit_pending_npe_action(code)` and reset to `0` by every bare
+>   `set_jit_pending_npe()` so a stale code can never leak onto an unrelated NPE.
+>   `take_jit_pending_npe_action()` / `stash_jit_pending_npe_action()` mirror the
+>   existing take/stash (OSR re-stash preserves the action).
+> - **Annotated helpers.** The array/length helpers that *know* their operation —
+>   `jit_baload`/`jit_bastore` (byte), `jit_iaload`/`jit_iastore` (int),
+>   `jit_aaload`/`jit_aastore` (object), `jit_arraylength` — now record their
+>   action. `jit_getfield` stays unmessaged (the helper has only a resolved slot
+>   index, not the field name HotSpot needs, so a message would diverge — no
+>   fabricated text).
+> - **Message mapping (`exceptions.rs`).** `helpful_npe::jit_action_message`
+>   maps each code to its **verbatim** HotSpot `BytecodeUtils` action-only string
+>   ("Cannot read the array length", "Cannot load from int array", "Cannot store
+>   to object array", …) — action-only is a valid HotSpot shape when the null
+>   expression can't be reconstructed (which is exactly the no-bci JIT case).
+>   `jit_npe_message_gated` returns `None` (today's unmessaged NPE) unless the
+>   `-XX:±ShowCodeDetailsInExceptionMessages` / `CRATONVM_HELPFUL_NPE_OPCODES`
+>   gate is on, so the default path is byte-for-byte unchanged.
+> - **Drains updated.** The four interpreter JIT-NPE drains
+>   (`interpreter.rs`: `execute_jit_call` early, the OSR bail, and the two
+>   void-return store drains) take the action and attach the gated message; the
+>   OSR re-stash preserves it.
+> - **Tests:** `helpful_npe_tests::jit_action_messages_match_hotspot` (exact
+>   strings + `NONE`/unknown → no message) and
+>   `jit_npe_message_gated_is_none_when_gate_off`; the 8 `jit_*_null_sets_pending_npe`
+>   helper regressions and all 15 `helpful_npe` tests stay green.
+> - **Still not done:** the **inline-codegen** null-check path (x64 deopt stubs)
+>   does not yet carry an action, so JIT NPEs that never reach a Rust helper stay
+>   unmessaged; threading the action (or the precise bci) through codegen overlaps
+>   `real-frame-deopt.md` and remains the full-parity follow-up. Field/invoke JIT
+>   NPEs also stay unmessaged (no name/owner available without the bci).
+
 > **Increment 3 landed (2026-06-18).** Step 5b: the real HotSpot opt-out flag
 > `-XX:±ShowCodeDetailsInExceptionMessages` now drives the non-invoke opcode
 > routing, replacing the interim `CRATONVM_HELPFUL_NPE_OPCODES`-only gate.
