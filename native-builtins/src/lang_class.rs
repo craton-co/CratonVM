@@ -8829,6 +8829,30 @@ pub(crate) fn native_class_get_generic_superclass(
         }
         return Ok(Some(Value::Object(None)));
     }
+    // Synthetic lambda proxies (class id >= 0x8000_0000) are not in the class
+    // store, so the `superclass_of` fallback below returns None → a *null*
+    // generic superclass. But a lambda's concrete runtime class extends Object,
+    // and HotSpot's `getGenericSuperclass()` returns the raw `Object` superclass
+    // for a class with no Signature attribute. `getSuperclass()` already special-
+    // cases this (SB-14, see `native_class_get_superclass`); mirror that guard
+    // here so the plain and generic super-class paths stay consistent and never
+    // report a null superclass for a concrete (non-interface) class. Spring's
+    // `ResolvableType` generic-hierarchy walk calls `clazz.getGenericSuperclass()`
+    // on functional-interface / listener lambdas, and a null there cascades into
+    // the bug-06 family-5 `getDeclaredMethod on null` (a resolved class going
+    // null). bug-06 family 5.
+    if ctx.lambda_functional_interface(class_id).is_some() {
+        if let Some(obj_id) = ctx.class_id_by_name("java/lang/Object") {
+            let mirror = ctx.get_class_mirror(obj_id);
+            if dbg_bb {
+                eprintln!(
+                    "[bb-dbg] getGenericSuperclass({}) -> java/lang/Object [lambda]",
+                    this_name
+                );
+            }
+            return Ok(Some(Value::Object(Some(mirror))));
+        }
+    }
     // If class has a Signature attribute, parse it for the generic superclass
     if let Some(sig_str) = ctx.class_signature(class_id) {
         if let Some(class_sig) = crate::generics::parse_class_signature(&sig_str) {
