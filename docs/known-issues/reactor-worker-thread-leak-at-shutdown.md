@@ -1,7 +1,43 @@
 # Intermittent reactor worker-thread leak at client shutdown (RUNNABLE, empty stack)
 
-**Status:** OPEN (intermittent, ~1 in 16 runs — reduced surface, one window closed). Follow-up to the
-`Thread.getState()` fix (commit `16d23e7b`).
+**Status:** OPEN (intermittent, ~1 in 16–60 runs; rate inflated by concurrent peer-session load on the
+shared worktree). Follow-up to the `Thread.getState()` fix (commit `16d23e7b`).
+
+## UPDATE: cross-thread stack walking now works; leak thread has NO Java frames
+
+`Thread.dumpThreads()` / `getStackTrace()` were stubs returning empty arrays — the reason the leak report
+showed `at (empty stack)`. **Cross-thread stack walking is now implemented** (commits in HEAD +
+`26382a17`): each thread publishes a frame snapshot at its blocking deposit points
+(`deposit_root_snapshot` → `stackwalker::capture_frames_no_lines` → registry `frame_trace`), and
+`dumpThreads` materialises it. Verified vs HotSpot (`scratch/eshang/StackDumpTest.java`): a
+`LinkedBlockingQueue.take()`-parked worker now reports its real 5-frame stack.
+
+**But the leaked reactor thread STILL reports an empty stack** when caught (it reproduced at ~1/16–1/60
+even with the stack walker). That is itself the key finding: the leaked thread has **no Java frames at
+all**, so it is parked in a **native that does not deposit a frame snapshot** — i.e. a blocking *socket
+I/O* native (read / accept), NOT `park`/`Object.wait`/a select-with-Java-frames (those deposit and now
+show frames). The earlier infinite-`select()` cap (`CRATONVM_SELECT_MAX_BLOCK_MS`, commit `26382a17`) is a
+sound defensive fix but did **NOT** stop the leak — confirming the stuck thread is not in `select()`.
+
+### Concrete next step (now unblocked, modulo perturbation)
+
+Add a frame-snapshot publish (the cheap `capture_frames_no_lines`) to the blocking *socket* natives
+(`SocketChannel.read`/`write` EAGAIN-park, `ServerSocketChannel.accept`, any blocking `Net`/socket read)
+and the selector `select` native — i.e. call the same publish that `deposit_root_snapshot` does, at those
+native blocking points. Then catch one leak: the now-non-empty stack names the exact stuck socket call,
+and the fix follows (give it a finite timeout / interrupt-driven unblock, like every other primitive).
+CAVEAT: the leak is a Heisenbug — heavy `eprintln` tracing masks it; the lock-free `frame_trace` publish
+is light enough that it still reproduced (~1/60), so keep instrumentation lock-free. Also run on an
+otherwise-idle machine — concurrent peer sessions (`cratonvm_*` worktree runs) inflate the rate and
+confound measurement.
+
+## Progress (commit `4064580d`)
+
+One lost-wakeup window was closed: `selector_wakeup()` documented that "the woken flag still gets
+observed at top of select()", but the blocking select paths (`WSAPoll`/`epoll_wait`/`poll`) only
+checked `woken` in the empty-key sleep branch — the normal path went straight into the kernel wait.
+A pre-wait `woken` check (drain + return 0) was added to all three `kernel_select_*` paths, so a
+`wakeup()` that lands *before* `select()` enters the wait is no longer lost. Verified no regression
 
 ## Progress (commit `4064580d`)
 
