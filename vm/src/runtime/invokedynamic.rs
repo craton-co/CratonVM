@@ -446,11 +446,24 @@ fn bootstrap_lambda(
     };
 
     // Register the lambda proxy and cache the call site
-    {
+    let registered = {
         let mut proxies = shared.lambda_proxies.write();
         if proxies.len() < crate::vm::MAX_LAMBDA_PROXIES {
             proxies.insert(proxy_class_id, call_site.clone());
+            true
+        } else {
+            false
         }
+    };
+    // Record the defining class (where this invokedynamic lives) so reflection
+    // name natives report `<host>$$Lambda/0x<id>` and a HotSpot-correct nest host
+    // — even for a cross-class method reference whose impl method is elsewhere.
+    // Bounded by the same cap as `lambda_proxies`. bug-06 fam5 #1.
+    if registered {
+        shared
+            .lambda_proxy_hosts
+            .write()
+            .insert(proxy_class_id, current_class_id);
     }
     shared.resolution_cache.write().put_call_site(
         current_class_id,

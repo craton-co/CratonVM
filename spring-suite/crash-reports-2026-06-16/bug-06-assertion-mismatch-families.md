@@ -128,19 +128,63 @@ synthetic-mode `cl_find_loaded_class` handler. **Verified on a built VM (--java-
   this is debug-build slowness or a separate metadata-reading issue is unresolved (re-check on a
   release build). The core family-3 "should not have been loaded" failure is fully resolved.
 
-### Family 5 — ⚠️ basic paths VERIFIED CLEAN; needs suite-level attribution
-The "`synthetic_class_mirror` writes `Object(None)` to slot 0" theory is **wrong**:
-`lang_class.rs:660-661` documents that `Object(None)` in slot 0 is *intentional* in
-real-JDK mode, and `synthetic_class_mirror` always returns a **non-null** mirror — it cannot
-be the source of "Cannot invoke getDeclaredMethod on null" (a JEP-358 helpful-NPE = some
-**native reflection method returned Java `null`**). **Verified:** the `Refl5` probe
-(`spring-suite/probe/Refl5.java`, 29 cases over `getSuperclass`/`getComponentType`/
-`getDeclaringClass`/`getEnclosingClass`/`Method.getDeclaringClass`/`forName`) is
-**byte-for-byte identical to HotSpot** on the built VM — so the common paths are correct.
-The `getDeclaredMethod on null` is a narrower generic/proxy/synthetic-type path; the suite
-data (`FAIL-ANALYSIS.md`) does **not** attribute it to a test class ("needs tracing"). Next:
-full suite re-run with per-test attribution to capture the specific failing stack. **Do not**
-touch `synthetic_class_mirror` slot 0 — it would break the documented `isArray` contract.
+### Family 5 — ✅ PINNED as a CASCADE; one clean reflection-null FIXED (lambda `getGenericSuperclass`)
+**Status (2026-06-18, branch `fix/bug06-fam5-refl-null`, worktree `CratonVM-fam5`):** the
+`getDeclaredMethod on null` ×28 does **NOT** reduce to a single clean
+"reflection-native-returns-null" bug. Established by **reproducer-driven diffing** (build VM,
+diff probes vs HotSpot JDK 25 — the same method that settled families 3 & 5's siblings):
+
+- **Refuted (again):** the `synthetic_class_mirror` slot-0 theory — `lang_class.rs:660-661`
+  documents `Object(None)` in slot 0 is *intentional*; the mirror is always non-null. **Do
+  not** touch slot 0 (breaks the `isArray` contract).
+- **`Refl5`** (29 common-accessor cases): byte-identical to HotSpot (re-confirmed on the fixed VM).
+- **`Refl6`** (`scratch/fam5/Refl6.java`, ≈240 cases over *every* `Class`/`Method`/`Field`/
+  `RecordComponent`-returning accessor × a wide receiver zoo — nested/local/anon/enum-body/
+  record/proxy/lambda/array/annotation): identical for **all normal classes**.
+- **`BridgeProbe`** (`scratch/fam5/BridgeProbe.java`): drives `BridgeMethodResolver.findBridgedMethod`
+  (the unguarded `searchForMatch` → `type.getDeclaredMethod`) + `ClassUtils.getAllInterfacesForClass`
+  over generic hierarchies → identical (only `getDeclaredMethods` *ordering* differs). The
+  "null interface element" hypothesis does **not** reproduce.
+- **`SpringFam5`** (`scratch/fam5/SpringFam5.java`): drives Spring's **real** machinery —
+  `ResolvableType` / `GenericTypeResolver` / `MethodParameter` / `MergedAnnotations` /
+  `AnnotatedElementUtils` / `AnnotationUtils` / `BeanUtils` over generic + `@AliasFor`-meta +
+  event-listener fixtures (mirrors the bug-05 generics + annotation test families). **Byte-identical
+  to HotSpot** except the lambda *name* (below). So Spring's generics+annotation reflection is correct.
+
+**Conclusion:** the ×28 is a **cascade** (matches this doc's own "(mix of CV + cascade)"
+hedge) — downstream of bug-04 (GC mirror→Object/null), bug-05 (generics reification, partial
+fix `d01345d1`), and the synthetic-type metadata gaps below — NOT a standalone reflection bug.
+
+**The one clean, family-5-shaped NULL found & FIXED:** for lambda/method-ref proxies
+(class id ≥ `0x8000_0000`, not in the class store), `Class.getGenericSuperclass()` returned
+**`null`** where HotSpot returns **`Object`** — even though `getSuperclass()` already returns
+`Object` for the same lambda (the SB-14 guard in `native_class_get_superclass`). Spring's
+`ResolvableType` generic-hierarchy walk calls `getGenericSuperclass()` on functional-interface /
+listener lambdas, and a null there propagates into a null resolved class →
+`getDeclaredMethod on null`. **Fix:** mirror the SB-14 lambda guard in
+`native_class_get_generic_superclass` (`native-builtins/src/lang_class.rs`) →
+`lambda_functional_interface(id).is_some()` returns the `Object` mirror. Verified: `Refl6`
+`lambda`/`mref` `genericSuperclass` `<NULL>`→`java.lang.Object`; normal classes, `Refl5`,
+`BridgeProbe`, `SpringFam5` unchanged (no regression).
+
+**Remaining synthetic-type reflection gaps (documented follow-ups, distinct bugs, NOT the
+family-5 null):**
+1. ✅ **FIXED** — lambda/hidden-class `getName()`/`getSimpleName()`/`getTypeName()` returned
+   `unknown_<classid>`, `getCanonicalName()` leaked it, `getNestHost()` was bogus,
+   `isSynthetic()=false`, `isHidden()=false`. Root cause: lambda proxy ids (≥ `0x8000_0000`,
+   via `alloc_lambda_proxy_id` → `lambda_proxies`) were never registered in the class-name map
+   → `class_name_of_id` None → the `unknown_<id>` fallback. **Fix:** record the *defining*
+   class per proxy id in a new `SharedVm.lambda_proxy_hosts` side table (populated in
+   `bootstrap_lambda`); a `lambda_proxy_host()` `NativeContext` accessor; and lambda-aware
+   arms in `getName`/`getSimpleName`/`getTypeName`/`getCanonicalName`(→null)/`getNestHost`
+   (→defining class)/`getModifiers`(→`0x1010` FINAL|SYNTHETIC)/`isHidden`(→true). Now
+   `Class.getName()` = `<host>$$Lambda/0x<id>` and `ClassUtils.isLambdaClass()` matches HotSpot.
+   Verified byte-identical to HotSpot JDK 25 (probe `spring-suite/probe/LMod.java`, all of
+   lambda + custom-SAM + cross-class method-ref) modulo the inherent non-deterministic
+   `/0x<hex>` suffix. The id-range gate keeps ordinary classes off the lambda lock.
+2. `getNestMembers0` returns only `[self]` instead of all nestmates. (still open)
+3. JDK `Proxy` subclass leaks: `getSuperclass()`/`getGenericSuperclass()` = `Proxy$Instance`
+   (HS `java.lang.reflect.Proxy`), `isSynthetic()=true` (HS false). (still open)
 
 ### Family 6 — open sub-bugs in Spring's synthesis layer (`spring-bug-01`)
 Raw annotation reading is JVMS-conformant (sub-bugs #0/#1 already fixed). Residual mismatches

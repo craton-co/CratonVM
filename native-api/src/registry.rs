@@ -875,6 +875,16 @@ pub trait NativeContext {
         None
     }
 
+    /// For a synthetic lambda-proxy `ClassId`, return the internal name of the
+    /// lambda's *defining* class (the class that owns the implementation method,
+    /// e.g. `Refl6` for a `() -> {}` whose body compiles to `Refl6.lambda$..`).
+    /// Returns `None` for any non-lambda class. Used by the reflection name
+    /// natives (`getName`/`getSimpleName`/`getNestHost`) to synthesize the
+    /// HotSpot-style `<host>$$Lambda/0x<id>` name instead of `unknown_<id>`.
+    fn lambda_proxy_host(&self, _class_id: ClassId) -> Option<String> {
+        None
+    }
+
     /// Get the ClassLoaderId for a loaded class.
     /// Returns 0 = Bootstrap, 1 = Extension, 2 = Application, 3+ = UserDefined(id).
     fn loader_id_of_class(&self, class_id: ClassId) -> i32;

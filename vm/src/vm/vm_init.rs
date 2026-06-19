@@ -381,6 +381,14 @@ pub struct SharedVm {
     /// T10.9.B: FxHashMap — ClassId-keyed.
     pub lambda_proxies: RwLock<FxHashMap<ClassId, LambdaCallSite>>,
 
+    /// Defining class (the class whose `invokedynamic` created this lambda /
+    /// method-ref) for each lambda proxy id — what HotSpot names the proxy after
+    /// and reports as its nest host. Kept as a side table so the reflection name
+    /// natives report `<host>$$Lambda/0x<id>` and a correct `getNestHost()` even
+    /// for a cross-class method reference, whose implementation method lives in a
+    /// different class than the one that defines the reference. bug-06 fam5 #1.
+    pub lambda_proxy_hosts: RwLock<FxHashMap<ClassId, ClassId>>,
+
     /// Counter for generating unique synthetic lambda proxy ClassIds.
     /// Starts at 0x8000_0000 to avoid collisions with real ClassIds from the ClassStore.
     pub next_lambda_id: AtomicU32,
@@ -2218,6 +2226,7 @@ impl SharedVm {
             main_thread_group: RwLock::new(None),
             system_properties: RwLock::new(sys_props),
             lambda_proxies: RwLock::new(FxHashMap::default()),
+            lambda_proxy_hosts: RwLock::new(FxHashMap::default()),
             next_lambda_id: AtomicU32::new(0x8000_0000),
             thread_registry: ThreadRegistry::new(),
             primitive_mirrors: RwLock::new(FxHashMap::default()),

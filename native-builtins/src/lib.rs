@@ -3210,6 +3210,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Int(0))),
         };
         let hidden = match lang_class::mirror_class_id(ctx, this) {
+            // Lambda proxies (id >= 0x8000_0000) are JVM hidden classes in HotSpot
+            // (JDK 15+). Reporting them as hidden makes `Class.getCanonicalName()`
+            // return null (matching HotSpot) instead of leaking the synthesized
+            // lambda name. bug-06 fam5 #1.
+            Some(cid) if cid.as_u32() >= 0x8000_0000 && ctx.lambda_proxy_host(cid).is_some() => true,
             Some(cid) => ctx.is_class_hidden(cid),
             None => false,
         };
@@ -36306,6 +36311,11 @@ fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Int(0))),
         };
         let hidden = match lang_class::mirror_class_id(ctx, this) {
+            // Lambda proxies (id >= 0x8000_0000) are JVM hidden classes in HotSpot
+            // (JDK 15+). Reporting them as hidden makes `Class.getCanonicalName()`
+            // return null (matching HotSpot) instead of leaking the synthesized
+            // lambda name. bug-06 fam5 #1.
+            Some(cid) if cid.as_u32() >= 0x8000_0000 && ctx.lambda_proxy_host(cid).is_some() => true,
             Some(cid) => ctx.is_class_hidden(cid),
             None => false,
         };

@@ -2865,6 +2865,32 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .map(|cs| cs.functional_interface.to_string())
     }
 
+    fn lambda_proxy_host(&self, class_id: ClassId) -> Option<String> {
+        // Prefer the recorded *defining* class (where the lambda / method-ref's
+        // invokedynamic appears) — this is what HotSpot names the proxy after and
+        // reports as the nest host, even for a cross-class method reference whose
+        // implementation method lives in a different class.
+        if let Some(host_id) = self.shared.lambda_proxy_hosts.read().get(&class_id).copied() {
+            if let Some(name) = self
+                .shared
+                .class_manager
+                .read()
+                .get_class(host_id)
+                .map(|c| c.name.to_string())
+            {
+                return Some(name);
+            }
+        }
+        // Fallback (lambda proxies created off the indy bootstrap path, e.g. in
+        // tests): the implementation method handle's owner — correct for genuine
+        // lambdas and same-class method references.
+        self.shared
+            .lambda_proxies
+            .read()
+            .get(&class_id)
+            .map(|cs| cs.impl_handle.class_name.to_string())
+    }
+
     fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool {
         if self
             .shared
