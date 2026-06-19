@@ -28937,6 +28937,27 @@ fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => String::new(),
     };
+    // Reject ASCII control characters (e.g. a raw newline/tab) like java.net.URI
+    // does — `new URI(String)` must throw URISyntaxException for them. Our parser
+    // was lenient and accepted them, so a malformed redirect URI such as
+    // "https://keycloak.org\n" was treated as valid (keycloak
+    // SecureRedirectUrisEnforcerExecutorTest.failUriSyntax). Scoped to control
+    // chars (<0x20 / 0x7F) to avoid rejecting otherwise-accepted inputs.
+    if let Some(pos) = url_str.find(|c: char| (c as u32) < 0x20 || (c as u32) == 0x7f) {
+        let input = ctx.create_string(&url_str);
+        let reason = ctx.create_string("Illegal character in URI");
+        if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+            "java/net/URISyntaxException",
+            "(Ljava/lang/String;Ljava/lang/String;I)V",
+            &[
+                Value::Object(Some(input)),
+                Value::Object(Some(reason)),
+                Value::Int(pos as i32),
+            ],
+        ) {
+            return Err(MethodCallFailed::ExceptionThrown(exc));
+        }
+    }
     url_parse(ctx, this, &url_str);
     uri_store_named(ctx, this, &url_str);
     Ok(None)
