@@ -8775,6 +8775,31 @@ fn stream_elements_mut(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Va
     }
 }
 
+/// Materialise a possibly-REAL primitive stream's elements. CratonVM's synthetic
+/// primitive streams keep elements in `STREAM_FIELD_ELEMENTS`, but factories like
+/// `IntStream.of(int...)` delegate to `Arrays.stream` and return a real
+/// `IntPipeline$Head`, whose elements are only reachable via the *primitive*
+/// `toArray()` (`()[I` / `()[J` / `()[D`, NOT `()[Ljava/lang/Object;`). `toarray_desc`
+/// selects the right one. Used by `flatMap`, whose mapper commonly returns such
+/// real primitive streams.
+fn prim_stream_values(ctx: &mut dyn NativeContext, stream: ObjectRef, toarray_desc: &str) -> Vec<Value> {
+    let cn = ctx.class_name_of_id(ctx.class_id_of_object(stream)).unwrap_or_default();
+    if is_synthetic_stream(&cn) {
+        if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
+            let len = ctx.array_length(arr);
+            return (0..len).map(|i| ctx.get_array_element(arr, i)).collect();
+        }
+        return Vec::new();
+    }
+    match ctx.invoke_virtual(stream, "toArray", toarray_desc, &[]) {
+        Ok(Some(Value::Object(Some(arr)))) => {
+            let len = ctx.array_length(arr);
+            (0..len).map(|i| ctx.get_array_element(arr, i)).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn register_stream_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -11041,6 +11066,116 @@ fn int_stream_elements(ctx: &dyn NativeContext, stream: ObjectRef) -> Vec<Value>
     stream_elements(ctx, stream)
 }
 
+// =============================================================================
+// IntStream — additional intermediate/terminal ops missing from the synthetic
+// surface. The synthetic IntStream is an object stamped with the *interface*
+// class, so any op not registered here resolves to the abstract interface
+// declaration and throws `AbstractMethodError ("… has no Code attribute")`.
+// These mirror the eager element-list model of map/filter/collect above.
+// =============================================================================
+
+fn native_int_stream_map_to_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return make_long_stream(ctx, &[]) };
+    let op = match args.get(1) { Some(Value::Object(Some(r))) => *r, _ => return make_long_stream(ctx, &[]) };
+    let els = int_stream_elements(ctx, this);
+    let mut out = Vec::with_capacity(els.len());
+    for e in &els { out.push(ctx.invoke_virtual(op, "applyAsLong", "(I)J", &[*e])?.unwrap_or(Value::Long(0))); }
+    make_long_stream(ctx, &out)
+}
+
+fn native_int_stream_map_to_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return make_double_stream(ctx, &[]) };
+    let op = match args.get(1) { Some(Value::Object(Some(r))) => *r, _ => return make_double_stream(ctx, &[]) };
+    let els = int_stream_elements(ctx, this);
+    let mut out = Vec::with_capacity(els.len());
+    for e in &els { out.push(ctx.invoke_virtual(op, "applyAsDouble", "(I)D", &[*e])?.unwrap_or(Value::Double(0.0))); }
+    make_double_stream(ctx, &out)
+}
+
+fn native_int_stream_as_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return make_long_stream(ctx, &[]) };
+    let out: Vec<Value> = int_stream_elements(ctx, this).iter()
+        .map(|v| Value::Long(if let Value::Int(i) = v { *i as i64 } else { 0 })).collect();
+    make_long_stream(ctx, &out)
+}
+
+fn native_int_stream_as_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return make_double_stream(ctx, &[]) };
+    let out: Vec<Value> = int_stream_elements(ctx, this).iter()
+        .map(|v| Value::Double(if let Value::Int(i) = v { *i as f64 } else { 0.0 })).collect();
+    make_double_stream(ctx, &out)
+}
+
+/// Shared match driver: kind 0=any, 1=all, 2=none. Predicate method/descriptor
+/// supplied by the per-stream caller (IntPredicate.test(I)Z etc.).
+fn stream_match(ctx: &mut dyn NativeContext, this: ObjectRef, pred: ObjectRef, desc: &str, kind: u8) -> MethodCallResult {
+    let els = stream_elements(ctx, this);
+    let mut any = false;
+    let mut all = true;
+    for e in &els {
+        let m = matches!(ctx.invoke_virtual(pred, "test", desc, &[*e])?, Some(Value::Int(1)));
+        if m { any = true; } else { all = false; }
+    }
+    let res = match kind { 0 => any, 1 => all, _ => !any };
+    Ok(Some(Value::Int(if res { 1 } else { 0 })))
+}
+
+fn native_int_stream_any_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return Ok(Some(Value::Int(0))) };
+    let p = match args.get(1) { Some(Value::Object(Some(r))) => *r, _ => return Ok(Some(Value::Int(0))) };
+    stream_match(ctx, this, p, "(I)Z", 0)
+}
+fn native_int_stream_all_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return Ok(Some(Value::Int(1))) };
+    let p = match args.get(1) { Some(Value::Object(Some(r))) => *r, _ => return Ok(Some(Value::Int(1))) };
+    stream_match(ctx, this, p, "(I)Z", 1)
+}
+fn native_int_stream_none_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return Ok(Some(Value::Int(1))) };
+    let p = match args.get(1) { Some(Value::Object(Some(r))) => *r, _ => return Ok(Some(Value::Int(1))) };
+    stream_match(ctx, this, p, "(I)Z", 2)
+}
+
+fn stream_limit_n(args: &[Value]) -> usize {
+    match args.get(1) { Some(Value::Long(n)) => (*n).max(0) as usize, _ => usize::MAX }
+}
+
+fn native_int_stream_limit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return make_int_stream(ctx, &[]) };
+    let n = stream_limit_n(args);
+    let els = int_stream_elements(ctx, this);
+    make_int_stream(ctx, &els[..n.min(els.len())])
+}
+fn native_int_stream_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return make_int_stream(ctx, &[]) };
+    let n = stream_limit_n(args);
+    let els = int_stream_elements(ctx, this);
+    make_int_stream(ctx, &els[n.min(els.len())..])
+}
+fn native_int_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return make_int_stream(ctx, &[]) };
+    let els = int_stream_elements(ctx, this);
+    let c = match args.get(1) { Some(Value::Object(Some(r))) => *r, _ => return make_int_stream(ctx, &els) };
+    for e in &els { ctx.invoke_virtual(c, "accept", "(I)V", &[*e])?; }
+    make_int_stream(ctx, &els)
+}
+fn native_int_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return make_int_stream(ctx, &[]) };
+    let f = match args.get(1) { Some(Value::Object(Some(r))) => *r, _ => return make_int_stream(ctx, &[]) };
+    // `this` is normally a synthetic stream, but the per-element sub-streams the
+    // mapper returns are frequently REAL JDK pipelines (e.g. `IntStream.of(a,b)`
+    // delegates to `Arrays.stream` → IntPipeline$Head), so use the materialising
+    // `stream_elements_mut` (toArray) which handles both synthetic and real.
+    let els = prim_stream_values(ctx, this, "()[I");
+    let mut out = Vec::new();
+    for e in &els {
+        if let Some(Value::Object(Some(sub))) = ctx.invoke_virtual(f, "apply", "(I)Ljava/lang/Object;", &[*e])? {
+            out.extend(prim_stream_values(ctx, sub, "()[I"));
+        }
+    }
+    make_int_stream(ctx, &out)
+}
+
 fn register_int_stream_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -11115,6 +11250,17 @@ fn register_int_stream_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/Supplier;Ljava/util/function/ObjIntConsumer;Ljava/util/function/BiConsumer;)Ljava/lang/Object;",
         native_int_stream_collect,
     );
+    r.register(c, "mapToLong", "(Ljava/util/function/IntToLongFunction;)Ljava/util/stream/LongStream;", native_int_stream_map_to_long);
+    r.register(c, "mapToDouble", "(Ljava/util/function/IntToDoubleFunction;)Ljava/util/stream/DoubleStream;", native_int_stream_map_to_double);
+    r.register(c, "asLongStream", "()Ljava/util/stream/LongStream;", native_int_stream_as_long);
+    r.register(c, "asDoubleStream", "()Ljava/util/stream/DoubleStream;", native_int_stream_as_double);
+    r.register(c, "anyMatch", "(Ljava/util/function/IntPredicate;)Z", native_int_stream_any_match);
+    r.register(c, "allMatch", "(Ljava/util/function/IntPredicate;)Z", native_int_stream_all_match);
+    r.register(c, "noneMatch", "(Ljava/util/function/IntPredicate;)Z", native_int_stream_none_match);
+    r.register(c, "limit", "(J)Ljava/util/stream/IntStream;", native_int_stream_limit);
+    r.register(c, "skip", "(J)Ljava/util/stream/IntStream;", native_int_stream_skip);
+    r.register(c, "peek", "(Ljava/util/function/IntConsumer;)Ljava/util/stream/IntStream;", native_int_stream_peek);
+    r.register(c, "flatMap", "(Ljava/util/function/IntFunction;)Ljava/util/stream/IntStream;", native_int_stream_flat_map);
     r.register(
         c,
         "sorted",
@@ -11682,10 +11828,79 @@ fn make_long_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCa
     Ok(Some(Value::Object(Some(stream))))
 }
 
+// LongStream — missing ops (element Value::Long via stream_elements). See the
+// IntStream block above for rationale (synthetic stream → AbstractMethodError).
+fn native_long_stream_map_to_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return make_int_stream(ctx, &[]) };
+    let op = match args.get(1) { Some(Value::Object(Some(r))) => *r, _ => return make_int_stream(ctx, &[]) };
+    let mut out = Vec::new();
+    for e in &stream_elements(ctx, this) { out.push(ctx.invoke_virtual(op, "applyAsInt", "(J)I", &[*e])?.unwrap_or(Value::Int(0))); }
+    make_int_stream(ctx, &out)
+}
+fn native_long_stream_map_to_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return make_double_stream(ctx, &[]) };
+    let op = match args.get(1) { Some(Value::Object(Some(r))) => *r, _ => return make_double_stream(ctx, &[]) };
+    let mut out = Vec::new();
+    for e in &stream_elements(ctx, this) { out.push(ctx.invoke_virtual(op, "applyAsDouble", "(J)D", &[*e])?.unwrap_or(Value::Double(0.0))); }
+    make_double_stream(ctx, &out)
+}
+fn native_long_stream_any_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return Ok(Some(Value::Int(0))) };
+    let p = match args.get(1) { Some(Value::Object(Some(r))) => *r, _ => return Ok(Some(Value::Int(0))) };
+    stream_match(ctx, this, p, "(J)Z", 0)
+}
+fn native_long_stream_all_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return Ok(Some(Value::Int(1))) };
+    let p = match args.get(1) { Some(Value::Object(Some(r))) => *r, _ => return Ok(Some(Value::Int(1))) };
+    stream_match(ctx, this, p, "(J)Z", 1)
+}
+fn native_long_stream_none_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return Ok(Some(Value::Int(1))) };
+    let p = match args.get(1) { Some(Value::Object(Some(r))) => *r, _ => return Ok(Some(Value::Int(1))) };
+    stream_match(ctx, this, p, "(J)Z", 2)
+}
+fn native_long_stream_limit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return make_long_stream(ctx, &[]) };
+    let n = stream_limit_n(args); let els = stream_elements(ctx, this);
+    make_long_stream(ctx, &els[..n.min(els.len())])
+}
+fn native_long_stream_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return make_long_stream(ctx, &[]) };
+    let n = stream_limit_n(args); let els = stream_elements(ctx, this);
+    make_long_stream(ctx, &els[n.min(els.len())..])
+}
+fn native_long_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return make_long_stream(ctx, &[]) };
+    let els = stream_elements(ctx, this);
+    let cn = match args.get(1) { Some(Value::Object(Some(r))) => *r, _ => return make_long_stream(ctx, &els) };
+    for e in &els { ctx.invoke_virtual(cn, "accept", "(J)V", &[*e])?; }
+    make_long_stream(ctx, &els)
+}
+fn native_long_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return make_long_stream(ctx, &[]) };
+    let f = match args.get(1) { Some(Value::Object(Some(r))) => *r, _ => return make_long_stream(ctx, &[]) };
+    let els = prim_stream_values(ctx, this, "()[J");
+    let mut out = Vec::new();
+    for e in &els {
+        if let Some(Value::Object(Some(sub))) = ctx.invoke_virtual(f, "apply", "(J)Ljava/lang/Object;", &[*e])? {
+            out.extend(prim_stream_values(ctx, sub, "()[J"));
+        }
+    }
+    make_long_stream(ctx, &out)
+}
 fn register_long_stream_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/stream/LongStream";
+    r.register(c, "mapToInt", "(Ljava/util/function/LongToIntFunction;)Ljava/util/stream/IntStream;", native_long_stream_map_to_int);
+    r.register(c, "mapToDouble", "(Ljava/util/function/LongToDoubleFunction;)Ljava/util/stream/DoubleStream;", native_long_stream_map_to_double);
+    r.register(c, "anyMatch", "(Ljava/util/function/LongPredicate;)Z", native_long_stream_any_match);
+    r.register(c, "allMatch", "(Ljava/util/function/LongPredicate;)Z", native_long_stream_all_match);
+    r.register(c, "noneMatch", "(Ljava/util/function/LongPredicate;)Z", native_long_stream_none_match);
+    r.register(c, "limit", "(J)Ljava/util/stream/LongStream;", native_long_stream_limit);
+    r.register(c, "skip", "(J)Ljava/util/stream/LongStream;", native_long_stream_skip);
+    r.register(c, "peek", "(Ljava/util/function/LongConsumer;)Ljava/util/stream/LongStream;", native_long_stream_peek);
+    r.register(c, "flatMap", "(Ljava/util/function/LongFunction;)Ljava/util/stream/LongStream;", native_long_stream_flat_map);
 
     r.register(
         c,
@@ -12088,10 +12303,57 @@ fn make_double_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> Method
     Ok(Some(Value::Object(Some(stream))))
 }
 
+// DoubleStream — missing ops (element Value::Double). See IntStream block above.
+fn native_double_stream_all_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return Ok(Some(Value::Int(1))) };
+    let p = match args.get(1) { Some(Value::Object(Some(r))) => *r, _ => return Ok(Some(Value::Int(1))) };
+    stream_match(ctx, this, p, "(D)Z", 1)
+}
+fn native_double_stream_none_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return Ok(Some(Value::Int(1))) };
+    let p = match args.get(1) { Some(Value::Object(Some(r))) => *r, _ => return Ok(Some(Value::Int(1))) };
+    stream_match(ctx, this, p, "(D)Z", 2)
+}
+fn native_double_stream_limit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return make_double_stream(ctx, &[]) };
+    let n = stream_limit_n(args); let els = stream_elements(ctx, this);
+    make_double_stream(ctx, &els[..n.min(els.len())])
+}
+fn native_double_stream_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return make_double_stream(ctx, &[]) };
+    let n = stream_limit_n(args); let els = stream_elements(ctx, this);
+    make_double_stream(ctx, &els[n.min(els.len())..])
+}
+fn native_double_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return make_double_stream(ctx, &[]) };
+    let els = stream_elements(ctx, this);
+    let cn = match args.get(1) { Some(Value::Object(Some(r))) => *r, _ => return make_double_stream(ctx, &els) };
+    for e in &els { ctx.invoke_virtual(cn, "accept", "(D)V", &[*e])?; }
+    make_double_stream(ctx, &els)
+}
+fn native_double_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(r))) => *r, _ => return make_double_stream(ctx, &[]) };
+    let f = match args.get(1) { Some(Value::Object(Some(r))) => *r, _ => return make_double_stream(ctx, &[]) };
+    let els = prim_stream_values(ctx, this, "()[D");
+    let mut out = Vec::new();
+    for e in &els {
+        if let Some(Value::Object(Some(sub))) = ctx.invoke_virtual(f, "apply", "(D)Ljava/lang/Object;", &[*e])? {
+            out.extend(prim_stream_values(ctx, sub, "()[D"));
+        }
+    }
+    make_double_stream(ctx, &out)
+}
+
 fn register_double_stream_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/stream/DoubleStream";
+    r.register(c, "allMatch", "(Ljava/util/function/DoublePredicate;)Z", native_double_stream_all_match);
+    r.register(c, "noneMatch", "(Ljava/util/function/DoublePredicate;)Z", native_double_stream_none_match);
+    r.register(c, "limit", "(J)Ljava/util/stream/DoubleStream;", native_double_stream_limit);
+    r.register(c, "skip", "(J)Ljava/util/stream/DoubleStream;", native_double_stream_skip);
+    r.register(c, "peek", "(Ljava/util/function/DoubleConsumer;)Ljava/util/stream/DoubleStream;", native_double_stream_peek);
+    r.register(c, "flatMap", "(Ljava/util/function/DoubleFunction;)Ljava/util/stream/DoubleStream;", native_double_stream_flat_map);
 
     r.register(
         c,
