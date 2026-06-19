@@ -2189,87 +2189,6 @@ pub fn init_thread_exec_depth_ceiling(native_stack_bytes: usize) {
 }
 
 // ---------------------------------------------------------------------------
-// H7 — native stack-bang (catch overflow the per-level counter can't)
-// ---------------------------------------------------------------------------
-//
-// The H6 counter ceiling (`derive_exec_depth_ceiling`) assumes a uniform
-// ~8 KiB native cost per `execute` level. Heavy re-entrant paths — notably
-// deep lambda dispatch (`execute -> execute_frame -> execute_invoke_kind ->
-// try_lambda_dispatch -> invoke_or_native -> invoke_on_class_shared_inner ->
-// execute`) — burn ~100-200 KiB of native stack per Java level, so on a
-// smaller (worker) carrier stack they overflow the OS guard page at a depth
-// FAR below the counter ceiling, producing an uncatchable SIGSEGV (e.g.
-// Hibernate `ByteArrayMappingTests` binding a `Byte[]` as an H2 array — see
-// docs/known-issues/hibernate-bytearraymapping-stream-layout-probe-sigsegv.md).
-//
-// A counter cannot distinguish a heavy path from legitimate deep recursion
-// (binaryTrees) because the heavy path overflows BELOW normal operation depth.
-// Instead, probe the ACTUAL remaining native stack and throw a *catchable*
-// `StackOverflowError` within a guard-page safety margin. This never
-// false-trips on recursion that genuinely fits the stack (unlike lowering the
-// counter ceiling). Default-on; opt out with `CRATONVM_NO_STACK_BANG=1`; tune
-// the reserve with `CRATONVM_STACK_BANG_MARGIN_KB` (default 1024 KiB).
-
-/// Bytes of native stack to keep in reserve so the `StackOverflowError` can be
-/// constructed and delivered without itself overflowing. `0` ⇒ stack-bang
-/// disabled. Read once (env is process-global).
-#[inline]
-fn stack_bang_margin() -> usize {
-    use std::sync::OnceLock;
-    static MARGIN: OnceLock<usize> = OnceLock::new();
-    *MARGIN.get_or_init(|| {
-        if std::env::var_os("CRATONVM_NO_STACK_BANG").is_some() {
-            return 0;
-        }
-        std::env::var("CRATONVM_STACK_BANG_MARGIN_KB")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .map(|kb| kb.saturating_mul(1024))
-            .unwrap_or(1024 * 1024)
-    })
-}
-
-/// Remaining bytes of native stack for the calling thread (current SP minus the
-/// thread's low stack limit). Returns `usize::MAX` ("plenty") when the bound is
-/// unknown so the bang never false-trips. The low limit is fixed per thread, so
-/// cache it thread-locally; only a cheap SP read happens per call.
-#[cfg(windows)]
-#[inline]
-fn native_stack_remaining() -> usize {
-    thread_local! {
-        static LOW_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    }
-    let low = LOW_LIMIT.with(|c| {
-        let v = c.get();
-        if v != 0 {
-            return v;
-        }
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn GetCurrentThreadStackLimits(low_limit: *mut usize, high_limit: *mut usize);
-        }
-        let (mut lo, mut hi) = (0usize, 0usize);
-        // SAFETY: both out-pointers are valid, writable, properly-aligned
-        // `usize` locals; the API only writes through them.
-        unsafe { GetCurrentThreadStackLimits(&mut lo, &mut hi) };
-        let _ = hi;
-        c.set(lo);
-        lo
-    });
-    if low == 0 {
-        return usize::MAX;
-    }
-    let probe = 0u8;
-    (&probe as *const u8 as usize).saturating_sub(low)
-}
-
-#[cfg(not(windows))]
-#[inline]
-fn native_stack_remaining() -> usize {
-    usize::MAX
-}
-
-// ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
@@ -2346,22 +2265,6 @@ pub fn execute(
         )));
     }
     let _exec_depth_guard = DepthGuard;
-
-    // H7 — native stack-bang. Probe the ACTUAL remaining native stack and
-    // throw a *catchable* `StackOverflowError` before the OS guard page faults
-    // (an uncatchable SIGSEGV). Only probe once recursion is non-trivial
-    // (`depth > 16`) so the overwhelmingly common shallow calls pay nothing but
-    // the cheap counter read above. `_exec_depth_guard`'s Drop decrements the
-    // counter on this early return. See the H7 note above `stack_bang_margin`.
-    if depth > 16 {
-        let margin = stack_bang_margin();
-        if margin != 0 && native_stack_remaining() < margin {
-            dump_stack_on_soe(thread); // one-shot Java stack (CRATONVM_DBG_SOE)
-            return Err(MethodCallFailed::InternalError(VmError::Runtime(
-                RuntimeError::StackOverflowError,
-            )));
-        }
-    }
 
     // letsgo postmortem instrumentation: record every bytecode-method
     // entry into the global dispatch ring. Gated by `CRATONVM_DBG_LETSGO=1`
@@ -3642,16 +3545,10 @@ pub fn execute(
                     // catch block. The `InternalError` fallback handles the
                     // rt.jar-not-loaded boot path (no NPE class yet).
                     let npe_routed = if crate::jit::helpers::take_jit_pending_npe() {
-                        // JEP 358 (partial): a JIT array/length helper may have
-                        // recorded its operation kind — attach the action-only
-                        // message when the gate is on (else `None`, today's shape).
-                        let npe_msg = crate::runtime::exceptions::helpful_npe::jit_npe_message_gated(
-                            crate::jit::helpers::take_jit_pending_npe_action(),
-                        );
                         match crate::runtime::exceptions::throw_runtime_error(
                             shared,
                             thread,
-                            RuntimeError::NullPointerException { message: npe_msg },
+                            RuntimeError::NullPointerException { message: None },
                         ) {
                             MethodCallFailed::ExceptionThrown(exc) => {
                                 jit_early_exception = Some(exc);
@@ -6968,34 +6865,21 @@ fn ir_deopt_resume_enabled() -> bool {
 }
 
 /// Map a reconstructed frame's locals/stack `FrameValue`s to interpreter
-/// `Value`s, after machine-state resolution. Handles the cat-1 cases the
-/// `real-frame-deopt` type source now distinguishes:
-///   * `Int`     → `Value::Int` (int/boolean/byte/char/short),
-///   * `Object`  → `Value::Object` (a real reference — e.g. an instance
-///     method's `this`; resolved from the slot's raw word by `resolve_value`'s
-///     `StackSlotRef` arm),
-///   * `Undefined` → `Value::Int(0)` (uninitialised slot).
-///
-/// Any other variant — `Unsupported` (category-2 `long`/`double` or FP slot,
-/// pending two-slot expansion / FP resolution), `Float`, `VirtualObject`
-/// (needs GC-backed materialisation), or an *unresolved* `Register`/`StackSlot`
+/// `Value`s. Conservative first cut: only integer slots are mapped (the IR
+/// path's deopt-eligible methods are integer-only). Any other variant —
+/// `Object`/`Float`/`VirtualObject`, or an unresolved `Register`/`StackSlot`
 /// (which should never reach here) — returns `None`, signalling the caller to
-/// fall back to the safe re-run path rather than fabricate or mistype a slot.
-/// This is the safety contract: a frame with any not-yet-precisely-resumable
-/// slot re-runs (correct, if double-executing) instead of resuming with garbage.
+/// fall back to the safe re-run path rather than materialise a mistyped slot.
+///
+/// LIMITATION: a long/double resolves to `FrameValue::Int(bits)` and would be
+/// truncated by `Value::Int`; until per-slot width tags exist, methods with
+/// category-2 locals must not precise-resume. The all-`Int` requirement plus
+/// the default-OFF gate keep that case off the live path.
 fn ir_deopt_frame_values(vals: &[cratonvm_jit::deopt::FrameValue]) -> Option<Vec<Value>> {
     use cratonvm_jit::deopt::FrameValue;
     vals.iter()
         .map(|v| match v {
             FrameValue::Int(i) => Some(Value::Int(*i as i32)),
-            FrameValue::Object(addr) => Some(Value::Object(if *addr == 0 {
-                None
-            } else {
-                // SAFETY: the slot held a live oop at the (synchronous) guard;
-                // no Java-heap allocation — hence no GC — runs between capture
-                // (`ir_deopt_entry`) and this resume, so the pointer is current.
-                Some(unsafe { ObjectRef::from_raw(*addr as *mut u8) })
-            })),
             FrameValue::Undefined => Some(Value::Int(0)),
             _ => None,
         })
@@ -7015,45 +6899,12 @@ fn resume_from_ir_deopt(
     cached: &Arc<CachedBytecodeMethod>,
     rframe: &cratonvm_jit::deopt::ReconstructedFrame,
 ) -> Option<CachedCallResult> {
-    // Env-gated diagnostic (CRATONVM_DBG_DEOPT): trace whether a precise resume
-    // engages or falls back to re-run, and why. Off by default — one cheap
-    // `var_os` per deopt (deopts are cold).
-    let dbg = std::env::var_os("CRATONVM_DBG_DEOPT").is_some();
     // Phase-A scope: single non-inlined frame, no held monitors.
     if !rframe.caller_frames.is_empty() || !rframe.monitors.is_empty() {
-        if dbg {
-            eprintln!(
-                "[cratonvm-deopt] FALLBACK re-run {}.{}{} bci={} (inlined_callers={} monitors={})",
-                cached.class_name, cached.method_name, cached.method_descriptor,
-                rframe.bci, rframe.caller_frames.len(), rframe.monitors.len()
-            );
-        }
         return None;
     }
-    let (locals, stack_vals) = match (
-        ir_deopt_frame_values(&rframe.locals),
-        ir_deopt_frame_values(&rframe.stack),
-    ) {
-        (Some(l), Some(s)) => (l, s),
-        _ => {
-            if dbg {
-                eprintln!(
-                    "[cratonvm-deopt] FALLBACK re-run {}.{}{} bci={} (a live slot is not \
-                     precisely resumable — cat-2/float/virtual/unresolved; locals={:?} stack={:?})",
-                    cached.class_name, cached.method_name, cached.method_descriptor,
-                    rframe.bci, rframe.locals, rframe.stack
-                );
-            }
-            return None;
-        }
-    };
-    if dbg {
-        eprintln!(
-            "[cratonvm-deopt] PRECISE resume {}.{}{} at bci={} ({} locals, {} stack) locals={:?}",
-            cached.class_name, cached.method_name, cached.method_descriptor,
-            rframe.bci, locals.len(), stack_vals.len(), rframe.locals
-        );
-    }
+    let locals = ir_deopt_frame_values(&rframe.locals)?;
+    let stack_vals = ir_deopt_frame_values(&rframe.stack)?;
 
     thread.refill_pools_from_shared(
         &shared.operand_stack_pool,
@@ -9825,6 +9676,23 @@ pub(crate) fn proxy_instance_satisfies_target(
         return true;
     }
 
+    let interfaces_arr = match shared.heap.get_field(obj_ref, PROXY_FIELD_INTERFACES) {
+        cratonvm_types::Value::Object(Some(a)) => a,
+        _ => {
+            // No CratonVM-internal interfaces array in slot 1. For a genuine
+            // generated `$ProxyN` the proxied interfaces are recorded in the
+            // class itself, so the `is_subclass_of(obj_class, target)` check at
+            // the `instanceof`/`checkcast` call site is authoritative — a `true`
+            // here would make the proxy `instanceof` EVERYTHING. That is exactly
+            // the spring-bug-08 regression: a proxy deserialized via the
+            // serialization path restores its handler (slot 0) but NOT this
+            // internal interfaces slot, so `proxy instanceof AbstractAssert`
+            // wrongly became true and tripped AssertJ's `isEqualTo` guard,
+            // collapsing `SerializableTypeWrapperTests` to 1/8. Defer to the
+            // class-declared interfaces by returning `false`; only the bare
+            // `Proxy$Instance` shim (which has neither a slot-1 array nor its
+            // own declared interface set) keeps the old liberal rule.
+            return obj_name == "java/lang/reflect/Proxy$Instance";
     // Source the proxy's interface set. The synthetic 3-slot layout stores the
     // `Class[]` at slot 1 (`PROXY_FIELD_INTERFACES`); the real-super layout
     // (proxy-real-classfile migration: the generated `$ProxyN` extends
@@ -9871,25 +9739,25 @@ pub(crate) fn proxy_instance_satisfies_target(
                 return true;
             }
         }
-    } else {
-        // Real-super layout: the generated `$ProxyN` declares the proxy
-        // interfaces directly, so they ARE the proxy's interface set. An
-        // empty-interface proxy correctly matches nothing here (only the
-        // Object/Serializable short-circuit above applies to it).
-        iface_cids = shared
-            .class_manager
-            .read()
-            .get_class(proxy_cid)
-            .map(|c| c.interfaces.clone())
-            .unwrap_or_default();
-    }
-
+    };
+    let n = shared.heap.array_length(interfaces_arr);
     let target_cid = shared
         .class_manager
         .write()
         .load_class(target_class_name)
         .ok();
-    for iface_cid in iface_cids {
+    for i in 0..n {
+        let mirror = match shared.heap.get_array_element(interfaces_arr, i) {
+            Ok(cratonvm_types::Value::Object(Some(m))) => m,
+            _ => continue,
+        };
+        // Read the `name` String off the Class mirror via the heap (slot 0
+        // on real-JDK Class is `cachedConstructor` — too fragile). Use the
+        // mirror→ClassId mapping we already maintain.
+        let iface_cid = match crate::vm::class_id_from_mirror(shared, mirror) {
+            Some(cid) => cid,
+            None => continue,
+        };
         // Direct identity match.
         if Some(iface_cid) == target_cid {
             return true;
@@ -10257,16 +10125,6 @@ pub(crate) fn aastore_element_assignable(
 fn class_chain_reaches_proxy_instance(shared: &SharedVm, class_id: ClassId) -> bool {
     const MAX_DEPTH: usize = 32;
     const PROXY_INSTANCE: &str = "java/lang/reflect/Proxy$Instance";
-    // proxy-real-classfile real-super migration: when the gate is on, generated
-    // proxies extend the *real* `java.lang.reflect.Proxy` (its sole instance
-    // field `h` is at slot 0 — the same handler slot the dispatch path reads),
-    // so the chain walk must also recognise that super. Default-off → this is a
-    // strict no-op and the function behaves exactly as before. (Only OUR
-    // generated proxies extend `java.lang.reflect.Proxy` — `newProxyInstance`
-    // and proxy deserialisation both route through CratonVM's own machinery —
-    // so recognising the real super does not misclassify any real JDK class.)
-    let recognise_real_proxy = crate::runtime::env_cache::real_proxy_super();
-    const REAL_PROXY: &str = "java/lang/reflect/Proxy";
 
     let cm = shared.class_manager.read();
     let mut current = Some(class_id);
@@ -10280,9 +10138,6 @@ fn class_chain_reaches_proxy_instance(shared: &SharedVm, class_id: ClassId) -> b
             None => return false,
         };
         if &*class.name == PROXY_INSTANCE {
-            return true;
-        }
-        if recognise_real_proxy && &*class.name == REAL_PROXY {
             return true;
         }
         // Stop early once we hit Object — Proxy$Instance sits below it
@@ -14166,10 +14021,7 @@ fn try_stackless_invoke(
     // 7. Handle synchronized: acquire monitor before pushing frame
     let monitor_obj: Option<ObjectRef> = if is_synchronized {
         let obj = if is_static {
-            // Static synchronized: monitor is the `Class` mirror (JVMS §2.11.10),
-            // not a synthetic lock — so `X.class.wait()/notify()` from within the
-            // method sees the calling thread as the monitor owner.
-            get_or_create_class_mirror(shared, declaring_id)
+            shared.get_class_lock_object(declaring_id)
         } else {
             match args.first() {
                 Some(Value::Object(Some(obj_ref))) => *obj_ref,
@@ -14726,50 +14578,31 @@ fn populate_invoke_cache(
         return;
     };
 
-    // Native-shadow check keyed on the *declaring* class. This covers two
-    // cases that the CP-class lookup above (line ~14428) misses:
-    //   1. The method is `native` in a superclass (the original intent).
-    //   2. The method has real-JDK *bytecode* but CratonVM shadows it with a
-    //      Rust native registered on the declaring class — e.g.
-    //      `ClassLoader.loadClass(String,Z)`. When reached via
-    //      `super.loadClass(...)` from a `URLClassLoader` subclass
-    //      (GroovyClassLoader's AST-transform loader), the CP symbolic ref
-    //      names the immediate super (`java/net/URLClassLoader`), not
-    //      `java/lang/ClassLoader`, so the CP-class native lookup misses and
-    //      we fall through to cache `Bytecode`. The slow path (cache MISS)
-    //      always serves the declaring-class shadow, so the first call works
-    //      but every cached call afterwards runs the real delegation bytecode
-    //      — which CratonVM cannot satisfy (BuiltinClassLoader module graph),
-    //      yielding a spurious ClassNotFoundException. Resolve the shadow here
-    //      so the cache matches the slow path.
-    let declaring_name = store
-        .get(declaring_id)
-        .map(|c| &*c.name)
-        .unwrap_or("");
-    if let Some(callback) =
-        shared
-            .native_methods
-            .find(declaring_name, &method_name, &descriptor)
-    {
-        // WP2.4-F1: gate bound to the *declaring* class — that's the
-        // class whose method body could be replaced via redefine.
-        let gate = RedefineGate::snapshot(
-            cm.class_redefine_generation_handle(declaring_id),
-        );
-        drop(cm);
-        let target = CachedInvokeTarget::Native {
-            callback,
-            num_params: num_params as u16, // Widening: parameter count conversion
-            gate,
-        };
-        shared.shared_resolution.insert_promoted_invoke(promoted_key, target.clone());
-        thread.invoke_cache.put(caller_class_id, cp_index, is_special, target);
-        return;
-    }
     if method.is_native() {
-        // Declaring-class native shadow not found, but the method is flagged
-        // `native` and has no bytecode body — leave it to the slow path
-        // (preserves the prior behavior of returning without caching).
+        // Already handled above, but the method might be native in a superclass
+        let declaring_name = store
+            .get(declaring_id)
+            .map(|c| &*c.name)
+            .unwrap_or("");
+        if let Some(callback) =
+            shared
+                .native_methods
+                .find(declaring_name, &method_name, &descriptor)
+        {
+            // WP2.4-F1: gate bound to the *declaring* class — that's the
+            // class whose method body could be replaced via redefine.
+            let gate = RedefineGate::snapshot(
+                cm.class_redefine_generation_handle(declaring_id),
+            );
+            drop(cm);
+            let target = CachedInvokeTarget::Native {
+                callback,
+                num_params: num_params as u16, // Widening: parameter count conversion
+                gate,
+            };
+            shared.shared_resolution.insert_promoted_invoke(promoted_key, target.clone());
+            thread.invoke_cache.put(caller_class_id, cp_index, is_special, target);
+        }
         return;
     }
 
@@ -15191,9 +15024,7 @@ fn execute_invokestatic_cached(
             // Acquire monitor for synchronized methods
             let monitor_obj: Option<ObjectRef> = if cached.is_synchronized {
                 let obj = if cached.is_static {
-                    // Static synchronized monitor = the `Class` mirror (JVMS §2.11.10),
-                    // so `X.class.wait()/notify()` finds the thread as owner.
-                    get_or_create_class_mirror(shared, cached.declaring_class_id)
+                    shared.get_class_lock_object(cached.declaring_class_id)
                 } else {
                     match args_slice.first() {
                         Some(Value::Object(Some(obj_ref))) => *obj_ref,
@@ -15924,15 +15755,10 @@ fn try_osr(
         // OSR→interpreter handoff and gets surfaced by the next JIT
         // helper return drain (~line 2253 / ~12723) so it does not
         // disappear silently.
-        // JEP 358 (partial): record the JIT helper's action kind so the NPE
-        // surfaced here (and any re-stash below) keeps its action-only message.
-        let npe_action = crate::jit::helpers::take_jit_pending_npe_action();
-        let npe_msg =
-            crate::runtime::exceptions::helpful_npe::jit_npe_message_gated(npe_action);
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
-            RuntimeError::NullPointerException { message: npe_msg },
+            RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
                 if let Some((handler_pc, exc_ref)) = find_exception_handler_any_pc(
@@ -15956,7 +15782,7 @@ fn try_osr(
                 // Couldn't construct a Java NPE object (e.g. rt.jar not
                 // loaded) — re-stash the raw flag as before so the next
                 // JIT drain still surfaces it.
-                crate::jit::helpers::stash_jit_pending_npe_action(npe_action);
+                crate::jit::helpers::stash_jit_pending_npe();
             }
         }
         return None;
@@ -18070,15 +17896,10 @@ fn execute_jit_call(
     // (which can't safely match without a known PC) but still matches
     // typed handlers by exception class.
     if crate::jit::helpers::take_jit_pending_npe() {
-        // JEP 358 (partial): attach the JIT helper's action-only message
-        // (gate-on; else `None`).
-        let npe_msg = crate::runtime::exceptions::helpful_npe::jit_npe_message_gated(
-            crate::jit::helpers::take_jit_pending_npe_action(),
-        );
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
-            RuntimeError::NullPointerException { message: npe_msg },
+            RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
                 let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
@@ -18402,15 +18223,10 @@ fn execute_jit_call_decoded(
     // Drain pending NPE / AIOOBE set by void-return store helpers (same as
     // execute_jit_call) — route through the JIT'd method's exception table.
     if crate::jit::helpers::take_jit_pending_npe() {
-        // JEP 358 (partial): attach the JIT helper's action-only message
-        // (gate-on; else `None`).
-        let npe_msg = crate::runtime::exceptions::helpful_npe::jit_npe_message_gated(
-            crate::jit::helpers::take_jit_pending_npe_action(),
-        );
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
-            RuntimeError::NullPointerException { message: npe_msg },
+            RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
                 return route_jit_exception_through_method(
@@ -19259,9 +19075,7 @@ fn execute_invokevirtual_cached(
                     // Acquire monitor for synchronized methods
                     let monitor_obj: Option<ObjectRef> = if cached.is_synchronized {
                         let obj = if cached.is_static {
-                            // Static synchronized monitor = the `Class` mirror
-                            // (JVMS §2.11.10), so `X.class.wait()/notify()` works.
-                            get_or_create_class_mirror(shared, cached.declaring_class_id)
+                            shared.get_class_lock_object(cached.declaring_class_id)
                         } else {
                             // Receiver is args_slice[0] for virtual calls
                             match args_slice.first() {
@@ -20613,41 +20427,6 @@ fn double_to_long(v: f64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -----------------------------------------------------------------------
-    // real-frame-deopt — type-source resume mapping
-    // -----------------------------------------------------------------------
-
-    /// `ir_deopt_frame_values` maps the cat-1 slots the type source now
-    /// distinguishes — `Int`→`Value::Int`, `Object`→`Value::Object` (a real
-    /// reference, e.g. an instance method's `this`), `Undefined`→`Value::Int(0)`
-    /// — and returns `None` (forcing the safe re-run) for any slot it cannot yet
-    /// precisely resume (`Unsupported` cat-2/FP, `Float`, or an unresolved slot).
-    #[test]
-    fn ir_deopt_frame_values_maps_object_and_int() {
-        use cratonvm_jit::deopt::FrameValue;
-
-        let mapped = ir_deopt_frame_values(&[
-            FrameValue::Int(42),
-            FrameValue::Object(0),
-            FrameValue::Undefined,
-        ])
-        .expect("all cat-1 slots must map");
-        assert_eq!(mapped[0], Value::Int(42));
-        assert!(matches!(mapped[1], Value::Object(None)));
-        assert_eq!(mapped[2], Value::Int(0));
-
-        // A non-null Object resolves to Value::Object(Some(_)) (handle only —
-        // not dereferenced here).
-        let nonnull = ir_deopt_frame_values(&[FrameValue::Object(0x1000)])
-            .expect("non-null object maps");
-        assert!(matches!(nonnull[0], Value::Object(Some(_))));
-
-        // Anything not-yet-precisely-resumable forces the re-run path (None).
-        assert!(ir_deopt_frame_values(&[FrameValue::Unsupported]).is_none());
-        assert!(ir_deopt_frame_values(&[FrameValue::Float(0)]).is_none());
-        assert!(ir_deopt_frame_values(&[FrameValue::StackSlot(-8)]).is_none());
-    }
 
     // -----------------------------------------------------------------------
     // H6 — native-stack-aware re-entrant recursion ceiling
