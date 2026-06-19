@@ -2740,6 +2740,26 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(obj))) => *obj,
             _ => return Ok(Some(Value::Object(None))),
         };
+        // Synthetic generic-reflection stubs (GenericArrayType / ParameterizedType
+        // / WildcardType — built by `generics::type_sig_to_java`, whose class IS
+        // the bare `java.lang.reflect` interface with no bytecode `toString`)
+        // resolve `toString` up to this `Object.toString` native and would leak
+        // `GenericArrayType@hash`. Emit the canonical `getTypeName()` rendering
+        // instead, e.g. `java.util.List<java.lang.String>[]` (Spring
+        // `SerializableTypeWrapperTests.genericArrayType()` asserts exactly this).
+        if ctx.heap_kind_of(this) != cratonvm_types::ObjectKind::Array {
+            let cid = ctx.class_id_of_object(this);
+            let is_reflect_type = matches!(
+                ctx.class_name_of_id(cid).as_deref(),
+                Some("java/lang/reflect/GenericArrayType")
+                    | Some("java/lang/reflect/ParameterizedType")
+                    | Some("java/lang/reflect/WildcardType")
+            );
+            if is_reflect_type {
+                let s = crate::phases_late::render_type_name(ctx, &Value::Object(Some(this)));
+                return Ok(Some(Value::Object(Some(ctx.create_string(&s)))));
+            }
+        }
         // Replicate: getClass().getName() + "@" + Integer.toHexString(hashCode())
         //
         // ARRAY receivers MUST render the array-class name ([Ljava.lang.Class;
@@ -2762,6 +2782,51 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         let hex = format!("{:x}", hash as u32);
         let result = format!("{}@{}", dot_name, hex);
         Ok(Some(Value::Object(Some(ctx.create_string(&result)))))
+    });
+
+    // Object.equals — reference identity for ordinary objects (matching the
+    // default JDK contract), PLUS structural equality for the synthetic
+    // generic-reflection stubs (GenericArrayType/ParameterizedType/WildcardType).
+    // Those stubs have no bytecode `equals`, so the default identity comparison
+    // wrongly reports a deserialized `GenericArrayType` as != its source
+    // (spring-bug-08 SerializableTypeWrapperTests.genericArrayType(): the
+    // toString matches but `isEqualTo` fails). Compare by canonical
+    // `getTypeName()` rendering — two reflection types are equal iff their
+    // rendered type names are equal. Real-JDK mode otherwise has no Object.equals
+    // native (it runs the identity bytecode); registering one here is behaviour-
+    // identical for non-reflection receivers.
+    registry.register("java/lang/Object", "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            Some(Value::Object(None)) | None => return Ok(Some(Value::Int(0))),
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let other = args.get(1).copied().unwrap_or(Value::Object(None));
+        // Identity fast path (the default Object.equals contract).
+        if let Value::Object(Some(bo)) = other {
+            if this.as_ptr() == bo.as_ptr() {
+                return Ok(Some(Value::Int(1)));
+            }
+        }
+        let cid = ctx.class_id_of_object(this);
+        let is_reflect = matches!(
+            ctx.class_name_of_id(cid).as_deref(),
+            Some("java/lang/reflect/GenericArrayType")
+                | Some("java/lang/reflect/ParameterizedType")
+                | Some("java/lang/reflect/WildcardType")
+        );
+        if is_reflect {
+            // Structural: equal iff the other is a non-null reference whose
+            // canonical type-name rendering matches this one's.
+            if matches!(other, Value::Object(Some(_))) {
+                let ra = crate::phases_late::render_type_name(ctx, &Value::Object(Some(this)));
+                let rb = crate::phases_late::render_type_name(ctx, &other);
+                return Ok(Some(Value::Int(if ra == rb { 1 } else { 0 })));
+            }
+            return Ok(Some(Value::Int(0)));
+        }
+        // Default: reference identity (the refs are known non-identical here).
+        Ok(Some(Value::Int(0)))
     });
 
     // --- jdk/internal/util/Preconditions overrides ---
@@ -11176,6 +11241,29 @@ fn native_object_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             .into());
         }
     };
+    // Synthetic generic-reflection stubs (GenericArrayType/ParameterizedType/
+    // WildcardType) need a value-based hashCode consistent with their
+    // structural `equals` (see the `Object.equals` override) — an identity hash
+    // would violate the equals/hashCode contract for an equal-but-distinct
+    // deserialized type (spring-bug-08 SerializableTypeWrapperTests). Hash the
+    // canonical `getTypeName()` rendering with FNV-1a (stable, deterministic).
+    {
+        let cid = ctx.class_id_of_object(this);
+        if matches!(
+            ctx.class_name_of_id(cid).as_deref(),
+            Some("java/lang/reflect/GenericArrayType")
+                | Some("java/lang/reflect/ParameterizedType")
+                | Some("java/lang/reflect/WildcardType")
+        ) {
+            let s = crate::phases_late::render_type_name(ctx, &Value::Object(Some(this)));
+            let mut h: u32 = 2166136261;
+            for b in s.as_bytes() {
+                h ^= *b as u32;
+                h = h.wrapping_mul(16777619);
+            }
+            return Ok(Some(Value::Int(h as i32)));
+        }
+    }
     let hash = ctx.identity_hash_code(this);
     if std::env::var_os("CRATONVM_DBG_VDISP").is_some() {
         eprintln!("[vdisp] native_object_hash_code (IDENTITY) called -> {hash}");

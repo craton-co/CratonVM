@@ -9679,10 +9679,20 @@ pub(crate) fn proxy_instance_satisfies_target(
     let interfaces_arr = match shared.heap.get_field(obj_ref, PROXY_FIELD_INTERFACES) {
         cratonvm_types::Value::Object(Some(a)) => a,
         _ => {
-            // Unknown — no interfaces stored. Fall back to old liberal rule
-            // for safety so we don't regress proxies that never went through
-            // `Proxy.newProxyInstance`.
-            return true;
+            // No CratonVM-internal interfaces array in slot 1. For a genuine
+            // generated `$ProxyN` the proxied interfaces are recorded in the
+            // class itself, so the `is_subclass_of(obj_class, target)` check at
+            // the `instanceof`/`checkcast` call site is authoritative — a `true`
+            // here would make the proxy `instanceof` EVERYTHING. That is exactly
+            // the spring-bug-08 regression: a proxy deserialized via the
+            // serialization path restores its handler (slot 0) but NOT this
+            // internal interfaces slot, so `proxy instanceof AbstractAssert`
+            // wrongly became true and tripped AssertJ's `isEqualTo` guard,
+            // collapsing `SerializableTypeWrapperTests` to 1/8. Defer to the
+            // class-declared interfaces by returning `false`; only the bare
+            // `Proxy$Instance` shim (which has neither a slot-1 array nor its
+            // own declared interface set) keeps the old liberal rule.
+            return obj_name == "java/lang/reflect/Proxy$Instance";
         }
     };
     let n = shared.heap.array_length(interfaces_arr);

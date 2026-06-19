@@ -28425,6 +28425,96 @@ pub(crate) fn register_p67_string_template(r: &mut NativeMethodRegistry) {
 }
 
 // =============================================================================
+// Generic-type rendering for the synthetic reflection stubs
+// =============================================================================
+
+/// Render a `java.lang.reflect.Type` value to its canonical `getTypeName()`
+/// string (e.g. `java.util.List<java.lang.String>[]`).
+///
+/// CratonVM's generic-signature reifier (`generics::type_sig_to_java`) builds
+/// the parametric/array/var/wildcard cases as synthetic stub objects whose
+/// class IS the bare interface name (`java/lang/reflect/ParameterizedType`
+/// etc.). Those stubs have no `toString`, so a bare `Object.toString`
+/// (`ParameterizedType@hash`) leaked out wherever the real
+/// `sun.reflect…Impl.toString()` was expected — e.g. Spring's
+/// `SerializableTypeWrapperTests.genericArrayType()` compares
+/// `GenericArrayType.toString()` against `java.util.List<java.lang.String>[]`.
+/// This renderer walks the synthetic stubs recursively and defers to the VM's
+/// real `getTypeName()` for `Class` mirrors and real reifier impls.
+pub(crate) fn render_type_name(ctx: &mut dyn NativeContext, val: &Value) -> String {
+    let obj = match val {
+        Value::Object(Some(o)) => *o,
+        _ => return "?".to_string(),
+    };
+    let cid = ctx.class_id_of_object(obj);
+    let cname = ctx.class_name_of_id(cid).unwrap_or_default();
+    match cname.as_str() {
+        "java/lang/reflect/ParameterizedType" => {
+            let raw = ctx.get_field(obj, 0);
+            let raw_s = render_type_name(ctx, &raw);
+            let mut parts = Vec::new();
+            if let Value::Object(Some(arr)) = ctx.get_field(obj, 1) {
+                for i in 0..ctx.array_length(arr) {
+                    let el = ctx.get_array_element(arr, i);
+                    parts.push(render_type_name(ctx, &el));
+                }
+            }
+            if parts.is_empty() {
+                raw_s
+            } else {
+                format!("{}<{}>", raw_s, parts.join(", "))
+            }
+        }
+        "java/lang/reflect/GenericArrayType" => {
+            let comp = ctx.get_field(obj, 0);
+            format!("{}[]", render_type_name(ctx, &comp))
+        }
+        "java/lang/reflect/TypeVariable" => match ctx.get_field(obj, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "?".to_string()),
+            _ => "?".to_string(),
+        },
+        "java/lang/reflect/WildcardType" => {
+            // upperBounds=0, lowerBounds=1
+            if let Value::Object(Some(arr)) = ctx.get_field(obj, 1) {
+                if ctx.array_length(arr) > 0 {
+                    let el = ctx.get_array_element(arr, 0);
+                    return format!("? super {}", render_type_name(ctx, &el));
+                }
+            }
+            if let Value::Object(Some(arr)) = ctx.get_field(obj, 0) {
+                if ctx.array_length(arr) > 0 {
+                    let el = ctx.get_array_element(arr, 0);
+                    let s = render_type_name(ctx, &el);
+                    if s != "java.lang.Object" {
+                        return format!("? extends {}", s);
+                    }
+                }
+            }
+            "?".to_string()
+        }
+        // Class mirror or a real reifier impl: ask the VM for getTypeName(),
+        // falling back to toString() and finally the dotted class name.
+        _ => {
+            if let Ok(Some(Value::Object(Some(s)))) =
+                ctx.invoke_virtual(obj, "getTypeName", "()Ljava/lang/String;", &[])
+            {
+                if let Some(rendered) = ctx.read_string(s) {
+                    return rendered;
+                }
+            }
+            if let Ok(Some(Value::Object(Some(s)))) =
+                ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[])
+            {
+                if let Some(rendered) = ctx.read_string(s) {
+                    return rendered;
+                }
+            }
+            cname.replace('/', ".")
+        }
+    }
+}
+
+// =============================================================================
 // Miscellaneous: Additional refinements
 // =============================================================================
 
@@ -28458,6 +28548,19 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/reflect/Type;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+    // Render `rawType<arg0, arg1, …>` (and via the Type default, getTypeName()).
+    r.register(pt, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let s = render_type_name(ctx, &Value::Object(Some(this)));
+        let out = ctx.create_string(&s);
+        Ok(Some(Value::Object(Some(out))))
+    });
+    r.register(pt, "getTypeName", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let s = render_type_name(ctx, &Value::Object(Some(this)));
+        let out = ctx.create_string(&s);
+        Ok(Some(Value::Object(Some(out))))
+    });
 
     // TypeVariable = 2-field (name=0 String, bounds=1 Type[])
     let tv = "java/lang/reflect/TypeVariable";
@@ -28521,6 +28624,19 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, 0)))
         },
     );
+    // Render `componentType[]` (and via the Type default, getTypeName()).
+    r.register(gat, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let s = render_type_name(ctx, &Value::Object(Some(this)));
+        let out = ctx.create_string(&s);
+        Ok(Some(Value::Object(Some(out))))
+    });
+    r.register(gat, "getTypeName", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let s = render_type_name(ctx, &Value::Object(Some(this)));
+        let out = ctx.create_string(&s);
+        Ok(Some(Value::Object(Some(out))))
+    });
 
     // Class.getGenericSuperclass and getGenericInterfaces are registered in lib.rs
     // with real implementations (Session 19).
