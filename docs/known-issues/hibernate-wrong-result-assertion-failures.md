@@ -25,10 +25,10 @@ and bisect to the diverging native (collection/JDBC/reflection/serialization).
 | ✅ `collection.delayedOperation.DetachedBagDelayedOperationTest` | `expected: <true> but was: <false>` | **FIXED** — not collection bookkeeping; the `HHH90030006` rollback watcher never fired because `DelegatingBasicLogger.isDebugEnabled()` was hard-stubbed to `false` + the base-`Logger` emit short-circuit (see **Resolved**) |
 | `entitygraph.EntityGraphBatchSizeTest` | `AssertionError` (empty) | `@BatchSize` fetch under an entity graph — batch-fetch count/ordering |
 | `bootstrap.registry.classloading.ClassLoaderServiceImplTest` | `expected:<1> but was:<0>` | **= HIB-CV-16** (user `ClassLoader` subclasses not virtualized) — already tracked |
-| `annotations.immutable.ImmutableWithAttributeConverterTest` | `SerializationException: could not deserialize` | `@Immutable` + `AttributeConverter` round-trip; a converted/serialized column value not restoring |
+| ✅ `annotations.immutable.ImmutableWithAttributeConverterTest` | `SerializationException: could not deserialize` | **FIXED** — `@AttributeConverter` stores a `Serializable` `Exif` (wraps a HashMap) as a serialized column; `new HashMap<>(src)` left the real `loadFactor`/`table` unset so `writeObject` emitted `loadFactor=0.0` + 0 entries (see **Resolved 3**) |
 | ✅ `connection.DriverManagerConnectionProviderValidationConfigTest` | `AssertionError` (empty) | **FIXED** (now passes; a watched-log assertion — resolved by the jboss-logging fix) |
 | ✅ `annotations.loader.LoaderWithInvalidQueryTest` | `AssertionFailedError` (empty) | **FIXED (nojit)** — not a `@Loader` issue; asserts `getSuppressed().length == 2`, but `Throwable.addSuppressed` silently dropped everything because shadowed `Throwable.<init>` left `suppressedExceptions` null (see **Resolved 2**). Still times out under **JIT** (separate pre-existing ANTLR-HQL-parse slowness, not the suppressed bug) |
-| `jpa.DetachedPreviousRowStateTest` | `'…product' is detached` | detached-entity state across a row update — cascade/merge state |
+| ✅ `jpa.DetachedPreviousRowStateTest` | `'…product' is detached` | **FIXED** — not cascade/merge; CratonVM's synthetic `Stream` was eager, so `getResultStream().forEach(...)` buffered all rows before the per-row `flush/clear` ran (see **Resolved 4**) |
 
 (Membership grows as the census completes; `DriverManagerRegistrationTest`'s "Unanticipated failure
 according to HHH-7272" and `ClassLoaderLeaksUtilityTest`'s `ClassNotFoundException` are likely
@@ -103,6 +103,51 @@ parse is pathologically slow under CratonVM JIT and trips the test's own `@Timeo
 pre-existing JIT-perf issue (same family as the ANTLR `computeTargetState` blowup), unrelated to suppressed
 exceptions (the primitive is correct under JIT — see probes above).
 
-**Still open (separate root causes):** `EntityGraphBatchSizeTest`, `ImmutableWithAttributeConverterTest`
-(serialization), `DetachedPreviousRowStateTest`; `ClassLoaderServiceImplTest` = HIB-CV-16. Plus the
+**Still open (separate root causes):** `EntityGraphBatchSizeTest`
+(both entity-graph fetch semantics); `ClassLoaderServiceImplTest` = HIB-CV-16. Plus the
 JIT-only ANTLR-HQL-parse slowness above.
+
+## Resolved 3 (2026-06-19) — `new HashMap<>(src)` serialized `loadFactor=0.0` + zero entries
+
+**Branch:** `fix/hashmap-serialization`. Fixes `ImmutableWithAttributeConverterTest`.
+
+`ExifConverter` is an `AttributeConverter<String, Exif>`, so the DB column type is `Exif` — a
+`Serializable` value that wraps a `HashMap`. Hibernate Java-serializes it to the column and deserializes
+on read, and that round-trip failed: `SerializationException: could not deserialize` caused by
+`java.io.InvalidObjectException: Illegal load factor: 0.0`.
+
+**Root cause:** CratonVM's native `HashMap.<init>(Map)` copy-constructor (`native_map_init_from_map`)
+populates the synthetic bucket side-table but leaves the real-JDK `loadFactor`/`threshold`/`table` fields
+unset (a top-level `new HashMap<>()` + `put` is real-backed and was fine; only the copy-constructor path
+is native-backed). The inherited real `HashMap.writeObject` then read `loadFactor=0.0` and iterated an
+empty real `table`, emitting a zero-load-factor, zero-entry stream. A hexdump cross-VM diff confirmed it
+(CV 179 bytes vs HotSpot 204; `3f400000`→`00000000` for loadFactor, entries dropped). This silently broke
+**any** object graph holding a `new HashMap<>(src)`.
+
+**Fix** (`native-collections/src/lib.rs`): register native `HashMap.writeObject`/`readObject` (mirroring
+the existing `TreeSet` pattern) that drive the stream from `collect_entries_any` — which reads BOTH
+native-backed maps (bucket reader) and real-backed maps (`entrySet().iterator()` fallback) — and ensure a
+valid `loadFactor` before `defaultWriteObject`. Capacity is taken from the real `table` length when present
+so a real-backed map stays byte-identical to the inherited method.
+
+**Verified** vs HotSpot: the `Exif` now round-trips and CratonVM's bytes (204) are byte-identical to
+HotSpot and read back on HotSpot; `ImmutableWithAttributeConverterTest` `ok=2`. No regression — real-backed
+HashMap (191B), LinkedHashMap (230B), the copy-constructor map, and the empty map all serialize
+byte-identically to HotSpot.
+
+**Still open:** `EntityGraphBatchSizeTest`; `ClassLoaderServiceImplTest` = HIB-CV-16. (`DetachedPreviousRowStateTest` is now **FIXED** — see **Resolved 4**.)
+
+## Resolved 4 (2026-06-19) — CratonVM's synthetic `Stream` was eager; `StreamSupport.stream(spliterator).forEach` is now lazy
+
+**Branch:** `feat/lazy-stream-pipeline`. Fixes `DetachedPreviousRowStateTest`.
+
+The test does `getResultStream().forEach(ld -> { assertTrue(em.contains(ld.description.product)); em.flush(); em.clear(); })`. Two rows share one `Product`. On HotSpot the stream is lazy: row 2 is fetched *after* row 1's `em.clear()`, so the shared Product is re-managed → `contains==true`. On CratonVM the nested Product was detached mid-iteration. **Root cause:** CratonVM's synthetic `java/util/stream/Stream` is array-backed and eager — `StreamSupport.stream(realSpliterator,false)` (`service_loader.rs`) drained the spliterator into an `Object[]` up front, so the whole pipeline ran stage-by-stage (all `tryAdvance`, then all `map`, then all `forEach`) **before** the terminal consumer. Minimal proof: `StreamSupport.stream(customSpliterator,false).forEach(g)` prints, on HotSpot, interleaved `tryAdvance/accept` per element; on CratonVM it printed **all** tryAdvance, then **all** accept — so `em.flush()/clear()` ran only after every row was buffered.
+
+**Fix** (make the common case lazy without rearchitecting the eager pipeline): `StreamSupport.stream(realSpliterator,false)` now stashes the spliterator in a new lazy slot (stream field 2) instead of draining; `Stream.forEach`, when the stream is still lazy (no intervening op materialised it), drives the spliterator one element at a time via `tryAdvance(consumer)`; and a single materialisation point — `stream_elements` is now `&mut` and drains the lazy spliterator into field 0 — means every other op (map/filter/collect/count/toArray/reduce/…) transparently sees the full list. A stream with an intermediate op materialises at that op and runs eagerly thereafter (correct results, just not interleaved — only a no-op forEach with side effects needs interleaving).
+
+**Verified** vs HotSpot: no-op forEach is interleaved; `DetachedPreviousRowStateTest` `ok=1` (JIT-on and `--nojit`); a broad stream-ops regression (Collection.stream + StreamSupport `map/filter/collect/count/sorted/distinct/reduce/toArray/anyMatch/findFirst/flatMap/iterate/generate/parallel/peek/IntStream`) is byte-identical; the previously-fixed Hibernate tests still pass. (Pre-existing, NOT from this change — both reproduce on the pre-change binary: `IntStream.boxed()` returns empty; reusing a consumed synthetic stream doesn't throw `IllegalStateException`.)
+
+## Root-caused but deep (2026-06-19) — the remaining entity-graph test
+
+### `EntityGraphBatchSizeTest` — eager element-collections force per-row instead of deferring
+Both methods fail at `assertSelectCount("GraphBatchBook_batchedTags", 1)` with `expected 1 but was 3`. Eager **entity** graph-batching works (`batchedAuthor` → 1 `where id in (?,?,?)`), and a persister-level `@BatchSize` lazy collection batches fine — but an **eager element-collection under a load-graph** is force-initialized **per row** instead of being deferred to `endLoading` after all keys are queued, so each `batchedTags` issues its own un-batched `where ..._id=?` (3 selects) instead of one batched `in (?,?,?)`. The behavioral boundary is sharp: `SelectEagerCollectionInitializer.initializeInstanceFromParent` (immediate `forceInitialization`) vs `resolveInstance` (deferred via `addNonLazyCollection`) — CV takes the per-row force path. **Fix direction:** the result-graph eager-collection deferral state machine; needs runtime instrumentation to pin the single diverging primitive.
