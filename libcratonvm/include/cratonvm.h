@@ -146,10 +146,35 @@ char *cratonvm_class_name(CratonVm *vm, CratonClass cls);
 cratonvm_jint cratonvm_field_count(CratonVm *vm, CratonRef obj);
 
 /* Read instance field slot `index` of `obj` as a typed CratonValue. The slot is
- * resolved by LAYOUT INDEX (not by name; combine with reflection or a getter via
- * cratonvm_invoke_virtual for name-based access). Returns tag CRATON_TAG_ERROR
- * on a bad handle or out-of-range index (last error set). */
+ * resolved by LAYOUT INDEX (see cratonvm_field_index / cratonvm_get_field_by_name
+ * for name-based access). Returns tag CRATON_TAG_ERROR on a bad handle or
+ * out-of-range index (last error set). */
 CratonValue cratonvm_get_field(CratonVm *vm, CratonRef obj, cratonvm_jint index);
+
+/* Resolve an instance field NAME on `cls` to its layout slot index (walking the
+ * superclass chain; most-derived declaration wins), written to *out_index.
+ * Returns 0 (JNI_OK) or -1 (JNI_ERR) on an unloaded class / unknown field (last
+ * error set, *out_index untouched). The index is usable with cratonvm_get_field
+ * / cratonvm_set_field. */
+cratonvm_jint cratonvm_field_index(CratonVm *vm, CratonClass cls, const char *name,
+                                   cratonvm_jint *out_index);
+
+/* Read the named instance field of `obj` (resolved against obj's RUNTIME class)
+ * as a typed CratonValue. tag CRATON_TAG_ERROR on a bad handle / unknown name. */
+CratonValue cratonvm_get_field_by_name(CratonVm *vm, CratonRef obj, const char *name);
+
+/* Write `value` into instance field slot `index` of `obj`. GC-barrier correct
+ * (same pre/post barriers as the interpreter's putfield). No coercion — the
+ * caller ensures the tag matches the field's declared type. Returns 0 (JNI_OK)
+ * or -1 (JNI_ERR) on a bad handle / out-of-range index (last error set). */
+cratonvm_jint cratonvm_set_field(CratonVm *vm, CratonRef obj, cratonvm_jint index,
+                                 CratonValue value);
+
+/* Write `value` into the named instance field of `obj` (resolved against obj's
+ * RUNTIME class), GC-barrier correct. Returns 0 (JNI_OK) or -1 (JNI_ERR) on a
+ * bad handle / unknown name (last error set). */
+cratonvm_jint cratonvm_set_field_by_name(CratonVm *vm, CratonRef obj, const char *name,
+                                         CratonValue value);
 
 /* ---- error access (thread-local) -------------------------------------- */
 

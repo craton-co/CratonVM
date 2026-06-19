@@ -1325,6 +1325,221 @@ pub extern "C" fn cratonvm_get_field(
     })
 }
 
+/// `int32_t cratonvm_field_index(CratonVm *vm, CratonClass cls, const char *name, int32_t *out_index)`
+///
+/// Resolve the **name** of an instance field on `cls` to its layout slot index
+/// (walking the superclass chain; most-derived declaration wins), writing it to
+/// `*out_index`. Returns [`JNI_OK`], or [`JNI_ERR`] (with the last error set,
+/// `*out_index` untouched) when the class is unloaded or has no such instance
+/// field. The resolved index is usable with [`cratonvm_get_field`] /
+/// [`cratonvm_set_field`]. (Resolution is by name; for a field shadowed by a
+/// same-name field in a subclass, the most-derived one wins.)
+///
+/// # Safety
+/// `vm` is a handle from [`cratonvm_create`]; `cls` is a [`CratonClass`] the VM
+/// handed out; `name` is a valid NUL-terminated C string; `out_index`, when
+/// non-null, is writable.
+#[no_mangle]
+pub extern "C" fn cratonvm_field_index(
+    vm: *mut CratonVm,
+    cls: CratonClass,
+    name: *const c_char,
+    out_index: *mut JInt,
+) -> JInt {
+    catch_unwind(AssertUnwindSafe(|| {
+        clear_last_error();
+        // SAFETY: `vm` per caller contract.
+        unsafe {
+            with_vm(vm, JNI_ERR, |h| {
+                // SAFETY: caller contract — `name` is a valid C string or null.
+                let field_name = match unsafe { cstr_or_err(name, "field name") } {
+                    Some(s) => s,
+                    None => return JNI_ERR,
+                };
+                let class_id = ClassId::new(cls as u32);
+                match h.vm.instance_field_index(class_id, field_name) {
+                    Some(idx) => {
+                        if !out_index.is_null() {
+                            // SAFETY: `out_index` checked non-null; writable per contract.
+                            unsafe { *out_index = idx as JInt };
+                        }
+                        JNI_OK
+                    }
+                    None => {
+                        set_last_error(format!(
+                            "cratonvm_field_index: no instance field \"{field_name}\" on class"
+                        ));
+                        JNI_ERR
+                    }
+                }
+            })
+        }
+    }))
+    .unwrap_or_else(|_| {
+        set_last_error("cratonvm_field_index: panic");
+        JNI_ERR
+    })
+}
+
+/// `CratonValue cratonvm_get_field_by_name(CratonVm *vm, CratonRef obj, const char *name)`
+///
+/// Read the named instance field of `obj` (resolved against `obj`'s **runtime**
+/// class via [`cratonvm_field_index`]) as a typed [`CratonValue`] — the
+/// name-based companion to the index-based [`cratonvm_get_field`]. Returns
+/// `tag == craton_tag::ERROR` (last error set) on a bad VM/handle or an unknown
+/// field name.
+///
+/// # Safety
+/// `vm` is a handle from [`cratonvm_create`]; `obj` is a live [`CratonRef`];
+/// `name` is a valid NUL-terminated C string.
+#[no_mangle]
+pub extern "C" fn cratonvm_get_field_by_name(
+    vm: *mut CratonVm,
+    obj: CratonRef,
+    name: *const c_char,
+) -> CratonValue {
+    catch_unwind(AssertUnwindSafe(|| {
+        clear_last_error();
+        // SAFETY: `vm` per caller contract.
+        unsafe {
+            with_vm(vm, CratonValue::error(), |h| {
+                let oref = match ref_from_handle(obj) {
+                    Some(r) => r,
+                    None => {
+                        set_last_error("cratonvm_get_field_by_name: null object handle");
+                        return CratonValue::error();
+                    }
+                };
+                // SAFETY: caller contract — `name` is a valid C string or null.
+                let field_name = match unsafe { cstr_or_err(name, "field name") } {
+                    Some(s) => s,
+                    None => return CratonValue::error(),
+                };
+                let class_id = h.vm.shared.heap.class_id_of(oref);
+                match h.vm.instance_field_index(class_id, field_name) {
+                    Some(idx) => CratonValue::from_value(h.vm.get_instance_field(oref, idx)),
+                    None => {
+                        set_last_error(format!(
+                            "cratonvm_get_field_by_name: no instance field \"{field_name}\""
+                        ));
+                        CratonValue::error()
+                    }
+                }
+            })
+        }
+    }))
+    .unwrap_or_else(|_| {
+        set_last_error("cratonvm_get_field_by_name: panic");
+        CratonValue::error()
+    })
+}
+
+/// `int32_t cratonvm_set_field(CratonVm *vm, CratonRef obj, int32_t index, CratonValue value)`
+///
+/// Write `value` into instance-field slot `index` of `obj` — the write-back
+/// companion to [`cratonvm_get_field`]. The write is **GC-barrier correct**
+/// (the VM applies the SATB pre-barrier + post write-barrier exactly as the
+/// interpreter's `putfield` does). Returns [`JNI_OK`], or [`JNI_ERR`] (last
+/// error set) on a bad VM/handle or an out-of-range `index`. No coercion is
+/// performed — the caller is responsible for the `CratonValue` tag matching the
+/// field's declared type.
+///
+/// # Safety
+/// `vm` is a handle from [`cratonvm_create`]; `obj` is a live [`CratonRef`].
+#[no_mangle]
+pub extern "C" fn cratonvm_set_field(
+    vm: *mut CratonVm,
+    obj: CratonRef,
+    index: JInt,
+    value: CratonValue,
+) -> JInt {
+    catch_unwind(AssertUnwindSafe(|| {
+        clear_last_error();
+        // SAFETY: `vm` per caller contract.
+        unsafe {
+            with_vm(vm, JNI_ERR, |h| {
+                let oref = match ref_from_handle(obj) {
+                    Some(r) => r,
+                    None => {
+                        set_last_error("cratonvm_set_field: null object handle");
+                        return JNI_ERR;
+                    }
+                };
+                let class_id = h.vm.shared.heap.class_id_of(oref);
+                let nfields = h.vm.instance_field_count(class_id);
+                if index < 0 || (index as usize) >= nfields {
+                    set_last_error(format!(
+                        "cratonvm_set_field: index {index} out of range for {nfields} field(s)"
+                    ));
+                    return JNI_ERR;
+                }
+                h.vm.set_instance_field(oref, index as usize, value.to_value());
+                JNI_OK
+            })
+        }
+    }))
+    .unwrap_or_else(|_| {
+        set_last_error("cratonvm_set_field: panic");
+        JNI_ERR
+    })
+}
+
+/// `int32_t cratonvm_set_field_by_name(CratonVm *vm, CratonRef obj, const char *name, CratonValue value)`
+///
+/// Write `value` into the named instance field of `obj` (resolved against
+/// `obj`'s **runtime** class) — the name-based companion to [`cratonvm_set_field`],
+/// GC-barrier correct. Returns [`JNI_OK`], or [`JNI_ERR`] (last error set) on a
+/// bad VM/handle or an unknown field name.
+///
+/// # Safety
+/// `vm` is a handle from [`cratonvm_create`]; `obj` is a live [`CratonRef`];
+/// `name` is a valid NUL-terminated C string.
+#[no_mangle]
+pub extern "C" fn cratonvm_set_field_by_name(
+    vm: *mut CratonVm,
+    obj: CratonRef,
+    name: *const c_char,
+    value: CratonValue,
+) -> JInt {
+    catch_unwind(AssertUnwindSafe(|| {
+        clear_last_error();
+        // SAFETY: `vm` per caller contract.
+        unsafe {
+            with_vm(vm, JNI_ERR, |h| {
+                let oref = match ref_from_handle(obj) {
+                    Some(r) => r,
+                    None => {
+                        set_last_error("cratonvm_set_field_by_name: null object handle");
+                        return JNI_ERR;
+                    }
+                };
+                // SAFETY: caller contract — `name` is a valid C string or null.
+                let field_name = match unsafe { cstr_or_err(name, "field name") } {
+                    Some(s) => s,
+                    None => return JNI_ERR,
+                };
+                let class_id = h.vm.shared.heap.class_id_of(oref);
+                match h.vm.instance_field_index(class_id, field_name) {
+                    Some(idx) => {
+                        h.vm.set_instance_field(oref, idx, value.to_value());
+                        JNI_OK
+                    }
+                    None => {
+                        set_last_error(format!(
+                            "cratonvm_set_field_by_name: no instance field \"{field_name}\""
+                        ));
+                        JNI_ERR
+                    }
+                }
+            })
+        }
+    }))
+    .unwrap_or_else(|_| {
+        set_last_error("cratonvm_set_field_by_name: panic");
+        JNI_ERR
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1556,6 +1771,53 @@ mod tests {
     }
 
     #[test]
+    fn field_index_null_handle_returns_err() {
+        clear_last_error();
+        let name = CString::new("h").unwrap();
+        let mut out: JInt = -999;
+        let rc = cratonvm_field_index(std::ptr::null_mut(), 0, name.as_ptr(), &mut out);
+        assert_eq!(rc, JNI_ERR);
+        assert_eq!(out, -999, "out_index must be untouched on error");
+        assert!(last_error_string().is_some());
+    }
+
+    #[test]
+    fn get_field_by_name_null_handle_returns_error_value() {
+        clear_last_error();
+        let name = CString::new("h").unwrap();
+        let r = cratonvm_get_field_by_name(std::ptr::null_mut(), 0, name.as_ptr());
+        assert_eq!(r.tag, craton_tag::ERROR);
+        assert!(last_error_string().is_some());
+    }
+
+    #[test]
+    fn set_field_null_handle_returns_err() {
+        clear_last_error();
+        let rc = cratonvm_set_field(
+            std::ptr::null_mut(),
+            0,
+            0,
+            CratonValue { tag: craton_tag::INT, payload: 1 },
+        );
+        assert_eq!(rc, JNI_ERR);
+        assert!(last_error_string().is_some());
+    }
+
+    #[test]
+    fn set_field_by_name_null_handle_returns_err() {
+        clear_last_error();
+        let name = CString::new("h").unwrap();
+        let rc = cratonvm_set_field_by_name(
+            std::ptr::null_mut(),
+            0,
+            name.as_ptr(),
+            CratonValue { tag: craton_tag::INT, payload: 1 },
+        );
+        assert_eq!(rc, JNI_ERR);
+        assert!(last_error_string().is_some());
+    }
+
+    #[test]
     fn last_error_clear_round_trip() {
         set_last_error("boom");
         assert_eq!(last_error_string().as_deref(), Some("boom"));
@@ -1634,6 +1896,32 @@ mod tests {
         // out-of-range field index is a clean error, not a crash.
         let oob = cratonvm_get_field(vm, s, fc);
         assert_eq!(oob.tag, craton_tag::ERROR);
+
+        // field-by-name resolution + read-back + write-back round trip on
+        // String.hash (the non-final cached-hashCode int field present in the
+        // JDK String layout).
+        let hash_name = CString::new("hash").unwrap();
+        let mut hash_idx: JInt = -1;
+        assert_eq!(cratonvm_field_index(vm, scls, hash_name.as_ptr(), &mut hash_idx), JNI_OK,
+            "field_index(String.hash) failed: {:?}", last_error_string());
+        assert!(hash_idx >= 0);
+        // name-based read agrees with index-based read at the resolved slot.
+        let by_name = cratonvm_get_field_by_name(vm, s, hash_name.as_ptr());
+        let by_index = cratonvm_get_field(vm, s, hash_idx);
+        assert_eq!(by_name.tag, craton_tag::INT);
+        assert_eq!(by_name.payload, by_index.payload);
+        // write-back by name, then read it back (round trip).
+        assert_eq!(
+            cratonvm_set_field_by_name(vm, s, hash_name.as_ptr(),
+                CratonValue { tag: craton_tag::INT, payload: 0x4d2 }),
+            JNI_OK, "set_field_by_name failed: {:?}", last_error_string());
+        let after = cratonvm_get_field_by_name(vm, s, hash_name.as_ptr());
+        assert_eq!(after.payload as u32 as i32, 0x4d2);
+        // an unknown field name is a clean error, not a crash.
+        let bogus = CString::new("no_such_field_xyz").unwrap();
+        let mut bogus_idx: JInt = -1;
+        assert_eq!(cratonvm_field_index(vm, scls, bogus.as_ptr(), &mut bogus_idx), JNI_ERR);
+        assert!(last_error_string().is_some());
 
         // invoke a void static (System.gc) with no args.
         let m = CString::new("gc").unwrap();

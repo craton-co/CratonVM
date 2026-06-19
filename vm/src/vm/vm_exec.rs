@@ -733,7 +733,7 @@ pub(crate) fn resolve_field_index_for_test(
     resolve_field_index_in_hierarchy(class_id, field_name, store)
 }
 
-fn resolve_field_index_in_hierarchy(
+pub(crate) fn resolve_field_index_in_hierarchy(
     class_id: ClassId,
     field_name: &str,
     store: &ClassStore,

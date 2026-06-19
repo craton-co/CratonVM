@@ -315,7 +315,39 @@ once it can create a VM and call statics.
   `no_run` doc example.
 - **Still next:** name-based field resolution (needs a VM layout-by-name
   accessor), object-field *write-back*, and a C-varargs *convenience shim* layered
-  over the typed-array core (if a host ABI ever needs it).
+  over the typed-array core (if a host ABI ever needs it). *(Field resolution +
+  write-back landed in Increment 5 below.)*
+
+## Increment 5 (name-based field resolution + object-field write-back) landed
+
+Closes the two field-access follow-ups Increment 4 deferred. The GC-correctness
+and layout logic live in the **vm crate** (the right layer); the C ABI and Rust
+facade are thin wrappers.
+
+- **VM accessors (`vm/src/vm/vm_init.rs`, `impl Vm`).** `instance_field_index`
+  (resolve a field *name* → absolute slot via the existing hierarchy walk
+  `resolve_field_index_in_hierarchy`, now `pub(crate)`; most-derived declaration
+  wins), `instance_field_count`, `get_instance_field`, and `set_instance_field` —
+  the last is **GC-barrier correct**, replicating the interpreter's `putfield`
+  exactly (SATB `write_barrier_pre` on the overwritten ref + the post
+  write-barrier fired inside `set_field`), so a moving/concurrent collector stays
+  sound on host-driven writes.
+- **Flat C API (`libcratonvm`).** `cratonvm_field_index(vm, cls, name, *out)`
+  (name→index, out-param + JNI_OK/ERR since 0 is a valid index),
+  `cratonvm_get_field_by_name`, `cratonvm_set_field(vm, obj, index, value)`
+  (bounds-checked write-back), and `cratonvm_set_field_by_name`. No coercion — the
+  caller's `CratonValue` tag must match the field's declared type.
+- **Layer-1 facade (`cratonvm-embed`).** `field_index`, `get_field_by_name`,
+  `set_field_by_name` free-function conveniences over the `Vm` accessors.
+- **Header + tests.** `cratonvm.h` declares all four; null-handle unit tests for
+  each (23 libcratonvm tests total); the `--cfg flat_api_live_vm` round trip now
+  resolves `String.hash` by name, asserts the **name-based read equals the
+  index-based read**, **writes it back and reads the new value**, and confirms an
+  unknown field name errors cleanly — **passing on a live JDK-25 VM**.
+- **Still next:** descriptor-based disambiguation of shadowed same-name fields
+  (resolution is by name today), and the C-varargs convenience shim (the typed
+  `CratonValue` array remains the stable core; a definition-side C-varargs entry
+  is unsound on stable Rust).
 
 ## Effort
 

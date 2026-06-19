@@ -106,6 +106,38 @@ pub fn describe_failure(vm: &Vm, e: &MethodCallFailed) -> String {
     }
 }
 
+/// Resolve a named instance field on `class_id` to its layout slot index (most-
+/// derived declaration wins; `None` if the class is unloaded or has no such
+/// instance field). Thin pass-through to [`Vm::instance_field_index`] for symmetry
+/// with the other facade helpers.
+pub fn field_index(vm: &Vm, class_id: ClassId, name: &str) -> Option<usize> {
+    vm.instance_field_index(class_id, name)
+}
+
+/// Read a named instance field of `obj`, resolved against its **runtime** class.
+/// `None` if the field name is unknown.
+pub fn get_field_by_name(vm: &Vm, obj: ObjectRef, name: &str) -> Option<Value> {
+    let class_id = vm.shared.heap.class_id_of(obj);
+    let idx = vm.instance_field_index(class_id, name)?;
+    Some(vm.get_instance_field(obj, idx))
+}
+
+/// Write `value` into a named instance field of `obj`, resolved against its
+/// **runtime** class — GC-barrier correct (see [`Vm::set_instance_field`]).
+/// Returns `true` if the field was found and written, `false` if the name is
+/// unknown. No type coercion is performed; the `Value` variant should match the
+/// field's declared type.
+pub fn set_field_by_name(vm: &Vm, obj: ObjectRef, name: &str, value: Value) -> bool {
+    let class_id = vm.shared.heap.class_id_of(obj);
+    match vm.instance_field_index(class_id, name) {
+        Some(idx) => {
+            vm.set_instance_field(obj, idx, value);
+            true
+        }
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
