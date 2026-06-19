@@ -147,8 +147,12 @@ The history below predates the fix.
 
 | # | Bug | Status | Doc |
 |---|---|---|---|
-| **B** | JUnit `@Timeout` interceptor chain `proceed()` invoked twice (cross-thread invocation / `MethodHandle` re-entry on the timeout worker). **Not GC-related.** Clears a broad band of Spring tests. | 🔴 **OPEN** | [spring-bug-04-junit-timeout-interceptor-double-proceed.md](spring-bug-04-junit-timeout-interceptor-double-proceed.md) |
 | **C** | Deep JIT→JIT recursion overruns the **native** stack (ANTLR `closure()`); the overflow path faults instead of throwing a catchable `StackOverflowError`. Only arises with an *unmerged* cold-path-throughput experiment; needs stack-banging + a fault-recovery handler. | ⚪ **LATENT** (not a current blocker) | [springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md) §6–7 |
+
+> Bug **B** (JUnit `@Timeout` "interceptor invoked twice") is **FIXED** and archived — it was
+> never threading/`MethodHandle`: a synthetic natural-order compare raised `NoSuchMethodError`
+> instead of `ClassCastException` for a non-`Comparable` element, escaping Spring's `catch (CCE)`
+> and tripping JUnit's chain detector. See [`docs/internal/fixed-suite-bugs/spring-bug-04-junit-timeout-interceptor-double-proceed.md`](../internal/fixed-suite-bugs/spring-bug-04-junit-timeout-interceptor-double-proceed.md).
 
 ## Standalone — bug-06 assertion-mismatch family (Spring suite reflection/annotation tail)
 
@@ -170,15 +174,15 @@ Genuine open VM defects pulled in from the suite-specific trackers
 `docs/kafka-suite-0617/`) so this folder is the single map. **These are copies** —
 the originals remain in their suite folders (which keep their own numbering). Only
 open, distinct bugs were copied; FIXED docs (bug-03, crash-01/02/03,
-spring-bug-02/03/05/09/12, kafka bug-A) and already-consolidated ones (fam5/6,
-spring-bug-04) were left in place.
+spring-bug-02/03/04/05/09/12, kafka bug-A — see `docs/internal/fixed-suite-bugs/`)
+and already-consolidated ones (fam5/6) were left in place.
 
 | Bug | Category | Status | Doc |
 |---|---|---|---|
 | String constant corrupted → `Object` under load | VM-CORRECTNESS / GC | 🔴 **OPEN** — a **Family A** (GC-root-undercount) manifestation, load-dependent | [springsuite-bug-04-string-constant-corrupted-under-load.md](springsuite-bug-04-string-constant-corrupted-under-load.md) |
 | `MergedAnnotations` hang | VM-HANG | 🔴 **OPEN** — first hang found in the suite; annotation synthesis (cf. bug-06 F6) | [spring-bug-06-mergedannotations-hang.md](spring-bug-06-mergedannotations-hang.md) |
 | Serializable proxy round-trip | VM-CORRECTNESS (proxy + serialization) | 🔴 **OPEN** | [spring-bug-08-serializable-proxy-roundtrip.md](spring-bug-08-serializable-proxy-roundtrip.md) |
-| JUnit-platform execution `LoadError` | VM-CORRECTNESS / dispatch | 🔴 **OPEN** — JUnit platform internals; GC-race-adjacent (cf. bug-04) | [spring-bug-10-junit-platform-execution-loaderr.md](spring-bug-10-junit-platform-execution-loaderr.md) |
+| JUnit-platform execution `LoadError` | VM-CORRECTNESS / dispatch | 🔴 **OPEN** — JUnit platform internals; Family-A GC-root race (NOT related to the now-fixed bug-04, which was a non-`Comparable` compare exception-type bug, not a GC race) | [spring-bug-10-junit-platform-execution-loaderr.md](spring-bug-10-junit-platform-execution-loaderr.md) |
 | Groovy / scheduler crashes (rc=139) | VM-CRASH | 🟡 **PARTIAL** — Groovy SIGSEGV fixed via the bug-12 HashMap-layout fix; residual = a separate Groovy **hang at BEGIN** (inventory, needs per-cluster trace) | [spring-bug-11-groovy-and-scheduler-crashes.md](spring-bug-11-groovy-and-scheduler-crashes.md) |
 | Mockito `mockStatic` + mock dispatch | VM-CORRECTNESS (Mockito dispatch) | 🔴 **OPEN** — root-caused; High (Mockito pervasive in Kafka suite) | [kafka-bug-B-mockito-mockstatic-mock-dispatch.md](kafka-bug-B-mockito-mockstatic-mock-dispatch.md) |
 | `WeakHashMap` stream infinite hang | VM-HANG → JIT codegen | 🟡 **HANG FIXED** (`1cd0ab26`, JIT ban; verified) — underlying `dup_x1` field-post-increment codegen defect still OPEN | [kafka-bug-C-weakhashmap-stream-infinite-hang.md](kafka-bug-C-weakhashmap-stream-infinite-hang.md) |
