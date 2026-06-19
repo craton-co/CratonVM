@@ -3840,6 +3840,23 @@ fn native_jimage_get_native_map(
     )
 }
 
+/// Real-by-default gate for the `java.io.FileWriter` byte-fd shim. The synthetic
+/// shim (registered in `register_io_natives`) treats FileWriter as a byte-level
+/// FileOutputStream with the OS fd in field 0 and silently DROPS all *character*
+/// data: FileWriter is a char Writer whose real
+/// `Writer.write(String) -> write([CII)V -> StreamEncoder` path is NOT intercepted,
+/// so the fd-shim and the real encoder are split-brained and `close()` flushes an
+/// empty fd. Default: run the REAL FileWriter bytecode
+/// (`super(new FileOutputStream(file))` + OutputStreamWriter/StreamEncoder), which
+/// round-trips correctly on CratonVM. Opt back into the broken shim with
+/// `CRATONVM_SYNTHETIC_FILEWRITER=1`. See
+/// docs/known-issues/filewriter-newbufferedwriter-synthetic-data-loss.md.
+fn real_filewriter_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("CRATONVM_SYNTHETIC_FILEWRITER").as_deref() != Ok("1"))
+}
+
 pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -4073,6 +4090,11 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // path works unmodified.
 
     // --- java.io.FileWriter ---
+    // REAL-BY-DEFAULT (2026-06-18): the synthetic byte-fd FileWriter shim below
+    // silently DROPS all character data and is gated off by default. See
+    // `real_filewriter_enabled` and
+    // docs/known-issues/filewriter-newbufferedwriter-synthetic-data-loss.md.
+    if !real_filewriter_enabled() {
     // FileWriter wraps FileOutputStream; we use the same fd-in-field-0 layout.
     registry.register(
         "java/io/FileWriter",
@@ -4171,6 +4193,7 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register("java/io/FileWriter", "flush", "()V", native_fos_flush);
     registry.register("java/io/FileWriter", "close", "()V", native_fos_close);
+    } // end if !real_filewriter_enabled() — synthetic byte-fd FileWriter shim
 
     // RDR-MIGRATION 2026-06-01: the InputStreamReader natives below used to be
     // registered UNCONDITIONALLY (even in real-JDK mode). They were a

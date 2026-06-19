@@ -6158,6 +6158,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         }
     }
 
+    // REAL-BY-DEFAULT (2026-06-18): the synthetic fd-backed BufferedWriter that
+    // `Files.newBufferedWriter` returned silently DROPPED all character data (the
+    // real `BufferedWriter -> OutputStreamWriter -> StreamEncoder` flush path never
+    // reached the fd). Default: run the REAL `Files.newBufferedWriter` bytecode
+    // (`BufferedWriter(OutputStreamWriter(Files.newOutputStream(p), encoder))`),
+    // which round-trips correctly on CratonVM and flows through the real-aware
+    // `bw_delegate_out` BufferedWriter natives below. Opt back into the broken
+    // synthetic with `CRATONVM_SYNTHETIC_BUFFERED_WRITER=1`. See
+    // docs/known-issues/filewriter-newbufferedwriter-synthetic-data-loss.md.
+    if std::env::var("CRATONVM_SYNTHETIC_BUFFERED_WRITER").as_deref() == Ok("1") {
     r.register(
         files,
         "newBufferedWriter",
@@ -6178,6 +6188,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             open_buffered_writer(ctx, path_obj, append)
         },
     );
+    } // end if CRATONVM_SYNTHETIC_BUFFERED_WRITER — synthetic fd-backed newBufferedWriter
 
     // Minimal BufferedWriter natives backed by the fd stored at slot 0.
     // These are also registered in synthetic-jdk mode by phases_late, but
