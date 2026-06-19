@@ -276,6 +276,46 @@ pub(crate) fn capture_throwable_trace(ctx: &mut dyn NativeContext, this: ObjectR
     // in the identity-hash-keyed trace store).
     ctx.set_field_by_name(this, "backtrace", Value::Object(Some(this)));
     ctx.set_field_by_name(this, "depth", Value::Int(depth));
+    // Mirror the JDK field initializer `suppressedExceptions = SUPPRESSED_SENTINEL`.
+    init_suppressed_sentinel(ctx, this);
+}
+
+/// Mirror the JDK `Throwable` instance-field initializer
+/// `suppressedExceptions = SUPPRESSED_SENTINEL`.
+///
+/// Our `native_exc_init_*` natives SHADOW `Throwable.<init>`, so the real
+/// field initializer never runs and `suppressedExceptions` stays `null`.
+/// `Throwable.addSuppressed` treats a `null` list as "suppression disabled"
+/// and silently drops every call, so `getSuppressed()` always returned an
+/// empty array — e.g. Hibernate's `NamedQueryValidationException` aggregates
+/// each invalid-query error via `addSuppressed`, and
+/// `LoaderWithInvalidQueryTest` asserts `getSuppressed().length == 2`. This is
+/// the suppressed-list sibling of the `cause = this` mirroring in
+/// `write_throwable_cause`.
+///
+/// Only initializes when the field is still `null`, so a re-entrant
+/// `fillInStackTrace()` (which also funnels through `capture_throwable_trace`)
+/// never clobbers a list that `addSuppressed` already populated. Reading the
+/// real static keeps `addSuppressed`/`getSuppressed`'s `== SUPPRESSED_SENTINEL`
+/// identity checks valid.
+fn init_suppressed_sentinel(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    // Don't overwrite an already-initialized list — a populated `ArrayList`
+    // from `addSuppressed`, or the sentinel itself (a re-entrant
+    // `fillInStackTrace()` also funnels through `capture_throwable_trace`).
+    // An unset reference slot reads back as `Int(0)`, not `Object(None)`, so
+    // skip ONLY when the field already holds a non-null object reference.
+    if let Value::Object(Some(_)) = ctx.get_field_by_name(this, "suppressedExceptions") {
+        return;
+    }
+    let sentinel = ctx.class_id_by_name("java/lang/Throwable").and_then(|cid| {
+        ctx.static_field_index_by_name(cid, "SUPPRESSED_SENTINEL")
+            .map(|idx| ctx.get_static_field(cid, idx))
+    });
+    // Only mirror once `Throwable.<clinit>` has populated the sentinel; before
+    // that (bootstrap-era throwables) leave the field as-is.
+    if let Some(v @ Value::Object(Some(_))) = sentinel {
+        ctx.set_field_by_name(this, "suppressedExceptions", v);
+    }
 }
 
 /// Exception <init>(Ljava/lang/String;)V — sets detailMessage.

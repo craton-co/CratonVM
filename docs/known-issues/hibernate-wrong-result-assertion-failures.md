@@ -26,8 +26,8 @@ and bisect to the diverging native (collection/JDBC/reflection/serialization).
 | `entitygraph.EntityGraphBatchSizeTest` | `AssertionError` (empty) | `@BatchSize` fetch under an entity graph — batch-fetch count/ordering |
 | `bootstrap.registry.classloading.ClassLoaderServiceImplTest` | `expected:<1> but was:<0>` | **= HIB-CV-16** (user `ClassLoader` subclasses not virtualized) — already tracked |
 | `annotations.immutable.ImmutableWithAttributeConverterTest` | `SerializationException: could not deserialize` | `@Immutable` + `AttributeConverter` round-trip; a converted/serialized column value not restoring |
-| `connection.DriverManagerConnectionProviderValidationConfigTest` | `AssertionError` (empty) | connection-provider validation config — assertion on pool/validation state |
-| `annotations.loader.LoaderWithInvalidQueryTest` | `AssertionFailedError` (empty) | expects a specific failure for an invalid `@Loader` query; CV diverges (no error or wrong error) |
+| ✅ `connection.DriverManagerConnectionProviderValidationConfigTest` | `AssertionError` (empty) | **FIXED** (now passes; a watched-log assertion — resolved by the jboss-logging fix) |
+| ✅ `annotations.loader.LoaderWithInvalidQueryTest` | `AssertionFailedError` (empty) | **FIXED (nojit)** — not a `@Loader` issue; asserts `getSuppressed().length == 2`, but `Throwable.addSuppressed` silently dropped everything because shadowed `Throwable.<init>` left `suppressedExceptions` null (see **Resolved 2**). Still times out under **JIT** (separate pre-existing ANTLR-HQL-parse slowness, not the suppressed bug) |
 | `jpa.DetachedPreviousRowStateTest` | `'…product' is detached` | detached-entity state across a row update — cascade/merge state |
 
 (Membership grows as the census completes; `DriverManagerRegistrationTest`'s "Unanticipated failure
@@ -65,4 +65,44 @@ Both tests assert on **emitted log messages** via the testing infra (`@LoggingIn
 
 **Verified** vs HotSpot (binary `cratonvm-hiblog.exe`, JIT-on and `--nojit`): UniqueConstraintBatchingTest `ok=1`, DetachedBagDelayedOperationTest `ok=2`. No regression in the HIB-CV-11 log-inspection tests (`BootLoggingTests`, `SessionFactoryNamingTests` 5/5, `AnyTypeFlushToLoggableStringTest`, `ImmutableEntityUpdateQueryHandlingModeWarningTest`). Opt-out `CRATONVM_JBOSS_LOGGER_BASE_EMIT=1` restores the old short-circuit. Other full-suite log-assertion tests (e.g. `@MessageKeyInspection`/`Triggerable` users) likely benefit too.
 
-**Still open (separate root causes):** `EntityGraphBatchSizeTest`, `ImmutableWithAttributeConverterTest` (serialization), `DriverManagerConnectionProviderValidationConfigTest`, `LoaderWithInvalidQueryTest` (asserts `getSuppressed().length==2`, not a log watcher), `DetachedPreviousRowStateTest`; `ClassLoaderServiceImplTest` = HIB-CV-16.
+## Resolved 2 (2026-06-19) — `Throwable.addSuppressed` silently no-op'd (suppressedExceptions left null)
+
+**Branch:** `fix/throwable-suppressed-init`. Fixes `LoaderWithInvalidQueryTest` (under nojit).
+
+The test builds a SessionFactory whose entity has two invalid named queries; Hibernate's
+`NamedQueryValidationException` aggregates each error via `Throwable.addSuppressed(...)`, and the test
+asserts `rootCause.getSuppressed().length == 2`. On CratonVM it was `0` — and a one-line probe showed the
+primitive itself was broken: `new Exception(); e.addSuppressed(a); e.addSuppressed(b); e.getSuppressed().length`
+returned **0** (HotSpot: 2).
+
+**Root cause:** CratonVM shadows `Throwable.<init>` with native constructors
+(`native_exc_init_message`/`_noargs`/`_cause`, registered by `register_throwable_subclass_natives` for the
+whole Throwable family). They mirror `detailMessage` and the `cause = this` sentinel and capture the stack
+trace — but never initialized `suppressedExceptions`, which the real JDK field initializer sets to
+`SUPPRESSED_SENTINEL`. `Throwable.addSuppressed` treats a **null** `suppressedExceptions` as "suppression
+disabled" and returns immediately, so every `addSuppressed` was silently dropped and `getSuppressed()` was
+always empty. (Reflection confirmed: `cause == this` ✓ but `stackTrace == null` and
+`suppressedExceptions == null` after the ctor.) This also silently broke **try-with-resources** suppressed
+exceptions everywhere.
+
+**Fix** (`native-builtins/src/lang_misc.rs`): `capture_throwable_trace` (the shared chokepoint for all
+exception-init natives) now mirrors `suppressedExceptions = SUPPRESSED_SENTINEL` via a new
+`init_suppressed_sentinel`, reading the real static so `addSuppressed`/`getSuppressed`'s
+`== SUPPRESSED_SENTINEL` identity checks hold. It only writes when the field isn't already a non-null list
+(an unset reference slot reads back as `Int(0)`, not `Object(None)` — the guard accounts for that), so a
+re-entrant `fillInStackTrace()` never clobbers an `addSuppressed`-populated list.
+
+**Verified** vs HotSpot: primitive `getSuppressed().length == 2`; the LoaderProbe bootstrap repro shows
+`root.getSuppressed().length == 2` with both messages; try-with-resources reports `suppressed=2` matching
+HotSpot — all under JIT-on **and** `--nojit`. `LoaderWithInvalidQueryTest` `ok=1` under `--nojit`. No
+regression in UniqueConstraintBatchingTest / DetachedBagDelayedOperationTest.
+
+**Caveat:** `LoaderWithInvalidQueryTest` still FAILs under **JIT** — but with a `TimeoutException` (>120s),
+not the suppressed assertion. The named-query errors are produced correctly; the EMF build's ANTLR HQL
+parse is pathologically slow under CratonVM JIT and trips the test's own `@Timeout(120s)`. Separate,
+pre-existing JIT-perf issue (same family as the ANTLR `computeTargetState` blowup), unrelated to suppressed
+exceptions (the primitive is correct under JIT — see probes above).
+
+**Still open (separate root causes):** `EntityGraphBatchSizeTest`, `ImmutableWithAttributeConverterTest`
+(serialization), `DetachedPreviousRowStateTest`; `ClassLoaderServiceImplTest` = HIB-CV-16. Plus the
+JIT-only ANTLR-HQL-parse slowness above.
