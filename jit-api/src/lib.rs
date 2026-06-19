@@ -59,6 +59,71 @@ pub struct CachedBytecodeMethod {
     pub is_static: bool,
 }
 
+/// JEP 358 (helpful NPE) — operation-kind codes carried out-of-band from a
+/// JIT-originated `NullPointerException` so the interpreter's post-JIT drain
+/// can attach the *action-only* JEP-358 message ("Cannot load from int array",
+/// "Cannot read the array length", …).
+///
+/// **Single source of truth.** These `u8` codes are baked as `MOV` immediates
+/// by the inline null-check stubs in `jit/src/x64.rs` (the JIT crate, which
+/// cannot depend on the VM crate) AND mapped to their HotSpot `BytecodeUtils`
+/// strings by `vm/src/runtime/exceptions.rs::helpful_npe` (which re-exports this
+/// module as `jit_action`). Keeping the numeric vocabulary in `jit-api` — the
+/// one crate both sides already depend on — removes the drift hazard of two
+/// hand-kept copies.
+///
+/// Codes `0..=7` are the increment-4 originals (length + int/object/byte
+/// load/store); `8..=17` extend the vocabulary to the remaining primitive
+/// element kinds (long/float/double/char/short) so the inline-codegen null
+/// path can name every array element type HotSpot does. Values are **stable**
+/// (append-only): the JIT bakes them into RWX code, so never renumber.
+///
+/// `baload`/`bastore` cannot distinguish `byte[]` from `boolean[]` at the null
+/// site (same opcode, null receiver), so both map to [`ALOAD_BYTE`]/
+/// [`ASTORE_BYTE`] — matching the existing per-type JIT helpers. (HotSpot
+/// spells this "byte/boolean"; the divergence is pre-existing and tracked
+/// separately, not introduced here.)
+pub mod npe_action {
+    /// No action recorded — the interpreter emits an unmessaged NPE
+    /// (today's default shape). Inline sites with no precise array kind
+    /// (e.g. an intrinsic's array null-check) use this.
+    pub const NONE: u8 = 0;
+    /// `arraylength` on a null array.
+    pub const ARRAY_LENGTH: u8 = 1;
+    /// `iaload` on a null `int[]`.
+    pub const ALOAD_INT: u8 = 2;
+    /// `aaload` on a null reference array.
+    pub const ALOAD_OBJECT: u8 = 3;
+    /// `baload` on a null `byte[]`/`boolean[]`.
+    pub const ALOAD_BYTE: u8 = 4;
+    /// `iastore` into a null `int[]`.
+    pub const ASTORE_INT: u8 = 5;
+    /// `aastore` into a null reference array.
+    pub const ASTORE_OBJECT: u8 = 6;
+    /// `bastore` into a null `byte[]`/`boolean[]`.
+    pub const ASTORE_BYTE: u8 = 7;
+    /// `laload` on a null `long[]`.
+    pub const ALOAD_LONG: u8 = 8;
+    /// `faload` on a null `float[]`.
+    pub const ALOAD_FLOAT: u8 = 9;
+    /// `daload` on a null `double[]`.
+    pub const ALOAD_DOUBLE: u8 = 10;
+    /// `caload` on a null `char[]`.
+    pub const ALOAD_CHAR: u8 = 11;
+    /// `saload` on a null `short[]`.
+    pub const ALOAD_SHORT: u8 = 12;
+    /// `lastore` into a null `long[]`.
+    pub const ASTORE_LONG: u8 = 13;
+    /// `fastore` into a null `float[]`.
+    pub const ASTORE_FLOAT: u8 = 14;
+    /// `dastore` into a null `double[]`.
+    pub const ASTORE_DOUBLE: u8 = 15;
+    /// `castore` into a null `char[]`.
+    pub const ASTORE_CHAR: u8 = 16;
+    /// `sastore` into a null `short[]`.
+    pub const ASTORE_SHORT: u8 = 17;
+}
+
 /// Function pointer table for JIT runtime callbacks.
 ///
 /// The JIT compiler embeds these addresses into generated machine code as
@@ -189,6 +254,19 @@ pub struct JitRuntimeHelpers {
     /// exception. Appended at the END of the struct so all prior golden
     /// offsets stay stable.
     pub throw_exception: usize,
+    /// JEP 358 (helpful NPE), inline-codegen path — `extern "C" fn(code: i64)`.
+    /// Called by the per-action inline null-check failure stubs emitted in
+    /// `jit/src/x64.rs::emit_null_check_store_stubs`. Sets the pending-NPE flag
+    /// *with* the JEP-358 [`npe_action`] code passed in `code` (so the
+    /// interpreter's post-JIT NPE drain attaches the right action-only message
+    /// — "Cannot load from int array", …, gated behind
+    /// `-XX:+ShowCodeDetailsInExceptionMessages`) AND the out-of-band deopt
+    /// signal (each stub loads `i64::MIN` as the method return value). This
+    /// replaces the prior single shared stub that called `bastore(0)` and
+    /// therefore fabricated the byte-store action for every array opcode.
+    /// Appended at the END of the struct so all prior golden offsets stay
+    /// stable.
+    pub jit_npe_with_action: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -319,6 +397,7 @@ helper_fields! {
     (frame_record,                   FieldKind::OptionalPtr),
     (shadow_stack_offset_in_thread,  FieldKind::Offset),
     (throw_exception,                FieldKind::RequiredPtr),
+    (jit_npe_with_action,            FieldKind::RequiredPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -344,7 +423,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 41,
+    JitRuntimeHelpers::NUM_FIELDS == 42,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -393,8 +472,8 @@ impl JitRuntimeHelpers {
     /// fix: the previous bool-returning, dead-loop implementation
     /// silently returned `true` on a null `tlab_post_init` because the
     /// hand-maintained bulk array did not include it. The validator now
-    /// iterates the macro-generated `all_fields()` list — all 41 fields,
-    /// 34 of which are required pointers — so no field can be silently
+    /// iterates the macro-generated `all_fields()` list — all 42 fields,
+    /// 35 of which are required pointers — so no field can be silently
     /// uncovered.)
     pub fn validate(&self) -> Result<(), Vec<&'static str>> {
         let nulls = self.null_pointers();
@@ -493,6 +572,7 @@ mod tests {
             frame_record: 0x1110,
             shadow_stack_offset_in_thread: 0,
             throw_exception: 0x1118,
+            jit_npe_with_action: 0x1120,
         }
     }
 
@@ -687,6 +767,7 @@ mod tests {
             frame_record: 0,
             shadow_stack_offset_in_thread: 0,
             throw_exception: 0,
+            jit_npe_with_action: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -847,8 +928,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 41.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 41);
+        // And the macro-driven count is the canonical 42.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 42);
     }
 
     #[test]
@@ -899,6 +980,7 @@ mod tests {
             (38, "frame_record",                 std::mem::offset_of!(JitRuntimeHelpers, frame_record)),
             (39, "shadow_stack_offset_in_thread", std::mem::offset_of!(JitRuntimeHelpers, shadow_stack_offset_in_thread)),
             (40, "throw_exception",              std::mem::offset_of!(JitRuntimeHelpers, throw_exception)),
+            (41, "jit_npe_with_action",          std::mem::offset_of!(JitRuntimeHelpers, jit_npe_with_action)),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -935,8 +1017,8 @@ mod tests {
 
     #[test]
     fn jit_runtime_helpers_all_fields_classified() {
-        // The macro must classify every field. 34 RequiredPtr + 4
-        // Offset + 3 OptionalPtr = 41. A new field whose classification
+        // The macro must classify every field. 35 RequiredPtr + 4
+        // Offset + 3 OptionalPtr = 42. A new field whose classification
         // is omitted will fail to compile (the macro requires both
         // arms); this test pins the *counts* so a reclassification
         // (e.g. demoting a RequiredPtr to OptionalPtr) is also a
@@ -946,7 +1028,7 @@ mod tests {
         let req = f.iter().filter(|e| e.kind == FieldKind::RequiredPtr).count();
         let opt = f.iter().filter(|e| e.kind == FieldKind::OptionalPtr).count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
-        assert_eq!(req, 34, "required-pointer count drifted");
+        assert_eq!(req, 35, "required-pointer count drifted");
         assert_eq!(opt, 3, "optional-pointer count drifted");
         assert_eq!(off, 4, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
@@ -958,7 +1040,7 @@ mod tests {
         // must NOT reject on that. (Regression for the round-9 fix —
         // the previous `validate()` looped over a hand-maintained array
         // that omitted all offset/optional fields, so this was true
-        // by accident. The new validator iterates ALL 41 fields and
+        // by accident. The new validator iterates ALL 42 fields and
         // must still pass when offsets are zero.)
         let mut h = make_helpers();
         h.tlab_cursor_offset_in_thread = 0;
@@ -990,7 +1072,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::RequiredPtr)
             .map(|e| e.name)
             .collect();
-        assert_eq!(names.len(), 34);
+        assert_eq!(names.len(), 35);
         for name in names {
             let mut h = make_helpers();
             // Zero the field by name via a match — the macro doesn't
@@ -1036,13 +1118,19 @@ mod tests {
             .filter(|e| e.kind == FieldKind::RequiredPtr)
             .map(|e| e.name)
             .collect();
-        assert_eq!(required.len(), 34, "expected 34 required pointers");
+        assert_eq!(required.len(), 35, "expected 35 required pointers");
         // throw_exception is the round-10 addition — pin it explicitly so
         // a regression that drops it from the required set is caught here
         // and not just by the count.
         assert!(
             required.contains(&"throw_exception"),
             "throw_exception must be a required (null-rejected) pointer",
+        );
+        // jit_npe_with_action is the JEP-358 inline-NPE-path addition — pin it
+        // explicitly for the same reason.
+        assert!(
+            required.contains(&"jit_npe_with_action"),
+            "jit_npe_with_action must be a required (null-rejected) pointer",
         );
 
         for name in &required {
@@ -1115,6 +1203,7 @@ mod tests {
             // sweep panics on it and the required-null coverage is silently
             // incomplete (the exact failure mode this test guards against).
             "throw_exception" => h.throw_exception = 0,
+            "jit_npe_with_action" => h.jit_npe_with_action = 0,
             other => panic!("unknown required-pointer field name in test: {}", other),
         }
     }

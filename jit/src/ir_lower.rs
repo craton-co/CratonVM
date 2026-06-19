@@ -804,9 +804,20 @@ impl<'a> Lowerer<'a> {
         }
         let node = &self.graph.nodes[node_id as usize];
         match node.op {
-            // Integer / long constants need no machine location.
-            Op::Const(v) => FrameValue::Int(v),
-            // Float / double constant bits.
+            // Integer / long constants need no machine location. A `long`
+            // constant doesn't fit a `Value::Int` resume slot (it would
+            // truncate), so mark it Unsupported until cat-2 two-slot expansion
+            // lands; a cat-1 `int` constant resolves directly.
+            Op::Const(v) => {
+                if node.ty == IrType::Long {
+                    FrameValue::Unsupported
+                } else {
+                    FrameValue::Int(v)
+                }
+            }
+            // Float / double constant bits. FP-slot resume is a follow-up, so
+            // the resume currently re-runs on a `Float` slot (safe) — the value
+            // is carried for a future FP-aware resume.
             Op::ConstF(bits) => FrameValue::Float(bits),
             Op::Param(idx) => {
                 // The prologue stored param `idx` at `[rbp - (idx+1)*8]`. If
@@ -818,12 +829,12 @@ impl<'a> Lowerer<'a> {
                 } else {
                     ((idx as i32) + 1) * 8
                 };
-                FrameValue::StackSlot(-off)
+                Self::typed_stack_slot(-off, node.ty)
             }
             _ => {
                 let slot = self.node_slot[node_id as usize];
                 if slot != 0 {
-                    FrameValue::StackSlot(-slot)
+                    Self::typed_stack_slot(-slot, node.ty)
                 } else {
                     // No machine location assigned (unscheduled / dead in this
                     // naive lowerer). A real resolver would never see this for
@@ -831,6 +842,23 @@ impl<'a> Lowerer<'a> {
                     FrameValue::Undefined
                 }
             }
+        }
+    }
+
+    /// Encode a spilled value at `off` (relative to `rbp`) as a typed
+    /// `FrameValue` location, driven by the IR node's value type
+    /// (`real-frame-deopt` type source). A `Ref` slot becomes `StackSlotRef`
+    /// (resolves to a `Value::Object`); a cat-1 `Int` slot stays `StackSlot`
+    /// (resolves to `Value::Int`). Category-2 (`Long`/`Double`) and FP (`Float`)
+    /// slots are `Unsupported` for now — the resume falls back to the safe
+    /// re-run path rather than truncate/mistype them (two-slot expansion + FP
+    /// resolution are follow-ups). `Void`/`Control`/`Memory` are never live
+    /// data slots, so they too map to `Unsupported`.
+    fn typed_stack_slot(off: i32, ty: IrType) -> FrameValue {
+        match ty {
+            IrType::Ref => FrameValue::StackSlotRef(off),
+            IrType::Int => FrameValue::StackSlot(off),
+            _ => FrameValue::Unsupported,
         }
     }
 

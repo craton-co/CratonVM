@@ -93,6 +93,7 @@ fn helpers() -> JitRuntimeHelpers {
         frame_record: 0,
         shadow_stack_offset_in_thread: 0,
         throw_exception: s,
+        jit_npe_with_action: s,
     }
 }
 

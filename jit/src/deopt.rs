@@ -79,12 +79,26 @@ pub enum FrameValue {
     Object(u64),
     /// Value currently in a machine register.
     Register(u8),
-    /// Value at a native stack slot offset.
+    /// Value at a native stack slot offset, holding a cat-1 **int** (JVM
+    /// `int`/`boolean`/`byte`/`char`/`short`). Resolves to [`FrameValue::Int`].
     StackSlot(i32),
+    /// Value at a native stack slot offset, holding an **object reference**
+    /// (`real-frame-deopt` type source). Resolves to [`FrameValue::Object`] —
+    /// the raw word read from the slot IS the heap pointer. Distinct from
+    /// `StackSlot` so the resume builds a `Value::Object` (not a truncated
+    /// `Value::Int`) for ref-typed locals/stack slots such as an instance
+    /// method's `this`.
+    StackSlotRef(i32),
     /// Scalar-replaced object that must be re-materialized.
     VirtualObject(VirtualObjectState),
     /// Undefined / uninitialized.
     Undefined,
+    /// A live slot whose precise value can't yet be reconstructed for resume
+    /// (category-2 `long`/`double`, or a float-in-slot — the two-slot
+    /// expansion and FP-slot resolution are follow-ups). The resume treats this
+    /// as "fall back to the safe re-run path" rather than fabricate a value, so
+    /// a method with such a slot live at a guard is never resumed with garbage.
+    Unsupported,
 }
 
 /// State of a scalar-replaced object that needs heap materialization.
@@ -793,6 +807,15 @@ fn resolve_value(v: &FrameValue, regs: &SavedRegisters, rbp: u64) -> FrameValue 
             // SAFETY: see function-level contract — frame is live, slot in-frame.
             FrameValue::Int(unsafe { addr.read_unaligned() })
         }
+        FrameValue::StackSlotRef(off) => {
+            let addr = (rbp as i64 + *off as i64) as u64 as *const u64;
+            // SAFETY: see function-level contract — frame is live, slot in-frame.
+            // The word IS the object pointer (0 == null); the resume builds a
+            // `Value::Object` from it. Reading it here (synchronously, before any
+            // Java-heap allocation) keeps the oop current — no GC has run since
+            // the guard captured it.
+            FrameValue::Object(unsafe { addr.read_unaligned() })
+        }
         other => other.clone(),
     }
 }
@@ -949,6 +972,48 @@ mod tests {
             speculation_id: 0,
             frame_state: simple_frame_state(),
         }
+    }
+
+    // -- real-frame-deopt type source -------------------------------------
+
+    /// `resolve_value` (via `reconstruct_frame_from_machine_state`) reads a
+    /// `StackSlotRef` slot as an `Object` (the raw word IS the heap pointer),
+    /// a `StackSlot` slot as an `Int`, and passes `Unsupported` through — so
+    /// the resume can build a real `Value::Object` for ref slots instead of a
+    /// truncated `Value::Int`.
+    #[test]
+    fn reconstruct_resolves_typed_slots() {
+        // A fake native frame. `resolve_value` reads `*(rbp + off)`; the IR
+        // convention stores spills below rbp, so we point `rbp` into the middle
+        // of the buffer and use negative offsets.
+        //   buf[0] @ rbp-16 (ref slot), buf[1] @ rbp-8 (int slot).
+        let buf: [u64; 3] = [0x1111_2222_3333_4444, 0x0000_0000_DEAD_BEEF, 0];
+        let rbp = (&buf[2] as *const u64) as u64;
+        let regs = SavedRegisters::default();
+        let fs = FrameState {
+            method_key: "T.m:()V".to_string(),
+            bci: 3,
+            locals: vec![
+                FrameValue::StackSlotRef(-16),
+                FrameValue::StackSlot(-8),
+                FrameValue::Unsupported,
+            ],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller: None,
+        };
+        let dp = DeoptimizationPoint {
+            native_offset: 0,
+            bci: 3,
+            reason: DeoptReason::DivByZero,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: fs,
+        };
+        let rf = reconstruct_frame_from_machine_state(&dp, &regs, rbp);
+        assert_eq!(rf.locals[0], FrameValue::Object(0x1111_2222_3333_4444));
+        assert_eq!(rf.locals[1], FrameValue::Int(0xDEAD_BEEF));
+        assert_eq!(rf.locals[2], FrameValue::Unsupported);
     }
 
     // -- DeoptReason -------------------------------------------------------

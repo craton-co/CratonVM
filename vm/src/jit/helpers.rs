@@ -546,6 +546,41 @@ pub extern "C" fn jit_set_deopt_pending() {
     set_jit_deopt_pending();
 }
 
+/// JEP 358 (helpful NPE), inline-codegen path — `extern "C"` trampoline for the
+/// per-action inline null-check failure stubs emitted in
+/// `jit/src/x64.rs::emit_null_check_store_stubs`.
+///
+/// Each inline array load/store/`arraylength` null-check site is grouped by its
+/// JEP-358 [`cratonvm_jit_api::npe_action`] code, and the per-action stub passes
+/// that code here. We set the pending-NPE flag *with* the code (so the
+/// interpreter's post-JIT NPE drain attaches the right action-only message —
+/// "Cannot load from int array", …, gated behind
+/// `-XX:+ShowCodeDetailsInExceptionMessages`) and the out-of-band deopt signal
+/// (the stub loads `i64::MIN` as the method return value, so the interpreter
+/// must not mistake it for a real `Long.MIN_VALUE`).
+///
+/// This replaces the old single shared stub, which called `jit_bastore(0)` and
+/// therefore fabricated `ASTORE_BYTE` ("Cannot store to byte array") for *every*
+/// inline array opcode regardless of its real element type or load/store
+/// direction. `code == NONE` (0) sets a bare (unmessaged) NPE — the same shape
+/// as today's default path — which is what the non-array intrinsic null-check
+/// sites use.
+///
+/// SAFETY: no pointer arguments; only touches thread-locals. Safe to call from
+/// JIT-compiled code at any point before loading the `i64::MIN` sentinel. The
+/// `code` is truncated to `u8`; an out-of-range value maps to no message
+/// (`jit_action_message` returns `None`), never a panic.
+pub extern "C" fn jit_npe_with_action(code: i64) {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache,
+    // matching every other array/field helper's entry (the next GC must
+    // re-scan after we deopt back out to the interpreter).
+    crate::jit::conservative_roots::note_jit_boundary();
+    set_jit_pending_npe_action(code as u8);
+    // Out-of-band deopt signal: the stub loads `i64::MIN` as the return value
+    // (same invariant as `jit_bastore`'s null arm did before).
+    set_jit_deopt_pending();
+}
+
 /// Obtain an exclusive reference to the JIT thread. Returns `None` if not set,
 /// otherwise the `&mut JvmThread` paired with a [`JitThreadGuard`] RAII token.
 ///
@@ -1534,18 +1569,16 @@ pub unsafe extern "C" fn jit_baload(array_ptr: i64, index: i64) -> i64 {
 // pointer to a byte/boolean array object. Null aborts the process — see comment.
 // Out-of-bounds is handled gracefully.
 //
-// Round-9 jit HIGH fix (audit `round9-jit.md`, fragile-ABI item): this helper
-// is part of an undocumented ABI contract relied on by the inline null-check
-// failure stub in `jit/src/x64.rs::emit_null_check_store_stubs`. That stub
-// calls `helpers.bastore(0, 0, 0)` after zeroing only the `array_ptr` argument
-// register — `index` and `val` are left undefined / zeroed only by happenstance
-// of the calling convention's volatile-register set. THIS HELPER MUST handle
-// `array_ptr == 0` by setting the pending-NPE flag and returning WITHOUT
-// reading `index` or `val`, regardless of their content. The null-guard short
-// circuit below is therefore load-bearing for that codegen path; do not move
-// any read of `index` or `val` above the null check, do not "optimize" the
-// null check away even if profiling shows nulls are rare, and do not change
-// the signature without also updating `emit_null_check_store_stubs` to match.
+// JEP 358 inline-NPE-path update (2026-06): the inline null-check failure stub
+// in `jit/src/x64.rs::emit_null_check_store_stubs` NO LONGER calls this helper —
+// it now calls the dedicated `jit_npe_with_action(code)` so it can attach the
+// correct per-element-type JEP-358 action (the old shared stub called
+// `bastore(0)` and therefore fabricated `ASTORE_BYTE` for every array opcode).
+// The `array_ptr == 0` null guard below is retained as honest defense-in-depth
+// for any *direct* compiled call to this helper (it stays registered in
+// `JitRuntimeHelpers` for ABI stability), and still must not read `index`/`val`
+// on the null path. The fragile "zeroed-by-happenstance argument register" ABI
+// coupling the previous comment described is gone with the shared-stub call.
 pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
@@ -5096,6 +5129,11 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         shadow_stack_offset_in_thread: JvmThread::shadow_stack_offset(),
         // RBC.6 — athrow lowering: stash pending exception + sentinel.
         throw_exception: jit_throw_exception as *const () as usize,
+        // JEP 358 (helpful NPE), inline-codegen path — per-action null-check
+        // failure stub target. Sets the pending NPE *with* its JEP-358 action
+        // code so the interpreter drain can attach the right action-only
+        // message.
+        jit_npe_with_action: jit_npe_with_action as *const () as usize,
     }
 }
 

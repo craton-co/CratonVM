@@ -14032,6 +14032,17 @@ fn native_unsafe_object_field_offset(
             slot
         };
 
+        if std::env::var("CRATONVM_DBG_PXSER").is_ok() {
+            if let Some((class_id, field_name)) =
+                crate::lang_class::field_class_and_name(ctx, *field_obj)
+            {
+                let cname = ctx.class_name_of_id(class_id).unwrap_or_default();
+                if cname.contains("Proxy") {
+                    eprintln!("[PXSER] objectFieldOffset(Field) class={cname:?} field={field_name:?} -> slot={effective_slot}");
+                }
+            }
+        }
+
         return Ok(Some(Value::Long(effective_slot as i64)));
     }
     Ok(Some(Value::Long(0)))
@@ -16078,6 +16089,12 @@ fn native_unsafe_object_field_offset1(
             let fields = ctx.declared_fields(cid);
             for f in &fields {
                 if !f.is_static && f.name == field_name {
+                    if std::env::var("CRATONVM_DBG_PXSER").is_ok() && field_name == "h" {
+                        let owner = ctx.class_name_of_id(cid);
+                        let queried = ctx.class_name_of_id(class_id);
+                        let tot = ctx.class_num_total_fields(cid);
+                        eprintln!("[PXSER] objectFieldOffset1 field=h queried={queried:?} owner={owner:?} slot_index={} owner_total_fields={tot}", f.slot_index);
+                    }
                     return Ok(Some(Value::Long(f.slot_index as i64)));
                 }
             }
@@ -35445,6 +35462,25 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 // synthetic stub loaded without bytecode can report 0 fields).
                 let min_fields = if use_real_super { 1 } else { 3 };
                 let n = ctx.class_num_total_fields(cid).max(min_fields);
+                if std::env::var("CRATONVM_DBG_PXSER").is_ok() {
+                    let cn = ctx.class_name_of_id(cid);
+                    let raw = ctx.class_num_total_fields(cid);
+                    eprintln!("[PXSER] alloc proxy class={cn:?} real_super={use_real_super} class_num_total_fields={raw} alloc_slots={n} (handler->slot 0)");
+                    // Dump the whole hierarchy's instance-field layout (slot_index)
+                    // so we can see where `h` actually lands for serialization.
+                    let mut walk = Some(cid);
+                    while let Some(c) = walk {
+                        let nm = ctx.class_name_of_id(c);
+                        let tot = ctx.class_num_total_fields(c);
+                        let fs: Vec<(String, usize, bool)> = ctx
+                            .declared_fields(c)
+                            .into_iter()
+                            .map(|f| (f.name, f.slot_index, f.is_static))
+                            .collect();
+                        eprintln!("[PXSER]   class={nm:?} total_fields={tot} declared={fs:?}");
+                        walk = ctx.superclass_of(c);
+                    }
+                }
                 (ctx.alloc_object(cid, n), use_real_super)
             }
             ProxyClassOutcome::Degrade => (

@@ -62,6 +62,10 @@
 
 use super::{CompiledMethod, ExecutableBuffer, JitInvokeInfo};
 use cratonvm_jit_api::JitRuntimeHelpers;
+// JEP 358 (helpful NPE) inline-codegen path: the canonical operation-kind
+// vocabulary baked into the inline null-check failure stubs. Single source of
+// truth in jit-api (the VM crate maps these same codes to HotSpot strings).
+use cratonvm_jit_api::npe_action;
 #[allow(unused_imports)]
 use cratonvm_types::{
     ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, FIELD_CELL_PAYLOAD64_OFFSET,
@@ -2737,6 +2741,40 @@ fn preceding_aload_nonnull_local(code: &[u8], pc: usize) -> Option<usize> {
     None
 }
 
+/// JEP 358 (helpful NPE) inline-codegen path — map the array load/store
+/// opcode at `code[bc_pc]` to its [`npe_action`] code, so the inline
+/// null-check failure stub can attach the right HotSpot-style action-only
+/// message ("Cannot load from int array", "Cannot store to char array", …).
+///
+/// `baload`/`bastore` cannot distinguish `byte[]` from `boolean[]` at the
+/// null site (same opcode), so both map to the byte action — matching the
+/// per-type JIT helpers. An unexpected opcode (the function is only called
+/// from array-load/store arms, so this is defensive) maps to
+/// [`npe_action::NONE`] (unmessaged), never a wrong message.
+fn array_opcode_npe_action(code: &[u8], bc_pc: usize) -> u8 {
+    match code.get(bc_pc).copied() {
+        // Loads: iaload laload faload daload aaload baload caload saload
+        Some(0x2e) => npe_action::ALOAD_INT,
+        Some(0x2f) => npe_action::ALOAD_LONG,
+        Some(0x30) => npe_action::ALOAD_FLOAT,
+        Some(0x31) => npe_action::ALOAD_DOUBLE,
+        Some(0x32) => npe_action::ALOAD_OBJECT,
+        Some(0x33) => npe_action::ALOAD_BYTE,
+        Some(0x34) => npe_action::ALOAD_CHAR,
+        Some(0x35) => npe_action::ALOAD_SHORT,
+        // Stores: iastore lastore fastore dastore aastore bastore castore sastore
+        Some(0x4f) => npe_action::ASTORE_INT,
+        Some(0x50) => npe_action::ASTORE_LONG,
+        Some(0x51) => npe_action::ASTORE_FLOAT,
+        Some(0x52) => npe_action::ASTORE_DOUBLE,
+        Some(0x53) => npe_action::ASTORE_OBJECT,
+        Some(0x54) => npe_action::ASTORE_BYTE,
+        Some(0x55) => npe_action::ASTORE_CHAR,
+        Some(0x56) => npe_action::ASTORE_SHORT,
+        _ => npe_action::NONE,
+    }
+}
+
 /// Round-11 HIGH-2 helper — for array load/store opcodes at `pc`, try
 /// to identify the local index that sourced the *array receiver* on
 /// the operand stack. The standard javac pattern is:
@@ -5288,17 +5326,26 @@ struct Compiler {
     /// After the main bytecode loop, we emit the slow-path code for each.
     bounds_check_stubs: Vec<usize>,
     /// Round-8 CRIT fix (audit `round8-jit.md`, "false-promise abort" item):
-    /// deferred null-check failure stubs for inline array-store opcodes
-    /// (iastore / bastore / aastore / lastore / fastore / dastore / castore /
-    /// sastore). The inline bounds check would otherwise dereference the
-    /// null array pointer at `[NULL + ARRAY_LENGTH_OFFSET]`, hitting the
-    /// signal-handler hs_err path that just re-raises and kills the VM.
-    /// Each `TEST RAX, RAX; JZ rel32` is recorded as a patch offset; a
-    /// single shared stub at the end calls `jit_bastore` with `array_ptr=0`
-    /// (which sets `JIT_PENDING_NPE` and returns) and then exits via the
-    /// method epilogue with `RAX = i64::MIN`. The interpreter's post-JIT
-    /// path drains the NPE flag and surfaces the exception.
-    null_check_store_stubs: Vec<usize>,
+    /// deferred null-check failure stubs for inline array load/store/length
+    /// opcodes (iastore / bastore / aastore / lastore / fastore / dastore /
+    /// castore / sastore plus the load + `arraylength` siblings). The inline
+    /// bounds check would otherwise dereference the null array pointer at
+    /// `[NULL + ARRAY_LENGTH_OFFSET]`, hitting the signal-handler hs_err path
+    /// that just re-raises and kills the VM.
+    ///
+    /// Each entry is `(action, patch_offset)`: `action` is the JEP-358
+    /// [`cratonvm_jit_api::npe_action`] code for the trapping opcode (so the
+    /// interpreter can attach "Cannot load from int array" etc. when
+    /// `-XX:+ShowCodeDetailsInExceptionMessages` is on), and `patch_offset` is
+    /// the rel32 placeholder of the `TEST RAX,RAX; JZ rel32`. At method end
+    /// [`Self::emit_null_check_store_stubs`] groups entries by `action` and
+    /// emits ONE stub per distinct code, each calling `jit_npe_with_action(code)`
+    /// (which sets `JIT_PENDING_NPE` + the action + the deopt flag) and exiting
+    /// via the method epilogue with `RAX = i64::MIN`. The interpreter's post-JIT
+    /// path drains the NPE flag and surfaces the (action-only) exception.
+    /// (Previously a single shared stub called `jit_bastore(0)`, which set the
+    /// byte-store action for *every* opcode regardless of element type.)
+    null_check_store_stubs: Vec<(u8, usize)>,
     /// Post-invoke exception checks. After every JIT-dispatched invoke
     /// (`invoke_dispatch` / `invoke_virtual_mic`) whose callee can throw,
     /// the codegen emits a `CMP RAX, i64::MIN; JE rel32` guard. The
@@ -11901,14 +11948,14 @@ impl Compiler {
     /// The previous `process::abort()` in `vm/src/jit/helpers.rs`
     /// jit_iastore/bastore/aastore was a comment-level "fail loudly"
     /// theater because the helpers were never reached on the inline path.
-    fn emit_null_check_array_store(&mut self) {
+    fn emit_null_check_array_store(&mut self, action: u8) {
         // TEST RAX, RAX  (48 85 C0)
         self.buf.emit(&[0x48, 0x85, 0xC0]);
         // JZ rel32 → null-store stub (patched later)
         self.buf.emit(&[0x0F, 0x84]);
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-        self.null_check_store_stubs.push(patch_offset);
+        self.null_check_store_stubs.push((action, patch_offset));
     }
 
     /// Round-11 HIGH-2: variant of `emit_null_check_array_store` that
@@ -11931,7 +11978,9 @@ impl Compiler {
                 return;
             }
         }
-        self.emit_null_check_array_store();
+        // JEP 358: the trapping opcode IS at `code[bc_pc]` (the array-store
+        // arm passes its own pc), so derive the per-element-type action.
+        self.emit_null_check_array_store(array_opcode_npe_action(code, bc_pc));
     }
 
     /// Round-9 HIGH fix (asymmetric coverage): emit an inline null check
@@ -11949,14 +11998,14 @@ impl Compiler {
     /// run the epilogue. We therefore reuse the SAME shared stub by
     /// pushing the JZ patch offset into the same `null_check_store_stubs`
     /// vector; both loads and stores branch to it.
-    fn emit_null_check_array_load(&mut self) {
+    fn emit_null_check_array_load(&mut self, action: u8) {
         // TEST RAX, RAX  (48 85 C0)
         self.buf.emit(&[0x48, 0x85, 0xC0]);
         // JZ rel32 → shared null-check stub (patched later)
         self.buf.emit(&[0x0F, 0x84]);
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-        self.null_check_store_stubs.push(patch_offset);
+        self.null_check_store_stubs.push((action, patch_offset));
     }
 
     /// Round-11 HIGH-2 (mirrors `emit_null_check_array_store_at`):
@@ -11970,7 +12019,8 @@ impl Compiler {
                 return;
             }
         }
-        self.emit_null_check_array_load();
+        // JEP 358: derive the per-element-type action from the trapping opcode.
+        self.emit_null_check_array_load(array_opcode_npe_action(code, bc_pc));
     }
 
     /// Emit an inline null check on the `arraylength` receiver (assumed
@@ -12004,8 +12054,9 @@ impl Compiler {
                 }
             }
         }
-        // Reuse the shared stub used by array loads/stores.
-        self.emit_null_check_array_load();
+        // Reuse the shared null-check stub machinery; the action is the
+        // `arraylength` JEP-358 code ("Cannot read the array length").
+        self.emit_null_check_array_load(npe_action::ARRAY_LENGTH);
     }
 
     /// Emit an array bounds check. RAX=array ptr, RCX=index (as i64).
@@ -12312,75 +12363,91 @@ impl Compiler {
         }
     }
 
-    /// Round-8 CRIT fix (audit `round8-jit.md`): emit the shared null-check
-    /// failure stub for inline array stores. All `JZ` branches recorded by
-    /// [`emit_null_check_array_store`] are patched to point here.
+    /// Round-8 CRIT fix (audit `round8-jit.md`): emit the inline null-check
+    /// failure stubs for inline array loads / stores / `arraylength`. All `JZ`
+    /// branches recorded by [`emit_null_check_array_store`] /
+    /// [`emit_null_check_array_load`] are patched to point at a stub.
     ///
-    /// The stub zeroes the array_ptr argument register, calls
-    /// `helpers.bastore` (which on null sets `JIT_PENDING_NPE` and returns
-    /// without dereferencing), loads `i64::MIN` into RAX, and runs the
-    /// method epilogue. The interpreter's post-JIT path drains the NPE
-    /// flag on every JIT return (round-8 fix in
-    /// `vm/src/runtime/interpreter.rs`) and surfaces the NPE.
+    /// JEP 358 (helpful NPE) inline-codegen path: each recorded entry carries an
+    /// [`npe_action`] code for its trapping opcode. We emit ONE stub per
+    /// *distinct* code present in the method, so a null `iaload` and a null
+    /// `castore` deopt through separate stubs that report "Cannot load from int
+    /// array" vs "Cannot store to char array" respectively. Each stub loads its
+    /// action code into the first argument register and calls
+    /// `helpers.jit_npe_with_action(code)` (which sets `JIT_PENDING_NPE` *with*
+    /// the action and the deopt flag), then loads `i64::MIN` into RAX and runs
+    /// the method epilogue. The interpreter's post-JIT path drains the NPE flag
+    /// on every JIT return and surfaces the (gated) action-only message.
     ///
-    /// We deliberately reuse the existing `helpers.bastore` rather than
-    /// add a dedicated `set_npe_and_return` helper to keep this change
-    /// surface tiny — the `bastore` helper short-circuits on null after
-    /// setting the flag, so the call has no other side effects.
+    /// This replaced the prior single shared stub that called
+    /// `helpers.bastore(0)` — which fabricated `ASTORE_BYTE` ("Cannot store to
+    /// byte array") for *every* inline array opcode regardless of element type
+    /// or load/store direction. The fast path (`TEST RAX,RAX; JZ`) is unchanged;
+    /// only these cold out-of-line stubs differ. The number of stubs is bounded
+    /// by the distinct element kinds the method touches (≤ ~18), all cold.
     ///
-    /// ABI CONTRACT (round-9 jit HIGH fix, audit `round9-jit.md`): this
-    /// stub depends on `helpers.bastore` accepting `(array_ptr=0, index=?,
-    /// val=?)` and returning without dereferencing — only `array_ptr` is
-    /// explicitly zeroed below (the other two argument registers retain
-    /// whatever value the original inline-store codegen left in them, which
-    /// may be poison). The helper's matching contract is documented inline
-    /// at `vm/src/jit/helpers.rs::jit_bastore`: it MUST handle `array_ptr
-    /// == 0` by setting the pending-NPE flag and returning WITHOUT reading
-    /// `index` or `val`. If either the helper signature or its null-guard
-    /// short-circuit changes, update both sites in lock-step.
+    /// `null_check_store_stubs` is left intact (not drained): a later
+    /// `has_dispatch` computation reads `!is_empty()` to force the
+    /// dispatch-aware entry path that drains the NPE flag.
     fn emit_null_check_store_stubs(&mut self) {
         if self.null_check_store_stubs.is_empty() {
             return;
         }
 
-        let stub_offset = self.buf.pos();
+        // Clone the (action, patch_offset) entries so we can borrow `self`
+        // mutably (emit_call_absolute / emit_epilogue) while iterating. The
+        // field itself stays populated for the `has_dispatch` check downstream.
+        let entries = self.null_check_store_stubs.clone();
 
-        // Zero the array_ptr argument register so `jit_bastore`'s null
-        // guard fires and sets the pending-NPE flag. The index and val
-        // arguments are ignored on the null path; we don't bother clearing
-        // them.
-        #[cfg(target_os = "windows")]
-        {
-            // Windows: arg1 = RCX
-            // XOR ECX, ECX  (31 C9) — zero-extends to RCX
-            self.buf.emit(&[0x31, 0xC9]);
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            // SysV: arg1 = RDI
-            // XOR EDI, EDI  (31 FF) — zero-extends to RDI
-            self.buf.emit(&[0x31, 0xFF]);
-        }
+        // Distinct action codes in first-seen order (small set, ≤ ~18). Emit one
+        // stub per code; all JZ sites with that code patch to it.
+        let mut emitted: Vec<u8> = Vec::new();
+        for &(action, _) in &entries {
+            if emitted.contains(&action) {
+                continue;
+            }
+            emitted.push(action);
 
-        // CALL jit_bastore (absolute). On array_ptr=0 the helper sets
-        // JIT_PENDING_NPE and returns. RAX is now clobbered by the call.
-        self.emit_call_absolute(self.helpers.bastore);
+            let stub_offset = self.buf.pos();
 
-        // MOV RAX, i64::MIN  — deopt sentinel so the interpreter's post-JIT
-        // path treats this as a deopt return and runs the NPE drain.
-        // 48 B8 <imm64>
-        self.buf.emit(&[0x48, 0xB8]);
-        self.buf.emit(&(i64::MIN as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
+            // MOV <arg1>, action  — `MOV r32, imm32` zero-extends to the full
+            // 64-bit argument register, so the `i64` code arg is exactly the
+            // (always-non-negative) action code.
+            #[cfg(target_os = "windows")]
+            {
+                // Windows arg1 = RCX → MOV ECX, imm32 (B9 id).
+                self.buf.emit_byte(0xB9);
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                // SysV arg1 = RDI → MOV EDI, imm32 (BF id).
+                self.buf.emit_byte(0xBF);
+            }
+            self.buf.emit(&(action as u32).to_le_bytes()); // Cast: x86-64 imm32
 
-        // Standard method epilogue: restore callee-saved regs and return.
-        self.emit_epilogue();
+            // CALL jit_npe_with_action (absolute). Sets JIT_PENDING_NPE + the
+            // action code + the deopt flag. RAX is clobbered by the call.
+            self.emit_call_absolute(self.helpers.jit_npe_with_action);
 
-        // Patch every recorded JZ branch to point to the shared stub.
-        for &patch_off in &self.null_check_store_stubs {
-            let rel32 = (stub_offset as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
-            self.buf
-                .try_patch_i32(patch_off, rel32)
-                .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+            // MOV RAX, i64::MIN  — deopt sentinel so the interpreter's post-JIT
+            // path treats this as a deopt return and runs the NPE drain.
+            // 48 B8 <imm64>
+            self.buf.emit(&[0x48, 0xB8]);
+            self.buf.emit(&(i64::MIN as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
+
+            // Standard method epilogue: restore callee-saved regs and return.
+            self.emit_epilogue();
+
+            // Patch every recorded JZ branch with THIS action to this stub.
+            for &(a, patch_off) in &entries {
+                if a != action {
+                    continue;
+                }
+                let rel32 = (stub_offset as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
+                self.buf
+                    .try_patch_i32(patch_off, rel32)
+                    .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+            }
         }
     }
 
@@ -15128,10 +15195,12 @@ impl Compiler {
                                     .filter(|&&po| po >= body_start && po < body_end)
                                     .copied()
                                     .collect();
-                                let orig_nullstore_stubs: Vec<usize> = self
+                                // JEP 358: each entry is (action, patch_offset);
+                                // filter by the offset, carry the action through.
+                                let orig_nullstore_stubs: Vec<(u8, usize)> = self
                                     .null_check_store_stubs
                                     .iter()
-                                    .filter(|&&po| po >= body_start && po < body_end)
+                                    .filter(|&&(_, po)| po >= body_start && po < body_end)
                                     .copied()
                                     .collect();
                                 let orig_self_calls: Vec<usize> = self
@@ -15347,7 +15416,7 @@ impl Compiler {
                                     self.null_check_store_stubs.extend(
                                         orig_nullstore_stubs
                                             .iter()
-                                            .map(|&po| po + shift_us),
+                                            .map(|&(action, po)| (action, po + shift_us)),
                                     );
                                     self.self_call_patches.extend(
                                         orig_self_calls
@@ -17051,8 +17120,11 @@ impl Compiler {
                             // Null array → JDK throws NullPointerException.
                             // Reuse the shared null-check stub (sets
                             // JIT_PENDING_NPE, deopts out): TEST RAX,RAX +
-                            // JZ stub.
-                            self.emit_null_check_array_load();
+                            // JZ stub. This is an intrinsic, not a plain
+                            // array opcode, so no precise JEP-358 array action
+                            // applies — record NONE (unmessaged NPE), matching
+                            // the prior behaviour.
+                            self.emit_null_check_array_load(npe_action::NONE);
 
                             // Save array base in R8 (RAX is needed as the
                             // STOS source register).
@@ -17335,7 +17407,9 @@ impl Compiler {
                             let arr_slot = self.pop_stack();
                             self.load_slot_to_reg(RAX, arr_slot);
                             // TEST RAX,RAX / JZ -> shared null-check stub.
-                            self.emit_null_check_array_load();
+                            // Intrinsic array access — no precise array opcode,
+                            // so record NONE (unmessaged NPE).
+                            self.emit_null_check_array_load(npe_action::NONE);
                             // MOV R8, RAX  (49 89 C0)
                             self.buf.emit(&[0x49, 0x89, 0xC0]);
                             // MOV R9D, [R8 + ARRAY_LENGTH_OFFSET]  (45 8B 48 dd)
@@ -21529,6 +21603,7 @@ mod tests {
             frame_record: 0,
             shadow_stack_offset_in_thread: 0,
             throw_exception: sentinel,
+            jit_npe_with_action: sentinel,
         }
     }
 
@@ -29583,9 +29658,13 @@ mod tests {
         /// access can be observed from a test: records `(index, length)`.
         static TEST_AIOOBE_HIT: std::cell::Cell<Option<(i64, i64)>> =
             const { std::cell::Cell::new(None) };
-        /// Set by [`flagging_bastore`] when the null-check deopt stub
-        /// fires with `array_ptr == 0`.
+        /// Set by [`flagging_npe_with_action`] when an inline null-check deopt
+        /// stub fires.
         static TEST_NPE_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// JEP 358 — the action code the firing null-check stub passed to
+        /// `jit_npe_with_action`. `-1` = no stub fired. Lets the null-NPE tests
+        /// assert the per-opcode action is threaded correctly.
+        static TEST_NPE_ACTION: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
     }
 
     /// Test stand-in for `jit_throw_aioobe`: records `(index, length)`
@@ -29599,25 +29678,25 @@ mod tests {
         i64::MIN
     }
 
-    /// Test stand-in for `jit_bastore`: the null-check deopt stub calls
-    /// `helpers.bastore` with `array_ptr == 0` to flag a pending NPE.
-    /// Records the hit; the stub itself loads the `i64::MIN` sentinel.
+    /// Test stand-in for `jit_npe_with_action`: each inline null-check deopt
+    /// stub calls `helpers.jit_npe_with_action(code)` to flag a pending NPE
+    /// with its JEP-358 action code. Records the hit AND the code; the stub
+    /// itself loads the `i64::MIN` sentinel.
     ///
-    /// SAFETY: plain `extern "C"` callback invoked by JIT code with the
-    /// `(array_ptr, index, val)` ABI; touches only a thread-local.
-    unsafe extern "C" fn flagging_bastore(array_ptr: i64, _index: i64, _val: i64) {
-        if array_ptr == 0 {
-            TEST_NPE_HIT.with(|c| c.set(true));
-        }
+    /// SAFETY: plain `extern "C"` callback invoked by JIT code with one `i64`
+    /// argument; touches only thread-locals.
+    unsafe extern "C" fn flagging_npe_with_action(code: i64) {
+        TEST_NPE_HIT.with(|c| c.set(true));
+        TEST_NPE_ACTION.with(|c| c.set(code));
     }
 
-    /// `test_helpers()` with the `throw_aioobe` and `bastore` slots wired
-    /// to the flagging stubs above so the exception-edge tests can take
-    /// the deopt path without panicking on an unimplemented stub.
+    /// `test_helpers()` with the `throw_aioobe` and `jit_npe_with_action`
+    /// slots wired to the flagging stubs above so the exception-edge tests
+    /// can take the deopt path without panicking on an unimplemented stub.
     fn array_test_helpers() -> JitRuntimeHelpers {
         let mut h = test_helpers();
         h.throw_aioobe = flagging_throw_aioobe as *const () as usize;
-        h.bastore = flagging_bastore as *const () as usize;
+        h.jit_npe_with_action = flagging_npe_with_action as *const () as usize;
         h
     }
 
@@ -29866,9 +29945,9 @@ mod tests {
     fn test_inline_arraylength_null_throws_npe() {
         // int f(int[] arr) { return arr.length; }  with arr == null.
         // The inline `MOV EAX, [arr + 12]` is guarded by a TEST/JZ that
-        // branches to the shared null-check deopt stub. That stub calls
-        // `helpers.bastore(0, ..)` (flagging our NPE thread-local) and
-        // returns the `i64::MIN` deopt sentinel.
+        // branches to the per-action null-check deopt stub. That stub calls
+        // `helpers.jit_npe_with_action(ARRAY_LENGTH)` (flagging our NPE
+        // thread-locals) and returns the `i64::MIN` deopt sentinel.
         let code: Vec<u8> = vec![
             0x2a, // 0: aload_0
             0xbe, // 1: arraylength
@@ -29878,12 +29957,19 @@ mod tests {
         let compiled = compile_array_test(&code, 3, 1, 1);
 
         TEST_NPE_HIT.with(|c| c.set(false));
+        TEST_NPE_ACTION.with(|c| c.set(-1));
         // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
         let result = unsafe { compiled.try_call(&[0]).expect("test JIT call") }; // null array
         assert_eq!(result, i64::MIN, "null arraylength must deopt with sentinel");
         assert!(
             TEST_NPE_HIT.with(|c| c.get()),
             "null arraylength must take the NPE deopt stub"
+        );
+        // JEP 358: the stub must thread the `arraylength` action code.
+        assert_eq!(
+            TEST_NPE_ACTION.with(|c| c.get()),
+            npe_action::ARRAY_LENGTH as i64,
+            "null arraylength must report the ARRAY_LENGTH action"
         );
     }
 
@@ -29900,12 +29986,53 @@ mod tests {
         let compiled = compile_array_test(&code, 4, 2, 2);
 
         TEST_NPE_HIT.with(|c| c.set(false));
+        TEST_NPE_ACTION.with(|c| c.set(-1));
         // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
         let result = unsafe { compiled.try_call(&[0, 0]).expect("test JIT call") }; // null array
         assert_eq!(result, i64::MIN, "null iaload must deopt with sentinel");
         assert!(
             TEST_NPE_HIT.with(|c| c.get()),
             "null iaload must take the NPE deopt stub"
+        );
+        // JEP 358: the stub must thread the `iaload` (int load) action code —
+        // proving the per-opcode threading, not the old fixed byte-store code.
+        assert_eq!(
+            TEST_NPE_ACTION.with(|c| c.get()),
+            npe_action::ALOAD_INT as i64,
+            "null iaload must report the ALOAD_INT action"
+        );
+    }
+
+    #[test]
+    fn test_inline_castore_null_threads_char_action() {
+        // void f(char[] arr) { arr[0] = 'x'; }  with arr == null.
+        // Proves a *store* of a *char[]* threads ASTORE_CHAR — i.e. both the
+        // direction (store) and the element type (char) are now precise,
+        // where the old single shared stub fabricated ASTORE_BYTE for every
+        // inline array opcode.
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0      (array)
+            0x03, // 1: iconst_0     (index)
+            0x10, 0x78, // 2: bipush 'x'
+            0x55, // 4: castore
+            0xb1, // 5: return
+            0, 0,
+        ];
+        let compiled = compile_array_test(&code, 6, 1, 1);
+
+        TEST_NPE_HIT.with(|c| c.set(false));
+        TEST_NPE_ACTION.with(|c| c.set(-1));
+        // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
+        let result = unsafe { compiled.try_call(&[0]).expect("test JIT call") }; // null array
+        assert_eq!(result, i64::MIN, "null castore must deopt with sentinel");
+        assert!(
+            TEST_NPE_HIT.with(|c| c.get()),
+            "null castore must take the NPE deopt stub"
+        );
+        assert_eq!(
+            TEST_NPE_ACTION.with(|c| c.get()),
+            npe_action::ASTORE_CHAR as i64,
+            "null castore must report the ASTORE_CHAR action"
         );
     }
 

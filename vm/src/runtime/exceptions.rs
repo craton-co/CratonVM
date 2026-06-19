@@ -274,36 +274,31 @@ pub mod helpful_npe {
     // trapping bci is unavailable (the design doc gates *full* JIT parity on
     // it). The doc's offered alternative is to "fall back to the **action-only**
     // message for JIT-originated NPEs" by threading the operation *kind*
-    // through the signal (`set_jit_pending_npe_action`). These codes are the
-    // vocabulary for that channel; only the cases whose action-only string is
-    // *exactly* a HotSpot `BytecodeUtils` string (the array family + length,
-    // where no `because` clause / field-name is needed) are represented — a
-    // field/invoke action would need the name/owner the helper does not have,
-    // so those stay `message: None` (no fabricated text; cf. the Risks doc).
+    // through the signal (`set_jit_pending_npe_action`).
+    //
+    // The action codes are now the canonical [`cratonvm_jit_api::npe_action`]
+    // vocabulary (re-exported here as `jit_action` for source compatibility),
+    // so the same numeric codes the inline JIT codegen (`jit/src/x64.rs`) bakes
+    // into its null-check stubs map here to the HotSpot `BytecodeUtils` string.
+    // Both the per-type array/length helpers AND the inline null-check failure
+    // stubs (via `jit_npe_with_action`) feed this channel.
+    //
+    // Only the cases whose action-only string is *exactly* a HotSpot
+    // `BytecodeUtils` string (the array family + length, where no `because`
+    // clause / field-name is needed) are represented — a field/invoke action
+    // would need the name/owner the bare signal does not carry, so those stay
+    // `message: None` (no fabricated text; cf. the Risks doc).
     pub mod jit_action {
-        /// No action recorded — fall back to the unmessaged NPE (today's shape).
-        pub const NONE: u8 = 0;
-        /// `arraylength` on a null array.
-        pub const ARRAY_LENGTH: u8 = 1;
-        /// `iaload` on a null `int[]`.
-        pub const ALOAD_INT: u8 = 2;
-        /// `aaload` on a null reference array.
-        pub const ALOAD_OBJECT: u8 = 3;
-        /// `baload` on a null `byte[]` (the `b`-helper also serves `boolean[]`;
-        /// the null array can't be type-probed, so this spells the dominant
-        /// `byte` case — an approximation confined to this gated, best-effort path).
-        pub const ALOAD_BYTE: u8 = 4;
-        /// `iastore` into a null `int[]`.
-        pub const ASTORE_INT: u8 = 5;
-        /// `aastore` into a null reference array.
-        pub const ASTORE_OBJECT: u8 = 6;
-        /// `bastore` into a null `byte[]` (see [`ALOAD_BYTE`] on byte/boolean).
-        pub const ASTORE_BYTE: u8 = 7;
+        // Single source of truth lives in `jit-api` so the JIT crate (which
+        // cannot depend on the VM crate) and this mapping share one numeric
+        // vocabulary. Re-exported under the historical `jit_action` name.
+        pub use cratonvm_jit_api::npe_action::*;
     }
 
     /// Map a JIT NPE action code (set by `set_jit_pending_npe_action` in the
-    /// array/length helpers) to its JEP 358 *action-only* message, or `None`
-    /// when no action was recorded ([`jit_action::NONE`]) so the caller emits an
+    /// array/length helpers, or by `jit_npe_with_action` from the inline
+    /// null-check stubs) to its JEP 358 *action-only* message, or `None` when no
+    /// action was recorded ([`jit_action::NONE`]) so the caller emits an
     /// unmessaged NPE exactly as before. Every returned string is a verbatim
     /// HotSpot `BytecodeUtils` action (action-only is a valid HotSpot shape when
     /// the null expression can't be reconstructed — see [`combine_opt`]).
@@ -314,9 +309,19 @@ pub mod helpful_npe {
             ALOAD_INT => action_array_load(ArrayElemKind::Int),
             ALOAD_OBJECT => action_array_load(ArrayElemKind::Object),
             ALOAD_BYTE => action_array_load(ArrayElemKind::Byte),
+            ALOAD_LONG => action_array_load(ArrayElemKind::Long),
+            ALOAD_FLOAT => action_array_load(ArrayElemKind::Float),
+            ALOAD_DOUBLE => action_array_load(ArrayElemKind::Double),
+            ALOAD_CHAR => action_array_load(ArrayElemKind::Char),
+            ALOAD_SHORT => action_array_load(ArrayElemKind::Short),
             ASTORE_INT => action_array_store(ArrayElemKind::Int),
             ASTORE_OBJECT => action_array_store(ArrayElemKind::Object),
             ASTORE_BYTE => action_array_store(ArrayElemKind::Byte),
+            ASTORE_LONG => action_array_store(ArrayElemKind::Long),
+            ASTORE_FLOAT => action_array_store(ArrayElemKind::Float),
+            ASTORE_DOUBLE => action_array_store(ArrayElemKind::Double),
+            ASTORE_CHAR => action_array_store(ArrayElemKind::Char),
+            ASTORE_SHORT => action_array_store(ArrayElemKind::Short),
             _ => return None,
         };
         Some(s)
@@ -1922,6 +1927,48 @@ mod helpful_npe_tests {
         assert_eq!(
             helpful_npe::jit_action_message(ASTORE_BYTE).as_deref(),
             Some("Cannot store to byte array")
+        );
+        // Inline-codegen path extension (JEP-358 follow-up): the remaining
+        // primitive element kinds the inline null-check stubs now name.
+        assert_eq!(
+            helpful_npe::jit_action_message(ALOAD_LONG).as_deref(),
+            Some("Cannot load from long array")
+        );
+        assert_eq!(
+            helpful_npe::jit_action_message(ALOAD_FLOAT).as_deref(),
+            Some("Cannot load from float array")
+        );
+        assert_eq!(
+            helpful_npe::jit_action_message(ALOAD_DOUBLE).as_deref(),
+            Some("Cannot load from double array")
+        );
+        assert_eq!(
+            helpful_npe::jit_action_message(ALOAD_CHAR).as_deref(),
+            Some("Cannot load from char array")
+        );
+        assert_eq!(
+            helpful_npe::jit_action_message(ALOAD_SHORT).as_deref(),
+            Some("Cannot load from short array")
+        );
+        assert_eq!(
+            helpful_npe::jit_action_message(ASTORE_LONG).as_deref(),
+            Some("Cannot store to long array")
+        );
+        assert_eq!(
+            helpful_npe::jit_action_message(ASTORE_FLOAT).as_deref(),
+            Some("Cannot store to float array")
+        );
+        assert_eq!(
+            helpful_npe::jit_action_message(ASTORE_DOUBLE).as_deref(),
+            Some("Cannot store to double array")
+        );
+        assert_eq!(
+            helpful_npe::jit_action_message(ASTORE_CHAR).as_deref(),
+            Some("Cannot store to char array")
+        );
+        assert_eq!(
+            helpful_npe::jit_action_message(ASTORE_SHORT).as_deref(),
+            Some("Cannot store to short array")
         );
         assert_eq!(helpful_npe::jit_action_message(NONE), None);
         assert_eq!(helpful_npe::jit_action_message(250), None);

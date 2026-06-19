@@ -367,3 +367,62 @@ reflection-suite soak.
 - **Still deferred:** flipping the default to real-super, then (design §3)
   deleting the `Proxy$Instance` shim + the three name-keyed intercepts once the
   real-super path is default-on and green. Both retained for now.
+
+### Increment 4 soak (2026-06-19) — flip BLOCKED on a serialization regression
+
+Ran the broader proxy-using soak the increment-4 note deferred (harness:
+`scratch/proxysoak/`, five programs diffed 3-way HotSpot ↔ CratonVM-default ↔
+CratonVM-`CRATONVM_REAL_PROXY_SUPER=1`, fresh release binary built from dev HEAD
++ the embedding working-tree changes). Results:
+
+- **Identity / dispatch / logging / edge — real-super is a strict win or no-op.**
+  - `ProxyIdentity`: real-super's *only* delta vs the default path is
+    `getClass().getSuperclass()` = `java.lang.reflect.Proxy$Instance` → 
+    `java.lang.reflect.Proxy` — i.e. real-super **fixes** `getSuperclass()` to
+    match HotSpot. Everything else (`getName`, `isProxyClass`,
+    `getInvocationHandler`, `getInterfaces`, per-method `getDeclaringClass`,
+    `instanceof`, modifiers, Object-method routing) is byte-identical between the
+    two modes.
+  - `ProxyDispatch`, `LoggingProxy`, `ProxyEdge` (incl. proxies as HashMap/HashSet
+    keys, interface inheritance, two-proxies-share-a-class): real-super output is
+    **identical to the default path** (`realsuper == default`).
+- **❌ Proxy SERIALIZATION round-trip REGRESSES under real-super (the blocker).**
+  `ProxySer` (serializable `InvocationHandler`, OOS→OIS round-trip): the **default
+  (synthetic-super) path matches HotSpot byte-for-byte**; the **real-super path
+  throws** during `oos.writeObject(proxy)`:
+  `NullPointerException: Cannot invoke "String.length()" because "str" is null`
+  at `ObjectStreamClass.writeNonProxy:622` (`out.writeUTF(name)` — i.e. the
+  **superclass descriptor's `name` is null** while writing the real
+  `java.lang.reflect.Proxy` super-desc), preceded by **OOB slot accesses on the
+  1-field `$Proxy0`** (reads at synthetic slots 1 & 18, a write at slot 18 —
+  serialization machinery still assuming the 3-slot synthetic layout).
+  100% reproducible (rc=1 ×3). Root cause (characterized, not yet fully isolated):
+  the default path serializes correctly because the synthetic `Proxy$Instance`
+  super is purpose-built for the proxy-serialization machinery (spring-bug-08:
+  it is excluded from `isProxyClass` so OOS writes it as a non-proxy desc that
+  carries the serializable `h`). The real-super path routes the proxy's super
+  (real `Proxy`, sole instance field `h` — all `Class[]` fields are static) through
+  the **general** serialization path, which yields a null `ObjectStreamClass.name`
+  for the super-desc and still probes the proxy at the synthetic slots. The
+  Increment-4 slot-1→declared-interfaces correction was applied to the dispatch /
+  declaring-class path (`proxy_resolve_declaring_class_mirror`) but **NOT** to the
+  serialization path.
+- **Orthogonal pre-existing proxy gaps (present in BOTH modes, not real-super
+  regressions; noted for follow-up, do not block the flip):**
+  1. `InvocationHandler.invokeDefault(proxy, m, args)` → `InternalError:
+     NoSuchMethodException: proxyClassLookup` — the generated `$ProxyN` does not
+     emit the `proxyClassLookup` accessor the JDK's `Proxy.invokeDefault` reflects
+     for (absent in `proxy_gen.rs` and the natives). Breaks handler-driven default
+     methods.
+  2. `Proxy.getProxyClass(loader, ifaces)` (deprecated) → `InternalError: Proxy is
+     not supported until module system is fully initialized`.
+  3. Generated proxy package name is `com.sun.proxy.$ProxyN` vs HotSpot-25's
+     per-loader `jdk.proxyN.$ProxyN` (cosmetic naming gap).
+
+**Verdict: do NOT flip `real_proxy_super()` to default-ON.** The soak is not green:
+real-super breaks proxy serialization, a named soak target. Step 2 (flip) and step
+3 (delete the shim) stay blocked. Fixing the serialization path so a real-`Proxy`-
+super proxy serializes identically to the synthetic path (correct super-desc
+`name`, no synthetic-slot assumptions) is the prerequisite for re-soaking and
+flipping. Real-app suites (Keycloak/Quarkus ArC, Hibernate JdbcSpies) not yet run —
+gated behind fixing the serialization blocker first.

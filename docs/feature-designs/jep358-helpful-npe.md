@@ -1,5 +1,63 @@
 # JEP 358 — Helpful NullPointerException Messages
 
+> **Increment 4 follow-up landed — inline-codegen null-check path.** Step 6's
+> *first* "Still not done" item (the x64 inline null-check stubs carried no
+> action code) is now done; the deopt-overlapping half (field/invoke names) is
+> still gated on `real-frame-deopt.md`. What shipped:
+> - **Single-source action vocabulary.** The JEP-358 operation-kind codes moved
+>   to `cratonvm_jit_api::npe_action` (the one crate both the JIT and VM crates
+>   depend on; the JIT crate cannot depend on the VM crate). The VM's
+>   `helpful_npe::jit_action` module now re-exports it. The vocabulary is
+>   **extended to every primitive element kind** — `ALOAD_/ASTORE_` ×
+>   {INT, LONG, FLOAT, DOUBLE, BYTE, CHAR, SHORT, OBJECT} plus `ARRAY_LENGTH`
+>   (codes `0..=17`, append-only/stable since the JIT bakes them into RWX code).
+>   `jit_action_message` maps the 10 new codes to their verbatim HotSpot
+>   `BytecodeUtils` strings ("Cannot load from long array", "Cannot store to
+>   char array", …).
+> - **New `jit_npe_with_action(code)` helper** (`vm/src/jit/helpers.rs`, ABI
+>   field 41 in `JitRuntimeHelpers`, appended at the end so prior golden offsets
+>   are stable). Sets `JIT_PENDING_NPE` *with* the passed action code +
+>   `JIT_DEOPT_PENDING`, then the stub loads the `i64::MIN` sentinel.
+> - **Per-action inline stubs (`jit/src/x64.rs`).** `null_check_store_stubs`
+>   became `Vec<(action, patch_offset)>`; `emit_null_check_array_load`/`_store`
+>   take the action, derived from the trapping opcode (`array_opcode_npe_action`
+>   reads `code[bc_pc]`); `arraylength` passes `ARRAY_LENGTH`; the two
+>   non-opcode intrinsic null-checks (`Arrays.fill`, the per-element intrinsic)
+>   pass `NONE`. `emit_null_check_store_stubs` now groups sites by action and
+>   emits **one cold stub per distinct code**, each calling
+>   `jit_npe_with_action(code)` — replacing the single shared stub that called
+>   `jit_bastore(0)` and therefore fabricated `ASTORE_BYTE` ("Cannot store to
+>   byte array") for *every* inline array opcode (the bug this fixes). The hot
+>   path (`TEST RAX,RAX; JZ`) is byte-for-byte unchanged; only the cold
+>   out-of-line stubs differ (≤ ~18 per method, bounded by distinct element
+>   kinds touched).
+> - **Default unchanged / gating.** The action code is always recorded but is
+>   surfaced *only* through the existing `jit_npe_message_gated`
+>   (`-XX:±ShowCodeDetailsInExceptionMessages` / `CRATONVM_HELPFUL_NPE_OPCODES`,
+>   default off). With the gate off the inline path emits the same unmessaged
+>   NPE as before — so there is **no observable default-behavior change**, and
+>   no separate codegen gate is needed (the codegen has no hot-path cost and is
+>   strictly more correct). Verified in a clean worktree at HEAD + only these
+>   changes: `bt18 = 68332206` (correct, == HotSpot) at 28s wall (within the
+>   ~20–33s baseline) → no JIT throughput or correctness regression — expected,
+>   since `bt18` never dereferences a null array and so never reaches a per-action
+>   stub.
+> - **Tests.** `jit-api` golden-ABI tests bumped to 42 fields; the x64
+>   `test_inline_{arraylength,iaload}_null_throws_npe` tests now also assert the
+>   threaded action code, and a new `test_inline_castore_null_threads_char_action`
+>   proves a `char[]` *store* threads `ASTORE_CHAR` (both direction and element
+>   type precise); `exceptions.rs` `jit_action_messages_match_hotspot` gained the
+>   10 new element-kind strings.
+> - **Still not done (unchanged from below):** field/invoke JIT NPEs need the
+>   precise trapping bci (→ field name / method owner+name), which
+>   `real-frame-deopt.md` provides — so they stay action-only-or-unmessaged. The
+>   differential compliance pass vs HotSpot's `getExtendedNPEMessage` on
+>   JIT-compiled methods and the default-flip (Increment 3) remain. A
+>   pre-existing nuance: HotSpot spells `baload`/`bastore` null as
+>   "byte/boolean array"; both the interpreter (`ArrayElemKind::Byte`) and this
+>   JIT path spell it "byte" — consistent across both paths, tracked as a
+>   separate uniform-fix follow-up, not introduced here.
+
 > **Increment 4 landed.** Step 6 (partial, deopt-independent): action-only
 > JEP-358 messages for **JIT-originated** NPEs, via the doc's offered fallback —
 > "thread the operation kind through the JIT NPE signal" — since the precise
@@ -34,11 +92,12 @@
 >   strings + `NONE`/unknown → no message) and
 >   `jit_npe_message_gated_is_none_when_gate_off`; the 8 `jit_*_null_sets_pending_npe`
 >   helper regressions and all 15 `helpful_npe` tests stay green.
-> - **Still not done:** the **inline-codegen** null-check path (x64 deopt stubs)
->   does not yet carry an action, so JIT NPEs that never reach a Rust helper stay
->   unmessaged; threading the action (or the precise bci) through codegen overlaps
->   `real-frame-deopt.md` and remains the full-parity follow-up. Field/invoke JIT
->   NPEs also stay unmessaged (no name/owner available without the bci).
+> - **Still not done:** ~~the **inline-codegen** null-check path (x64 deopt
+>   stubs) does not yet carry an action~~ — **DONE** (see the "Increment 4
+>   follow-up" note at the very top: the inline stubs now thread the per-opcode
+>   action via `jit_npe_with_action`). Field/invoke JIT NPEs still stay
+>   unmessaged (no name/owner available without the precise bci that
+>   `real-frame-deopt.md` provides).
 
 > **Increment 3 landed (2026-06-18).** Step 5b: the real HotSpot opt-out flag
 > `-XX:±ShowCodeDetailsInExceptionMessages` now drives the non-invoke opcode
@@ -285,6 +344,14 @@ dataflow — JEP 358 is a syntactic reconstruction, deliberately approximate.
    Either thread the trapping bci through the JIT NPE signal, or fall back to the
    action-only message for JIT-originated NPEs. Full parity is gated on
    `real-frame-deopt.md` (which makes the trapping bci available).
+   - **Done (helper path):** the array/length JIT helpers record their action
+     (Increment 4).
+   - **Done (inline-codegen path):** the x64 inline null-check stubs now thread
+     the per-opcode action via `jit_npe_with_action` (Increment 4 follow-up; see
+     top note). Covers every array element kind + `arraylength`, action-only.
+   - **Remaining (bci-gated):** field/invoke names need the precise trapping bci
+     from `real-frame-deopt.md`; until then those JIT NPEs stay
+     action-only-or-unmessaged.
 
 ## Risks
 

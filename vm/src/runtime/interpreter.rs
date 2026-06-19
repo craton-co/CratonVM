@@ -2189,6 +2189,95 @@ pub fn init_thread_exec_depth_ceiling(native_stack_bytes: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// H7 — native stack-bang (catch overflow the per-level counter can't)
+// ---------------------------------------------------------------------------
+//
+// The H6 counter ceiling (`derive_exec_depth_ceiling`) assumes a uniform
+// ~8 KiB native cost per `execute` level. Heavy re-entrant paths — notably
+// deep lambda dispatch (`execute -> execute_frame -> execute_invoke_kind ->
+// try_lambda_dispatch -> invoke_or_native -> invoke_on_class_shared_inner ->
+// execute`) — burn ~100-200 KiB of native stack per Java level, so on a
+// smaller (worker) carrier stack they overflow the OS guard page at a depth
+// FAR below the counter ceiling, producing an uncatchable SIGSEGV (e.g.
+// Hibernate `ByteArrayMappingTests` binding a `Byte[]` as an H2 array — see
+// docs/known-issues/hibernate-bytearraymapping-stream-layout-probe-sigsegv.md).
+//
+// A counter cannot distinguish a heavy path from legitimate deep recursion
+// (binaryTrees) because the heavy path overflows BELOW normal operation depth.
+// Instead, probe the ACTUAL remaining native stack and throw a *catchable*
+// `StackOverflowError` within a guard-page safety margin. This never
+// false-trips on recursion that genuinely fits the stack (unlike lowering the
+// counter ceiling). Default-on; opt out with `CRATONVM_NO_STACK_BANG=1`; tune
+// the reserve with `CRATONVM_STACK_BANG_MARGIN_KB` (default 1024 KiB).
+
+/// Bytes of native stack to keep in reserve so the `StackOverflowError` can be
+/// constructed and delivered without itself overflowing. `0` ⇒ stack-bang
+/// disabled. Read once (env is process-global).
+#[inline]
+fn stack_bang_margin() -> usize {
+    use std::sync::OnceLock;
+    static MARGIN: OnceLock<usize> = OnceLock::new();
+    *MARGIN.get_or_init(|| {
+        if std::env::var_os("CRATONVM_NO_STACK_BANG").is_some() {
+            return 0;
+        }
+        std::env::var("CRATONVM_STACK_BANG_MARGIN_KB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map(|kb| kb.saturating_mul(1024))
+            .unwrap_or(1024 * 1024)
+    })
+}
+
+/// Remaining bytes of native stack for the calling thread (current SP minus the
+/// thread's low stack limit). Returns `usize::MAX` ("plenty") when the bound is
+/// unknown so the bang never false-trips. The low limit is fixed per thread, so
+/// cache it thread-locally; only a cheap SP read happens per call.
+#[cfg(windows)]
+#[inline]
+fn native_stack_remaining() -> usize {
+    thread_local! {
+        static LOW_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    let low = LOW_LIMIT.with(|c| {
+        let v = c.get();
+        if v != 0 {
+            return v;
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentThreadStackLimits(low_limit: *mut usize, high_limit: *mut usize);
+        }
+        let (mut lo, mut hi) = (0usize, 0usize);
+        // SAFETY: both out-pointers are valid, writable, properly-aligned
+        // `usize` locals; the API only writes through them.
+        unsafe { GetCurrentThreadStackLimits(&mut lo, &mut hi) };
+        if std::env::var_os("CRATONVM_DBG_STACKBANG").is_some() {
+            let probe = 0u8;
+            let sp = &probe as *const u8 as usize;
+            eprintln!(
+                "[STACKBANG] thread bounds: low=0x{lo:x} high=0x{hi:x} size={}KiB sp=0x{sp:x} used={}KiB",
+                hi.saturating_sub(lo) / 1024,
+                sp.saturating_sub(lo) / 1024
+            );
+        }
+        c.set(lo);
+        lo
+    });
+    if low == 0 {
+        return usize::MAX;
+    }
+    let probe = 0u8;
+    (&probe as *const u8 as usize).saturating_sub(low)
+}
+
+#[cfg(not(windows))]
+#[inline]
+fn native_stack_remaining() -> usize {
+    usize::MAX
+}
+
+// ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
@@ -2265,6 +2354,47 @@ pub fn execute(
         )));
     }
     let _exec_depth_guard = DepthGuard;
+
+    // H7 — native stack-bang. Probe the ACTUAL remaining native stack and
+    // throw a *catchable* `StackOverflowError` before the OS guard page faults
+    // (an uncatchable SIGSEGV). Only probe once recursion is non-trivial
+    // (`depth > 16`) so the overwhelmingly common shallow calls pay nothing but
+    // the cheap counter read above. `_exec_depth_guard`'s Drop decrements the
+    // counter on this early return. See the H7 note above `stack_bang_margin`.
+    {
+        let margin = stack_bang_margin();
+        if margin != 0 && depth > 16 {
+            let remaining = native_stack_remaining();
+            if std::env::var_os("CRATONVM_DBG_STACKBANG").is_some() {
+                if depth % 4 == 0 {
+                    eprintln!(
+                        "[STACKBANG] depth={depth} remaining={}KiB margin={}KiB {}.{}",
+                        remaining / 1024,
+                        margin / 1024,
+                        thread.frames.last().map(|f| f.class_name()).unwrap_or("?"),
+                        thread.frames.last().map(|f| f.method_name()).unwrap_or("?"),
+                    );
+                }
+                // One-shot full Java-stack dump the first time a `dropWhile`
+                // frame is on top, to reveal the caller chain producing the
+                // looping mis-sized stream (uses CRATONVM_DBG_SOE machinery).
+                let is_drop = thread
+                    .frames
+                    .last()
+                    .map(|f| f.method_name() == "dropWhile")
+                    .unwrap_or(false);
+                if is_drop {
+                    dump_stack_on_soe(thread);
+                }
+            }
+            if remaining < margin {
+                dump_stack_on_soe(thread); // one-shot Java cycle dump (CRATONVM_DBG_SOE)
+                return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                    RuntimeError::StackOverflowError,
+                )));
+            }
+        }
+    }
 
     // letsgo postmortem instrumentation: record every bytecode-method
     // entry into the global dispatch ring. Gated by `CRATONVM_DBG_LETSGO=1`
@@ -6871,21 +7001,34 @@ fn ir_deopt_resume_enabled() -> bool {
 }
 
 /// Map a reconstructed frame's locals/stack `FrameValue`s to interpreter
-/// `Value`s. Conservative first cut: only integer slots are mapped (the IR
-/// path's deopt-eligible methods are integer-only). Any other variant —
-/// `Object`/`Float`/`VirtualObject`, or an unresolved `Register`/`StackSlot`
-/// (which should never reach here) — returns `None`, signalling the caller to
-/// fall back to the safe re-run path rather than materialise a mistyped slot.
+/// `Value`s, after machine-state resolution. Handles the cat-1 cases the
+/// `real-frame-deopt` type source now distinguishes:
+///   * `Int`     → `Value::Int` (int/boolean/byte/char/short),
+///   * `Object`  → `Value::Object` (a real reference — e.g. an instance
+///     method's `this`; resolved from the slot's raw word by `resolve_value`'s
+///     `StackSlotRef` arm),
+///   * `Undefined` → `Value::Int(0)` (uninitialised slot).
 ///
-/// LIMITATION: a long/double resolves to `FrameValue::Int(bits)` and would be
-/// truncated by `Value::Int`; until per-slot width tags exist, methods with
-/// category-2 locals must not precise-resume. The all-`Int` requirement plus
-/// the default-OFF gate keep that case off the live path.
+/// Any other variant — `Unsupported` (category-2 `long`/`double` or FP slot,
+/// pending two-slot expansion / FP resolution), `Float`, `VirtualObject`
+/// (needs GC-backed materialisation), or an *unresolved* `Register`/`StackSlot`
+/// (which should never reach here) — returns `None`, signalling the caller to
+/// fall back to the safe re-run path rather than fabricate or mistype a slot.
+/// This is the safety contract: a frame with any not-yet-precisely-resumable
+/// slot re-runs (correct, if double-executing) instead of resuming with garbage.
 fn ir_deopt_frame_values(vals: &[cratonvm_jit::deopt::FrameValue]) -> Option<Vec<Value>> {
     use cratonvm_jit::deopt::FrameValue;
     vals.iter()
         .map(|v| match v {
             FrameValue::Int(i) => Some(Value::Int(*i as i32)),
+            FrameValue::Object(addr) => Some(Value::Object(if *addr == 0 {
+                None
+            } else {
+                // SAFETY: the slot held a live oop at the (synchronous) guard;
+                // no Java-heap allocation — hence no GC — runs between capture
+                // (`ir_deopt_entry`) and this resume, so the pointer is current.
+                Some(unsafe { ObjectRef::from_raw(*addr as *mut u8) })
+            })),
             FrameValue::Undefined => Some(Value::Int(0)),
             _ => None,
         })
@@ -6905,12 +7048,45 @@ fn resume_from_ir_deopt(
     cached: &Arc<CachedBytecodeMethod>,
     rframe: &cratonvm_jit::deopt::ReconstructedFrame,
 ) -> Option<CachedCallResult> {
+    // Env-gated diagnostic (CRATONVM_DBG_DEOPT): trace whether a precise resume
+    // engages or falls back to re-run, and why. Off by default — one cheap
+    // `var_os` per deopt (deopts are cold).
+    let dbg = std::env::var_os("CRATONVM_DBG_DEOPT").is_some();
     // Phase-A scope: single non-inlined frame, no held monitors.
     if !rframe.caller_frames.is_empty() || !rframe.monitors.is_empty() {
+        if dbg {
+            eprintln!(
+                "[cratonvm-deopt] FALLBACK re-run {}.{}{} bci={} (inlined_callers={} monitors={})",
+                cached.class_name, cached.method_name, cached.method_descriptor,
+                rframe.bci, rframe.caller_frames.len(), rframe.monitors.len()
+            );
+        }
         return None;
     }
-    let locals = ir_deopt_frame_values(&rframe.locals)?;
-    let stack_vals = ir_deopt_frame_values(&rframe.stack)?;
+    let (locals, stack_vals) = match (
+        ir_deopt_frame_values(&rframe.locals),
+        ir_deopt_frame_values(&rframe.stack),
+    ) {
+        (Some(l), Some(s)) => (l, s),
+        _ => {
+            if dbg {
+                eprintln!(
+                    "[cratonvm-deopt] FALLBACK re-run {}.{}{} bci={} (a live slot is not \
+                     precisely resumable — cat-2/float/virtual/unresolved; locals={:?} stack={:?})",
+                    cached.class_name, cached.method_name, cached.method_descriptor,
+                    rframe.bci, rframe.locals, rframe.stack
+                );
+            }
+            return None;
+        }
+    };
+    if dbg {
+        eprintln!(
+            "[cratonvm-deopt] PRECISE resume {}.{}{} at bci={} ({} locals, {} stack) locals={:?}",
+            cached.class_name, cached.method_name, cached.method_descriptor,
+            rframe.bci, locals.len(), stack_vals.len(), rframe.locals
+        );
+    }
 
     thread.refill_pools_from_shared(
         &shared.operand_stack_pool,
@@ -20432,6 +20608,41 @@ fn double_to_long(v: f64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // real-frame-deopt — type-source resume mapping
+    // -----------------------------------------------------------------------
+
+    /// `ir_deopt_frame_values` maps the cat-1 slots the type source now
+    /// distinguishes — `Int`→`Value::Int`, `Object`→`Value::Object` (a real
+    /// reference, e.g. an instance method's `this`), `Undefined`→`Value::Int(0)`
+    /// — and returns `None` (forcing the safe re-run) for any slot it cannot yet
+    /// precisely resume (`Unsupported` cat-2/FP, `Float`, or an unresolved slot).
+    #[test]
+    fn ir_deopt_frame_values_maps_object_and_int() {
+        use cratonvm_jit::deopt::FrameValue;
+
+        let mapped = ir_deopt_frame_values(&[
+            FrameValue::Int(42),
+            FrameValue::Object(0),
+            FrameValue::Undefined,
+        ])
+        .expect("all cat-1 slots must map");
+        assert_eq!(mapped[0], Value::Int(42));
+        assert!(matches!(mapped[1], Value::Object(None)));
+        assert_eq!(mapped[2], Value::Int(0));
+
+        // A non-null Object resolves to Value::Object(Some(_)) (handle only —
+        // not dereferenced here).
+        let nonnull = ir_deopt_frame_values(&[FrameValue::Object(0x1000)])
+            .expect("non-null object maps");
+        assert!(matches!(nonnull[0], Value::Object(Some(_))));
+
+        // Anything not-yet-precisely-resumable forces the re-run path (None).
+        assert!(ir_deopt_frame_values(&[FrameValue::Unsupported]).is_none());
+        assert!(ir_deopt_frame_values(&[FrameValue::Float(0)]).is_none());
+        assert!(ir_deopt_frame_values(&[FrameValue::StackSlot(-8)]).is_none());
+    }
 
     // -----------------------------------------------------------------------
     // H6 — native-stack-aware re-entrant recursion ceiling
