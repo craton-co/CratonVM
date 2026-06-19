@@ -1,11 +1,22 @@
-# keycloak #15 — `java.nio.file.Path` Windows drive/UNC root parsing (OPEN)
+# keycloak #15 — `java.nio.file.Path` Windows drive/UNC root parsing (root/name ✅ FIXED; UNC-join residual)
 
-**Status:** open, deferred (pervasive subsystem; fix risk outweighs the single
-affected test class — documented here for a focused follow-up).
+**Status:** **`getRoot`/`getNameCount`/`getName`/`subpath` ✅ FIXED** (2026-06-18, branch
+`fix/keycloak-15-path-root`) — resolves **testFiles** (the `getRoot()==null` NPE). One residual
+(**testResource**) remains: `Path.of("/", x)` does not produce the JDK UNC `\\x\` form — that needs
+faithful `WindowsPathParser` join semantics in the (pervasive, higher-risk) `Paths.get` join, deferred.
+
+**Fix (verified):** `getRoot`/`getNameCount`/`getName`/`subpath` now parse the Windows drive/UNC/verbatim
+prefix explicitly (helper `p57_parse_win_root` in `native-builtins/src/phases_late.rs`, and the mirror
+`parse_windows_path_root` in `native-io/src/lib.rs`) instead of relying on `std::path::Component`, which in
+this build leaves `C:` as a `Normal` component. Verified == HotSpot for drive-abs/drive-fwd/drive-rel/UNC/
+root-rel/relative/dot-abs (`repros/keycloak-15-path-root/PathRoot.java`, plus a `subpath`/`resolve`/
+`normalize`/`startsWith`/`Files.exists` regression check — all match HotSpot). **Root cause of the
+non-dispatch trap:** the live handlers are the p57 closures over a `/`-canonical string (the old getRoot
+only checked for a `\` at index 2, so it never matched the drive).
 
 **Affected (CV-only, HotSpot passes):**
-- `org.keycloak.theme.ResourceLoaderTest` — `testFiles` (NPE) + `testResource`
-  (wrong content), 2/2 fail.
+- `org.keycloak.theme.ResourceLoaderTest` — was 2/2 fail; **`testFiles` (getRoot NPE) now fixed**;
+  `testResource` (UNC-join content) still open (residual above).
 
 ## Symptom
 ```
