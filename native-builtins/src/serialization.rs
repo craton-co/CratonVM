@@ -2749,15 +2749,6 @@ fn build_object_stream_class(
     };
     let field_count = owned_osf_fields.len() as i32;
 
-    if std::env::var("CRATONVM_DBG_PXSER").is_ok()
-        && (class_name.contains("Proxy") || class_name.contains("$Proxy"))
-    {
-        eprintln!(
-            "[PXSER] build_osc class={class_name:?} serializable={is_serializable} fields={:?}",
-            owned_osf_fields
-        );
-    }
-
     let mut flags = 0;
     if is_serializable {
         flags |= OSC_FLAG_SERIALIZABLE;

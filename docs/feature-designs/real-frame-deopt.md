@@ -1,5 +1,48 @@
 # Real-Frame Deoptimization (the keystone)
 
+> **Increment landed — IR-path deopt type source (oop + cat-2 safety).** The
+> reconstruct→resume pipeline already existed on the IR path (gated
+> `CRATONVM_IR_DEOPT_RESUME`, fired live by the div-by-zero guard
+> `emit_div_zero_guard`), but it was **integer-only and silently unsafe for
+> object/cat-2 slots**: `resolve_value` turned every `StackSlot` into `Int`, so a
+> ref slot (e.g. an instance method's `this`) resolved to a *truncated pointer*
+> that still passed the resume's all-`Int` check — resuming with a garbage `this`.
+> What shipped (the doc's "single most under-scoped item" — the type source):
+> - **Typed slot locations** (`jit/src/deopt.rs`): `FrameValue::StackSlotRef(i32)`
+>   (resolves to `Object(word)` — the raw slot word IS the heap pointer) and
+>   `FrameValue::Unsupported` (a live slot that can't yet be precisely
+>   reconstructed — cat-2 `long`/`double`, FP-in-slot — which forces the **safe
+>   re-run** instead of fabricating/truncating a value).
+> - **IR producer** (`jit/src/ir_lower.rs`): `frame_value_for` now routes each
+>   spilled value by its IR `ty` via `typed_stack_slot` — `Ref`→`StackSlotRef`,
+>   `Int`→`StackSlot`, `Long`/`Double`/`Float`→`Unsupported` (long constants too).
+> - **VM resume** (`vm/src/runtime/interpreter.rs`): `ir_deopt_frame_values` maps
+>   `Object`→`Value::Object` (a real reference), keeps `Int`/`Undefined`, and
+>   returns `None` (→ re-run) for `Unsupported`/`Float`/virtual/unresolved — the
+>   safety contract that a not-yet-resumable slot re-runs rather than resumes with
+>   garbage. The oop is read synchronously at the guard (no intervening Java
+>   alloc, hence no GC) so the pointer stays valid.
+> - **Diagnostic:** `CRATONVM_DBG_DEOPT` traces each deopt as `PRECISE resume …`
+>   (with the reconstructed locals) or `FALLBACK re-run … (reason)`.
+> - **Validation.** jit `reconstruct_resolves_typed_slots` (StackSlotRef→Object,
+>   StackSlot→Int, Unsupported pass-through) + vm `ir_deopt_frame_values_maps_object_and_int`;
+>   68 jit-deopt + 17 ir_lower + the vm test all green. **Live end-to-end PROOF**
+>   (debug binary, JDK 25, `CRATONVM_IR_DEOPT_RESUME=1`): a pure-int IR-compiled
+>   method `d(II)I` div-by-zero deopts and **precisely resumes at the div bci**
+>   (`[cratonvm-deopt] PRECISE resume … at bci=2`), throwing `ArithmeticException`
+>   correctly — the mechanism fires on a live VM.
+> - **Honest scope / next step.** The object/cat-2 arms are **unit-validated, not
+>   yet live-exercised**: the *current* IR-path selection routes object-bearing
+>   and side-effecting methods (e.g. an instance `g(I)I`, anything with
+>   `putstatic`) to the **single-pass x64 backend**, which has no IR deopt — so
+>   they never reach this resume today. This increment is the *correct
+>   prerequisite* (the type source the x64 backport doc names as most-under-scoped)
+>   that makes object resume sound once a producer compiles such methods —
+>   **broaden the IR-path selection to object/side-effecting methods, or land the
+>   x64 backport** (which compiles everything) to make it fire live. Cat-2
+>   two-slot expansion + FP-slot resolution + `materialize_virtual_objects`
+>   (still a panic stub) remain the follow-ups.
+
 Status: design / not started. XL. **This is the keystone** — almost every
 other aggressive JIT optimization (speculative guards, aggressive inlining,
 scalar replacement that survives a guard failure) is unsafe until the JIT can

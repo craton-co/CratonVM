@@ -2252,15 +2252,7 @@ fn native_stack_remaining() -> usize {
         // SAFETY: both out-pointers are valid, writable, properly-aligned
         // `usize` locals; the API only writes through them.
         unsafe { GetCurrentThreadStackLimits(&mut lo, &mut hi) };
-        if std::env::var_os("CRATONVM_DBG_STACKBANG").is_some() {
-            let probe = 0u8;
-            let sp = &probe as *const u8 as usize;
-            eprintln!(
-                "[STACKBANG] thread bounds: low=0x{lo:x} high=0x{hi:x} size={}KiB sp=0x{sp:x} used={}KiB",
-                hi.saturating_sub(lo) / 1024,
-                sp.saturating_sub(lo) / 1024
-            );
-        }
+        let _ = hi;
         c.set(lo);
         lo
     });
@@ -2361,38 +2353,13 @@ pub fn execute(
     // (`depth > 16`) so the overwhelmingly common shallow calls pay nothing but
     // the cheap counter read above. `_exec_depth_guard`'s Drop decrements the
     // counter on this early return. See the H7 note above `stack_bang_margin`.
-    {
+    if depth > 16 {
         let margin = stack_bang_margin();
-        if margin != 0 && depth > 16 {
-            let remaining = native_stack_remaining();
-            if std::env::var_os("CRATONVM_DBG_STACKBANG").is_some() {
-                if depth % 4 == 0 {
-                    eprintln!(
-                        "[STACKBANG] depth={depth} remaining={}KiB margin={}KiB {}.{}",
-                        remaining / 1024,
-                        margin / 1024,
-                        thread.frames.last().map(|f| f.class_name()).unwrap_or("?"),
-                        thread.frames.last().map(|f| f.method_name()).unwrap_or("?"),
-                    );
-                }
-                // One-shot full Java-stack dump the first time a `dropWhile`
-                // frame is on top, to reveal the caller chain producing the
-                // looping mis-sized stream (uses CRATONVM_DBG_SOE machinery).
-                let is_drop = thread
-                    .frames
-                    .last()
-                    .map(|f| f.method_name() == "dropWhile")
-                    .unwrap_or(false);
-                if is_drop {
-                    dump_stack_on_soe(thread);
-                }
-            }
-            if remaining < margin {
-                dump_stack_on_soe(thread); // one-shot Java cycle dump (CRATONVM_DBG_SOE)
-                return Err(MethodCallFailed::InternalError(VmError::Runtime(
-                    RuntimeError::StackOverflowError,
-                )));
-            }
+        if margin != 0 && native_stack_remaining() < margin {
+            dump_stack_on_soe(thread); // one-shot Java stack (CRATONVM_DBG_SOE)
+            return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::StackOverflowError,
+            )));
         }
     }
 
@@ -9858,33 +9825,71 @@ pub(crate) fn proxy_instance_satisfies_target(
         return true;
     }
 
-    let interfaces_arr = match shared.heap.get_field(obj_ref, PROXY_FIELD_INTERFACES) {
-        cratonvm_types::Value::Object(Some(a)) => a,
-        _ => {
-            // Unknown — no interfaces stored. Fall back to old liberal rule
-            // for safety so we don't regress proxies that never went through
-            // `Proxy.newProxyInstance`.
-            return true;
+    // Source the proxy's interface set. The synthetic 3-slot layout stores the
+    // `Class[]` at slot 1 (`PROXY_FIELD_INTERFACES`); the real-super layout
+    // (proxy-real-classfile migration: the generated `$ProxyN` extends
+    // `java.lang.reflect.Proxy`, sole field `h` at slot 0) has no such slot, so
+    // its interfaces come from the proxy class's own declared interfaces. Decide
+    // by the receiver's field count so we never read slot 1 out of bounds on the
+    // 1-field real-super proxy — that OOB read returned null and fell into the
+    // liberal "matches every target" fallback below, which made a real-super
+    // proxy report `instanceof` TRUE for ARBITRARY types (e.g. `java.lang.Class`).
+    // That in turn routed the proxy through `ObjectOutputStream.writeClass` → a
+    // null-`name` class descriptor → NPE, breaking proxy serialization
+    // round-trips (proxy-real-classfile Increment 4 soak). Mirrors the same
+    // slot-1→declared-interfaces fix applied to
+    // `proxy_resolve_declaring_class_mirror`.
+    let proxy_cid = shared.heap.class_id_of(obj_ref);
+    let has_iface_slot = shared
+        .class_manager
+        .read()
+        .get_class(proxy_cid)
+        .map(|c| c.num_total_fields >= 2)
+        .unwrap_or(false);
+
+    let mut iface_cids: Vec<ClassId> = Vec::new();
+    if has_iface_slot {
+        match shared.heap.get_field(obj_ref, PROXY_FIELD_INTERFACES) {
+            cratonvm_types::Value::Object(Some(arr)) => {
+                let n = shared.heap.array_length(arr);
+                for i in 0..n {
+                    // Use the mirror→ClassId mapping we already maintain (slot 0
+                    // on real-JDK Class is `cachedConstructor` — too fragile).
+                    if let Ok(cratonvm_types::Value::Object(Some(m))) =
+                        shared.heap.get_array_element(arr, i)
+                    {
+                        if let Some(cid) = crate::vm::class_id_from_mirror(shared, m) {
+                            iface_cids.push(cid);
+                        }
+                    }
+                }
+            }
+            _ => {
+                // Synthetic-layout proxy with no interfaces array recorded —
+                // preserve the historical liberal rule so we don't regress
+                // proxies that never went through `Proxy.newProxyInstance`.
+                return true;
+            }
         }
-    };
-    let n = shared.heap.array_length(interfaces_arr);
+    } else {
+        // Real-super layout: the generated `$ProxyN` declares the proxy
+        // interfaces directly, so they ARE the proxy's interface set. An
+        // empty-interface proxy correctly matches nothing here (only the
+        // Object/Serializable short-circuit above applies to it).
+        iface_cids = shared
+            .class_manager
+            .read()
+            .get_class(proxy_cid)
+            .map(|c| c.interfaces.clone())
+            .unwrap_or_default();
+    }
+
     let target_cid = shared
         .class_manager
         .write()
         .load_class(target_class_name)
         .ok();
-    for i in 0..n {
-        let mirror = match shared.heap.get_array_element(interfaces_arr, i) {
-            Ok(cratonvm_types::Value::Object(Some(m))) => m,
-            _ => continue,
-        };
-        // Read the `name` String off the Class mirror via the heap (slot 0
-        // on real-JDK Class is `cachedConstructor` — too fragile). Use the
-        // mirror→ClassId mapping we already maintain.
-        let iface_cid = match crate::vm::class_id_from_mirror(shared, mirror) {
-            Some(cid) => cid,
-            None => continue,
-        };
+    for iface_cid in iface_cids {
         // Direct identity match.
         if Some(iface_cid) == target_cid {
             return true;

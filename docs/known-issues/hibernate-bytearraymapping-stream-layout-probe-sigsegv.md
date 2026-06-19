@@ -1,110 +1,74 @@
-# `ByteArrayMappingTests` SIGSEGV — native-stack overflow from CV-specific deep recursion in `Byte[]`→H2-array binding
+# `ByteArrayMappingTests` SIGSEGV — log4j2 `getCallerClass` → `StackWalker.walk` re-entrant non-termination
 
 **Severity:** High (hard, uncatchable crash, `EXCEPTION_ACCESS_VIOLATION` / SIGSEGV, rc=139).
-**Status:** 🔴 OPEN — root cause CONFIRMED (see "CONFIRMED mechanism" below); deterministic, reproduces solo
-on latest dev. Two non-trivial root causes, neither a safe quick fix — handoff/decision needed.
-**Mode:** Interpreter (JIT-off; `CRATONVM_DISABLE_JIT=1`).
-**HotSpot (JDK 25):** PASS (persists the entity with shallow depth).
+**Status:** 🔴 OPEN (root cause CONFIRMED & precisely pinned; root fix is non-trivial — handoff). A separate
+general **mitigation (H7 native stack-bang)** landed for the *class* of uncatchable native-stack overflows
+(it does NOT catch this bug — see below).
+**Mode:** Interpreter (JIT-off). **HotSpot (JDK 25):** PASS.
 
-## Symptom
+## What it actually is (confirmed via instrumentation — supersedes earlier hypotheses)
 
-`org.hibernate.orm.test.mapping.basic.ByteArrayMappingTests` crashes the VM:
+It is **not** the `Byte[]`→H2-array binding, and **not** a stack overflow. It is **log4j2's
+`StackLocator.getCallerClass`** using **`StackWalker.walk(s -> s.dropWhile(...)...)`** during Hibernate's
+logging bootstrap (`BootLogging.<clinit>`), where the walk **re-enters itself without terminating**.
 
+Full Java caller chain captured at the spin (one-shot `CRATONVM_DBG_SOE` dump):
 ```
-#  EXCEPTION_ACCESS_VIOLATION (SIGSEGV) (0xC0000005) at pc=0x00007FF720686994
-```
-
-The crash is preceded by a **flood** (hundreds) of identical gen_heap guard WARNs:
-
-```
-WARN cratonvm::gc::guard: gen_heap::get_field / set_field: out-of-bounds field read/write dropped
-  (caller used slot index past receiver's layout)
-  obj=0x… index=1 num_slots=1 class_id=ClassId(275) class_name=java/util/stream/Stream real_field_count=Some(0)
-```
-
-i.e. something repeatedly reads/writes **slot index 1 on a `java/util/stream/Stream` object that has 0/1
-slots** ("speculative collection-layout probe dispatched on a non-matching receiver type"). The
-`gen_heap::guard` *drops* each individual OOB access, but the underlying mis-dispatch eventually performs a
-raw access that the guard does **not** intercept → hard SIGSEGV. The hs_err frame shows a ShadowStack /
-native-frame context (VM internals), not a Java NPE.
-
-## Repro
-
-```
-CRATONVM_DISABLE_JIT=1 cratonvm --java-home <jdk25> @common.args -Dcraton.batch=1 \
-  CratonRunner <list-with-only ByteArrayMappingTests> 0
-```
-Reproduces **strictly alone** (census fully drained, 0 other CV procs) → rc=139. Not contamination.
-DDL + first inserts run (`create table EntityOfByteArrays`, `EntityOfByteArrays` insert) before the fault,
-so the crash is during entity/Stream processing, not bootstrap.
-
-## CONFIRMED mechanism (2026-06-19, release-with-debug symbolized)
-
-The crash is a **native (Rust) call-stack overflow**, not the operand stack and not (directly) the Stream
-slot read. Symbolized native frames show a tight recursive cycle repeating to the guard page, faulting in
-`ValueStack::push` (which itself has a correct `max_size` check — it just happened to run when the native
-guard page was hit):
-
-```
-ValueStack::push  (value_stack.rs:328)          <- faults (guard page)
-  execute_instruction (interpreter.rs:8359)
-  execute_frame      (interpreter.rs:6115)
-  execute            (interpreter.rs:3730)  ┐
-  invoke_on_class_shared_inner (vm_exec.rs) │ recursive cycle,
-  invoke_or_native   (vm_exec.rs:6301)      │ repeats to overflow
-  try_lambda_dispatch (interpreter.rs:13106)│  (~6 large Rust frames
-  execute_invoke_kind (interpreter.rs:11574)│   per Java call level)
-  execute_frame      (interpreter.rs:6043)  ┘
+#0  java/util/stream/Stream.dropWhile
+#1  org/apache/logging/log4j/util/StackLocator.lambda$getCallerClass$6
+#2  java/lang/StackStreamFactory$StackFrameTraverser.consumeFrames
+#3  java/lang/StackStreamFactory$AbstractStackWalker.beginStackWalk
+#4  java/lang/StackStreamFactory$AbstractStackWalker.walkHelper
+#5  org/apache/logging/log4j/util/StackLocator.getCallerClass
+…   org/jboss/logging/… → org/hibernate/boot/BootLogging.<clinit>
 ```
 
-Triggered while **binding the INSERT parameters** — specifically the `Byte[] boxed` column bound as an H2
-`tinyint array` (last SQL before the fault is the `insert into EntityOfByteArrays (boxed, …)`). A flood of
-`gen_heap get_field OOB index=1 on a 1-slot ClassId(275) java/util/stream/Stream` WARNs (each a *different*
-object) accompanies the recursion — a CV-specific Stream mis-handling (synthetic streams are 2-slot;
-something produces/processes a 1-slot real-layout Stream) drives a deep lambda-dispatch recursion that
-**HotSpot does not have** (HotSpot persists this entity with shallow depth and PASSES).
+`CRATONVM_DEBUG_STACKWALK=1` shows the smoking gun — **the same walk runs hundreds of times (777 SW-DBG
+events), and the captured stack GROWS each round** until a wild dereference faults:
+```
+callStackWalk consumed=2 … ordered_len=83 trace_len=91
+fetchStackFrames anchor=2 → 7 → 18 → 41 → 72       (one walk consumes all 83 frames — correct)
+callStackWalk capture len=101 … ordered_len=99     ← a NEW walk; stack grew 83 → 99
+fetchStackFrames anchor=2 → 7 → 18 → 41 → 72 …      ordered_len=99 → grows again → …
+```
+Each complete walk leaves ~16 extra frames that the next walk sees (83 → 99 → …). The `fetchStackFrames`
+cursor advances correctly *within* a walk (the JDK FrameBuffer doubles batch size 5,11,23,31…), so the
+per-walk batch protocol is fine — the bug is that **a fresh `StackWalker.walk` is launched from inside the
+walk's own frame processing**, unboundedly. EXEC_DEPTH stays ~24 and native `remaining` stays at the full
+128 MiB throughout, confirming it is NOT native-stack exhaustion.
 
-### Why the StackOverflowError guard (H6) fails to catch it
+## Why it doesn't reproduce in a toy repro
 
-`derive_exec_depth_ceiling` (interpreter.rs:2079) assumes `NATIVE_STACK_BYTES_PER_EXEC_LEVEL = 8 KiB`. The
-**lambda-dispatch path here burns ~100–200 KiB of native stack per Java level** (6 large nested Rust frames),
-so on the (worker) thread it runs on, the native stack overflows at **~40 levels**:
+`jsonrepro/{SWDrop,RecurseSW,SWDropAll}.java` exercise `StackWalker.walk(s -> s.dropWhile(...).findFirst())`
+(including never-matching predicates and 60-deep stacks) and all **complete cleanly** on CratonVM, matching
+HotSpot. The re-entrancy only arises in the real log4j2 bootstrap, where resolving a walked frame
+(`populate_sfi` → `getDeclaringClass` / class init / `org.jboss.logging` → log4j2) re-enters
+`getCallerClass` → `StackWalker.walk`. The CV defect is most likely that CV's synthetic `StackFrameInfo`
+(`native-builtins/src/lang_stackwalker.rs`, 6-slot layout) returns a caller class log4j2 doesn't accept, so
+its `ClassLoaderContextSelector.getContext` re-initialises and walks again — an infinite re-init loop that
+HotSpot avoids because its `getDeclaringClass`/`getCallerClass` return the expected frame.
 
-- `CRATONVM_EXEC_DEPTH_CEILING=40/100/400` → **SIGSEGV** (native stack dies before the counter trips).
-- `CRATONVM_EXEC_DEPTH_CEILING=5` → catchable `StackOverflowError` (but that's below *normal* Hibernate
-  nesting, so it false-trips during SessionFactory build).
+## Root fix (handoff)
 
-The native-overflow depth (~40) is **lower than normal operation depth** (~200), so a *uniform per-level
-counter* fundamentally cannot distinguish this heavy path from legitimate deep recursion (binaryTrees etc.).
-The guard is structurally unable to protect this path → uncatchable SIGSEGV.
+Trace one full walk→walk boundary (what re-invokes `getCallerClass`): instrument `native_fetch_stack_frames`
+/ `populate_sfi` to log the class each StackFrameInfo resolves to, and compare against HotSpot for the same
+bootstrap. Likely fixes: ensure `StackWalker$StackFrame.getDeclaringClass()` / `getClassName()` on CV's
+synthetic frames return exactly what log4j2's `dropWhile` predicate expects (so the walk finds the caller and
+terminates), or break the logging re-entrancy during frame resolution. Not a localized one-liner.
 
-## Two root causes, neither a quick localized fix
+## H7 — native stack-bang (general mitigation, landed separately)
 
-1. **CV-specific deep recursion** during `Byte[]`→H2-array INSERT binding, induced by the 1-slot class-275
-   Stream mis-handling (HotSpot doesn't recurse here). FIX = find the Java recursion cycle (the harness
-   swallows the forced-SOE stack; the hard fault yields no Java frames — needs gen_heap-guard backtrace
-   instrumentation on the ClassId(275) OOB, or a path that prints the uncaught-SOE Java stack) and stop the
-   mis-sized Stream from being produced/streamed. This is the one that would make the test PASS like HotSpot.
-2. **Structural SOE-guard gap**: the per-level native-stack estimate (8 KiB) is 12–25× too low for the
-   lambda-dispatch path, and a uniform counter can't catch a heavy path that overflows below normal depth.
-   FIX = a real native-stack-pointer probe (stack banging) in `execute`, throwing a catchable SOE within a
-   guard-page safety margin — robust regardless of per-level cost — instead of (or in addition to) the
-   counter. Risky on the interpreter hot path; needs care not to regress throughput.
+While diagnosing, a real **SP-based stack-bang** was added to `execute` (`interpreter.rs`): it probes the
+actual remaining native stack via `GetCurrentThreadStackLimits` and throws a *catchable*
+`StackOverflowError` within a 1 MiB margin, converting the class of **uncatchable native-stack-overflow
+SIGSEGVs** (e.g. deep ByteBuddy reflection cascades the H6 per-level counter can't size correctly) into
+recoverable Java errors. Default-on; opt out `CRATONVM_NO_STACK_BANG=1`; tune `CRATONVM_STACK_BANG_MARGIN_KB`.
+Verified: catches genuine overflow when the H6 counter is disabled; does not false-trip legit recursion
+(simple infinite recursion still caught by the existing Java-frame guard; binaryTrees unaffected). **This
+mitigation does NOT fix `ByteArrayMappingTests`** — that crash is a re-entrant loop, not stack exhaustion.
 
-Raising `NATIVE_STACK_BYTES_PER_EXEC_LEVEL` globally is **not** safe — it lowers the ceiling for all
-interpreter recursion and would regress legitimate deep-recursion workloads (binaryTrees) that the comment at
-interpreter.rs:2065 explicitly calls out.
-
-### Diagnostic recipe (for the next session)
-- Build `--profile release-with-debug`; reproduce solo; symbolize the VEH frames with
-  `CRATONVM_SYMBOLIZE=0x<rva>,… cratonvm` (plain `--release` has no symbols).
-- `CRATONVM_EXEC_DEPTH_CEILING=5` proves the cycle goes through guarded `execute` (throws catchable SOE).
-- Repro is the single class `mapping.basic.ByteArrayMappingTests` (JIT-off), reproduces strictly solo.
-
-## Related
-
-Distinct from the JSON-function `al_state` foreign-receiver SIGSEGV (fixed this session) — that was a native
-reading ArrayList slots off a non-ArrayList; this is a Stream layout-probe. Same *family* (native slot
-computation on a non-matching receiver), different native. The sibling crash
-`onetoone.nopojo.DynamicMapOneToOneTest` exits **rc=127** (abnormal exit, not SIGSEGV) and also reproduces
-solo — likely a separate dynamic-map (`Map`-backed entity, no POJO) issue; not yet triaged.
+### Diagnostic recipe
+- `--profile release-with-debug`; `CRATONVM_SYMBOLIZE=0x<rva>,… cratonvm` to symbolize VEH frames.
+- `CRATONVM_DBG_SOE=1` + the H7 `dropWhile`/depth hook → one-shot Java caller chain.
+- `CRATONVM_DEBUG_STACKWALK=1` → the repeated `callStackWalk` / growing `ordered_len` loop signature.
+- Repro: single class `mapping.basic.ByteArrayMappingTests` (JIT-off), reproduces strictly solo.
